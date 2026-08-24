@@ -1,0 +1,42 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+!**/.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Node / Vue
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+*.tsbuildinfo
+
+# Runtime logs and generated data
+*.log
+*.xlsx
+backend/bounding_box/*cache*.json
+backend/trajectories_tree/*cache*.json
+
+# The workspace is local-only. Keep only its empty directory structure.
+backend_workspace/*
+!backend_workspace/.gitkeep
+!backend_workspace/rollout_trajectories/
+backend_workspace/rollout_trajectories/*
+!backend_workspace/rollout_trajectories/.gitkeep
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+

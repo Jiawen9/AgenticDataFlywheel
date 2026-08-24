@@ -1,0 +1,8 @@
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+anyio>=3.6.2,<5
+exceptiongroup>=1.2,<2; python_version < "3.11"
+openpyxl>=3.0.9,<4
+pillow>=9.0.1,<12
+httpx>=0.27,<1
+openai>=1.40,<2

@@ -1,0 +1,3 @@
+Pillow>=10.0
+openai>=2.0
+httpx>=0.27
