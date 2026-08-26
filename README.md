@@ -213,7 +213,96 @@ npm run build --prefix frontend
 
 测试不会调用真实模型服务；涉及 Qwen 的路径使用模拟 reviewer。
 
+## 10. 生成动态 Rubric
+
+`backend/DevelopRubrics` 会把本地 rollout 轨迹转换成 AdaRubric 标准对象，并使用
+Qwen 生成每一步的截图观察、整条轨迹总结和任务级 Rubric。该模块要求 Python
+3.10+，推荐使用已有的 `guigent` Conda 环境：
+
+```powershell
+conda activate guigent
+python -m pip install -e backend\DevelopRubrics
+```
+
+统一入口支持三种命令：
+
+```powershell
+# 仅导出标准工作簿，不调用模型
+python backend\DevelopRubrics\run_jiawen.py export --skip-model
+
+# 使用 Qwen 导出带观察描述的工作簿
+python backend\DevelopRubrics\run_jiawen.py export
+
+# 使用已有工作簿生成 Rubric
+python backend\DevelopRubrics\run_jiawen.py generate
+
+# 依次执行模型观察导出和 Rubric 生成
+python backend\DevelopRubrics\run_jiawen.py all
+```
+
+默认输入为 `backend_workspace/rollout_trajectories`，输出为：
+
+```text
+backend_workspace/
+├─ rubric_trajectories.xlsx
+└─ rubric_outputs/
+   ├─ cache/qwen_summaries.json
+   └─ rubrics/
+      ├─ jiawen_gui_initial_rubric.json
+      ├─ jiawen_gui_initial_rubric.evidence.md
+      └─ jiawen_gui_initial_rubric.raw_response.txt
+```
+
+工具会递归发现正式轨迹并忽略 `_prefetch_staging`。截图优先使用
+`input_stability.jpg`，缺失时依次回退到 `input.jpg` 和 `done.jpg`。模型响应逐次写入
+缓存，中断后重新执行同一命令即可续跑。默认关闭 embedding 相似度校验，但仍校验
+Rubric JSON、任务 ID、维度数量、权重和 1–5 评分等级。
+
 ## 数据与密钥说明
+
+## 11. 批量轨迹质检
+
+### 建树时预生成质检输入
+
+新建的轨迹树任务集会在逐步判断广告、加载和弹窗时，用同一次 Qwen 视觉请求同步生成
+post-action observation。所有步骤完成后，系统再为每条轨迹生成一次基于视觉证据的
+`final_answer`。有序的 action 与 observation 会在 AdaRubric 评价时自动组成 history，
+不需要额外模型调用。
+
+质检输入作为建树快照保存在：
+
+```text
+backend_workspace/trajectory_tree_runs/<run_id>/rubric_trajectories.xlsx
+```
+
+因此新任务集进入质检时不会再次生成 observation 和 final answer，只需生成缺失的 Rubric
+并执行评分。旧任务集若没有随附工作簿，仍会回退到全局工作簿及原有自动补齐流程。
+任一 observation、final answer 或工作簿生成失败时，本次建树任务集不会发布；已完成缓存会保留供重新提交续跑。
+
+轨迹质检依赖 Python 3.10 以上版本运行 AdaRubric。后端本身仍可使用原有 Python 环境，
+并通过 `backend/.env` 中的下列配置启动专用子进程：
+
+```dotenv
+ADARUBRIC_PYTHON=D:\anaconda3\envs\guigent\python.exe
+```
+
+使用流程：
+
+1. 在“轨迹采集”页完成建树，形成一个时间串任务集。
+2. 进入“轨迹质检”，选择该任务集；页面会列出其中全部任务。
+3. 勾选一个或多个任务，点击“提交轨迹质检”。后端会全局串行执行模型作业，并显示当前任务、轨迹和完成进度。
+4. 若 observation、final answer 或 Rubric 缺失，作业会自动生成；已完成的模型响应和逐轨迹 checkpoint 会被复用。
+5. 作业成功后点击“查看轨迹树”。已质检的终点叶子会显示 0–5 分：绿色表示通过，红色表示未通过；点击叶子可查看各维度得分、理由和逐步评价。
+
+最新成功结果保存到：
+
+```text
+backend_workspace/trajectory_quality_results/<建树任务集 ID>/
+```
+
+质检作业状态保存在 `backend_workspace/trajectory_quality_jobs/`。服务重启后，未完成作业会标记为
+`interrupted`；重新提交相同任务即可从缓存和 checkpoint 续跑。批量作业只有在本次所选任务全部成功后才发布，
+失败不会覆盖已有成功结果；重新质检部分任务时也只更新这些任务。
 
 代码仓只保存源码、测试、文档和配置示例。以下内容始终保留在本机：
 

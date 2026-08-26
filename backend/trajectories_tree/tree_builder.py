@@ -181,6 +181,8 @@ class Step:
     confirmation_node_ids: list[int] = field(default_factory=list)
     confirmation_step_indices: list[int] = field(default_factory=list)
     alignment_review: dict[str, Any] | None = None
+    observation: str = ""
+    excluded_intermediate_terminate: bool = False
 
     def apply_classification(
         self,
@@ -188,6 +190,7 @@ class Step:
         confidence_threshold: float,
     ) -> None:
         self.classification = result
+        self.observation = result.observation
         self.classification_candidate = bool(
             result.is_intermediate and result.confidence >= confidence_threshold
         )
@@ -210,6 +213,8 @@ class Step:
             "action": self.action,
             "summary": self.summary,
             "actions_box": self.actions_box,
+            "observation": self.observation,
+            "excluded_intermediate_terminate": self.excluded_intermediate_terminate,
             "classification": classification_value,
             "classification_candidate": self.classification_candidate,
             "alignment_review": self.alignment_review,
@@ -301,6 +306,7 @@ class Node:
             "label": label,
             "action": action,
             "summary": summary,
+            "observation": self.reference.observation if self.reference else "",
             "actions_box": box,
             "image": image,
             "xml": xml,
@@ -409,18 +415,40 @@ def classify_trajectories(
     classifier: StepClassifier,
     trajectory_root: Path,
     confidence_threshold: float,
+    task: str = "",
 ) -> None:
-    total = sum(len(steps) for _, steps in trajectories)
+    total = sum(
+        1
+        for _, steps in trajectories
+        for position, step in enumerate(steps)
+        if not (step.action.get("action") == "terminate" and position < len(steps) - 1)
+    )
     completed = 0
     for trajectory, steps in trajectories:
+        if steps and steps[-1].action.get("action") == "terminate":
+            status = steps[-1].action.get("status")
+            if status not in {"success", "failure"}:
+                raise ValueError(
+                    f"final terminate must use status success or failure: "
+                    f"trajectory={trajectory}, step={steps[-1].step_index}, status={status!r}"
+                )
         for position, step in enumerate(steps):
+            if step.action.get("action") == "terminate" and position < len(steps) - 1:
+                step.excluded_intermediate_terminate = True
+                step.counted_in_tree = False
+                step.tree_decision = "ignore_intermediate"
+                step.decision_source = "intermediate_terminate"
+                continue
             previous_summary = steps[position - 1].summary if position > 0 else ""
             next_step = steps[position + 1] if position + 1 < len(steps) else None
+            current_path = _artifact_path(trajectory_root, step.image)
+            done_name = re.sub(r"_input(?:_stability)?\.jpg$", "_done.jpg", current_path.name, flags=re.IGNORECASE)
+            done_path = current_path.with_name(done_name)
             try:
                 result = classifier.classify(
                     trajectory=trajectory,
                     step_index=step.step_index,
-                    current_image_path=_artifact_path(trajectory_root, step.image),
+                    current_image_path=current_path,
                     next_image_path=(
                         _artifact_path(trajectory_root, next_step.image)
                         if next_step is not None
@@ -430,6 +458,8 @@ def classify_trajectories(
                     summary=step.summary,
                     previous_summary=previous_summary,
                     next_summary=next_step.summary if next_step is not None else "",
+                    after_image_path=done_path if done_path.is_file() else None,
+                    task=task,
                 )
             except Exception as exc:
                 raise RuntimeError(
@@ -455,12 +485,26 @@ def apply_bounded_skip_policy(
     """Ignore only short classified runs followed by stable recovery steps."""
     for step in steps:
         step.effective_intermediate = False
-        step.counted_in_tree = True
+        step.counted_in_tree = not step.excluded_intermediate_terminate
         step.skip_count = 0
         step.confirmation_step_indices = []
 
+    def protected_task_action(position: int, step: Step) -> bool:
+        """Never erase actions that establish the trajectory's common task start."""
+        kind = str(step.action.get("action", "")).lower()
+        summary = step.summary.lower()
+        launch_words = ("打开", "启动", "open", "launch")
+        app_words = ("应用", "app", "爱奇艺")
+        return (
+            kind == "open"
+            or (any(word in summary for word in launch_words) and any(word in summary for word in app_words))
+        )
+
     position = 0
     while position < len(steps):
+        if steps[position].excluded_intermediate_terminate:
+            position += 1
+            continue
         if not steps[position].classification_candidate:
             position += 1
             continue
@@ -480,10 +524,14 @@ def apply_bounded_skip_policy(
         )
         if run_length <= max_skip and has_stable_recovery:
             confirmation_indices = [item.step_index for item in confirmation]
-            for item in steps[position:end]:
+            ignored_items = [
+                item for offset, item in enumerate(steps[position:end], position)
+                if not protected_task_action(offset, item)
+            ]
+            for item in ignored_items:
                 item.effective_intermediate = True
                 item.counted_in_tree = False
-                item.skip_count = run_length
+                item.skip_count = len(ignored_items)
                 item.confirmation_step_indices = confirmation_indices
         position = end
 
@@ -625,6 +673,7 @@ def build_tree(
                     "action": {"action": "desktop"},
                     "action_text": "",
                     "summary": "轨迹起始桌面",
+                    "observation": "",
                     "actions_box": "",
                     "score": FULL_SCORE,
                     "reused": len(root.occurrences) > 0,
@@ -637,6 +686,18 @@ def build_tree(
         while position < len(steps):
             step = steps[position]
             parent_id = current.id
+
+            if step.excluded_intermediate_terminate:
+                _record_ignored_step(
+                    decisions,
+                    step,
+                    parent_node=parent_id,
+                    decision_source="intermediate_terminate",
+                    reason="non-final terminate is excluded before model classification",
+                    confidence_threshold=confidence_threshold,
+                )
+                position += 1
+                continue
 
             if step.effective_intermediate:
                 _record_ignored_step(
@@ -753,6 +814,7 @@ def build_tree(
                     "action": step.action,
                     "action_text": step.action_text,
                     "summary": step.summary,
+                    "observation": step.observation,
                     "actions_box": step.actions_box,
                     "score": best_score,
                     "reused": reused,
@@ -805,6 +867,9 @@ def source_trajectory_audit(
             "ignored_incidental_step_count": sum(
                 not step.counted_in_tree for step in steps
             ),
+            "ignored_intermediate_terminate_count": sum(
+                step.excluded_intermediate_terminate for step in steps
+            ),
             "steps": [step.audit_dict(confidence_threshold) for step in steps],
         }
         for trajectory, steps in trajectories
@@ -844,6 +909,9 @@ def write_output(
             "ignored_incidental_step_count": sum(
                 not step.counted_in_tree for step in all_steps
             ),
+            "ignored_intermediate_terminate_count": sum(
+                step.excluded_intermediate_terminate for step in all_steps
+            ),
             "classification_count": sum(
                 step.classification is not None for step in all_steps
             ),
@@ -866,7 +934,9 @@ def write_output(
             "classification_category_counts": dict(sorted(category_counts.items())),
             **statistics.to_dict(),
             "matching_policy": (
-                "Every source step is classified. High-confidence one/two-step "
+                "Every source step except non-final terminate actions is classified. "
+                "Non-final terminate actions remain in the audit but are excluded from "
+                "the tree and quality workbook before model calls. High-confidence one/two-step "
                 "transient runs are ignored only when followed by two high-confidence "
                 "normal steps, including recovery into a new branch. Low-confidence "
                 "steps may be ignored only after a mismatch, two full action/bbox "

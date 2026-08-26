@@ -21,6 +21,8 @@ from backend.trajectory_data import (
     update_action_bbox,
 )
 from backend.tree_build_jobs import TreeBuildJobManager
+from backend.quality_data import quality_manifest, quality_task
+from backend.quality_jobs import QualityJobManager
 
 
 def write_request(path: Path, goal: str) -> None:
@@ -258,6 +260,43 @@ class TreeBuildJobTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "interrupted")
             self.assertTrue(result["error"])
+
+
+class QualityJobTests(unittest.TestCase):
+    def test_successful_quality_job_persists_trajectory_progress(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            finished = threading.Event()
+
+            def runner(run_id, task_ids, *, job_id, progress):
+                self.assertEqual((run_id, task_ids), ("run-1", ["TASK-A"]))
+                progress({"stage": "evaluating", "current_task": "TASK-A", "current_trajectory": "TASK-A-1", "completed_trajectories": 1, "total_trajectories": 2, "percent": 55})
+                finished.set()
+                return {"run_id": run_id}
+
+            manager = QualityJobManager(Path(temp_dir), runner)
+            job = manager.submit("run-1", ["TASK-A"])
+            self.assertTrue(finished.wait(2))
+            for _ in range(100):
+                result = manager.get(job["job_id"])
+                if result and result["status"] == "succeeded":
+                    break
+                time.sleep(0.01)
+            manager.shutdown()
+            self.assertEqual(result["status"], "succeeded")
+            self.assertEqual(result["percent"], 100)
+            self.assertEqual(result["current_trajectory"], "TASK-A-1")
+
+    def test_quality_result_readers_handle_missing_and_published_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.assertEqual(quality_manifest("run-1", root)["tasks"], [])
+            run = root / "run-1"
+            run.mkdir()
+            (run / "manifest.json").write_text(json.dumps({"run_id": "run-1", "tasks": [{"task_id": "TASK-A"}]}), encoding="utf-8")
+            (run / "TASK-A.json").write_text(json.dumps({"task_id": "TASK-A", "evaluations": {}}), encoding="utf-8")
+            self.assertEqual(quality_manifest("run-1", root)["run_id"], "run-1")
+            self.assertEqual(quality_task("run-1", "TASK-A", root)["task_id"], "TASK-A")
+            self.assertIsNone(quality_task("run-1", "../secret", root))
 
 
 if __name__ == "__main__":

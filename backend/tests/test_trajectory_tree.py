@@ -4,11 +4,13 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from PIL import Image
 
 from backend.trajectories_tree.intermediate_state_classifier import (
     IntermediateStateResult,
+    QwenIntermediateStateClassifier,
     parse_classification_response,
 )
 from backend.trajectories_tree.state_alignment_reviewer import (
@@ -139,6 +141,45 @@ class ResponseParsingTests(unittest.TestCase):
         )
         self.assertTrue(parsed.is_intermediate)
         self.assertEqual(parsed.category, "loading")
+        combined = parse_classification_response(
+            '{"is_intermediate":false,"category":"none","confidence":0.98,'
+            '"reason":"正常页面","observation":"执行后进入详情页"}',
+            require_observation=True,
+        )
+        self.assertEqual(combined.observation, "执行后进入详情页")
+        with self.assertRaisesRegex(ValueError, "observation"):
+            parse_classification_response(
+                '{"is_intermediate":false,"category":"none","confidence":0.98,"reason":"正常"}',
+                require_observation=True,
+            )
+
+    def test_combined_classifier_returns_observation_and_disables_thinking(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            before, after = root / "before.jpg", root / "after.jpg"
+            Image.new("RGB", (20, 20), "white").save(before)
+            Image.new("RGB", (20, 20), "black").save(after)
+            calls = []
+
+            class Completions:
+                def create(self, **kwargs):
+                    calls.append(kwargs)
+                    content = json.dumps({"is_intermediate": False, "category": "none", "confidence": 0.98, "reason": "正常页面", "observation": "执行后页面变为黑色"}, ensure_ascii=False)
+                    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+            classifier = object.__new__(QwenIntermediateStateClassifier)
+            classifier.model = "fake-model"
+            classifier.cache_path = root / "cache.json"
+            classifier.cache = {}
+            classifier.client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+            result = classifier.classify(trajectory="t-1", step_index=1, current_image_path=before,
+                next_image_path=None, after_image_path=after, action={"action": "terminate", "status": "success"},
+                summary="结束", previous_summary="", next_summary="", task="测试任务")
+
+            self.assertEqual(result.observation, "执行后页面变为黑色")
+            self.assertFalse(result.cached)
+            self.assertFalse(calls[0]["extra_body"]["chat_template_kwargs"]["enable_thinking"])
+            self.assertNotIn('"status": "success"', calls[0]["messages"][1]["content"][0]["text"].split("Observation action：", 1)[1])
         with self.assertRaisesRegex(ValueError, "category='none'"):
             parse_classification_response(
                 '{"is_intermediate":false,"category":"advertisement",'
@@ -157,6 +198,40 @@ class ResponseParsingTests(unittest.TestCase):
 
 
 class AllTrajectoryClassificationTests(unittest.TestCase):
+    def test_non_final_terminate_is_excluded_without_model_call(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            steps = [
+                step("run", 1, {"action": "terminate", "status": "failure"}),
+                step("run", 2, {"action": "wait"}),
+                step("run", 3, {"action": "terminate", "status": "success"}),
+            ]
+            for current in steps:
+                image_path = root / current.image
+                image_path.parent.mkdir(parents=True, exist_ok=True)
+                Image.new("RGB", (20, 20), "white").save(image_path)
+            classifier = FakeClassifier({2: classification(), 3: classification()})
+
+            classify_trajectories([("run", steps)], classifier, root, 0.8)
+            apply_bounded_skip_policy(steps)
+            tree, decisions, _ = build_tree(
+                [("run", steps)], confidence_threshold=0.8,
+                trajectory_root=root, alignment_reviewer=None,
+            )
+
+            self.assertEqual([call["step_index"] for call in classifier.calls], [2, 3])
+            self.assertTrue(steps[0].excluded_intermediate_terminate)
+            self.assertFalse(steps[0].counted_in_tree)
+            self.assertEqual(decisions[0]["decision_source"], "intermediate_terminate")
+            self.assertEqual(count_nodes(tree) - 1, 2)
+
+    def test_final_terminate_requires_standard_status(self):
+        steps = [step("run", 1, {"action": "terminate", "status": "sucfailure"})]
+        with self.assertRaisesRegex(ValueError, "success or failure"):
+            classify_trajectories(
+                [("run", steps)], FakeClassifier({1: classification()}), Path("unused"), 0.8
+            )
+
     def test_every_step_in_every_trajectory_reaches_classifier(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -169,6 +244,8 @@ class AllTrajectoryClassificationTests(unittest.TestCase):
                 image_path = root / current.image
                 image_path.parent.mkdir(parents=True, exist_ok=True)
                 Image.new("RGB", (20, 20), "white").save(image_path)
+            done = root / first_steps[0].image.replace("_input.jpg", "_done.jpg")
+            Image.new("RGB", (20, 20), "black").save(done)
             classifier = FakeClassifier(
                 {
                     ("first", 1): classification(),
@@ -182,17 +259,20 @@ class AllTrajectoryClassificationTests(unittest.TestCase):
                 classifier,
                 root,
                 0.8,
+                task="test task",
             )
 
             self.assertEqual(len(classifier.calls), 3)
             self.assertIsNotNone(classifier.calls[0]["next_image_path"])
+            self.assertEqual(classifier.calls[0]["after_image_path"], done)
+            self.assertEqual(classifier.calls[0]["task"], "test task")
             self.assertIsNone(classifier.calls[1]["next_image_path"])
             self.assertIsNone(classifier.calls[2]["next_image_path"])
             self.assertTrue(first_steps[1].classification_candidate)
 
     def test_policy_ignores_only_short_runs_with_two_stable_followups(self):
         steps = [step("seed", index, {"action": "wait"}) for index in range(1, 14)]
-        # Short prefix run followed by two stable states: ignore step 1.
+        # The first action establishes the common start and is always retained.
         steps[0].apply_classification(classification(True), 0.8)
         steps[1].apply_classification(classification(), 0.8)
         steps[2].apply_classification(classification(), 0.8)
@@ -216,6 +296,26 @@ class AllTrajectoryClassificationTests(unittest.TestCase):
         self.assertTrue(all(steps[index - 1].counted_in_tree for index in [8, 9, 10, 13]))
         self.assertEqual(steps[3].skip_count, 2)
         self.assertEqual(steps[3].confirmation_step_indices, [6, 7])
+
+    def test_app_launch_is_retained_while_following_ad_wait_is_ignored(self):
+        steps = [
+            step("run-8", 1, {"action": "click", "coordinate": [848, 125]}),
+            step("run-8", 2, {"action": "wait"}),
+            step("run-8", 3, {"action": "click"}),
+            step("run-8", 4, {"action": "click"}),
+        ]
+        steps[0].summary = "点击爱奇艺图标打开应用"
+        steps[0].apply_classification(classification(True, 0.99, "advertisement"), 0.8)
+        steps[1].apply_classification(classification(True, 0.99, "advertisement"), 0.8)
+        steps[2].apply_classification(classification(), 0.8)
+        steps[3].apply_classification(classification(), 0.8)
+
+        apply_bounded_skip_policy(steps)
+
+        self.assertTrue(steps[0].counted_in_tree)
+        self.assertFalse(steps[0].effective_intermediate)
+        self.assertFalse(steps[1].counted_in_tree)
+        self.assertTrue(steps[1].effective_intermediate)
 
     def test_low_confidence_result_is_retained_for_structural_fallback(self):
         steps = [step("seed", index, {"action": "wait"}) for index in range(1, 4)]

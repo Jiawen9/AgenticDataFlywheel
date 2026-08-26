@@ -11,6 +11,7 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from .trajectories_preprocessing import configure_reviewer_environment
+from .quality_input_builder import build_quality_workbook
 from .trajectory_data import (
     ANNOTATED_XLSX,
     BACKEND_DIR,
@@ -62,7 +63,7 @@ class _ProgressClassifier:
         self.completed += 1
         self.callback(
             {
-                "stage": "classifying",
+                "stage": "classifying_and_observing",
                 "current_task": self.task_id,
                 "classified_steps": self.offset + self.completed,
                 "total_steps": self.total_steps,
@@ -109,6 +110,7 @@ def build_tree_run(
     alignment_cache: Path = DEFAULT_ALIGNMENT_CACHE,
     confidence_threshold: float = 0.8,
     max_incidental_skip: int = MAX_INCIDENTAL_SKIP,
+    quality_builder: Callable[..., tuple[int, int, int]] = build_quality_workbook,
 ) -> tuple[str, dict[str, Any]]:
     if not xlsx_path.is_file():
         raise FileNotFoundError(f"缺少预处理文件：{xlsx_path}")
@@ -124,7 +126,11 @@ def build_tree_run(
 
     metadata = discover_tasks(trajectory_root)
     total_steps = sum(
-        len(steps) for task_id in task_ids for _, steps in grouped[task_id]
+        1
+        for task_id in task_ids
+        for _, steps in grouped[task_id]
+        for position, step in enumerate(steps)
+        if not (step.action.get("action") == "terminate" and position < len(steps) - 1)
     )
     runs_dir.mkdir(parents=True, exist_ok=True)
     temporary_dir = runs_dir / f".building-{job_id}"
@@ -142,7 +148,7 @@ def build_tree_run(
             trajectories = grouped[task_id]
             progress(
                 {
-                    "stage": "classifying",
+            "stage": "classifying_and_observing",
                     "current_task": task_id,
                     "task_index": task_index,
                     "total_tasks": len(task_ids),
@@ -158,8 +164,14 @@ def build_tree_run(
                 progress_classifier,
                 trajectory_root,
                 confidence_threshold,
+                task=(metadata[task_id].goal if task_id in metadata else task_id),
             )
-            task_step_count = sum(len(steps) for _, steps in trajectories)
+            task_step_count = sum(
+                1
+                for _, steps in trajectories
+                for position, step in enumerate(steps)
+                if not (step.action.get("action") == "terminate" and position < len(steps) - 1)
+            )
             completed_steps += task_step_count
             for _, steps in trajectories:
                 apply_bounded_skip_policy(
@@ -211,6 +223,16 @@ def build_tree_run(
                 }
             )
 
+        quality_workbook = temporary_dir / "rubric_trajectories.xlsx"
+        quality_task_count, quality_trajectory_count, quality_step_count = quality_builder(
+            grouped={task_id: grouped[task_id] for task_id in task_ids},
+            task_goals={task_id: (metadata[task_id].goal if task_id in metadata else task_id) for task_id in task_ids},
+            trajectory_root=trajectory_root,
+            output=quality_workbook,
+            env_path=env_path,
+            progress=progress,
+        )
+
         progress({"stage": "publishing", "classified_steps": total_steps, "total_steps": total_steps})
         completed_at = datetime.now(ZoneInfo("Asia/Shanghai"))
         run_id = _new_run_id(runs_dir, completed_at)
@@ -223,6 +245,11 @@ def build_tree_run(
             "total_original_steps": sum(item["original_step_count"] for item in task_manifests),
             "total_tree_steps": sum(item["tree_step_count"] for item in task_manifests),
             "source_xlsx": _file_fingerprint(xlsx_path),
+            "quality_input_file": quality_workbook.name,
+            "quality_input_prompt_version": "trajectory-intermediate-observation-v4",
+            "quality_task_count": quality_task_count,
+            "quality_observation_count": quality_step_count,
+            "quality_final_answer_count": quality_trajectory_count,
             "tasks": task_manifests,
         }
         (temporary_dir / "manifest.json").write_text(
@@ -234,4 +261,3 @@ def build_tree_run(
         if temporary_dir.exists():
             shutil.rmtree(temporary_dir)
         raise
-

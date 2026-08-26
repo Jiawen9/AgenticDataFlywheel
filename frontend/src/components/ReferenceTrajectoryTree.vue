@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import type { TrajectoryTreeNode } from '@/types'
+import type { TrajectoryQualityEvaluation, TrajectoryTreeNode } from '@/types'
 
 const props = defineProps<{
   root: TrajectoryTreeNode
   selectedId?: number
+  quality?: Record<string, TrajectoryQualityEvaluation>
 }>()
 
 const emit = defineEmits<{
@@ -16,6 +17,8 @@ interface LayoutNode {
   x: number
   y: number
   actionClass: 'root' | 'click' | 'swipe' | 'other'
+  score: number | null
+  passed: boolean | null
 }
 
 interface LayoutEdge {
@@ -48,6 +51,7 @@ const layout = computed(() => {
   const collect = (node: TrajectoryTreeNode) => {
     const point = positions.get(node.id)!
     const label = node.label.toLowerCase()
+    const results = node.terminal_trajectories.map((id) => props.quality?.[id]).filter(Boolean) as TrajectoryQualityEvaluation[]
     nodes.push({
       node,
       ...point,
@@ -58,6 +62,8 @@ const layout = computed(() => {
           : label.includes('swipe')
             ? 'swipe'
             : 'other',
+      score: results.length ? results.reduce((sum, result) => sum + result.global_score, 0) / results.length : null,
+      passed: results.length ? results.every((result) => result.passed_threshold) : null,
     })
     for (const child of node.children) {
       const childPoint = positions.get(child.id)!
@@ -187,11 +193,14 @@ onBeforeUnmount(() => window.removeEventListener('resize', resetView))
           </text>
           <circle
             v-if="item.node.terminal_trajectories.length"
-            class="terminal"
+            :class="['terminal', item.passed === true ? 'terminal--passed' : item.passed === false ? 'terminal--failed' : '']"
             cx="20"
             cy="-20"
-            r="5"
+            r="7"
           />
+          <text v-if="item.score !== null" class="quality-score" x="33" y="29">
+            {{ item.score.toFixed(2) }} / 5
+          </text>
         </g>
       </g>
     </svg>
@@ -225,6 +234,9 @@ onBeforeUnmount(() => window.removeEventListener('resize', resetView))
 .reference-node .node-action { font-weight: 700; }
 .reference-node .node-summary { fill: #91a6c0; font-size: 10px; }
 .terminal { fill: #ffd166; stroke: #0b1220; stroke-width: 1; }
+.terminal--passed { fill: #34d399; }
+.terminal--failed { fill: #fb7185; }
+.reference-node .quality-score { fill: #f8fafc; font-size: 11px; font-weight: 800; }
 .tree-controls { position: absolute; top: 14px; left: 14px; z-index: 4; display: flex; overflow: hidden; border: 1px solid #58708f; border-radius: 6px; background: rgba(17,24,39,.92); box-shadow: 0 6px 18px rgba(0,0,0,.3); }
 .tree-controls button { min-width: 34px; height: 32px; padding: 0 9px; border: 0; border-right: 1px solid #354158; background: transparent; color: #dce7f5; cursor: pointer; }
 .tree-controls button:last-child { border-right: 0; }

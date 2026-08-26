@@ -46,9 +46,77 @@ export interface BuildJob {
   total_tasks: number
   classified_steps: number
   total_steps: number
+  summarized_trajectories?: number
+  total_trajectories?: number
   percent: number
   error: string | null
   run_id: string | null
+}
+
+export interface QualityJob {
+  job_id: string
+  run_id: string
+  task_ids: string[]
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted'
+  stage: 'queued' | 'preparing' | 'generating_rubric' | 'evaluating' | 'publishing' | 'succeeded' | 'failed' | 'interrupted'
+  created_at: string
+  started_at: string | null
+  completed_at: string | null
+  current_task: string | null
+  current_trajectory: string | null
+  completed_trajectories: number
+  total_trajectories: number
+  percent: number
+  error: string | null
+}
+
+export interface QualityTaskSummary {
+  task_id: string
+  status: 'unreviewed' | 'succeeded'
+  rubric_ready: boolean
+  trajectory_count?: number
+  average_score?: number
+  passed_count?: number
+  updated_at?: string
+}
+
+export interface RunQualitySummary {
+  run_id: string
+  updated_at?: string
+  tasks: QualityTaskSummary[]
+}
+
+export interface DimensionEvaluation {
+  dimension_id?: string
+  dimension_name: string
+  score: number
+  rationale?: string
+  confidence?: number
+}
+
+export interface StepQualityEvaluation {
+  step_id: number
+  dimension_scores: DimensionEvaluation[]
+  step_quality_summary?: string
+}
+
+export interface TrajectoryQualityEvaluation {
+  trajectory_id: string
+  global_score: number
+  passed_threshold: boolean
+  dimension_global_scores: DimensionEvaluation[] | Record<string, number>
+  step_evaluations: StepQualityEvaluation[]
+  evaluation_config?: Record<string, unknown>
+}
+
+export interface TaskQualityResult {
+  run_id: string
+  task_id: string
+  completed_at: string
+  rubric: Record<string, unknown>
+  evaluations: Record<string, TrajectoryQualityEvaluation>
+  average_score: number
+  passed_count: number
 }
 
 export interface TreeRunTask {
@@ -91,6 +159,7 @@ export interface TreeOccurrence {
   action: ActionPayload
   action_text: string
   summary: string
+  observation?: string
   actions_box: string
   score: number
   reused: boolean
@@ -104,6 +173,7 @@ export interface AuditStep {
   action: ActionPayload
   action_text: string
   summary: string
+  observation?: string
   actions_box: string
   classification: ClassificationResult | null
   counted_in_tree: boolean
@@ -125,6 +195,7 @@ export interface TrajectoryTreeNode {
   label: string
   action: ActionPayload
   summary: string
+  observation?: string
   actions_box: string
   image: string
   xml: string

@@ -23,6 +23,8 @@ TRAJECTORY_ROOT = WORKSPACE_DIR / "rollout_trajectories"
 ANNOTATED_XLSX = WORKSPACE_DIR / "annotated_trajectories.xlsx"
 TREE_RUNS_DIR = WORKSPACE_DIR / "trajectory_tree_runs"
 TREE_JOBS_DIR = WORKSPACE_DIR / "trajectory_tree_jobs"
+QUALITY_JOBS_DIR = WORKSPACE_DIR / "trajectory_quality_jobs"
+QUALITY_RESULTS_DIR = WORKSPACE_DIR / "trajectory_quality_results"
 
 GOAL_RE = re.compile(
     r"\*\*原始目标\*\*\s*[:：]\s*(.*?)(?=\r?\n\s*\r?\n|\Z)",

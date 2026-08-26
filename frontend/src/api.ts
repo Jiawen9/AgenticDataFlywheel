@@ -1,4 +1,4 @@
-import type { BuildJob, TaskSummary, TrajectoryRecord, TrajectorySummary, TrajectoryTreeNode, TreeRun } from './types'
+import type { BuildJob, QualityJob, RunQualitySummary, TaskQualityResult, TaskSummary, TrajectoryRecord, TrajectorySummary, TrajectoryTreeNode, TreeRun } from './types'
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
 
@@ -64,6 +64,21 @@ export const api = {
     return request(
       `/api/tree-runs/${encodeURIComponent(runId)}/tasks/${encodeURIComponent(taskId)}/tree`,
     )
+  },
+  createQuality(runId: string, taskIds: string[]): Promise<QualityJob> {
+    return request('/api/quality-jobs', {
+      method: 'POST',
+      body: JSON.stringify({ run_id: runId, task_ids: taskIds }),
+    })
+  },
+  qualityJob(jobId: string): Promise<QualityJob> {
+    return request(`/api/quality-jobs/${encodeURIComponent(jobId)}`)
+  },
+  runQuality(runId: string): Promise<RunQualitySummary> {
+    return request(`/api/tree-runs/${encodeURIComponent(runId)}/quality`)
+  },
+  taskQuality(runId: string, taskId: string): Promise<TaskQualityResult> {
+    return request(`/api/tree-runs/${encodeURIComponent(runId)}/tasks/${encodeURIComponent(taskId)}/quality`)
   },
 }
 

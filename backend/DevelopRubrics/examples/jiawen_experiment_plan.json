@@ -1,0 +1,8 @@
+{
+  "experiments": [
+    "eval-stepwise-no-thinking",
+    "eval-stepwise-thinking",
+    "eval-stepwise-observation-no-thinking",
+    "eval-stepwise-observation-thinking"
+  ]
+}

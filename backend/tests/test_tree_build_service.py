@@ -3,14 +3,16 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from functools import partial
 from pathlib import Path
 from unittest.mock import patch
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from PIL import Image
 
 from backend.trajectories_tree.intermediate_state_classifier import IntermediateStateResult
 from backend.tree_build_service import build_tree_run
+from backend.quality_input_builder import build_quality_workbook
 
 
 class FakeClassifier:
@@ -20,7 +22,7 @@ class FakeClassifier:
         pass
 
     def classify(self, **_kwargs):
-        return IntermediateStateResult(False, "none", 1.0, "normal", "{}", True)
+        return IntermediateStateResult(False, "none", 1.0, "normal", "{}", True, "页面保持稳定")
 
 
 class FailingSecondTaskClassifier(FakeClassifier):
@@ -38,6 +40,13 @@ class FakeAlignmentReviewer:
 
     def review(self, **_kwargs):
         raise AssertionError("stable one-step tasks must not request alignment review")
+
+
+class FakeSummarizer:
+    model = "fake-model"
+
+    def summarize_trajectory(self, task, trajectory_id, steps):
+        return f"{task}: {trajectory_id} 共 {len(steps)} 步"
 
 
 def prepare_source(root: Path) -> tuple[Path, Path]:
@@ -105,13 +114,25 @@ class TreeBuildServiceTests(unittest.TestCase):
                     env_path=root / ".env",
                     classification_cache=root / "classification.json",
                     alignment_cache=root / "alignment.json",
+                    quality_builder=partial(build_quality_workbook, summarizer=FakeSummarizer()),
                 )
 
             published = runs_dir / run_id
             self.assertTrue((published / "manifest.json").is_file())
             self.assertTrue((published / "TASK-A.json").is_file())
             self.assertTrue((published / "TASK-B.json").is_file())
+            self.assertTrue((published / "rubric_trajectories.xlsx").is_file())
             self.assertEqual(manifest["task_count"], 2)
+            self.assertEqual(manifest["quality_input_file"], "rubric_trajectories.xlsx")
+            workbook = load_workbook(published / "rubric_trajectories.xlsx", read_only=True)
+            try:
+                self.assertEqual(workbook.sheetnames, ["Tasks", "Trajectories", "Steps"])
+                self.assertEqual(workbook["Trajectories"].max_row, 3)
+                self.assertEqual(workbook["Steps"].max_row, 3)
+                headers = [cell.value for cell in workbook["Steps"][1]]
+                self.assertNotIn("thought", headers)
+            finally:
+                workbook.close()
             self.assertEqual([item["task_id"] for item in manifest["tasks"]], ["TASK-A", "TASK-B"])
             first_tree = json.loads((published / "TASK-A.json").read_text(encoding="utf-8"))
             self.assertEqual(first_tree["task_id"], "TASK-A")

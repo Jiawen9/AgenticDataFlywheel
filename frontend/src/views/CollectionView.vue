@@ -143,7 +143,8 @@ onBeforeUnmount(() => { if (pollTimer) window.clearTimeout(pollTimer) })
           <span>{{ job.percent }}%</span>
         </div>
         <el-progress :percentage="job.percent" :status="job.status === 'failed' ? 'exception' : job.status === 'succeeded' ? 'success' : undefined" :show-text="false" />
-        <p v-if="job.total_steps">分类步骤 {{ job.classified_steps }} / {{ job.total_steps }} · 任务 {{ job.task_index }} / {{ job.total_tasks }}</p>
+        <p v-if="job.stage === 'summarizing_trajectories'">轨迹摘要 {{ job.summarized_trajectories || 0 }} / {{ job.total_trajectories || 0 }} · observation 已完成 {{ job.classified_steps }} 步</p>
+        <p v-else-if="job.total_steps">分类与 observation {{ job.classified_steps }} / {{ job.total_steps }} · 任务 {{ job.task_index }} / {{ job.total_tasks }}</p>
         <p v-if="job.error" class="job-card__error">{{ job.error }}</p>
         <router-link v-if="job.run_id" :to="{ path: '/quality', query: { run: job.run_id } }">进入任务集 {{ job.run_id }} →</router-link>
       </div>

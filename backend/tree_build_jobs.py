@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Executor, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -27,11 +27,13 @@ class TreeBuildJobManager:
         self,
         jobs_dir: Path = TREE_JOBS_DIR,
         runner: BuildRunner = build_tree_run,
+        executor: Executor | None = None,
     ) -> None:
         self.jobs_dir = jobs_dir
         self.runner = runner
         self._lock = threading.RLock()
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tree-build")
+        self._owns_executor = executor is None
+        self._executor = executor or ThreadPoolExecutor(max_workers=1, thread_name_prefix="tree-build")
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         self.mark_interrupted_jobs()
 
@@ -88,6 +90,8 @@ class TreeBuildJobManager:
             "total_tasks": len(task_ids),
             "classified_steps": 0,
             "total_steps": 0,
+            "summarized_trajectories": 0,
+            "total_trajectories": 0,
             "percent": 0,
             "error": None,
             "run_id": None,
@@ -105,8 +109,12 @@ class TreeBuildJobManager:
             payload.update(changes)
             total = int(payload.get("total_steps") or 0)
             completed = int(payload.get("classified_steps") or 0)
-            if payload.get("stage") == "building" and total:
-                percent = 80 + round(15 * completed / total)
+            if payload.get("stage") == "summarizing_trajectories":
+                summary_total = int(payload.get("total_trajectories") or 0)
+                summarized = int(payload.get("summarized_trajectories") or 0)
+                percent = 80 + round(10 * summarized / summary_total) if summary_total else 80
+            elif payload.get("stage") == "building" and total:
+                percent = 92
             elif payload.get("stage") == "publishing":
                 percent = 97
             else:
@@ -119,7 +127,7 @@ class TreeBuildJobManager:
             payload = self.get(job_id)
             if payload is None:
                 return
-            payload.update({"status": "running", "stage": "classifying", "started_at": _now()})
+            payload.update({"status": "running", "stage": "classifying_and_observing", "started_at": _now()})
             self._write(payload)
         try:
             run_id, _ = self.runner(
@@ -155,5 +163,5 @@ class TreeBuildJobManager:
             self._write(payload)
 
     def shutdown(self) -> None:
-        self._executor.shutdown(wait=False, cancel_futures=True)
-
+        if self._owns_executor:
+            self._executor.shutdown(wait=False, cancel_futures=True)
