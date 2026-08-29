@@ -263,6 +263,26 @@ class TreeBuildJobTests(unittest.TestCase):
 
 
 class QualityJobTests(unittest.TestCase):
+    def test_list_jobs_restores_persisted_queue_in_creation_order(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for job_id, created_at, status in (
+                ("old", "2026-08-27T10:00:00+08:00", "succeeded"),
+                ("queued", "2026-08-27T12:00:00+08:00", "queued"),
+                ("new", "2026-08-27T13:00:00+08:00", "failed"),
+            ):
+                (root / f"{job_id}.json").write_text(
+                    json.dumps({"job_id": job_id, "created_at": created_at, "status": status}),
+                    encoding="utf-8",
+                )
+            (root / "broken.json").write_text("not json", encoding="utf-8")
+
+            manager = QualityJobManager(root, lambda *_args, **_kwargs: {"run_id": ""})
+            jobs = manager.list_jobs()
+            manager.shutdown()
+
+            self.assertEqual([job["job_id"] for job in jobs], ["new", "queued", "old"])
+
     def test_successful_quality_job_persists_trajectory_progress(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             finished = threading.Event()

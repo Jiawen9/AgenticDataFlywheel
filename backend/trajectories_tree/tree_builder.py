@@ -12,6 +12,7 @@ import argparse
 import json
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -416,6 +417,7 @@ def classify_trajectories(
     trajectory_root: Path,
     confidence_threshold: float,
     task: str = "",
+    max_concurrent: int = 1,
 ) -> None:
     total = sum(
         1
@@ -423,7 +425,18 @@ def classify_trajectories(
         for position, step in enumerate(steps)
         if not (step.action.get("action") == "terminate" and position < len(steps) - 1)
     )
-    completed = 0
+    work_items: list[
+        tuple[
+            str,
+            Step,
+            Path,
+            Path | None,
+            Path | None,
+            str,
+            str,
+            str,
+        ]
+    ] = []
     for trajectory, steps in trajectories:
         if steps and steps[-1].action.get("action") == "terminate":
             status = steps[-1].action.get("status")
@@ -442,37 +455,78 @@ def classify_trajectories(
             previous_summary = steps[position - 1].summary if position > 0 else ""
             next_step = steps[position + 1] if position + 1 < len(steps) else None
             current_path = _artifact_path(trajectory_root, step.image)
+            next_path = (
+                _artifact_path(trajectory_root, next_step.image)
+                if next_step is not None
+                else None
+            )
             done_name = re.sub(r"_input(?:_stability)?\.jpg$", "_done.jpg", current_path.name, flags=re.IGNORECASE)
             done_path = current_path.with_name(done_name)
-            try:
-                result = classifier.classify(
-                    trajectory=trajectory,
-                    step_index=step.step_index,
-                    current_image_path=current_path,
-                    next_image_path=(
-                        _artifact_path(trajectory_root, next_step.image)
-                        if next_step is not None
-                        else None
-                    ),
-                    action=step.action,
-                    summary=step.summary,
-                    previous_summary=previous_summary,
-                    next_summary=next_step.summary if next_step is not None else "",
-                    after_image_path=done_path if done_path.is_file() else None,
-                    task=task,
+            work_items.append(
+                (
+                    trajectory,
+                    step,
+                    current_path,
+                    next_path,
+                    done_path if done_path.is_file() else None,
+                    previous_summary,
+                    next_step.summary if next_step is not None else "",
+                    task,
                 )
-            except Exception as exc:
-                raise RuntimeError(
-                    f"中间状态分类失败: trajectory={trajectory}, "
-                    f"step={step.step_index}, error={exc}"
-                ) from exc
-            step.apply_classification(result, confidence_threshold)
-            completed += 1
-            print(
-                f"Classified {completed}/{total}: {trajectory} "
-                f"step{step.step_index:03d}; cached={result.cached}; "
-                f"intermediate={result.is_intermediate}; confidence={result.confidence:.3f}"
             )
+
+    def _classify(item: tuple[str, Step, Path, Path | None, Path | None, str, str, str]) -> IntermediateStateResult:
+        trajectory, step, current_path, next_path, done_path, previous_summary, next_summary, task_text = item
+        try:
+            return classifier.classify(
+                trajectory=trajectory,
+                step_index=step.step_index,
+                current_image_path=current_path,
+                next_image_path=next_path,
+                action=step.action,
+                summary=step.summary,
+                previous_summary=previous_summary,
+                next_summary=next_summary,
+                after_image_path=done_path,
+                task=task_text,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"中间状态分类失败: trajectory={trajectory}, "
+                f"step={step.step_index}, error={exc}"
+            ) from exc
+
+    results: list[IntermediateStateResult | None] = [None] * len(work_items)
+    worker_count = max(1, int(max_concurrent))
+    if worker_count == 1:
+        for index, item in enumerate(work_items):
+            results[index] = _classify(item)
+    else:
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="tree-classify",
+        ) as executor:
+            pending = {
+                executor.submit(_classify, item): index
+                for index, item in enumerate(work_items)
+            }
+            for future in as_completed(pending):
+                results[pending[future]] = future.result()
+
+    completed = 0
+    for item, result in zip(work_items, results):
+        trajectory, step = item[0], item[1]
+        if result is None:
+            raise RuntimeError(
+                f"中间状态分类没有返回结果: trajectory={trajectory}, step={step.step_index}"
+            )
+        step.apply_classification(result, confidence_threshold)
+        completed += 1
+        print(
+            f"Classified {completed}/{total}: {trajectory} "
+            f"step{step.step_index:03d}; cached={result.cached}; "
+            f"intermediate={result.is_intermediate}; confidence={result.confidence:.3f}"
+        )
 
 
 def apply_bounded_skip_policy(

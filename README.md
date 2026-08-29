@@ -12,6 +12,7 @@
 - 在网页中浏览任务、轨迹、步骤截图和动作标注。
 - 在线修改 bbox，并将结果更新到标注 Excel。
 - 批量提交任务建树，在质检页面查看分叉、occurrence 和中间态审计。
+- 在网页中修正 Action、SOP 和步骤，并按 SFT/RL/原生数据分流导出。
 
 ## 目录结构
 
@@ -20,12 +21,14 @@ AgenticDataFlywheel/
 ├─ backend/                       FastAPI、轨迹预处理和建树代码
 │  ├─ bounding_box/              bbox 生成与视觉复核
 │  ├─ trajectories_tree/         中间态判断和轨迹树构建
+│  ├─ trajectory_correction/    轨迹修正网页模块（独立后端包）
 │  ├─ tests/                     后端测试
 │  ├─ .env.example               模型配置示例
 │  └─ api.py                     FastAPI 入口
 ├─ frontend/                     Vue 3 + Vite 前端
 ├─ backend_workspace/            本地数据与运行结果，不提交 Git
-│  └─ rollout_trajectories/      原始轨迹放置目录
+│  ├─ rollout_trajectories/      原始轨迹放置目录
+│  └─ trajectory_correction/    轨迹修正输入、草稿与导出
 └─ README.md
 ```
 
@@ -159,6 +162,28 @@ backend_workspace/trajectory_tree_runs/<完成时间串>/
 
 作业状态保存在 `backend_workspace/trajectory_tree_jobs/`。这些都是本地运行产物，
 不会提交到 GitHub。
+
+### 轨迹修正
+
+进入“轨迹修正”页面后，可以直接选择
+`backend_workspace/trajectory_correction/inputs/` 中的 `.xlsx/.xlsm`，也可以上传
+Excel 或包含 Excel、截图和 XML 的 ZIP 数据包。上传数据会被解压到
+`inputs/uploads/<随机目录>/`，不会和原始轨迹树数据混放。
+
+页面按 `task + meta_task` 的连续行分组，复用 `human8.0.py` 的完成/异常判断和导出规则：
+
+1. 修改 Action：支持 click、long_press、swipe、type、open、system_button、wait、terminate、answer，坐标可以直接在截图上取点。
+2. 修改 SOP、删除/恢复步骤、切换任务组是否导出：每次操作立即保存为草稿。
+3. 点击导出后生成 SFT、RL、原生完美通过、原生异常待处理四类工作表；原 Excel 不会被覆盖。
+
+该模块的数据目录为：
+
+```text
+backend_workspace/trajectory_correction/
+├─ inputs/       # 固定输入和上传包
+├─ sessions/     # 草稿 JSON
+└─ exports/      # 导出 Excel
+```
 
 ## 7. 生产模式运行
 

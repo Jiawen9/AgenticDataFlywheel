@@ -40,5 +40,9 @@ def configure_model_environment(path: Path = DEFAULT_ENV_FILE) -> dict[str, str]
     }
     for name, value in mapping.items():
         os.environ.setdefault(name, value)
+    if values.get("ADARUBRIC_EVAL_MAX_CONCURRENT"):
+        os.environ.setdefault(
+            "ADARUBRIC_EVAL_MAX_CONCURRENT",
+            values["ADARUBRIC_EVAL_MAX_CONCURRENT"],
+        )
     return {"model": values["MODEL_NAME"], "base_url": values["MODEL_URL"]}
-

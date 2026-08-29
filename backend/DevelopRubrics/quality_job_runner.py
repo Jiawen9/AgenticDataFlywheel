@@ -174,29 +174,52 @@ async def run(run_id: str, task_ids: list[str], job_id: str) -> dict[str, Any]:
         existing = EVAL.load_existing_evaluations_jsonl(checkpoint)
         settings = EVAL._evaluation_settings(config)
         signature = EVAL._settings_signature(settings)
-        evaluations = []
+        cached_count = 0
         for trajectory in trajectories:
+            key = EVAL._evaluation_key(
+                task_id=task_id,
+                run_number=1,
+                trajectory_id=trajectory.trajectory_id,
+                settings_signature=signature,
+            )
+            if key in existing:
+                cached_count += 1
+        completed += cached_count
+        if cached_count:
             progress(
-                stage="evaluating", current_task=task_id, current_trajectory=trajectory.trajectory_id,
-                task_index=task_index, completed_trajectories=completed, total_trajectories=total,
+                stage="evaluating", current_task=task_id, task_index=task_index,
+                completed_trajectories=completed, total_trajectories=total,
                 percent=20 + round(75 * completed / max(total, 1)),
             )
-            key = EVAL._evaluation_key(task_id=task_id, run_number=1, trajectory_id=trajectory.trajectory_id, settings_signature=signature)
-            evaluation = existing.get(key)
-            if evaluation is None:
-                evaluation = await EVAL.evaluate_trajectory(
-                    pipeline=pipeline, task=task, trajectory=trajectory, rubric=rubric,
-                    config=config, temperature=float(config.get("evaluation_temperature", 0.0)),
-                    eval_max_tokens=int(config.get("evaluation_max_tokens", 8192)),
-                )
-                EVAL.append_evaluation_jsonl(
-                    path=checkpoint, task=task, rubric_path=rubric_path, run_number=1,
-                    evaluation=evaluation, evaluation_settings=settings,
-                )
-                existing[key] = evaluation
-            evaluations.append(evaluation)
+
+        def on_trajectory_complete(evaluation: Any) -> None:
+            nonlocal completed
             completed += 1
-        pipeline.filter_evaluations(evaluations)
+            progress(
+                stage="evaluating", current_task=task_id,
+                current_trajectory=evaluation.trajectory_id, task_index=task_index,
+                completed_trajectories=completed, total_trajectories=total,
+                percent=20 + round(75 * completed / max(total, 1)),
+            )
+
+        result = await EVAL.evaluate_run_incrementally(
+            pipeline=pipeline,
+            task=task,
+            trajectories=trajectories,
+            rubric=rubric,
+            rubric_path=rubric_path,
+            run_number=1,
+            temperature=float(config.get("evaluation_temperature", 0.0)),
+            eval_max_tokens=int(config.get("evaluation_max_tokens", 8192)),
+            max_concurrent=EVAL._int_setting(
+                config, "evaluation_max_concurrent", "ADARUBRIC_EVAL_MAX_CONCURRENT", default=2
+            ),
+            evaluations_path=checkpoint,
+            config=config,
+            existing_evaluations=existing,
+            on_trajectory_complete=on_trajectory_complete,
+        )
+        evaluations = result.all_evaluations
         serialized = {}
         for evaluation in evaluations:
             data = json.loads(evaluation.model_dump_json(exclude={"rubric_used"}))

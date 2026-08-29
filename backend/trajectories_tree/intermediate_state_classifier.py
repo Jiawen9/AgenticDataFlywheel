@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64, hashlib, io, json
+import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -83,12 +84,17 @@ class QwenIntermediateStateClassifier:
         self.cache: dict[str, Any] = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
         if not isinstance(self.cache, dict):
             raise ValueError(f"classification cache must be a JSON object: {cache_path}")
+        self._cache_lock = threading.RLock()
 
-    def _save_cache(self) -> None:
+    def _save_cache_unlocked(self) -> None:
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.cache_path.with_name(f".{self.cache_path.name}.tmp")
         temporary.write_text(json.dumps(self.cache, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(self.cache_path)
+
+    def _save_cache(self) -> None:
+        with self._cache_lock:
+            self._save_cache_unlocked()
 
     @staticmethod
     def _key(payload: dict[str, Any]) -> str:
@@ -98,19 +104,26 @@ class QwenIntermediateStateClassifier:
                  next_image_path: Path | None, action: dict[str, Any], summary: str,
                  previous_summary: str, next_summary: str, after_image_path: Path | None = None,
                  task: str = "") -> IntermediateStateResult:
+        # A few tests construct this class with ``object.__new__``; keep that
+        # lightweight fixture compatible with the production lock.
+        if not hasattr(self, "_cache_lock"):
+            self._cache_lock = threading.RLock()
         after = after_image_path or next_image_path or current_image_path
         common = {"model": self.model, "trajectory": trajectory, "step_index": step_index,
                   "current_image_digest": _image_digest(current_image_path),
                   "next_image_digest": _image_digest(next_image_path) if next_image_path else "",
                   "action": action, "summary": summary, "previous_summary": previous_summary,
                   "next_summary": next_summary}
-        legacy = self.cache.get(self._key({"version": LEGACY_PROMPT_VERSION, **common}))
+        with self._cache_lock:
+            legacy = self.cache.get(self._key({"version": LEGACY_PROMPT_VERSION, **common}))
         legacy_result = parse_classification_response(legacy) if isinstance(legacy, str) else None
         payload = {"version": PROMPT_VERSION, **common, "task": task, "after_image_digest": _image_digest(after)}
         cache_key = self._key(payload)
-        cached = cache_key in self.cache
+        with self._cache_lock:
+            cached_item = self.cache.get(cache_key)
+        cached = cached_item is not None
         if cached:
-            item = self.cache[cache_key]
+            item = cached_item
             raw = str(item.get("raw_response", "")) if isinstance(item, dict) else str(item)
         else:
             observation_action = {"action": "terminate"} if action.get("action") == "terminate" else action
@@ -151,8 +164,14 @@ Observation action：{json.dumps(observation_action, ensure_ascii=False)}
             message = response.choices[0].message
             raw = (message.content or getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None) or "").strip()
             parse_classification_response(raw, require_observation=True)
-            self.cache[cache_key] = {"version": PROMPT_VERSION, "raw_response": raw}
-            self._save_cache()
+            with self._cache_lock:
+                existing_item = self.cache.get(cache_key)
+                if existing_item is not None:
+                    cached = True
+                    raw = str(existing_item.get("raw_response", "")) if isinstance(existing_item, dict) else str(existing_item)
+                else:
+                    self.cache[cache_key] = {"version": PROMPT_VERSION, "raw_response": raw}
+                    self._save_cache_unlocked()
         result = parse_classification_response(raw, require_observation=True)
         if legacy_result:
             result.classification_changed = (result.is_intermediate, result.category, result.confidence) != (legacy_result.is_intermediate, legacy_result.category, legacy_result.confidence)

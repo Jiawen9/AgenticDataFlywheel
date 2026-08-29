@@ -213,3 +213,116 @@ export interface TrajectoryTreeNode {
   classification_category_counts?: Record<string, number>
   source_trajectories?: SourceTrajectory[]
 }
+
+export interface CorrectionSource {
+  source_id: string
+  name: string
+  kind: 'annotated_workbook'
+  relative_path: string
+  size_bytes: number
+  package_root: string
+}
+
+export interface CorrectionTop1Task {
+  task_id: string
+  goal: string
+  trajectory_id: string
+  global_score: number
+  passed_threshold: boolean
+  trajectory_count: number
+  step_count: number
+}
+
+export interface CorrectionRecommendation {
+  status: 'ready' | 'blocked'
+  message?: string
+  tree_run_id?: string
+  run_id?: string
+  tree_completed_at?: string
+  quality_completed_at?: string
+  completed_at?: string
+  total_task_count?: number
+  reviewed_task_count?: number
+  source_id?: string
+  source_path?: string
+  source_sha256?: string
+  tasks: CorrectionTop1Task[]
+  selected_trajectories?: Record<string, string>
+}
+
+export interface CorrectionBatch {
+  tree_run_id: string
+  tree_completed_at: string
+  quality_completed_at: string
+  total_task_count: number
+  reviewed_task_count: number
+  status: 'ready'
+  is_default: boolean
+}
+
+export interface CorrectionRow {
+  excel_row: number
+  step: number
+  task: string
+  meta_task: string
+  image: string
+  image_url: string
+  xml: string
+  actions: string
+  action: ActionPayload
+  sop: string
+  summary: string
+  task_manual_result: string
+  micro_manual: string
+  macro_manual: string
+  micro_pred: string
+  macro_pred: string
+  Bad_Interval: string
+  trajectory_quality_type: string
+  actions_box: string
+  deleted: boolean
+  edited: boolean
+  action_edited: boolean
+  sop_edited: boolean
+  edit_status: string
+}
+
+export interface CorrectionGroupSummary {
+  group_id: string
+  task: string
+  meta_task: string
+  quality: string
+  prefix: string
+  export: boolean
+  row_count: number
+  active_row_count: number
+  edited_row_count: number
+  action_edit_count: number
+}
+
+export interface CorrectionGroup extends CorrectionGroupSummary {
+  rows: CorrectionRow[]
+}
+
+export interface CorrectionExport {
+  export_id: string
+  filename: string
+  created_at: string
+  download_url: string
+  sheets: Record<string, number>
+  summary?: { rows: number; groups: number }
+}
+
+export interface CorrectionSession {
+  session_id: string
+  source_id: string
+  source: CorrectionSource | null
+  tree_run_id: string
+  selection: CorrectionRecommendation
+  created_at: string
+  updated_at: string
+  row_count: number
+  group_count: number
+  groups: CorrectionGroupSummary[]
+  exports: CorrectionExport[]
+}

@@ -1,11 +1,13 @@
-import type { BuildJob, QualityJob, RunQualitySummary, TaskQualityResult, TaskSummary, TrajectoryRecord, TrajectorySummary, TrajectoryTreeNode, TreeRun } from './types'
+import type { BuildJob, CorrectionBatch, CorrectionExport, CorrectionGroup, CorrectionGroupSummary, CorrectionRecommendation, CorrectionSession, QualityJob, RunQualitySummary, TaskQualityResult, TaskSummary, TrajectoryRecord, TrajectorySummary, TrajectoryTreeNode, TreeRun } from './types'
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers)
+  if (!(init?.body instanceof FormData)) headers.set('Content-Type', 'application/json')
   const response = await fetch(`${API_BASE}${path}`, {
     ...init,
-    headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
+    headers,
   })
   if (!response.ok) {
     let detail = `${response.status} ${response.statusText}`
@@ -74,15 +76,67 @@ export const api = {
   qualityJob(jobId: string): Promise<QualityJob> {
     return request(`/api/quality-jobs/${encodeURIComponent(jobId)}`)
   },
+  async qualityJobs(): Promise<QualityJob[]> {
+    return (await request<{ jobs: QualityJob[] }>('/api/quality-jobs')).jobs
+  },
   runQuality(runId: string): Promise<RunQualitySummary> {
     return request(`/api/tree-runs/${encodeURIComponent(runId)}/quality`)
   },
   taskQuality(runId: string, taskId: string): Promise<TaskQualityResult> {
     return request(`/api/tree-runs/${encodeURIComponent(runId)}/tasks/${encodeURIComponent(taskId)}/quality`)
   },
+  correctionBatches(): Promise<{ default_tree_run_id: string | null; batches: CorrectionBatch[] }> {
+    return request('/api/correction/batches')
+  },
+  correctionRecommendation(treeRunId?: string): Promise<CorrectionRecommendation> {
+    const query = treeRunId ? `?tree_run_id=${encodeURIComponent(treeRunId)}` : ''
+    return request(`/api/correction/recommendation${query}`)
+  },
+  async correctionSessions(): Promise<CorrectionSession[]> {
+    return (await request<{ sessions: CorrectionSession[] }>('/api/correction/sessions')).sessions
+  },
+  async createCorrectionSession(treeRunId: string): Promise<CorrectionSession> {
+    return (await request<{ session: CorrectionSession }>('/api/correction/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ tree_run_id: treeRunId }),
+    })).session
+  },
+  correctionSession(sessionId: string): Promise<CorrectionSession> {
+    return request<{ session: CorrectionSession }>(`/api/correction/sessions/${encodeURIComponent(sessionId)}`).then((result) => result.session)
+  },
+  correctionGroups(sessionId: string): Promise<CorrectionGroupSummary[]> {
+    return request<{ groups: CorrectionGroupSummary[] }>(`/api/correction/sessions/${encodeURIComponent(sessionId)}/tasks`).then((result) => result.groups)
+  },
+  correctionGroup(sessionId: string, groupId: string): Promise<CorrectionGroup> {
+    return request<{ group: CorrectionGroup }>(`/api/correction/sessions/${encodeURIComponent(sessionId)}/tasks/${encodeURIComponent(groupId)}`).then((result) => result.group)
+  },
+  async patchCorrectionRow(sessionId: string, excelRow: number, patch: { sop?: string; actions?: string; deleted?: boolean }): Promise<{ group: CorrectionGroupSummary; row: CorrectionGroup['rows'][number] }> {
+    return request(`/api/correction/sessions/${encodeURIComponent(sessionId)}/rows/${excelRow}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    })
+  },
+  async patchCorrectionExport(sessionId: string, groupId: string, exportState: boolean): Promise<CorrectionGroupSummary> {
+    return (await request<{ group: CorrectionGroupSummary }>(`/api/correction/sessions/${encodeURIComponent(sessionId)}/tasks/${encodeURIComponent(groupId)}/export`, {
+      method: 'PATCH',
+      body: JSON.stringify({ export: exportState }),
+    })).group
+  },
+  correctionExport(sessionId: string): Promise<CorrectionExport> {
+    return request(`/api/correction/sessions/${encodeURIComponent(sessionId)}/export`, { method: 'POST' })
+  },
 }
 
 export function imageUrl(relativePath: string): string {
   const normalized = relativePath.replaceAll('\\', '/').replace(/^\/+/, '')
   return `${API_BASE}/api/assets/${normalized.split('/').map(encodeURIComponent).join('/')}`
+}
+
+export function correctionAssetUrl(sessionId: string, relativePath: string): string {
+  const normalized = relativePath.replaceAll('\\', '/').replace(/^\/+/, '')
+  return `${API_BASE}/api/correction/sessions/${encodeURIComponent(sessionId)}/assets/${normalized.split('/').map(encodeURIComponent).join('/')}`
+}
+
+export function correctionDownloadUrl(sessionId: string, filename: string): string {
+  return `${API_BASE}/api/correction/sessions/${encodeURIComponent(sessionId)}/exports/${encodeURIComponent(filename)}`
 }

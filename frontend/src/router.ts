@@ -5,5 +5,6 @@ export default createRouter({
     { path: '/', redirect: '/collection' },
     { path: '/collection', component: () => import('@/views/CollectionView.vue') },
     { path: '/quality', component: () => import('@/views/QualityView.vue') },
+    { path: '/correction', component: () => import('@/views/CorrectionView.vue') },
   ],
 })

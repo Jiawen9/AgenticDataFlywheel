@@ -49,14 +49,19 @@ class TreeBuildJobManager:
         temporary.replace(path)
 
     def get(self, job_id: str) -> dict[str, Any] | None:
-        path = self._path(job_id)
-        if not path.is_file():
-            return None
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, json.JSONDecodeError):
-            return None
-        return payload if isinstance(payload, dict) else None
+        # The frontend polls this file while the worker replaces it with an
+        # atomic temporary-file rename.  Windows can reject that rename when
+        # the reader still owns an open handle, so reads must share the same
+        # process lock as writes.
+        with self._lock:
+            path = self._path(job_id)
+            if not path.is_file():
+                return None
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                return None
+            return payload if isinstance(payload, dict) else None
 
     def mark_interrupted_jobs(self) -> None:
         for path in self.jobs_dir.glob("*.json"):

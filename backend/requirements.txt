@@ -6,3 +6,4 @@ openpyxl>=3.0.9,<4
 pillow>=9.0.1,<12
 httpx>=0.27,<1
 openai>=1.40,<2
+python-multipart>=0.0.9,<1

@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from statistics import mean, pstdev
-from typing import Any
+from typing import Any, Callable
 
 from adarubric import (
     AdaRubricPipeline,
@@ -861,6 +861,7 @@ async def evaluate_run_incrementally(
     evaluations_path: Path,
     config: Config,
     existing_evaluations: dict[EvaluationKey, TrajectoryEvaluation],
+    on_trajectory_complete: Callable[[TrajectoryEvaluation], None] | None = None,
 ) -> PipelineResult:
     sem = asyncio.Semaphore(max(1, max_concurrent))
     evaluation_settings = _evaluation_settings(config)
@@ -935,6 +936,8 @@ async def evaluate_run_incrementally(
                 settings_signature=settings_signature,
             )
             existing_evaluations[key] = evaluation
+            if on_trajectory_complete is not None:
+                on_trajectory_complete(evaluation)
     except Exception:
         for task_handle in tasks:
             task_handle.cancel()

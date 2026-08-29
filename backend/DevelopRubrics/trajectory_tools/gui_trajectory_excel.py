@@ -8,6 +8,7 @@ import json
 import mimetypes
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -241,8 +242,9 @@ class QwenSummarizer:
         self.client = OpenAI(api_key=api_key, base_url=base_url, max_retries=2)
         self.cache_path = cache_path
         self.cache = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.is_file() else {}
+        self._cache_lock = threading.RLock()
 
-    def _save(self) -> None:
+    def _save_unlocked(self) -> None:
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.cache_path.with_suffix(self.cache_path.suffix + ".tmp")
         temporary.write_text(json.dumps(self.cache, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -255,9 +257,15 @@ class QwenSummarizer:
                     raise
                 time.sleep(0.1 * (attempt + 1))
 
+    def _save(self) -> None:
+        with self._cache_lock:
+            self._save_unlocked()
+
     def _complete(self, key: str, messages: list[dict[str, Any]], max_tokens: int) -> str:
-        if key in self.cache:
-            return str(self.cache[key])
+        with self._cache_lock:
+            cached = self.cache.get(key)
+        if cached is not None:
+            return str(cached)
         response = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
@@ -268,9 +276,13 @@ class QwenSummarizer:
         text = (response.choices[0].message.content or "").strip()
         if not text:
             raise ValueError("Qwen returned an empty summary")
-        self.cache[key] = text
-        self._save()
-        return text
+        with self._cache_lock:
+            cached = self.cache.get(key)
+            if cached is not None:
+                return str(cached)
+            self.cache[key] = text
+            self._save_unlocked()
+            return text
 
     def summarize_screenshot(self, image_path: Path, task: str, summary: str, action: str) -> str:
         image = image_path.read_bytes()

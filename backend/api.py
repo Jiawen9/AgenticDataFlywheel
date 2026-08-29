@@ -32,6 +32,7 @@ from .trajectory_data import (
 from .quality_data import quality_manifest, quality_task, rubric_ready
 from .quality_jobs import QualityJobManager
 from .tree_build_jobs import TreeBuildJobManager
+from .trajectory_correction.router import router as correction_router
 
 
 FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
@@ -100,6 +101,7 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
     allow_headers=["*"],
 )
+app.include_router(correction_router)
 model_job_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="model-job")
 job_manager = TreeBuildJobManager(executor=model_job_executor)
 quality_job_manager = QualityJobManager(executor=model_job_executor)
@@ -201,6 +203,11 @@ def create_quality_job(request: QualityJobRequest) -> dict[str, Any]:
     if unknown:
         raise HTTPException(status_code=404, detail=f"任务不在该任务集中：{', '.join(unknown)}")
     return quality_job_manager.submit(run_id, unique)
+
+
+@app.get("/api/quality-jobs")
+def get_quality_jobs() -> dict[str, Any]:
+    return {"jobs": quality_job_manager.list_jobs()}
 
 
 @app.get("/api/quality-jobs/{job_id}")

@@ -90,14 +90,34 @@ class QualityJobManager:
         temporary.replace(path)
 
     def get(self, job_id: str) -> dict[str, Any] | None:
-        path = self._path(job_id)
-        if not path.is_file():
-            return None
-        try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, json.JSONDecodeError):
-            return None
-        return value if isinstance(value, dict) else None
+        # Share the writer lock with polling reads.  Without this, Windows
+        # may keep the JSON read handle open while _write() replaces it.
+        with self._lock:
+            path = self._path(job_id)
+            if not path.is_file():
+                return None
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                return None
+            return value if isinstance(value, dict) else None
+
+    def list_jobs(self) -> list[dict[str, Any]]:
+        """Return persisted quality jobs so clients can restore the queue."""
+        with self._lock:
+            jobs: list[dict[str, Any]] = []
+            for path in self.jobs_dir.glob("*.json"):
+                try:
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError, json.JSONDecodeError):
+                    continue
+                if isinstance(value, dict):
+                    jobs.append(value)
+            return sorted(
+                jobs,
+                key=lambda item: str(item.get("created_at", "")),
+                reverse=True,
+            )
 
     def mark_interrupted_jobs(self) -> None:
         for path in self.jobs_dir.glob("*.json"):

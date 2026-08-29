@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -198,6 +200,42 @@ class ResponseParsingTests(unittest.TestCase):
 
 
 class AllTrajectoryClassificationTests(unittest.TestCase):
+    def test_independent_classifications_can_run_in_parallel(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            steps = [step("parallel", index, {"action": "wait"}) for index in range(1, 5)]
+            for current in steps:
+                image_path = root / current.image
+                image_path.parent.mkdir(parents=True, exist_ok=True)
+                Image.new("RGB", (20, 20), "white").save(image_path)
+
+            class ParallelClassifier:
+                model = "fake-model"
+
+                def __init__(self):
+                    self.lock = threading.Lock()
+                    self.active = 0
+                    self.max_active = 0
+
+                def classify(self, **_kwargs):
+                    with self.lock:
+                        self.active += 1
+                        self.max_active = max(self.max_active, self.active)
+                    try:
+                        time.sleep(0.03)
+                        return classification()
+                    finally:
+                        with self.lock:
+                            self.active -= 1
+
+            classifier = ParallelClassifier()
+            classify_trajectories(
+                [("parallel", steps)], classifier, root, 0.8, max_concurrent=3
+            )
+
+            self.assertGreaterEqual(classifier.max_active, 2)
+            self.assertTrue(all(item.classification is not None for item in steps))
+
     def test_non_final_terminate_is_excluded_without_model_call(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

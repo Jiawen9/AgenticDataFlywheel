@@ -5,12 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from .trajectories_preprocessing import configure_reviewer_environment
+from .trajectories_preprocessing import configure_reviewer_environment, read_env_file
 from .quality_input_builder import build_quality_workbook
 from .trajectory_data import (
     ANNOTATED_XLSX,
@@ -39,6 +40,20 @@ from .trajectories_tree.tree_builder import (
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
+DEFAULT_TREE_CLASSIFICATION_MAX_CONCURRENT = 4
+DEFAULT_TREE_SUMMARY_MAX_CONCURRENT = 2
+
+
+def _positive_int(value: str | None, *, name: str, default: int) -> int:
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}") from exc
+    if parsed < 1:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return parsed
 
 
 class _ProgressClassifier:
@@ -57,15 +72,18 @@ class _ProgressClassifier:
         self.offset = offset
         self.total_steps = total_steps
         self.completed = 0
+        self._lock = threading.Lock()
 
     def classify(self, **kwargs: Any):
         result = self.classifier.classify(**kwargs)
-        self.completed += 1
+        with self._lock:
+            self.completed += 1
+            completed = self.completed
         self.callback(
             {
                 "stage": "classifying_and_observing",
                 "current_task": self.task_id,
-                "classified_steps": self.offset + self.completed,
+                "classified_steps": self.offset + completed,
                 "total_steps": self.total_steps,
             }
         )
@@ -142,6 +160,17 @@ def build_tree_run(
 
     try:
         model_name = configure_reviewer_environment(env_path)
+        env_values = read_env_file(env_path) if env_path.is_file() else {}
+        classification_max_concurrent = _positive_int(
+            env_values.get("TREE_CLASSIFICATION_MAX_CONCURRENT"),
+            name="TREE_CLASSIFICATION_MAX_CONCURRENT",
+            default=DEFAULT_TREE_CLASSIFICATION_MAX_CONCURRENT,
+        )
+        summary_max_concurrent = _positive_int(
+            env_values.get("TREE_SUMMARY_MAX_CONCURRENT"),
+            name="TREE_SUMMARY_MAX_CONCURRENT",
+            default=DEFAULT_TREE_SUMMARY_MAX_CONCURRENT,
+        )
         classifier = QwenIntermediateStateClassifier(model_name, classification_cache)
         alignment_reviewer = QwenStateAlignmentReviewer(model_name, alignment_cache)
         for task_index, task_id in enumerate(task_ids, 1):
@@ -165,6 +194,7 @@ def build_tree_run(
                 trajectory_root,
                 confidence_threshold,
                 task=(metadata[task_id].goal if task_id in metadata else task_id),
+                max_concurrent=classification_max_concurrent,
             )
             task_step_count = sum(
                 1
@@ -231,6 +261,7 @@ def build_tree_run(
             output=quality_workbook,
             env_path=env_path,
             progress=progress,
+            max_concurrent=summary_max_concurrent,
         )
 
         progress({"stage": "publishing", "classified_steps": total_steps, "total_steps": total_steps})
