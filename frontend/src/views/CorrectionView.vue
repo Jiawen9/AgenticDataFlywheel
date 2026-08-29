@@ -76,7 +76,7 @@ function selectionForGroup(group: CorrectionGroupSummary | CorrectionGroup) {
 
 async function loadRecommendation() {
   if (!selectedTreeRunId.value) {
-    recommendation.value = { status: 'blocked', message: '请先完成一个批次的轨迹质检，再进入轨迹修正', tasks: [] }
+    recommendation.value = { status: 'blocked', message: '请先完成一个批次的轨迹质检，再进入专家动作纠偏', tasks: [] }
     return recommendation.value
   }
   try {
@@ -321,7 +321,7 @@ onMounted(async () => {
 <template>
   <div class="page correction-page">
     <header class="page-hero">
-      <div><span class="eyebrow">TRAJECTORY CORRECTION</span><h1>轨迹修正</h1><p>基于 human8.0.py 的 Excel 精修工作台：查看截图、修正 Action/SOP、删除异常步骤，并按 SFT/RL/原生数据分流导出。</p></div>
+      <div><span class="eyebrow">EXPERT ACTION CORRECTION</span><h1>专家动作纠偏</h1><p>基于 human8.0.py 的 Excel 精修工作台：查看截图、修正 Action/SOP、删除异常步骤，并按 SFT/RL/原生数据分流导出。</p></div>
       <div class="hero-metrics"><div><b>{{ currentSession?.group_count ?? 0 }}</b><span>任务组</span></div><div><b>{{ currentSession?.row_count ?? 0 }}</b><span>步骤</span></div><div><b>{{ editedCount }}</b><span>已编辑</span></div></div>
     </header>
 
@@ -333,7 +333,7 @@ onMounted(async () => {
       </div>
       <div class="flow-line"><div class="flow-node" :class="flowNodeClass(1)"><b>1</b><span>轨迹树构建</span></div><i>→</i><div class="flow-node" :class="flowNodeClass(2)"><b>2</b><span>轨迹质检</span></div><i>→</i><div class="flow-node" :class="flowNodeClass(3)"><b>3</b><span>Top-1 选择</span></div><i>→</i><div class="flow-node" :class="flowNodeClass(4)"><b>4</b><span>人工修正</span></div></div>
       <div class="batch-picker"><label>可修正批次</label><el-select v-model="selectedTreeRunId" :loading="loadingBatches" :disabled="loadingBatches || !batches.length" placeholder="选择已质检批次" style="width:330px" @change="switchBatch"><el-option v-for="batch in batches" :key="batch.tree_run_id" :label="`${batch.tree_run_id} · 已质检 ${batch.reviewed_task_count}/${batch.total_task_count} 个任务`" :value="batch.tree_run_id" /></el-select><span v-if="selectedBatch">建树：{{ selectedBatch.tree_completed_at }} · 质检：{{ selectedBatch.quality_completed_at }}</span></div>
-      <el-alert v-if="recommendation?.status === 'blocked'" :title="recommendation.message || '请先完成轨迹质检，再进入轨迹修正'" type="warning" :closable="false" />
+      <el-alert v-if="recommendation?.status === 'blocked'" :title="recommendation.message || '请先完成轨迹质检，再进入专家动作纠偏'" type="warning" :closable="false" />
       <template v-else-if="recommendation?.status === 'ready'">
         <div class="run-meta"><span>轨迹树批次：<code>{{ recommendation.tree_run_id }}</code></span><span>建树完成：{{ recommendation.tree_completed_at }}</span><span>质检完成：{{ recommendation.quality_completed_at }}</span><span>已质检任务：{{ recommendation.reviewed_task_count }}/{{ recommendation.total_task_count }}</span></div>
         <el-alert v-if="recommendation.reviewed_task_count !== recommendation.total_task_count" title="该批次还有部分任务未完成质检，当前仅展示已质检任务。" type="info" :closable="false" />

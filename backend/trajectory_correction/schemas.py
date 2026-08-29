@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 from pydantic import BaseModel, Field
 
 
@@ -10,9 +12,9 @@ class CreateSessionRequest(BaseModel):
 
 
 class RowPatchRequest(BaseModel):
-    sop: str | None = None
-    actions: str | None = None
-    deleted: bool | None = None
+    sop: Optional[str] = None
+    actions: Optional[str] = None
+    deleted: Optional[bool] = None
 
 
 class ExportStateRequest(BaseModel):

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 
@@ -30,7 +32,7 @@ router = APIRouter(prefix="/api/correction", tags=["trajectory-correction"])
 
 @router.get("/recommendation")
 def correction_recommendation(
-    tree_run_id: str | None = Query(default=None),
+    tree_run_id: Optional[str] = Query(default=None),
 ) -> dict[str, object]:
     try:
         return top1_recommendation(tree_run_id)
