@@ -34,16 +34,19 @@ run_build.cmd
 
 运行前需要配置模型 API：
 
+```dotenv
+# 在仓库根目录的 backend/.env 中配置；不再把地址写进脚本或命令行。
+MODEL_API_KEY=你的密钥
+MODEL_BASE_URL=http://你的内部模型网关/v1
+BBOX_MODEL=qwen3.6-27b:floor
+```
+
 ```powershell
-$env:TRAJECTORY_API_KEY="你的密钥"
-$env:TRAJECTORY_API_BASE_URL="https://yunai.chat/v1"
-$env:TRAJECTORY_MODEL="qwen3.6-27b:floor"
 python build_annotations.py
 ```
 
-也支持 `TRAJECTORY_VLA_API_KEY` 和 `TRAJECTORY_VLA_API_BASE_URL`。模型响应会缓存到
-`qwen_review_cache.json`，重复运行不会再次请求已经完成的相同复核。只有明确传入
-`--rules-only` 时才会跳过模型。
+也兼容旧的 `TRAJECTORY_*` 环境变量。模型响应会缓存到 `qwen_review_cache.json`，
+重复运行不会再次请求已经完成的相同复核。只有明确传入 `--rules-only` 时才会跳过模型。
 
 也可以从终端运行：
 

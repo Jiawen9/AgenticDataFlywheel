@@ -80,7 +80,7 @@ class QwenStateAlignmentReviewer:
     """Confirm that two post-gap steps match two existing tree states."""
 
     def __init__(self, model: str, cache_path: Path) -> None:
-        settings = qwen_settings()
+        settings = qwen_settings("tree")
         http_client = httpx.Client(
             proxy=settings["proxy"] or None,
             verify=settings["verify"],
@@ -88,10 +88,10 @@ class QwenStateAlignmentReviewer:
             trust_env=settings["trust_env"],
         )
         self.client = OpenAI(
-            api_key=settings["api_key"],
+            api_key=settings["api_key"] or "EMPTY",
             base_url=settings["base_url"],
             timeout=settings["timeout"],
-            max_retries=0,
+            max_retries=settings["max_retries"],
             http_client=http_client,
         )
         self.model = model

@@ -16,7 +16,12 @@ from zoneinfo import ZoneInfo
 
 from trajectory_tools.excel_to_object import load_objects
 from trajectory_tools.gui_trajectory_excel import QwenSummarizer, export_trajectory_workbook
-from trajectory_tools.settings import DEFAULT_ENV_FILE, configure_model_environment, load_repository_env
+from trajectory_tools.settings import (
+    DEFAULT_ENV_FILE,
+    configure_model_environment,
+    load_model_config,
+    load_repository_env,
+)
 
 
 HERE = Path(__file__).resolve().parent
@@ -128,8 +133,18 @@ def _ensure_workbook(run_id: str, manifest: dict[str, Any], task_ids: list[str])
         answers_ready = all(str(item.final_answer or "").strip() for item in selected)
         if all(task_id in tasks for task_id in task_ids) and selected and observations_ready and answers_ready:
             return WORKBOOK, tasks, trajectories
-    values = load_repository_env(DEFAULT_ENV_FILE)
-    summarizer = QwenSummarizer(values["MODEL_NAME"], values["MODEL_URL"], values["YUNAI_API_KEY"], SUMMARY_CACHE)
+    model_config = load_model_config(DEFAULT_ENV_FILE, module="quality")
+    summarizer = QwenSummarizer(
+        model_config.model,
+        model_config.base_url,
+        model_config.api_key or "EMPTY",
+        SUMMARY_CACHE,
+        timeout=model_config.timeout,
+        max_retries=model_config.max_retries,
+        verify=model_config.verify,
+        proxy=model_config.proxy,
+        trust_env=model_config.trust_env,
+    )
     export_trajectory_workbook(WORKSPACE / "rollout_trajectories", WORKBOOK, summarizer)
     tasks, trajectories = load_objects(WORKBOOK)
     return WORKBOOK, tasks, trajectories

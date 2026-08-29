@@ -1,4 +1,8 @@
+<<<<<<< Updated upstream
 import type { BuildJob, QualityJob, RunQualitySummary, TaskQualityResult, TaskSummary, TrajectoryRecord, TrajectorySummary, TrajectoryTreeNode, TreeRun } from './types'
+=======
+import type { BuildJob, CorrectionBatch, CorrectionExport, CorrectionGroup, CorrectionGroupSummary, CorrectionRecommendation, CorrectionSession, QualityJob, RunQualitySummary, TaskGenerationInput, TaskGenerationJob, TaskGenerationPreview, TaskGenerationSource, TaskQualityResult, TaskSummary, TrajectoryRecord, TrajectorySummary, TrajectoryTreeNode, TreeRun } from './types'
+>>>>>>> Stashed changes
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
 
@@ -80,9 +84,109 @@ export const api = {
   taskQuality(runId: string, taskId: string): Promise<TaskQualityResult> {
     return request(`/api/tree-runs/${encodeURIComponent(runId)}/tasks/${encodeURIComponent(taskId)}/quality`)
   },
+<<<<<<< Updated upstream
+=======
+  correctionBatches(): Promise<{ default_tree_run_id: string | null; batches: CorrectionBatch[] }> {
+    return request('/api/correction/batches')
+  },
+  correctionRecommendation(treeRunId?: string): Promise<CorrectionRecommendation> {
+    const query = treeRunId ? `?tree_run_id=${encodeURIComponent(treeRunId)}` : ''
+    return request(`/api/correction/recommendation${query}`)
+  },
+  async correctionSessions(): Promise<CorrectionSession[]> {
+    return (await request<{ sessions: CorrectionSession[] }>('/api/correction/sessions')).sessions
+  },
+  async createCorrectionSession(treeRunId: string): Promise<CorrectionSession> {
+    return (await request<{ session: CorrectionSession }>('/api/correction/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ tree_run_id: treeRunId }),
+    })).session
+  },
+  correctionSession(sessionId: string): Promise<CorrectionSession> {
+    return request<{ session: CorrectionSession }>(`/api/correction/sessions/${encodeURIComponent(sessionId)}`).then((result) => result.session)
+  },
+  correctionGroups(sessionId: string): Promise<CorrectionGroupSummary[]> {
+    return request<{ groups: CorrectionGroupSummary[] }>(`/api/correction/sessions/${encodeURIComponent(sessionId)}/tasks`).then((result) => result.groups)
+  },
+  correctionGroup(sessionId: string, groupId: string): Promise<CorrectionGroup> {
+    return request<{ group: CorrectionGroup }>(`/api/correction/sessions/${encodeURIComponent(sessionId)}/tasks/${encodeURIComponent(groupId)}`).then((result) => result.group)
+  },
+  async patchCorrectionRow(sessionId: string, excelRow: number, patch: { sop?: string; actions?: string; deleted?: boolean }): Promise<{ group: CorrectionGroupSummary; row: CorrectionGroup['rows'][number] }> {
+    return request(`/api/correction/sessions/${encodeURIComponent(sessionId)}/rows/${excelRow}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    })
+  },
+  async patchCorrectionExport(sessionId: string, groupId: string, exportState: boolean): Promise<CorrectionGroupSummary> {
+    return (await request<{ group: CorrectionGroupSummary }>(`/api/correction/sessions/${encodeURIComponent(sessionId)}/tasks/${encodeURIComponent(groupId)}/export`, {
+      method: 'PATCH',
+      body: JSON.stringify({ export: exportState }),
+    })).group
+  },
+  correctionExport(sessionId: string): Promise<CorrectionExport> {
+    return request(`/api/correction/sessions/${encodeURIComponent(sessionId)}/export`, { method: 'POST' })
+  },
+  taskGenerationSource(): Promise<TaskGenerationSource> {
+    return request('/api/task-generation/source')
+  },
+  async taskGenerationJobs(): Promise<TaskGenerationJob[]> {
+    return (await request<{ jobs: TaskGenerationJob[] }>('/api/task-generation/jobs')).jobs
+  },
+  taskGenerationJob(jobId: string): Promise<TaskGenerationJob> {
+    return request(`/api/task-generation/jobs/${encodeURIComponent(jobId)}`)
+  },
+  taskGenerationPreview(jobId: string): Promise<TaskGenerationPreview> {
+    return request(`/api/task-generation/jobs/${encodeURIComponent(jobId)}/preview`)
+  },
+  createKnowledgeGeneration(params: {
+    app?: string | null
+    scene?: string | null
+    capability?: string | null
+    sub_capability?: string | null
+    generate_per_sub_capability: number
+  }): Promise<TaskGenerationJob> {
+    return request('/api/task-generation/knowledge/jobs', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    })
+  },
+  async uploadFlywheelInput(file: File): Promise<TaskGenerationInput> {
+    const form = new FormData()
+    form.append('file', file)
+    return request('/api/task-generation/flywheel/inputs', { method: 'POST', body: form })
+  },
+  createSceneMatchGeneration(inputId: string): Promise<TaskGenerationJob> {
+    return request('/api/task-generation/flywheel/scene-match/jobs', {
+      method: 'POST',
+      body: JSON.stringify({ input_id: inputId }),
+    })
+  },
+  createVariantGeneration(sceneMatchJobId: string, generateN: number): Promise<TaskGenerationJob> {
+    return request('/api/task-generation/flywheel/variant/jobs', {
+      method: 'POST',
+      body: JSON.stringify({ scene_match_job_id: sceneMatchJobId, generate_n: generateN }),
+    })
+  },
+>>>>>>> Stashed changes
 }
 
 export function imageUrl(relativePath: string): string {
   const normalized = relativePath.replaceAll('\\', '/').replace(/^\/+/, '')
   return `${API_BASE}/api/assets/${normalized.split('/').map(encodeURIComponent).join('/')}`
 }
+<<<<<<< Updated upstream
+=======
+
+export function correctionAssetUrl(sessionId: string, relativePath: string): string {
+  const normalized = relativePath.replaceAll('\\', '/').replace(/^\/+/, '')
+  return `${API_BASE}/api/correction/sessions/${encodeURIComponent(sessionId)}/assets/${normalized.split('/').map(encodeURIComponent).join('/')}`
+}
+
+export function correctionDownloadUrl(sessionId: string, filename: string): string {
+  return `${API_BASE}/api/correction/sessions/${encodeURIComponent(sessionId)}/exports/${encodeURIComponent(filename)}`
+}
+
+export function taskGenerationDownloadUrl(jobId: string, format: 'json' | 'xlsx'): string {
+  return `${API_BASE}/api/task-generation/jobs/${encodeURIComponent(jobId)}/download?format=${format}`
+}
+>>>>>>> Stashed changes

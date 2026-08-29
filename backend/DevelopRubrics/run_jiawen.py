@@ -9,7 +9,12 @@ import sys
 from pathlib import Path
 
 from trajectory_tools.gui_trajectory_excel import QwenSummarizer, export_trajectory_workbook
-from trajectory_tools.settings import DEFAULT_ENV_FILE, configure_model_environment, load_repository_env
+from trajectory_tools.settings import (
+    DEFAULT_ENV_FILE,
+    configure_model_environment,
+    load_model_config,
+    load_repository_env,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -48,12 +53,17 @@ def run_export(args: argparse.Namespace) -> None:
     output = args.workbook.resolve()
     summarizer = None
     if not args.skip_model:
-        values = load_repository_env(args.env_file.resolve())
+        model_config = load_model_config(args.env_file.resolve(), module="quality")
         summarizer = QwenSummarizer(
-            model=values["MODEL_NAME"],
-            base_url=values["MODEL_URL"],
-            api_key=values["YUNAI_API_KEY"],
+            model=model_config.model,
+            base_url=model_config.base_url,
+            api_key=model_config.api_key or "EMPTY",
             cache_path=args.cache.resolve(),
+            timeout=model_config.timeout,
+            max_retries=model_config.max_retries,
+            verify=model_config.verify,
+            proxy=model_config.proxy,
+            trust_env=model_config.trust_env,
         )
     counts = export_trajectory_workbook(source, output, summarizer)
     print(f"Exported {counts[0]} task(s), {counts[1]} trajectories and {counts[2]} steps to {output}")

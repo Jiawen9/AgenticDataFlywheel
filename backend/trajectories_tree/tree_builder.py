@@ -1021,7 +1021,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"trajectory root not found: {trajectory_root}")
 
     trajectories = load_trajectories(xlsx_path, args.sheet)
-    model_name = configure_reviewer_environment(env_path)
+    model_name = configure_reviewer_environment(env_path, module="tree")
     classifier = QwenIntermediateStateClassifier(model_name, classification_cache)
     classify_trajectories(
         trajectories, classifier, trajectory_root, args.confidence_threshold

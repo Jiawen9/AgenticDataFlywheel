@@ -15,6 +15,11 @@ import httpx
 from openai import OpenAI
 from PIL import Image, ImageDraw
 
+try:
+    from ..model_config import load_model_config
+except ImportError:  # Support direct imports while debugging from backend/.
+    from model_config import load_model_config
+
 
 JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
@@ -34,50 +39,14 @@ class ReviewResult:
         return value
 
 
-def _bool_env(name: str, default: bool) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+def qwen_settings(module: str = "bbox") -> dict[str, Any]:
+    """Resolve settings through the shared backend/.env entry point."""
 
-
-def _verify_env(name: str, default: bool = True) -> bool | str:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    if value.strip().lower() in {"1", "true", "yes", "on"}:
-        return True
-    if value.strip().lower() in {"0", "false", "no", "off"}:
-        return False
-    return value
-
-
-def qwen_settings() -> dict[str, Any]:
-    api_key = os.environ.get("TRAJECTORY_VLA_API_KEY") or os.environ.get("TRAJECTORY_API_KEY", "")
-    if not api_key:
-        raise RuntimeError(
-            "Qwen review requires TRAJECTORY_API_KEY or TRAJECTORY_VLA_API_KEY. "
-            "No key is currently configured."
-        )
-    return {
-        "api_key": api_key,
-        "base_url": os.environ.get("TRAJECTORY_VLA_API_BASE_URL")
-        or os.environ.get("TRAJECTORY_API_BASE_URL", "https://yunai.chat/v1"),
-        "proxy": os.environ.get("TRAJECTORY_VLA_HTTP_PROXY_URL")
-        or os.environ.get("TRAJECTORY_HTTP_PROXY_URL", ""),
-        "verify": _verify_env(
-            "TRAJECTORY_VLA_HTTP_VERIFY", _verify_env("TRAJECTORY_HTTP_VERIFY", True)
-        ),
-        "timeout": float(
-            os.environ.get("TRAJECTORY_VLA_HTTP_TIMEOUT")
-            or os.environ.get("TRAJECTORY_HTTP_TIMEOUT")
-            or 120
-        ),
-        "trust_env": _bool_env(
-            "TRAJECTORY_VLA_HTTP_TRUST_ENV",
-            _bool_env("TRAJECTORY_HTTP_TRUST_ENV", False),
-        ),
-    }
+    configured_path = os.environ.get("MODEL_CONFIG_PATH")
+    path = Path(configured_path) if configured_path else None
+    if path is None:
+        return load_model_config(module=module).to_dict()
+    return load_model_config(path, module=module).to_dict()
 
 
 def _boxed_image_data_url(
@@ -167,9 +136,10 @@ class QwenBoxReviewer:
             trust_env=settings["trust_env"],
         )
         self.client = OpenAI(
-            api_key=settings["api_key"],
+            api_key=settings["api_key"] or "EMPTY",
             base_url=settings["base_url"],
             timeout=settings["timeout"],
+            max_retries=settings["max_retries"],
             http_client=http_client,
         )
         self.model = model

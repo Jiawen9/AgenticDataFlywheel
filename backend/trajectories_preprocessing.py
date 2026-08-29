@@ -15,10 +15,12 @@ from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
 try:
+    from .model_config import load_env_values, load_model_config
     from .bounding_box.build_annotations import resolve_action_box
     from .bounding_box.qwen_reviewer import QwenBoxReviewer
     from .export_vla_trajectories import collect_rows, write_xlsx
 except ImportError:  # Keep direct `python backend/trajectories_preprocessing.py` usage working.
+    from model_config import load_env_values, load_model_config
     from bounding_box.build_annotations import resolve_action_box
     from bounding_box.qwen_reviewer import QwenBoxReviewer
     from export_vla_trajectories import collect_rows, write_xlsx
@@ -32,7 +34,6 @@ DEFAULT_EXPORT_OUTPUT = WORKSPACE_DIR / "trajectories_to_excel.xlsx"
 DEFAULT_ANNOTATED_OUTPUT = WORKSPACE_DIR / "annotated_trajectories.xlsx"
 DEFAULT_ENV_FILE = BACKEND_DIR / ".env"
 DEFAULT_CACHE_FILE = BACKEND_DIR / "bounding_box" / "qwen_review_cache.json"
-REQUIRED_MODEL = "qwen3.6-27b:floor"
 TARGET_ACTIONS = {"click", "swipe", "long_press"}
 STEP_IMAGE_RE = re.compile(r"^step(?P<step>\d+)_vla_input\.jpg$", re.IGNORECASE)
 REQUIRED_COLUMNS = ("文件夹名", "image", "xml", "action", "summary")
@@ -40,42 +41,22 @@ REQUIRED_COLUMNS = ("文件夹名", "image", "xml", "action", "summary")
 
 def read_env_file(path: Path) -> dict[str, str]:
     """Read the small KEY=VALUE configuration used by this backend."""
-    if not path.is_file():
-        raise FileNotFoundError(f"environment file does not exist: {path}")
-
-    values: dict[str, str] = {}
-    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[7:].lstrip()
-        key, separator, value = line.partition("=")
-        key = key.strip()
-        if not separator or not key:
-            raise ValueError(f"invalid .env entry at {path}:{line_number}")
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-            value = value[1:-1]
-        values[key] = value
-    return values
+    return load_env_values(path)
 
 
-def configure_reviewer_environment(env_file: Path) -> str:
-    """Load model settings and map them to the bounding-box review client."""
-    values = read_env_file(env_file)
-    missing = [name for name in ("YUNAI_API_KEY", "MODEL_URL", "MODEL_NAME") if not values.get(name)]
-    if missing:
-        raise ValueError(f"missing required .env settings: {', '.join(missing)}")
-
-    model = values["MODEL_NAME"]
-    if model != REQUIRED_MODEL:
-        raise ValueError(f"MODEL_NAME must be {REQUIRED_MODEL!r}, got {model!r}")
-
-    os.environ["TRAJECTORY_API_KEY"] = values["YUNAI_API_KEY"]
-    os.environ["TRAJECTORY_API_BASE_URL"] = values["MODEL_URL"]
-    os.environ["TRAJECTORY_MODEL"] = model
-    return model
+def configure_reviewer_environment(env_file: Path, module: str = "bbox") -> str:
+    """Resolve a module profile and export compatibility variables for old clients."""
+    config = load_model_config(env_file, module=module)
+    os.environ["MODEL_CONFIG_PATH"] = str(Path(env_file).expanduser().resolve())
+    os.environ["TRAJECTORY_API_KEY"] = config.api_key
+    os.environ["TRAJECTORY_API_BASE_URL"] = config.base_url
+    os.environ["TRAJECTORY_MODEL"] = config.model
+    os.environ["TRAJECTORY_HTTP_TIMEOUT"] = str(config.timeout)
+    os.environ["TRAJECTORY_HTTP_VERIFY"] = str(config.verify).lower()
+    os.environ["TRAJECTORY_HTTP_TRUST_ENV"] = str(config.trust_env).lower()
+    if config.proxy:
+        os.environ["TRAJECTORY_HTTP_PROXY_URL"] = config.proxy
+    return config.model
 
 
 def export_trajectories(source_root: Path, output_path: Path) -> tuple[int, list[str]]:
@@ -305,7 +286,7 @@ def run_pipeline(
     for warning in warnings:
         print(f"Warning: {warning}", file=sys.stderr)
 
-    model = configure_reviewer_environment(env_file.expanduser().resolve())
+    model = configure_reviewer_environment(env_file.expanduser().resolve(), module="bbox")
     reviewer = QwenBoxReviewer(model=model, cache_path=DEFAULT_CACHE_FILE)
     counts = annotate_trajectory_workbook(
         export_output,

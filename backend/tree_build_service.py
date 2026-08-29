@@ -141,7 +141,22 @@ def build_tree_run(
     task_manifests: list[dict[str, Any]] = []
 
     try:
+<<<<<<< Updated upstream
         model_name = configure_reviewer_environment(env_path)
+=======
+        model_name = configure_reviewer_environment(env_path, module="tree")
+        env_values = read_env_file(env_path) if env_path.is_file() else {}
+        classification_max_concurrent = _positive_int(
+            env_values.get("TREE_CLASSIFICATION_MAX_CONCURRENT"),
+            name="TREE_CLASSIFICATION_MAX_CONCURRENT",
+            default=DEFAULT_TREE_CLASSIFICATION_MAX_CONCURRENT,
+        )
+        summary_max_concurrent = _positive_int(
+            env_values.get("TREE_SUMMARY_MAX_CONCURRENT"),
+            name="TREE_SUMMARY_MAX_CONCURRENT",
+            default=DEFAULT_TREE_SUMMARY_MAX_CONCURRENT,
+        )
+>>>>>>> Stashed changes
         classifier = QwenIntermediateStateClassifier(model_name, classification_cache)
         alignment_reviewer = QwenStateAlignmentReviewer(model_name, alignment_cache)
         for task_index, task_id in enumerate(task_ids, 1):

@@ -76,9 +76,9 @@ def _image_data_url(path: Path) -> str:
 
 class QwenIntermediateStateClassifier:
     def __init__(self, model: str, cache_path: Path) -> None:
-        settings = qwen_settings()
+        settings = qwen_settings("tree")
         http_client = httpx.Client(proxy=settings["proxy"] or None, verify=settings["verify"], timeout=settings["timeout"], trust_env=settings["trust_env"])
-        self.client = OpenAI(api_key=settings["api_key"], base_url=settings["base_url"], timeout=settings["timeout"], max_retries=0, http_client=http_client)
+        self.client = OpenAI(api_key=settings["api_key"] or "EMPTY", base_url=settings["base_url"], timeout=settings["timeout"], max_retries=settings["max_retries"], http_client=http_client)
         self.model, self.cache_path = model, cache_path
         self.cache: dict[str, Any] = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
         if not isinstance(self.cache, dict):

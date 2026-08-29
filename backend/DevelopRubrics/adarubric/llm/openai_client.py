@@ -88,13 +88,24 @@ class OpenAIClient(LLMClient):
         *,
         api_key: str | None = None,
         base_url: str | None = None,
-        max_retries: int = 3,
+        max_retries: int | None = None,
+        timeout: float | None = None,
         extra_body: dict[str, Any] | None = None,
     ) -> None:
         self.model = model
-        self._max_retries = max(1, max_retries)
+        configured_retries = max_retries
+        if configured_retries is None:
+            configured_retries = int(os.environ.get("ADARUBRIC_MAX_RETRIES", "3"))
+        self._max_retries = max(1, configured_retries)
         self._extra_body = extra_body if extra_body is not None else _extra_body_from_env()
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        configured_timeout = timeout
+        if configured_timeout is None and os.environ.get("ADARUBRIC_HTTP_TIMEOUT"):
+            configured_timeout = float(os.environ["ADARUBRIC_HTTP_TIMEOUT"])
+        self._client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=configured_timeout,
+        )
 
     async def _chat(
         self,

@@ -32,6 +32,11 @@ from .trajectory_data import (
 from .quality_data import quality_manifest, quality_task, rubric_ready
 from .quality_jobs import QualityJobManager
 from .tree_build_jobs import TreeBuildJobManager
+<<<<<<< Updated upstream
+=======
+from .task_generation.router import router as task_generation_router
+from .trajectory_correction.router import router as correction_router
+>>>>>>> Stashed changes
 
 
 FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
@@ -100,6 +105,11 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
     allow_headers=["*"],
 )
+<<<<<<< Updated upstream
+=======
+app.include_router(correction_router)
+app.include_router(task_generation_router)
+>>>>>>> Stashed changes
 model_job_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="model-job")
 job_manager = TreeBuildJobManager(executor=model_job_executor)
 quality_job_manager = QualityJobManager(executor=model_job_executor)

@@ -1,7 +1,7 @@
 # Agentic Data Flywheel
 
-一个前后端分离的 GUI Agent 轨迹数据飞轮工程，包含轨迹 Excel 导出、动作 bbox
-标注、受限中间态过滤、任务级轨迹树构建，以及 Vue 轨迹采集与质检界面。
+一个前后端分离的 GUI Agent 数据飞轮工程，包含任务生成、轨迹 Excel 导出、动作 bbox
+标注、受限中间态过滤、任务级轨迹树构建，以及 Vue 轨迹工作台。
 
 ## 主要能力
 
@@ -20,12 +20,23 @@ AgenticDataFlywheel/
 ├─ backend/                       FastAPI、轨迹预处理和建树代码
 │  ├─ bounding_box/              bbox 生成与视觉复核
 │  ├─ trajectories_tree/         中间态判断和轨迹树构建
+<<<<<<< Updated upstream
+=======
+│  ├─ trajectory_correction/    轨迹修正网页模块（独立后端包）
+│  ├─ task_generation/          任务生成网页模块（独立后端包）
+>>>>>>> Stashed changes
 │  ├─ tests/                     后端测试
 │  ├─ .env.example               模型配置示例
 │  └─ api.py                     FastAPI 入口
 ├─ frontend/                     Vue 3 + Vite 前端
 ├─ backend_workspace/            本地数据与运行结果，不提交 Git
+<<<<<<< Updated upstream
 │  └─ rollout_trajectories/      原始轨迹放置目录
+=======
+│  ├─ rollout_trajectories/      原始轨迹放置目录
+│  ├─ trajectory_correction/    轨迹修正输入、草稿与导出
+│  └─ task_generation/          任务生成上传文件、作业与结果
+>>>>>>> Stashed changes
 └─ README.md
 ```
 
@@ -52,16 +63,28 @@ Copy-Item backend\.env.example backend\.env
 编辑 `backend/.env`：
 
 ```dotenv
-YUNAI_API_KEY=你的_api_key
-MODEL_URL=https://yunai.chat/v1
-MODEL_NAME=qwen3.6-27b:floor
+MODEL_API_KEY=你的_api_key
+MODEL_BASE_URL=http://你的内部模型网关/v1
+MODEL_TIMEOUT_SECONDS=120
+MODEL_MAX_RETRIES=2
+MODEL_VERIFY_TLS=true
+MODEL_TRUST_ENV=false
+
+TREE_MODEL=你的轨迹树模型
+BBOX_MODEL=你的框选复核模型
+QUALITY_MODEL=你的轨迹质检模型
+TASK_GENERATION_MODEL=你的任务生成模型
 ```
 
-三个变量都是必填项：
+公共连接配置只在这里填写一次，各模块只通过模型名和可选覆盖项选择模型：
 
-- `YUNAI_API_KEY`：OpenAI-compatible 模型服务的 API key。
-- `MODEL_URL`：模型服务的 base URL。
-- `MODEL_NAME`：预处理和建树使用的模型名称。
+- `MODEL_API_KEY`、`MODEL_BASE_URL`：内部 OpenAI-compatible 网关的认证信息和 base URL。
+- `MODEL_TIMEOUT_SECONDS`、`MODEL_MAX_RETRIES`、`MODEL_VERIFY_TLS`、`MODEL_TRUST_ENV`：公共连接行为。
+- `TREE_MODEL`、`BBOX_MODEL`、`QUALITY_MODEL`、`TASK_GENERATION_MODEL`：各模块使用的模型名。
+- 如果某模块需要独立网关，可增加 `QUALITY_BASE_URL`、`QUALITY_API_KEY` 这类同前缀配置；未填写时继承 `MODEL_*`。
+
+旧版的 `YUNAI_API_KEY`、`MODEL_URL`、`MODEL_NAME` 仍可作为兼容回退，但新部署建议只使用上述配置。
+程序不会在缺少 `MODEL_BASE_URL` 时自动连接外部默认地址。
 
 `backend/.env` 已被 Git 忽略，不要把真实密钥写入 `.env.example`、源码或日志。
 
@@ -135,6 +158,28 @@ npm run dev --prefix frontend
 Vite 默认把 `/api` 代理到 `http://127.0.0.1:8765`。
 
 ## 6. 网页使用流程
+
+### 任务生成
+
+进入系统根地址或点击左侧第一项“任务生成”，页面提供两条独立链路：
+
+1. “知识库生成”直接读取 `backend_workspace/task_generation/KnowledgeBase/` 下的三份 Excel，可按 App、场景、能力和子能力筛选，并设置每个子能力的生成数量。
+2. “失败用例扩写”上传包含 `任务结果`、`任务`、`涉及APP` 字段的 `.xlsx`，先执行“场景匹配”，确认匹配结果后再生成变体任务。
+
+任务生成作业之间按队列串行执行，单个作业内的模型请求继续使用
+`TASK_GENERATION_MAX_CONCURRENT` 并发。模型地址、模型名和 Key 只从后端
+`.env` 读取，网页不会接收或保存这些配置。
+
+原始 KnowledgeBase 和上传 Excel 不会被覆盖。任务生成 Web 结果保存在：
+
+```text
+backend_workspace/task_generation/
+├─ inputs/       # 上传的失败用例源文件
+├─ jobs/         # 可在刷新页面后恢复的作业状态
+└─ outputs/      # JSON/Excel 结果
+```
+
+结果表格可在页面预览并下载；首版不会自动导入轨迹采集。
 
 ### 轨迹采集
 

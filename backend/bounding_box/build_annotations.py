@@ -13,9 +13,11 @@ from PIL import Image
 try:
     from .action_box import BoxResult, annotate_image, infer_box, load_trajectory_actions
     from .qwen_reviewer import QwenBoxReviewer
+    from ..model_config import load_model_config
 except ImportError:  # Keep direct `python build_annotations.py` usage working.
     from action_box import BoxResult, annotate_image, infer_box, load_trajectory_actions
     from qwen_reviewer import QwenBoxReviewer
+    from model_config import load_model_config
 
 
 DEFAULT_SOURCE = Path(r"C:\Users\panda\Desktop\gui-trajectory-adarubric-project\trajectories\20260711_104625")
@@ -261,9 +263,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate one action box for every stability screenshot.")
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
     parser.add_argument("--output", type=Path, default=PROJECT_DIR / "annotated")
-    parser.add_argument(
-        "--model", default=os.environ.get("TRAJECTORY_MODEL", "qwen3.6-27b:floor")
-    )
+    parser.add_argument("--model", default=None)
     parser.add_argument("--max-review-rounds", type=int, default=4)
     parser.add_argument(
         "--rules-only",
@@ -271,17 +271,23 @@ def main() -> None:
         help="Disable Qwen review explicitly; default builds require Qwen.",
     )
     args = parser.parse_args()
+    model = args.model
+    if not model:
+        if args.rules_only:
+            model = ""
+        else:
+            model = load_model_config(module="bbox").model
     reviewer = None
     if not args.rules_only:
         reviewer = QwenBoxReviewer(
-            model=args.model,
+            model=model,
             cache_path=PROJECT_DIR / "qwen_review_cache.json",
         )
     manifest = build(
         args.source.resolve(),
         args.output.resolve(),
         reviewer=reviewer,
-        model=args.model,
+        model=model,
         max_review_rounds=max(1, args.max_review_rounds),
     )
     print(f"Generated: {manifest['generated_count']}")

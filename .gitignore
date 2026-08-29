@@ -23,6 +23,7 @@ frontend/.vite/
 
 # Runtime logs and generated data
 *.log
+任务生成草稿/logs/
 *.xlsx
 backend/bounding_box/*cache*.json
 backend/trajectories_tree/*cache*.json

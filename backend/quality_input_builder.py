@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Any, Callable
 
+from .model_config import load_env_values, load_model_config
 from .DevelopRubrics.trajectory_tools.gui_trajectory_excel import (
     QwenSummarizer, StepRecord, TaskRecord, TrajectoryRecord, write_workbook,
 )
@@ -12,14 +13,11 @@ from .DevelopRubrics.trajectory_tools.gui_trajectory_excel import (
 FINAL_ANSWER_CACHE = Path(__file__).resolve().parent.parent / "backend_workspace" / "rubric_outputs" / "cache" / "qwen_tree_final_answers.json"
 
 def _env(path: Path) -> dict[str, str]:
-    values: dict[str, str] = {}
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if line and not line.startswith("#") and "=" in line:
-            key, value = line.split("=", 1); values[key.strip()] = value.strip().strip('"').strip("'")
-    missing = [key for key in ("YUNAI_API_KEY", "MODEL_URL", "MODEL_NAME") if not values.get(key)]
-    if missing:
-        raise ValueError(f"missing required model settings: {', '.join(missing)}")
+    values = load_env_values(path)
+    config = load_model_config(path, module="quality")
+    values["MODEL_NAME"] = config.model
+    values["MODEL_URL"] = config.base_url
+    values["YUNAI_API_KEY"] = config.api_key
     return values
 
 def build_quality_workbook(*, grouped: dict[str, list[tuple[str, list[Any]]]], task_goals: dict[str, str],
@@ -28,7 +26,18 @@ def build_quality_workbook(*, grouped: dict[str, list[tuple[str, list[Any]]]], t
                            summarizer: Any | None = None) -> tuple[int, int, int]:
     values = _env(env_path) if summarizer is None else {"MODEL_NAME": getattr(summarizer, "model", "test-model")}
     if summarizer is None:
-        summarizer = QwenSummarizer(values["MODEL_NAME"], values["MODEL_URL"], values["YUNAI_API_KEY"], FINAL_ANSWER_CACHE)
+        config = load_model_config(env_path, module="quality")
+        summarizer = QwenSummarizer(
+            config.model,
+            config.base_url,
+            config.api_key or "EMPTY",
+            FINAL_ANSWER_CACHE,
+            timeout=config.timeout,
+            max_retries=config.max_retries,
+            verify=config.verify,
+            proxy=config.proxy,
+            trust_env=config.trust_env,
+        )
     tasks = {task_id: TaskRecord(task_id, task_goals.get(task_id, task_id)) for task_id in grouped}
     trajectories: list[TrajectoryRecord] = []
     total = sum(len(items) for items in grouped.values()); completed = 0

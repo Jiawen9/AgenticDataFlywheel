@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+import httpx
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
@@ -234,11 +235,34 @@ def write_workbook(output: Path, tasks: dict[str, TaskRecord], trajectories: lis
 
 
 class QwenSummarizer:
-    def __init__(self, model: str, base_url: str, api_key: str, cache_path: Path) -> None:
+    def __init__(
+        self,
+        model: str,
+        base_url: str,
+        api_key: str,
+        cache_path: Path,
+        *,
+        timeout: float = 120.0,
+        max_retries: int = 2,
+        verify: bool = True,
+        proxy: str = "",
+        trust_env: bool = False,
+    ) -> None:
         from openai import OpenAI
 
         self.model = model
-        self.client = OpenAI(api_key=api_key, base_url=base_url, max_retries=2)
+        self.client = OpenAI(
+            api_key=api_key or "EMPTY",
+            base_url=base_url,
+            timeout=timeout,
+            max_retries=max_retries,
+            http_client=httpx.Client(
+                proxy=proxy or None,
+                verify=verify,
+                timeout=timeout,
+                trust_env=trust_env,
+            ),
+        )
         self.cache_path = cache_path
         self.cache = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.is_file() else {}
 
