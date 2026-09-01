@@ -99,4 +99,18 @@ export const phoneFactoryApi = {
   removeTask(filename: string): Promise<FactoryState> {
     return request<FactoryState>('/tasks', jsonInit('DELETE', { filename }))
   },
+  /** 新增手机 -> 通知 server 端（client add-phone） */
+  remoteAddPhone(phoneId: string): Promise<{ ok: boolean; message?: string; error?: string }> {
+    return request<{ ok: boolean; message?: string; error?: string }>(
+      '/remote/add-phone',
+      jsonInit('POST', { phone_id: phoneId }),
+    )
+  },
+  /** 开始运行 -> 把任务文件与 手机ID/运行APP 关联文件 发送到 server 端 */
+  remoteStartRun(filename: string, phoneId: string, app: string): Promise<{ ok: boolean; message?: string; error?: string }> {
+    return request<{ ok: boolean; message?: string; error?: string }>(
+      '/remote/start-run',
+      jsonInit('POST', { filename, phone_id: phoneId, app }),
+    )
+  },
 }

@@ -1,6 +1,7 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { execFile } from 'node:child_process'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Plugin } from 'vite'
 
@@ -50,6 +51,22 @@ const DEFAULT_CONFIG: FactoryConfig = {
 }
 
 const API_PREFIX = '/api/phone-factory'
+
+// 后端 client 脚本（新增手机/开始运行 时由中间件调用，转发到 server 端）
+const CLIENT_SCRIPT = path.resolve(FRONTEND_ROOT, '..', 'backend', 'phonefactory_client.py')
+
+/** 调用后端 client 脚本，超时 12 秒（client 内部 10 秒超时兜底）。 */
+function runClient(args: string[]): Promise<{ ok: boolean; output: string }> {
+  return new Promise((resolve) => {
+    execFile('python3', [CLIENT_SCRIPT, ...args], { timeout: 12000 }, (error, stdout, stderr) => {
+      if (error) {
+        resolve({ ok: false, output: (stderr || error.message || '').trim() })
+      } else {
+        resolve({ ok: true, output: stdout.trim() })
+      }
+    })
+  })
+}
 
 async function ensureDirs(): Promise<void> {
   await fs.mkdir(DATA_DIR, { recursive: true })
@@ -245,6 +262,52 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<boolea
       task.status = '运行中'
       await writeJson('tasks.json', state.tasks)
       send(res, 200, await loadState())
+      return true
+    }
+
+    // 新增手机 -> 转发到 server 端（client add-phone）
+    if (route === '/remote/add-phone' && method === 'POST') {
+      const phoneId = String(data.phone_id ?? '').trim()
+      if (!phoneId) return fail(res, '手机ID不能为空'), true
+      const result = await runClient(['add-phone', phoneId])
+      if (!result.ok) return fail(res, result.output || '功能不支持或者网络断连', 502), true
+      try {
+        send(res, 200, JSON.parse(result.output))
+      } catch {
+        send(res, 200, { ok: true, message: result.output })
+      }
+      return true
+    }
+
+    // 开始运行 -> 把任务文件与 手机ID/运行APP 关联文件 发送到 server 端（client start-run）
+    if (route === '/remote/start-run' && method === 'POST') {
+      const filename = path.basename(String(data.filename ?? '').trim())
+      const phoneId = String(data.phone_id ?? '').trim()
+      const app = String(data.app ?? '').trim()
+      if (!filename) return fail(res, '任务文件名不能为空'), true
+      if (!phoneId) return fail(res, '手机ID不能为空'), true
+      if (!app) return fail(res, '运行APP不能为空'), true
+      const taskPath = path.join(UPLOAD_DIR, filename)
+      const appsPath = path.join(DATA_DIR, 'phone_apps.json')
+      const config = await readJson<FactoryConfig>('config.json', DEFAULT_CONFIG)
+      const args = [
+        'start-run',
+        taskPath,
+        appsPath,
+        phoneId,
+        app,
+        ...(config.sampling_enabled ? ['--sampling'] : []),
+        '--temperature', String(config.temperature),
+        '--top-p', String(config.top_p),
+        ...(config.use_experience_lib ? ['--exp'] : []),
+      ]
+      const result = await runClient(args)
+      if (!result.ok) return fail(res, result.output || '功能不支持或者网络断连', 502), true
+      try {
+        send(res, 200, JSON.parse(result.output))
+      } catch {
+        send(res, 200, { ok: true, message: result.output })
+      }
       return true
     }
 

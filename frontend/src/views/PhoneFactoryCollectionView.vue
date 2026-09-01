@@ -21,7 +21,7 @@
             v-model="newPhoneId"
             placeholder="示例：3B65AB01LBl00000"
             clearable
-            class="field-input"
+            class="field-input phone-id-input"
             @keyup.enter="handleAddPhoneApp"
           />
           <span class="field-label app-gap">运行APP</span>
@@ -42,8 +42,8 @@
 
         <h3 class="sub-title">手机列表</h3>
         <el-table :data="sortedPhoneApps" border stripe>
-          <el-table-column prop="phone_id" label="手机ID" min-width="200" show-overflow-tooltip />
-          <el-table-column prop="app" label="运行APP" min-width="160" show-overflow-tooltip />
+          <el-table-column prop="phone_id" label="手机ID" min-width="130" show-overflow-tooltip />
+          <el-table-column prop="app" label="运行APP" min-width="90" show-overflow-tooltip />
           <el-table-column label="状态" width="110" align="center">
             <template #default="{ row }">
               <el-tag :type="row.status === '运行中' ? 'success' : 'info'" effect="light">
@@ -79,7 +79,7 @@
             default-first-option
             clearable
             placeholder="ip:port"
-            class="field-input"
+            class="field-input vla-input"
             @keyup.enter="handleSaveVla"
           >
             <el-option v-for="item in vla" :key="item" :label="item" :value="item" />
@@ -129,24 +129,53 @@
               <el-tag type="warning" effect="light">{{ row.status }}</el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="190" align="center">
+          <el-table-column label="操作" width="220" align="center">
             <template #default="{ row }">
+              <el-button link type="danger" :loading="deletingTask === row.filename" @click="handleRemoveTask(row)">
+                删除
+              </el-button>
               <el-button
                 link
                 type="primary"
                 :loading="startingTask === row.filename"
                 :disabled="row.status === '运行中'"
-                @click="handleStartTask(row)"
+                @click="openRunDialog(row)"
               >
                 {{ row.status === '运行中' ? '运行中' : '开始运行' }}
               </el-button>
-              <el-button link type="danger" :loading="deletingTask === row.filename" @click="handleRemoveTask(row)">
-                删除
+              <el-button
+                link
+                type="warning"
+                :loading="customStarting === row.filename"
+                :disabled="row.status === '运行中'"
+                @click="openRunDialog(row)"
+              >
+                定制运行
               </el-button>
             </template>
           </el-table-column>
         </el-table>
         <p v-if="!tasks.length" class="empty-hint">暂无任务，请在上方新增。</p>
+
+        <!-- 开始运行 / 定制运行 弹窗：选择手机ID 与 运行APP -->
+        <el-dialog v-model="runDialogVisible" title="选择手机运行" width="420px" :close-on-click-modal="false">
+          <div class="row-form">
+            <span class="field-label">手机ID</span>
+            <el-select v-model="runDialogPhoneId" filterable placeholder="选择手机ID" style="width: 240px">
+              <el-option v-for="phoneId in phoneIdOptions" :key="phoneId" :label="phoneId" :value="phoneId" />
+            </el-select>
+          </div>
+          <div class="row-form" style="margin-top: 14px">
+            <span class="field-label">运行APP</span>
+            <el-select v-model="runDialogApp" filterable placeholder="选择运行APP" style="width: 240px">
+              <el-option v-for="app in runDialogAppOptions" :key="app" :label="app" :value="app" />
+            </el-select>
+          </div>
+          <template #footer>
+            <el-button @click="runDialogVisible = false">取消</el-button>
+            <el-button type="primary" :loading="confirmingRun" @click="confirmRun">确定</el-button>
+          </template>
+        </el-dialog>
       </section>
     </div>
   </div>
@@ -184,8 +213,25 @@ const savingConfig = ref(false)
 const deletingKey = ref('')
 const deletingTask = ref('')
 const startingTask = ref('')
+const customStarting = ref('')
+const confirmingRun = ref(false)
+
+// 开始运行 / 定制运行 弹窗状态
+const runDialogVisible = ref(false)
+const runDialogPhoneId = ref('')
+const runDialogApp = ref('')
+const runTargetTask = ref<TaskRow | null>(null)
 
 const rowKey = (row: PhoneAppRow) => `${row.phone_id}||${row.app}`
+
+// 手机ID下拉选项（去重）
+const phoneIdOptions = computed(() => [...new Set(phoneApps.value.map((row) => row.phone_id))])
+// 运行APP下拉选项（选中手机后，列出该手机已关联的APP）
+const runDialogAppOptions = computed(() =>
+  runDialogPhoneId.value
+    ? phoneApps.value.filter((row) => row.phone_id === runDialogPhoneId.value).map((row) => row.app)
+    : [],
+)
 
 // 手机ID列排好序，逐个显示；同一手机多 APP 时手机ID列可重复
 const sortedPhoneApps = computed(() =>
@@ -216,6 +262,12 @@ async function handleAddPhoneApp() {
     ElMessage.success(`已关联 手机 ${phoneId} ↔ ${app}`)
     newPhoneId.value = ''
     newApp.value = ''
+    // 向 server 端发送新增手机通知（client 转发，10 秒超时显示“功能不支持或者网络断连”）
+    try {
+      await phoneFactoryApi.remoteAddPhone(phoneId)
+    } catch (error) {
+      ElMessage.warning(`已本地保存，但通知 server 失败：${(error as Error).message}`)
+    }
   } catch (error) {
     ElMessage.error((error as Error).message)
   } finally {
@@ -308,17 +360,35 @@ async function handleRemoveTask(row: TaskRow) {
   }
 }
 
-// ---------- 3.3 开始运行任务（未运行 -> 运行中） ----------
-async function handleStartTask(row: TaskRow) {
-  startingTask.value = row.filename
+// ---------- 3.3 开始运行/定制运行：打开弹窗选择手机ID与运行APP ----------
+function openRunDialog(row: TaskRow) {
+  runTargetTask.value = row
+  runDialogPhoneId.value = phoneIdOptions.value[0] || ''
+  runDialogApp.value = ''
+  runDialogVisible.value = true
+}
+
+// ---------- 3.3 确认运行：把任务文件与 手机ID/运行APP 关联文件 发送到 server 端 ----------
+async function confirmRun() {
+  if (!runTargetTask.value) return
+  const phoneId = runDialogPhoneId.value
+  const app = runDialogApp.value
+  if (!phoneId) return ElMessage.warning('请选择手机ID')
+  if (!app) return ElMessage.warning('请选择运行APP')
+  confirmingRun.value = true
+  const task = runTargetTask.value
   try {
-    const state = await phoneFactoryApi.startTask(row.filename)
+    // 先通知 server 端（client 转发，10 秒超时显示“功能不支持或者网络断连”）
+    const remote = await phoneFactoryApi.remoteStartRun(task.filename, phoneId, app)
+    // 再更新本地任务状态：未运行 -> 运行中
+    const state = await phoneFactoryApi.startTask(task.filename)
     tasks.value = state.tasks
-    ElMessage.success(`任务「${row.description}」已开始运行`)
+    runDialogVisible.value = false
+    ElMessage.success(remote.message || `已发送 任务「${task.description}」到手机 ${phoneId}（${app}）`)
   } catch (error) {
     ElMessage.error((error as Error).message)
   } finally {
-    startingTask.value = ''
+    confirmingRun.value = false
   }
 }
 
@@ -346,8 +416,9 @@ onMounted(() => {
 .page-hero { margin-bottom: 26px; }
 .page-hero h1 { margin: 6px 0 4px; }
 
-/* 左右双栏：左列=新增手机（含手机列表），右列=轨迹生产（含任务列表），两列互不交叉 */
-.factory-layout { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 22px; align-items: start; }
+/* 左右双栏：左列=新增手机（含手机列表），右列=轨迹生产（含任务列表），两列互不交叉
+   左列整体比右列窄 20 个英文字符（约 140px），手机ID/运行APP 两列合计减少 20 字符 */
+.factory-layout { display: grid; grid-template-columns: minmax(0, calc(50% - 70px)) minmax(0, calc(50% + 70px)); gap: 22px; align-items: start; }
 
 .panel { padding: 20px 22px; border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.88); box-shadow: 0 10px 30px rgba(15,23,42,.05); }
 .panel-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
@@ -360,6 +431,8 @@ onMounted(() => {
 .row-form { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .field-label { flex: none; color: var(--ink); font-size: 13px; font-weight: 800; white-space: nowrap; }
 .field-input { width: 173px; flex: none; }
+/* 手机ID 输入框：比默认加宽 10 个英文字符 */
+.phone-id-input { width: 243px; }
 .row-form + .row-form { margin-top: 12px; }
 .config-row { margin-top: 12px; }
 .config-row + .config-row { margin-top: 10px; }
@@ -369,6 +442,8 @@ onMounted(() => {
 
 /* 轨迹生产：标签统一宽度并右对齐，输入框左对齐 */
 .traj-panel .field-label { width: 112px; text-align: right; }
+/* VLA接口 输入框：比默认加宽 10 个英文字符 */
+.traj-panel .vla-input { width: 243px; }
 /* 是/否 单选下拉框：一个字的选项，无需很长 */
 .traj-panel .yesno-input { width: 90px; flex: none; }
 /* temperature/top_p：标签无需对齐主标签宽度，数字框宽度减半 */
