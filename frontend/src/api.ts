@@ -1,4 +1,4 @@
-import type { BuildJob, CorrectionBatch, CorrectionExport, CorrectionGroup, CorrectionGroupSummary, CorrectionRecommendation, CorrectionSession, QualityJob, RunQualitySummary, TaskQualityResult, TaskSummary, TrajectoryRecord, TrajectorySummary, TrajectoryTreeNode, TreeRun } from './types'
+import type { BuildJob, CorrectionBatch, CorrectionExport, CorrectionGroup, CorrectionGroupSummary, CorrectionRecommendation, CorrectionSession, KnowledgeBaseSummary, QualityJob, RunQualitySummary, TaskGenerationExport, TaskGenerationJob, TaskGenerationResult, TaskGenerationTree, TaskGenerationSelection, TaskGenerationTreeNode, TaskQualityResult, TaskSummary, TrajectoryRecord, TrajectorySummary, TrajectoryTreeNode, TreeRun } from './types'
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
 
@@ -12,8 +12,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!response.ok) {
     let detail = `${response.status} ${response.statusText}`
     try {
-      const payload = (await response.json()) as { detail?: string }
-      detail = payload.detail || detail
+      const payload = (await response.json()) as { detail?: string | Array<{ msg: string }> }
+      detail = Array.isArray(payload.detail) ? payload.detail.map(item => item.msg).join('；') : payload.detail || detail
     } catch {
       // Keep the HTTP fallback message.
     }
@@ -23,6 +23,45 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  async taskGenerationKnowledgeBases(): Promise<KnowledgeBaseSummary[]> {
+    return (await request<{ knowledge_bases: KnowledgeBaseSummary[] }>('/api/task-generation/knowledge-bases')).knowledge_bases
+  },
+  async taskGenerationTree(): Promise<TaskGenerationTree> {
+    return request('/api/task-generation/tree')
+  },
+  async saveTaskGenerationTree(scenes: TaskGenerationTreeNode[], baseVersion: string): Promise<TaskGenerationTree> {
+    return request('/api/task-generation/tree', { method: 'PUT', body: JSON.stringify({ scenes, base_version: baseVersion }) })
+  },
+  async replaceTaskGenerationKnowledgeBase(kind: KnowledgeBaseSummary['kind'], file: File, baseVersion?: string): Promise<KnowledgeBaseSummary> {
+    const form = new FormData()
+    form.append('file', file)
+    if (baseVersion) form.append('base_version', baseVersion)
+    return (await request<{ knowledge_base: KnowledgeBaseSummary }>(`/api/task-generation/knowledge-bases/${encodeURIComponent(kind)}`, { method: 'PUT', body: form })).knowledge_base
+  },
+  async createTaskGeneration(selections: TaskGenerationSelection[], generateN: number, version: string): Promise<TaskGenerationJob> {
+    return request('/api/task-generation/jobs', { method: 'POST', body: JSON.stringify({ selections, generate_n: generateN, version }) })
+  },
+  async createAugmentation(file: File, generateN: number): Promise<TaskGenerationJob> {
+    const form = new FormData()
+    form.append('file', file)
+    form.append('generate_n', String(generateN))
+    return request('/api/task-generation/augmentation-jobs', { method: 'POST', body: form })
+  },
+  async taskGenerationJobs(): Promise<TaskGenerationJob[]> {
+    return (await request<{ jobs: TaskGenerationJob[] }>('/api/task-generation/jobs')).jobs
+  },
+  taskGenerationJob(jobId: string): Promise<TaskGenerationJob> {
+    return request(`/api/task-generation/jobs/${encodeURIComponent(jobId)}`)
+  },
+  async taskGenerationResults(jobId: string): Promise<{ results: TaskGenerationResult[]; errors: TaskGenerationJob['errors'] }> {
+    return request(`/api/task-generation/jobs/${encodeURIComponent(jobId)}/results`)
+  },
+  async patchTaskGenerationResult(jobId: string, resultId: string, patch: { task?: string; deleted?: boolean }): Promise<TaskGenerationResult> {
+    return (await request<{ result: TaskGenerationResult }>(`/api/task-generation/jobs/${encodeURIComponent(jobId)}/results/${encodeURIComponent(resultId)}`, { method: 'PATCH', body: JSON.stringify(patch) })).result
+  },
+  taskGenerationExport(jobId: string): Promise<TaskGenerationExport> {
+    return request(`/api/task-generation/jobs/${encodeURIComponent(jobId)}/export`, { method: 'POST' })
+  },
   async tasks(): Promise<TaskSummary[]> {
     return (await request<{ tasks: TaskSummary[] }>('/api/tasks')).tasks
   },
@@ -139,4 +178,12 @@ export function correctionAssetUrl(sessionId: string, relativePath: string): str
 
 export function correctionDownloadUrl(sessionId: string, filename: string): string {
   return `${API_BASE}/api/correction/sessions/${encodeURIComponent(sessionId)}/exports/${encodeURIComponent(filename)}`
+}
+
+export function taskGenerationDownloadUrl(jobId: string, filename: string): string {
+  return `${API_BASE}/api/task-generation/jobs/${encodeURIComponent(jobId)}/exports/${encodeURIComponent(filename)}`
+}
+
+export function sceneTreeDownloadUrl(): string {
+  return `${API_BASE}/api/task-generation/tree/export`
 }

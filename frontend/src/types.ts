@@ -304,6 +304,23 @@ export interface CorrectionGroup extends CorrectionGroupSummary {
   rows: CorrectionRow[]
 }
 
+// View models only: the persisted Top-1 selection and API remain unchanged.
+export interface CorrectionTrajectoryItem {
+  trajectory_id: string
+  rank: number
+  global_score: number
+  passed_threshold: boolean
+  group: CorrectionGroupSummary
+}
+
+export interface CorrectionTaskItem {
+  task_id: string
+  goal: string
+  trajectories: CorrectionTrajectoryItem[]
+  edited_row_count: number
+  export_count: number
+}
+
 export interface CorrectionExport {
   export_id: string
   filename: string
@@ -325,4 +342,107 @@ export interface CorrectionSession {
   group_count: number
   groups: CorrectionGroupSummary[]
   exports: CorrectionExport[]
+}
+
+export interface KnowledgeBaseSummary {
+  kind: 'scene_tree' | 'control_prior' | 'resource_prior'
+  filename: string
+  exists: boolean
+  valid: boolean
+  rows?: number
+  sheets?: string[]
+  size_bytes: number
+  modified_at?: string
+  error?: string
+  version?: string | null
+}
+
+export interface TaskTypeAppConfig {
+  app: string
+  reference_example: string
+  use_resource_prior: boolean
+  control_prior_available?: boolean
+  resource_count?: number
+}
+
+export interface TaskGenerationTreeNode {
+  id: string
+  label: string
+  kind: 'scene' | 'capability' | 'sub_capability'
+  children?: TaskGenerationTreeNode[]
+  app_configs?: TaskTypeAppConfig[]
+  generatable?: boolean
+  scene?: string
+  capability?: string
+  sub_capability?: string
+}
+
+export interface TaskGenerationTree {
+  version: string
+  scenes: TaskGenerationTreeNode[]
+  leaf_count: number
+  execution_unit_count: number
+  warnings: string[]
+}
+
+export interface TaskGenerationSelection {
+  node_id: string
+  apps: string[]
+}
+
+export interface TaskGenerationResult {
+  result_id: string
+  task_uuid?: string
+  pre_task_uuid?: string | null
+  pre_dependency?: 'pre_node' | 'zero' | 'weak' | 'strong'
+  dependency_group_id?: string
+  status?: string
+  app: string
+  target_app?: string
+  scene: string
+  capability: string
+  sub_capability: string
+  task: string
+  source_node_id?: string
+  source_row?: number
+  source_task?: string
+  '用例编号'?: string
+  '源失败任务'?: string
+  '生成的变体任务'?: string
+  run?: string
+  '审核状态'?: string
+  deleted: boolean
+  dependency_error?: string
+  created_at?: string
+  updated_at?: string
+}
+
+export interface TaskGenerationJob {
+  job_id: string
+  kind: 'task_generation' | 'augmentation'
+  status: 'queued' | 'running' | 'succeeded' | 'partial' | 'failed' | 'interrupted'
+  stage: string
+  created_at: string
+  started_at: string | null
+  completed_at: string | null
+  current_item: string | null
+  completed_items: number
+  total_items: number
+  percent: number
+  generate_n: number
+  input_filename?: string | null
+  result_count: number
+  errors: Array<{ item_id?: string; stage?: string; error: string }>
+  warnings: string[]
+  error: string | null
+  knowledge_base_version?: string
+  task_type_count?: number
+  expected_main_tasks?: number
+}
+
+export interface TaskGenerationExport {
+  filename: string
+  created_at: string
+  download_url: string
+  row_count: number
 }

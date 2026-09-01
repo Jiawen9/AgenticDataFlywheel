@@ -1,12 +1,11 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { CorrectionRow } from '@/types'
 import { parseBBox, type BBox, type Point } from '@/utils/actionOverlay'
 
 const props = defineProps<{ row: CorrectionRow; imageUrl: string; saving?: boolean }>()
-const emit = defineEmits<{ save: [actions: string] }>()
+const emit = defineEmits<{ save: [actions: string]; draft: [actions: string | null] }>()
 
-type PickMode = 'single' | 'start' | 'end' | null
 interface ActionForm {
   action: string
   x: number
@@ -22,15 +21,33 @@ interface ActionForm {
 
 const actionTypes = ['click', 'long_press', 'type', 'open', 'swipe', 'system_button', 'wait', 'terminate', 'answer']
 const form = ref<ActionForm>(emptyForm())
-const pickMode = ref<PickMode>(null)
+const baseline = ref('')
+const swipeDragging = ref(false)
+const swipeStart = ref<Point | null>(null)
+const swipeDragPoint = ref<Point | null>(null)
 const naturalWidth = ref(1080)
 const naturalHeight = ref(2340)
+const imageShell = ref<HTMLElement | null>(null)
+const canvasSize = ref({ width: 1, height: 1 })
+let resizeObserver: ResizeObserver | null = null
 const bbox = computed<BBox | null>(() => parseBBox(props.row.actions_box))
 const actionType = computed(() => form.value.action)
 const clickPoint = computed<Point | null>(() => normalized(form.value.x, form.value.y))
 const swipePoints = computed<[Point, Point] | null>(() => {
   if (actionType.value !== 'swipe') return null
-  return [normalized(form.value.sx, form.value.sy), normalized(form.value.ex, form.value.ey)]
+  const start = swipeStart.value || { x: form.value.sx, y: form.value.sy }
+  const end = swipeDragPoint.value || { x: form.value.ex, y: form.value.ey }
+  return [normalized(start.x, start.y), normalized(end.x, end.y)]
+})
+const coordinateBadge = computed(() => {
+  if (['click', 'long_press'].includes(actionType.value)) return `坐标 ${clamp(form.value.x)}, ${clamp(form.value.y)}`
+  if (actionType.value === 'swipe') return `起点 ${clamp(form.value.sx)}, ${clamp(form.value.sy)} · 终点 ${clamp(form.value.ex)}, ${clamp(form.value.ey)}`
+  return ''
+})
+const imageHint = computed(() => {
+  if (['click', 'long_press'].includes(actionType.value)) return '点击图片设置动作点'
+  if (actionType.value === 'swipe') return '按住并拖动设置滑动起点和终点'
+  return '当前动作无需在图片上取点'
 })
 const markerId = `correction-arrow-${Math.random().toString(36).slice(2)}`
 
@@ -62,7 +79,10 @@ function loadAction() {
     // Keep a valid click form for malformed legacy rows.
   }
   form.value = next
-  pickMode.value = null
+  baseline.value = JSON.stringify(actionPayload())
+  swipeDragging.value = false
+  swipeStart.value = null
+  swipeDragPoint.value = null
 }
 
 function normalized(x: number, y: number): Point {
@@ -73,25 +93,64 @@ function onImageLoad(event: Event) {
   const image = event.target as HTMLImageElement
   naturalWidth.value = image.naturalWidth || 1080
   naturalHeight.value = image.naturalHeight || 2340
+  updateCanvasSize()
 }
 
-function pickPoint(event: MouseEvent) {
-  if (!pickMode.value) return
+function updateCanvasSize() {
+  const shell = imageShell.value
+  if (!shell) return
+  const availableWidth = Math.max(1, shell.clientWidth - 24)
+  const availableHeight = Math.max(1, shell.clientHeight - 24)
+  const scale = Math.min(availableWidth / naturalWidth.value, availableHeight / naturalHeight.value)
+  canvasSize.value = {
+    width: Math.max(1, Math.round(naturalWidth.value * scale)),
+    height: Math.max(1, Math.round(naturalHeight.value * scale)),
+  }
+}
+
+function pointFromEvent(event: MouseEvent | PointerEvent): Point {
   const target = event.currentTarget as HTMLElement
   const rect = target.getBoundingClientRect()
-  const x = Math.round(Math.max(0, Math.min(999, ((event.clientX - rect.left) / rect.width) * 999)))
-  const y = Math.round(Math.max(0, Math.min(999, ((event.clientY - rect.top) / rect.height) * 999)))
-  if (pickMode.value === 'single') {
-    form.value.x = x
-    form.value.y = y
-  } else if (pickMode.value === 'start') {
-    form.value.sx = x
-    form.value.sy = y
-  } else {
-    form.value.ex = x
-    form.value.ey = y
+  return {
+    x: Math.round(Math.max(0, Math.min(999, ((event.clientX - rect.left) / rect.width) * 999))),
+    y: Math.round(Math.max(0, Math.min(999, ((event.clientY - rect.top) / rect.height) * 999))),
   }
-  pickMode.value = null
+}
+
+function handleImageClick(event: MouseEvent) {
+  if (props.saving || !['click', 'long_press'].includes(actionType.value)) return
+  const point = pointFromEvent(event)
+  form.value.x = point.x
+  form.value.y = point.y
+}
+
+function startSwipe(event: PointerEvent) {
+  if (props.saving || actionType.value !== 'swipe') return
+  event.preventDefault()
+  const point = pointFromEvent(event)
+  swipeDragging.value = true
+  swipeStart.value = point
+  swipeDragPoint.value = point
+  ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
+}
+
+function moveSwipe(event: PointerEvent) {
+  if (!swipeDragging.value || actionType.value !== 'swipe') return
+  swipeDragPoint.value = pointFromEvent(event)
+}
+
+function finishSwipe(event: PointerEvent) {
+  if (!swipeDragging.value || !swipeStart.value || actionType.value !== 'swipe') return
+  const end = pointFromEvent(event)
+  form.value.sx = swipeStart.value.x
+  form.value.sy = swipeStart.value.y
+  form.value.ex = end.x
+  form.value.ey = end.y
+  swipeDragging.value = false
+  swipeStart.value = null
+  swipeDragPoint.value = null
+  const target = event.currentTarget as HTMLElement
+  if (target.hasPointerCapture(event.pointerId)) target.releasePointerCapture(event.pointerId)
 }
 
 function actionPayload(): Record<string, unknown> {
@@ -117,12 +176,26 @@ function save() {
 }
 
 watch(() => [props.row.excel_row, props.row.actions], loadAction, { immediate: true })
+watch(actionType, () => {
+  swipeDragging.value = false
+  swipeStart.value = null
+  swipeDragPoint.value = null
+})
+watch(() => JSON.stringify(actionPayload()), (value) => emit('draft', value === baseline.value ? null : value), { immediate: true, flush: 'post' })
+
+onMounted(() => {
+  resizeObserver = new ResizeObserver(updateCanvasSize)
+  if (imageShell.value) resizeObserver.observe(imageShell.value)
+  void nextTick(updateCanvasSize)
+})
+onBeforeUnmount(() => resizeObserver?.disconnect())
 </script>
 
 <template>
   <section class="correction-editor">
-    <div class="editor-image-shell">
-      <div class="editor-image">
+    <div ref="imageShell" class="editor-image-shell">
+      <div class="editor-image" :style="{ width: `${canvasSize.width}px`, height: `${canvasSize.height}px` }" :class="{ 'is-clickable': ['click', 'long_press'].includes(actionType), 'is-draggable': actionType === 'swipe' }"
+        @click="handleImageClick" @pointerdown="startSwipe" @pointermove="moveSwipe" @pointerup="finishSwipe" @pointercancel="finishSwipe">
         <img :src="imageUrl" :alt="`第 ${row.step} 步截图`" @load="onImageLoad" />
         <svg class="editor-overlay" :viewBox="`0 0 ${naturalWidth} ${naturalHeight}`" preserveAspectRatio="none" aria-hidden="true">
           <defs><marker :id="markerId" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto"><path d="M0,0 L0,8 L10,4 z" fill="#f43f5e" /></marker></defs>
@@ -130,32 +203,27 @@ watch(() => [props.row.excel_row, props.row.actions], loadAction, { immediate: t
           <template v-if="['click', 'long_press'].includes(actionType) && clickPoint"><circle :cx="clickPoint.x" :cy="clickPoint.y" r="18" fill="none" stroke="#f43f5e" stroke-width="8" /><circle :cx="clickPoint.x" :cy="clickPoint.y" r="7" fill="#f43f5e" /></template>
           <line v-if="swipePoints" :x1="swipePoints[0].x" :y1="swipePoints[0].y" :x2="swipePoints[1].x" :y2="swipePoints[1].y" stroke="#f43f5e" stroke-width="12" stroke-linecap="round" :marker-end="`url(#${markerId})`" />
         </svg>
-        <div v-if="pickMode" class="pick-surface" @click="pickPoint"><span>请在图片上点击{{ pickMode === 'single' ? '动作点' : pickMode === 'start' ? '滑动起点' : '滑动终点' }}</span></div>
+        <div v-if="coordinateBadge" class="coordinate-badge" aria-live="polite">{{ coordinateBadge }}</div>
+        <div class="image-hint">{{ imageHint }}</div>
       </div>
     </div>
-    <div class="editor-form">
+    <fieldset class="editor-form" :disabled="props.saving">
       <div class="editor-heading"><span>STEP {{ String(row.step).padStart(3, '0') }}</span><el-tag v-if="row.edited" type="warning">{{ row.edit_status }}</el-tag></div>
-      <el-select v-model="form.action" class="action-select"><el-option v-for="type in actionTypes" :key="type" :label="type" :value="type" /></el-select>
-
-      <div v-if="['click', 'long_press'].includes(actionType)" class="coordinate-grid">
-        <el-input-number v-model="form.x" :min="0" :max="999" controls-position="right" /><el-input-number v-model="form.y" :min="0" :max="999" controls-position="right" />
-        <el-button @click="pickMode = 'single'">图上取点</el-button>
-      </div>
-      <template v-else-if="actionType === 'swipe'">
-        <div class="coordinate-grid"><el-input-number v-model="form.sx" :min="0" :max="999" controls-position="right" /><el-input-number v-model="form.sy" :min="0" :max="999" controls-position="right" /><el-button @click="pickMode = 'start'">取起点</el-button></div>
-        <div class="coordinate-grid"><el-input-number v-model="form.ex" :min="0" :max="999" controls-position="right" /><el-input-number v-model="form.ey" :min="0" :max="999" controls-position="right" /><el-button @click="pickMode = 'end'">取终点</el-button></div>
-      </template>
+      <label class="field-label" for="correction-action-type">修正动作</label>
+      <el-select id="correction-action-type" v-model="form.action" class="action-select" :disabled="props.saving" aria-label="动作类型"><el-option v-for="type in actionTypes" :key="type" :label="type" :value="type" /></el-select>
+      <div v-if="['click', 'long_press', 'swipe'].includes(actionType)" class="interaction-hint">{{ imageHint }}<span v-if="coordinateBadge">{{ coordinateBadge }}</span></div>
       <el-input v-else-if="['type', 'open', 'answer'].includes(actionType)" v-model="form.text" :placeholder="actionType === 'open' ? '应用名称' : '输入内容'" />
-      <el-select v-else-if="actionType === 'system_button'" v-model="form.button"><el-option v-for="button in ['back', 'home', 'menu', 'enter']" :key="button" :label="button" :value="button" /></el-select>
-      <el-select v-else-if="actionType === 'terminate'" v-model="form.status"><el-option label="success" value="success" /><el-option label="failure" value="failure" /></el-select>
+      <el-select v-else-if="actionType === 'system_button'" v-model="form.button" :disabled="props.saving"><el-option v-for="button in ['back', 'home', 'menu', 'enter']" :key="button" :label="button" :value="button" /></el-select>
+      <el-select v-else-if="actionType === 'terminate'" v-model="form.status" :disabled="props.saving"><el-option label="success" value="success" /><el-option label="failure" value="failure" /></el-select>
       <el-alert v-else-if="actionType === 'wait'" title="wait 动作无需额外参数" type="info" :closable="false" />
 
-      <div class="editor-hint">坐标使用 0–999 归一化值，与原始标注格式一致。</div>
-      <el-button type="primary" :loading="props.saving" @click="save">保存动作</el-button>
-    </div>
+      <div class="editor-hint">坐标使用 0–999 归一化值；图片上的修改需要点击保存动作后写入。</div>
+      <el-button class="save-action" type="primary" :loading="props.saving" @click="save">保存动作</el-button>
+    </fieldset>
   </section>
 </template>
 
 <style scoped>
-.correction-editor{display:grid;grid-template-columns:minmax(0,1fr);gap:18px;min-width:0}.editor-image-shell{display:grid;place-items:center;min-width:0;min-height:300px;border-radius:14px;background:#0b1220;padding:14px;overflow:hidden}.editor-image{position:relative;display:inline-block;max-width:100%;line-height:0}.editor-image img{display:block;width:auto;max-width:100%;max-height:46vh;border-radius:10px}.editor-overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}.pick-surface{position:absolute;inset:0;z-index:2;display:grid;place-items:center;cursor:crosshair;background:rgba(15,23,42,.22);line-height:normal}.pick-surface span{padding:9px 12px;border-radius:8px;background:#0f172a;color:white;font-size:12px}.editor-form{display:grid;align-content:start;min-width:0;gap:12px;padding-top:16px;border-top:1px solid #334155}.editor-heading{display:flex;align-items:center;justify-content:space-between;color:#64748b;font-size:11px;font-weight:900;letter-spacing:.12em}.action-select{width:100%}.coordinate-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto;gap:6px}.coordinate-grid :deep(.el-input-number){width:100%;min-width:0}.editor-hint{color:#94a3b8;font-size:11px;line-height:1.5}@media(max-width:850px){.editor-image-shell{min-height:260px}.editor-image img{max-height:52vh}}
+.editor-form{margin:0;padding:0;border:0}
+.correction-editor{display:grid;grid-template-columns:minmax(0,1fr) 184px;gap:12px;min-width:0;padding:12px;border:1px solid var(--line);border-radius:14px;background:#f8fafc}.editor-image-shell{display:grid;place-items:center;min-width:0;height:clamp(420px,70vh,720px);padding:12px;border-radius:12px;background:#0b1220;overflow:hidden}.editor-image{position:relative;display:block;line-height:0}.editor-image img{display:block;width:100%;height:100%;border-radius:10px;object-fit:contain}.editor-image.is-clickable{cursor:crosshair}.editor-image.is-draggable{cursor:grab;touch-action:none}.editor-image.is-draggable:active{cursor:grabbing}.editor-overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}.coordinate-badge{position:absolute;top:10px;right:10px;z-index:2;max-width:calc(100% - 20px);padding:6px 9px;border:1px solid rgba(255,255,255,.2);border-radius:7px;background:rgba(2,6,23,.84);color:white;font-size:11px;line-height:1.3;white-space:nowrap}.image-hint{position:absolute;right:10px;bottom:10px;left:10px;z-index:2;padding:6px 9px;border-radius:7px;background:rgba(2,6,23,.72);color:#e2e8f0;font-size:11px;line-height:1.35;text-align:center;pointer-events:none}.editor-form{display:grid;align-content:start;min-width:0;gap:12px;height:100%;padding:14px;border:1px solid var(--line);border-radius:12px;background:white;color:#334155}.editor-heading{display:flex;align-items:center;justify-content:space-between;color:#64748b;font-size:11px;font-weight:900;letter-spacing:.12em}.field-label{color:#64748b;font-size:12px;font-weight:800}.action-select{width:100%}.interaction-hint{display:grid;gap:4px;padding:9px 10px;border-radius:8px;background:#f0fdfa;color:#0f766e;font-size:11px;line-height:1.45}.interaction-hint span{color:#334155;font-variant-numeric:tabular-nums}.editor-hint{color:#64748b;font-size:11px;line-height:1.5}.save-action{width:100%}@media(max-width:850px){.correction-editor{grid-template-columns:1fr}.editor-image-shell{height:clamp(360px,62vh,620px)}.editor-form{height:auto}}
 </style>

@@ -43,6 +43,23 @@ backend_workspace/trajectory_correction/sessions/*
 !backend_workspace/trajectory_correction/sessions/.gitkeep
 backend_workspace/trajectory_correction/exports/*
 !backend_workspace/trajectory_correction/exports/.gitkeep
+!backend_workspace/task_generation/
+backend_workspace/task_generation/*
+!backend_workspace/task_generation/KnowledgeBase/
+backend_workspace/task_generation/KnowledgeBase/*
+!backend_workspace/task_generation/KnowledgeBase/.gitkeep
+!backend_workspace/task_generation/jobs/
+backend_workspace/task_generation/jobs/*
+!backend_workspace/task_generation/jobs/.gitkeep
+!backend_workspace/task_generation/runs/
+backend_workspace/task_generation/runs/*
+!backend_workspace/task_generation/runs/.gitkeep
+!backend_workspace/task_generation/exports/
+backend_workspace/task_generation/exports/*
+!backend_workspace/task_generation/exports/.gitkeep
+!backend_workspace/task_generation/logs/
+backend_workspace/task_generation/logs/*
+!backend_workspace/task_generation/logs/.gitkeep
 
 # Editors and operating systems
 .idea/

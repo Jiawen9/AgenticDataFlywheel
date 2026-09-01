@@ -1,7 +1,7 @@
 # Agentic Data Flywheel
 
-一个前后端分离的 GUI Agent 轨迹数据飞轮工程，包含轨迹 Excel 导出、动作 bbox
-标注、受限中间态过滤、任务级轨迹树构建，以及 Vue 轨迹采集与质检界面。
+一个前后端分离的 GUI Agent 轨迹数据飞轮工程，包含场景任务生成、失败任务扩增、轨迹 Excel
+导出、动作 bbox 标注、受限中间态过滤、任务级轨迹树构建，以及 Vue 轨迹采集与质检界面。
 
 ## 主要能力
 
@@ -9,10 +9,12 @@
 - 为 `click`、`swipe`、`long_press` 动作生成并复核 bbox。
 - 使用 Qwen 判断广告、加载、弹窗等临时中间状态。
 - 在仅忽略短暂插入状态的前提下构建 action 前缀树。
+- 在网页中按真实场景能力树生成、审核和导出任务。
+- 上传失败任务并自动匹配场景、扩增变体任务。
 - 在网页中浏览任务、轨迹、步骤截图和动作标注。
 - 在线修改 bbox，并将结果更新到标注 Excel。
 - 批量提交任务建树，在质检页面查看分叉、occurrence 和中间态审计。
-- 在网页中修正 Action、SOP 和步骤，并按 SFT/RL/原生数据分流导出。
+- 在网页中直接修正 Action 和步骤，并按 SFT/RL/原生数据分流导出；SOP/COT 由后续模型生成。
 
 ## 目录结构
 
@@ -21,6 +23,7 @@ AgenticDataFlywheel/
 ├─ backend/                       FastAPI、轨迹预处理和建树代码
 │  ├─ bounding_box/              bbox 生成与视觉复核
 │  ├─ trajectories_tree/         中间态判断和轨迹树构建
+│  ├─ task_generation/           任务生成与任务扩增网页模块
 │  ├─ trajectory_correction/    轨迹修正网页模块（独立后端包）
 │  ├─ tests/                     后端测试
 │  ├─ .env.example               模型配置示例
@@ -28,7 +31,9 @@ AgenticDataFlywheel/
 ├─ frontend/                     Vue 3 + Vite 前端
 ├─ backend_workspace/            本地数据与运行结果，不提交 Git
 │  ├─ rollout_trajectories/      原始轨迹放置目录
-│  └─ trajectory_correction/    轨迹修正输入、草稿与导出
+│  ├─ task_generation/           任务生成知识库、作业和导出结果
+│  │  └─ KnowledgeBase/         三份任务生成 Excel 知识库
+│  └─ trajectory_correction/     轨迹修正输入、草稿与导出
 └─ README.md
 ```
 
@@ -139,6 +144,47 @@ Vite 默认把 `/api` 代理到 `http://127.0.0.1:8765`。
 
 ## 6. 网页使用流程
 
+### 任务生成与任务扩增
+
+任务生成页面读取以下本地知识库：
+
+```text
+backend_workspace/task_generation/KnowledgeBase/
+├─ VLA场景树.xlsx
+├─ APP操控先验知识库.xlsx
+└─ APP资源先验知识库.xlsx
+```
+
+进入“场景能力树”，按 **场景 → 一级能力 → 任务类型** 浏览。点击节点查看详情，勾选节点选择生成范围；App 不再作为树的根节点。任务类型数量按路径去重，App 数量单独计入执行单元。
+
+- 点击“编辑场景树”可新增、重命名、删除三级节点，并按 App 编辑参考示例、资源先验开关。修改统一保存或取消，离开页面前会提示未保存内容；编辑期间不能提交生成。
+- 每个选中任务类型默认勾选全部适用 App，可逐项取消。例如一个任务类型选择三个 App、数量设为 5，预计生成 15 条主任务；弱依赖前置任务另计。
+- 空场景、空能力和未配置 App 的任务类型可以保存，后者不可生成。缺少操控或资源先验会显示提示，不阻止其他已就绪配置的生成。
+- 生成完成后可编辑任务文本、成组删除/恢复弱依赖任务并导出 Excel。历史作业使用提交时的快照，不受后续编辑影响。
+
+首次使用时，系统从上述三个 Excel 初始化知识库版本。根目录原文件保留，之后 **`KnowledgeBase/current.json` 指向的 `versions/<版本>/` 才是当前有效知识库**；请通过网页替换文件，不要直接修改根目录旧文件或版本目录。
+每个版本保存三份 Excel 和 `scene_tree.json`（稳定 UUID 与树结构），通过原子切换版本指针一起发布。改名同步更新操控先验路径；删除节点或移除 App 不删除已有先验记录。旧版本目录完整保留，作为备份。
+
+知识库卡片支持单文件替换和“下载已保存场景树”。下载文件保留六个业务列，并带有隐藏的 `_scene_tree_nodes` sheet，用于保留节点 UUID、空分支及无 App 的任务类型；回传时请保留该 sheet。普通六列表仍支持导入，相同路径复用当前 UUID。不同 App 的示例/资源配置分别保存，同一任务类型/App 出现冲突行时拒绝导入并提示修正。多个标签页同时保存时，旧版本请求返回 `409`，不会覆盖新版本。
+
+场景树接口：`GET /api/task-generation/tree` 返回 `version/scenes/leaf_count/execution_unit_count/warnings`；`PUT` 同路径接收 `base_version/scenes`；`GET /api/task-generation/tree/export` 下载当前 Excel。生成提交采用 `{version, selections: [{node_id, apps}], generate_n}`，不再使用 App 展开的 `node_ids`；历史作业读取接口不变。
+
+如需无模型费用、无业务数据改动的页面验收，先构建前端，再运行 `python -m backend.tests.scene_tree_demo_server --port 8791`，访问 `http://127.0.0.1:8791/task-generation/scenario-tree`。该验收服务把知识库复制到临时目录，并使用模拟模型；按 Ctrl+C 结束后清理临时数据，不应将其作为正式服务运行。
+
+进入“任务扩增”后上传失败任务 Excel。原始表需要包含 `任务`、`涉及APP`，如果存在 `任务结果` 列则只扩增非 `TRUE` 行；也可以直接上传含有 `app/task/scene/capability/sub_capability` 的 `新场景匹配` 表。扩增结果同样可以审核、删除和导出。
+
+任务生成作业和导出结果保存在：
+
+```text
+backend_workspace/task_generation/
+├─ jobs/       # 作业状态 JSON
+├─ runs/       # 知识库快照、输入文件和结果 JSON
+├─ exports/    # 导出的任务 Excel
+└─ logs/       # 本地日志
+```
+
+如需使用不同模型，可在 `backend/.env` 中设置 `TASK_GENERATION_MODEL_NAME`、`TASK_GENERATION_MODEL_URL` 和 `TASK_GENERATION_API_KEY`；未设置时回退到通用 `MODEL_NAME`、`MODEL_URL` 和 `YUNAI_API_KEY`。并发数使用 `TASK_GENERATION_MAX_CONCURRENT`，默认值为 4。
+
 ### 轨迹采集
 
 1. 进入“轨迹采集”，查看从工作区发现的任务和轨迹名称。
@@ -165,22 +211,22 @@ backend_workspace/trajectory_tree_runs/<完成时间串>/
 
 ### 轨迹修正
 
-进入“轨迹修正”页面后，可以直接选择
-`backend_workspace/trajectory_correction/inputs/` 中的 `.xlsx/.xlsm`，也可以上传
-Excel 或包含 Excel、截图和 XML 的 ZIP 数据包。上传数据会被解压到
-`inputs/uploads/<随机目录>/`，不会和原始轨迹树数据混放。
+进入“轨迹纠偏 → 专家动作纠偏”，选择已质检批次。当前每个任务仍按原规则选取质检 Top-1；同分时保留原工作簿顺序。已有批次自动恢复原草稿和入选轨迹，不用新推荐覆盖；源标注表版本不匹配时仍拒绝修正。
 
-页面按 `task + meta_task` 的连续行分组，复用 `human8.0.py` 的完成/异常判断和导出规则：
+页面按“任务行（用例编号）→ 轨迹行 → 修正台”展开，首次进入和刷新默认全部收起。可同时展开多个任务，但整页只展开一个轨迹修正台，展开轨迹才加载步骤与截图。任务统计与轨迹统计分开；前端已预留一任务多轨迹的结构，本次没有开放 Top-3 筛选。
 
-1. 修改 Action：支持 click、long_press、swipe、type、open、system_button、wait、terminate、answer，坐标可以直接在截图上取点。
-2. 修改 SOP、删除/恢复步骤、切换任务组是否导出：每次操作立即保存为草稿。
-3. 点击导出后生成 SFT、RL、原生完美通过、原生异常待处理四类工作表；原 Excel 不会被覆盖。
+1. 展开轨迹后，左侧查看截图并直接修正 Action，右侧选择步骤；click/long_press 点击图片取点，swipe 按住拖动取起止点，坐标以图片角标显示。
+2. Action 点击“保存动作”保存。收起、切换步骤/轨迹/批次、离开页面或导出前保护未保存输入：动作可选择保存、放弃或取消；保存失败保留当前位置和输入。
+3. 删除/恢复步骤、加入/取消导出即时保存到草稿。收起轨迹不影响导出开关；“已修改”不代表审核完成。
+4. 导出生成 SFT、RL、原生完美通过、原生异常待处理四类工作表；原 Excel 不会被覆盖。批次详情和导出历史默认折叠。
+
+无真实数据和模型调用的浏览器验收：先执行 `npm run build --prefix frontend`，再执行 `python -m backend.tests.correction_demo_server --port 8792`，访问 `http://127.0.0.1:8792/correction/expert-action`。模拟服务提供一个三轨迹任务及一个单轨迹批次，编辑仅驻留内存，重启即丢弃；模拟导出仅用于下载交互检查，实际四类数据分流由后端单元测试覆盖。该服务不是正式后端。
 
 该模块的数据目录为：
 
 ```text
 backend_workspace/trajectory_correction/
-├─ inputs/       # 固定输入和上传包
+├─ inputs/       # 历史输入目录；当前批次来源为正式 annotated_trajectories.xlsx
 ├─ sessions/     # 草稿 JSON
 └─ exports/      # 导出 Excel
 ```

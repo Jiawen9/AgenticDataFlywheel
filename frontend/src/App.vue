@@ -39,7 +39,7 @@ const modelTrainingActive = computed(() => route.path.startsWith('/model-trainin
                 <el-icon :class="{ 'is-collapsed': !taskGenerationExpanded }"><ArrowDown /></el-icon>
               </button>
               <div v-show="taskGenerationExpanded" class="nav-tertiary-items">
-                <router-link to="/task-generation/scenario-tree"><el-icon><Share /></el-icon><span>场景树构建</span></router-link>
+                <router-link to="/task-generation/scenario-tree"><el-icon><Share /></el-icon><span>场景能力树</span></router-link>
                 <router-link to="/task-generation/augmentation"><el-icon><MagicStick /></el-icon><span>任务扩增</span></router-link>
               </div>
             </div>
