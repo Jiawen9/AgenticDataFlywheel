@@ -280,13 +280,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<boolea
     }
 
     // 开始运行 -> 把任务文件与 手机ID/运行APP 关联文件 发送到 server 端（client start-run）
+    // phone_id/app 为空表示：关联文件中的所有手机都执行；不为空表示：仅指定手机/APP 执行（定制运行）
     if (route === '/remote/start-run' && method === 'POST') {
       const filename = path.basename(String(data.filename ?? '').trim())
       const phoneId = String(data.phone_id ?? '').trim()
       const app = String(data.app ?? '').trim()
       if (!filename) return fail(res, '任务文件名不能为空'), true
-      if (!phoneId) return fail(res, '手机ID不能为空'), true
-      if (!app) return fail(res, '运行APP不能为空'), true
       const taskPath = path.join(UPLOAD_DIR, filename)
       const appsPath = path.join(DATA_DIR, 'phone_apps.json')
       const config = await readJson<FactoryConfig>('config.json', DEFAULT_CONFIG)

@@ -139,7 +139,7 @@
                 type="primary"
                 :loading="startingTask === row.filename"
                 :disabled="row.status === '运行中'"
-                @click="openRunDialog(row)"
+                @click="handleStartTask(row)"
               >
                 {{ row.status === '运行中' ? '运行中' : '开始运行' }}
               </el-button>
@@ -368,7 +368,25 @@ function openRunDialog(row: TaskRow) {
   runDialogVisible.value = true
 }
 
-// ---------- 3.3 确认运行：把任务文件与 手机ID/运行APP 关联文件 发送到 server 端 ----------
+// ---------- 3.3 开始运行：不弹窗，把任务文件与 手机ID/运行APP 关联文件 发送到 server 端，
+// 关联文件中的所有手机都执行 ----------
+async function handleStartTask(row: TaskRow) {
+  startingTask.value = row.filename
+  try {
+    // 不带 phone_id/app：server 端对关联文件中所有手机下发
+    const remote = await phoneFactoryApi.remoteStartRun(row.filename, '', '')
+    const state = await phoneFactoryApi.startTask(row.filename)
+    tasks.value = state.tasks
+    ElMessage.success(remote.message || `任务「${row.description}」已下发全部手机`)
+  } catch (error) {
+    ElMessage.error((error as Error).message)
+  } finally {
+    startingTask.value = ''
+  }
+}
+
+// ---------- 3.3 定制运行确认：把任务文件、关联文件 + 手机ID/运行APP 发送到 server 端，
+// 仅指定的 手机ID 执行 ----------
 async function confirmRun() {
   if (!runTargetTask.value) return
   const phoneId = runDialogPhoneId.value
