@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
@@ -9,7 +10,10 @@ from unittest.mock import patch
 from openpyxl import Workbook, load_workbook
 
 from backend.trajectory_correction.assets import resolve_asset
-from backend.trajectory_correction.exporter import export_session_workbook
+from backend.trajectory_correction.exporter import (
+    export_full_dataset_workbook,
+    export_session_workbook,
+)
 from backend.trajectory_correction import quality_selection
 from backend.trajectory_correction import workbook as correction_workbook
 from backend.trajectory_correction.workbook import load_snapshot
@@ -387,6 +391,82 @@ class CorrectionWorkbookTests(unittest.TestCase):
                 self.assertEqual(sheet["G2"].value, 1)
             finally:
                 exported.close()
+
+    def test_full_dataset_export_preserves_rows_and_overlays_valid_correction(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "annotated.xlsx"
+            assets = root / "rollout_trajectories"
+            write_annotated_workbook(source)
+            write_annotated_assets(assets)
+            source_book = load_workbook(source)
+            source_book.create_sheet("metadata")["A1"] = "keep-me"
+            source_book.save(source)
+            source_book.close()
+            snapshot = load_snapshot(source, asset_root=assets)
+
+            new_action = json.dumps(
+                {"action": "click", "coordinate": [500, 600]},
+                ensure_ascii=False,
+            )
+            new_bbox = "click(bbox=<bbox>[10,20,200,300]</bbox>)"
+            action_hash = hashlib.sha256(
+                json.dumps(
+                    json.loads(new_action),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            bbox_hash = hashlib.sha256(new_bbox.encode()).hexdigest()
+            session = {
+                "row_edits": {
+                    "2": {"actions": new_action, "actions_box": new_bbox},
+                    "3": {"deleted": True},
+                },
+                "cot": {
+                    "2": {
+                        "action_hash": action_hash,
+                        # BBox is deliberately stale: COT validity follows the
+                        # corrected action JSON, because bbox is not in prompt.
+                        "bbox_hash": hashlib.sha256(b"old-bbox").hexdigest(),
+                        "content_tag": "thought_summary",
+                        "thought": "模型生成的新 Thought",
+                        "summary": "模型生成的新 Summary",
+                    }
+                },
+            }
+
+            result = export_full_dataset_workbook(
+                workbook_path=source,
+                snapshot=snapshot,
+                session=session,
+                output_dir=root / "exports",
+                export_id="full1234567890",
+            )
+
+            exported = load_workbook(root / "exports" / result["filename"], data_only=False)
+            try:
+                sheet = exported.active
+                headers = [sheet.cell(1, column).value for column in range(1, sheet.max_column + 1)]
+                self.assertEqual(sheet.max_row, 4)
+                self.assertEqual(headers[-1], "thought")
+                self.assertEqual(sheet["D2"].value, new_action)
+                self.assertEqual(sheet["E2"].value, "模型生成的新 Summary")
+                self.assertEqual(sheet["F2"].value, new_bbox)
+                self.assertEqual(sheet["G2"].value, "模型生成的新 Thought")
+                self.assertEqual(sheet["D3"].value, json.dumps({"action": "wait"}))
+                self.assertEqual(exported["metadata"]["A1"].value, "keep-me")
+                self.assertEqual(result["summary"]["changed_rows"], 1)
+            finally:
+                exported.close()
+
+            original = load_workbook(source, read_only=True)
+            try:
+                self.assertEqual(original.active.max_column, 6)
+                self.assertEqual(original.active["D2"].value, json.dumps({"action": "click", "coordinate": [10, 20]}))
+            finally:
+                original.close()
 
     def test_annotated_asset_traversal_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -8,6 +8,8 @@
         <div class="home-actions">
           <router-link class="primary-action" to="/pipeline"><el-icon><Operation /></el-icon>进入自动 Pipeline</router-link>
           <router-link class="secondary-action" to="/collection/tree-building"><el-icon><Collection /></el-icon>进入专家工作台</router-link>
+          <router-link class="secondary-action overview-action" to="/data-publishing/overview"><el-icon><DataAnalysis /></el-icon>训练数据总览</router-link>
+          <router-link class="secondary-action" to="/phone-factory"><el-icon><Iphone /></el-icon>手机工厂监控</router-link>
         </div>
       </div>
       <div class="flywheel-visual" aria-label="数据飞轮流程">
@@ -33,14 +35,14 @@
 </template>
 
 <script setup lang="ts">
-import { Collection, Cpu, DataAnalysis, EditPen, Plus, Promotion, TrendCharts, Upload, Operation } from '@element-plus/icons-vue'
+import { Collection, Cpu, DataAnalysis, EditPen, Iphone, Plus, Promotion, TrendCharts, Upload, Operation } from '@element-plus/icons-vue'
 
 const stages = [
   { name: '任务生成', path: '/task-generation/scenario-tree', icon: Plus },
   { name: '轨迹采集', path: '/collection/tree-building', icon: Collection },
   { name: '轨迹质检', path: '/quality', icon: DataAnalysis },
   { name: '轨迹纠偏', path: '/correction/expert-action', icon: EditPen },
-  { name: '数据发布', path: '/data-publishing', icon: Upload },
+  { name: '数据发布', path: '/data-publishing/archive', icon: Upload },
   { name: '模型训练', path: '/model-training/launch', icon: Cpu },
   { name: '模型发布', path: '/model-publishing', icon: Promotion },
   { name: '迭代评估', path: '/model-iteration-evaluation', icon: TrendCharts },

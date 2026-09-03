@@ -1,4 +1,4 @@
-import type { BuildJob, CorrectionBatch, CorrectionExport, CorrectionGroup, CorrectionGroupSummary, CorrectionRecommendation, CorrectionSession, KnowledgeBaseSummary, QualityJob, RunQualitySummary, TaskGenerationExport, TaskGenerationJob, TaskGenerationResult, TaskGenerationTree, TaskGenerationSelection, TaskGenerationTreeNode, TaskQualityResult, TaskSummary, TrajectoryRecord, TrajectorySummary, TrajectoryTreeNode, TreeRun } from './types'
+import type { BuildJob, CorrectionBatch, CorrectionCotJob, CorrectionCotResponse, CorrectionExport, CorrectionGroup, CorrectionGroupSummary, CorrectionRecommendation, CorrectionSession, DatasetRelease, DatasetReleaseCandidate, DatasetUploadJob, KnowledgeBaseSummary, QualityJob, RunQualitySummary, TaskGenerationExport, TaskGenerationJob, TaskGenerationResult, TaskGenerationTree, TaskGenerationSelection, TaskGenerationTreeNode, TaskQualityResult, TaskSummary, TrajectoryRecord, TrajectorySummary, TrajectoryTreeNode, TreeRun } from './types'
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
 
@@ -143,13 +143,34 @@ export const api = {
   correctionSession(sessionId: string): Promise<CorrectionSession> {
     return request<{ session: CorrectionSession }>(`/api/correction/sessions/${encodeURIComponent(sessionId)}`).then((result) => result.session)
   },
+  correctionSessionCot(sessionId: string): Promise<CorrectionCotResponse> {
+    return request(`/api/correction/sessions/${encodeURIComponent(sessionId)}/cot`)
+  },
+  async createCorrectionCotJob(sessionId: string, groupIds?: string[], rowIds?: number[], options?: { generateBBox?: boolean; forceOverwrite?: boolean }): Promise<CorrectionCotJob> {
+    return request('/api/correction/cot-jobs', {
+      method: 'POST',
+      body: JSON.stringify({ session_id: sessionId, group_ids: groupIds && groupIds.length ? groupIds : undefined, row_ids: rowIds && rowIds.length ? rowIds : undefined, generate_bbox: options?.generateBBox ?? false, force_overwrite: options?.forceOverwrite ?? false }),
+    })
+  },
+  updateActionBBox(taskId: string, trajectoryId: string, step: number, excelRow: number, bbox: [number, number, number, number], action?: Record<string, unknown>): Promise<{ actions_box: string }> {
+    return request(`/api/tasks/${encodeURIComponent(taskId)}/trajectories/${encodeURIComponent(trajectoryId)}/steps/${step}/bbox`, {
+      method: 'PATCH',
+      body: JSON.stringify({ excel_row: excelRow, bbox, action }),
+    })
+  },
+  correctionCotJob(jobId: string): Promise<CorrectionCotJob> {
+    return request(`/api/correction/cot-jobs/${encodeURIComponent(jobId)}`)
+  },
+  async correctionCotJobs(): Promise<CorrectionCotJob[]> {
+    return (await request<{ jobs: CorrectionCotJob[] }>('/api/correction/cot-jobs')).jobs
+  },
   correctionGroups(sessionId: string): Promise<CorrectionGroupSummary[]> {
     return request<{ groups: CorrectionGroupSummary[] }>(`/api/correction/sessions/${encodeURIComponent(sessionId)}/tasks`).then((result) => result.groups)
   },
   correctionGroup(sessionId: string, groupId: string): Promise<CorrectionGroup> {
     return request<{ group: CorrectionGroup }>(`/api/correction/sessions/${encodeURIComponent(sessionId)}/tasks/${encodeURIComponent(groupId)}`).then((result) => result.group)
   },
-  async patchCorrectionRow(sessionId: string, excelRow: number, patch: { sop?: string; actions?: string; deleted?: boolean }): Promise<{ group: CorrectionGroupSummary; row: CorrectionGroup['rows'][number] }> {
+  async patchCorrectionRow(sessionId: string, excelRow: number, patch: { sop?: string; actions?: string; actions_box?: string; summary?: string; thought?: string; deleted?: boolean }): Promise<{ group: CorrectionGroupSummary; row: CorrectionGroup['rows'][number] }> {
     return request(`/api/correction/sessions/${encodeURIComponent(sessionId)}/rows/${excelRow}`, {
       method: 'PATCH',
       body: JSON.stringify(patch),
@@ -163,6 +184,30 @@ export const api = {
   },
   correctionExport(sessionId: string): Promise<CorrectionExport> {
     return request(`/api/correction/sessions/${encodeURIComponent(sessionId)}/export`, { method: 'POST' })
+  },
+  correctionDatasetExport(sessionId: string): Promise<CorrectionExport> {
+    return request(`/api/correction/sessions/${encodeURIComponent(sessionId)}/dataset-export`, { method: 'POST' })
+  },
+  async datasetReleaseCandidates(): Promise<DatasetReleaseCandidate[]> {
+    return (await request<{ candidates: DatasetReleaseCandidate[] }>('/api/dataset-releases/candidates')).candidates
+  },
+  async datasetReleases(): Promise<DatasetRelease[]> {
+    return (await request<{ releases: DatasetRelease[] }>('/api/dataset-releases')).releases
+  },
+  async createDatasetRelease(name: string, sessionIds: string[]): Promise<DatasetRelease> {
+    return (await request<{ release: DatasetRelease }>('/api/dataset-releases', {
+      method: 'POST',
+      body: JSON.stringify({ name, session_ids: sessionIds }),
+    })).release
+  },
+  async datasetRelease(releaseId: string): Promise<DatasetRelease> {
+    return (await request<{ release: DatasetRelease }>(`/api/dataset-releases/${encodeURIComponent(releaseId)}`)).release
+  },
+  async uploadDatasetRelease(releaseId: string): Promise<DatasetUploadJob> {
+    return (await request<{ job: DatasetUploadJob }>(`/api/dataset-releases/${encodeURIComponent(releaseId)}/upload`, { method: 'POST' })).job
+  },
+  async datasetUploadJob(jobId: string): Promise<DatasetUploadJob> {
+    return (await request<{ job: DatasetUploadJob }>(`/api/dataset-upload-jobs/${encodeURIComponent(jobId)}`)).job
   },
 }
 
@@ -186,4 +231,8 @@ export function taskGenerationDownloadUrl(jobId: string, filename: string): stri
 
 export function sceneTreeDownloadUrl(): string {
   return `${API_BASE}/api/task-generation/tree/export`
+}
+
+export function datasetReleaseExcelUrl(releaseId: string, index: number): string {
+  return `${API_BASE}/api/dataset-releases/${encodeURIComponent(releaseId)}/excels/${index}`
 }

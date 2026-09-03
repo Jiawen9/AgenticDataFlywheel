@@ -96,6 +96,26 @@ def _cell_value(sheet: Any, row: int, headers: dict[str, int], *names: str) -> A
     return sheet.cell(row, column).value if column else None
 
 
+def _original_thought(image: str, asset_root: Path | None) -> str:
+    """Read the original VLA thought when the rollout response is available."""
+    if asset_root is None or not image:
+        return ""
+    image_path = _safe_asset_path(image, asset_root)
+    if image_path is None:
+        return ""
+    match = re.match(r"(step\d+_vla)_", image_path.stem, re.IGNORECASE)
+    if not match:
+        return ""
+    response_path = image_path.parent / f"{match.group(1)}_model_response.json"
+    try:
+        value = json.loads(response_path.read_text(encoding="utf-8-sig"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return ""
+    content = str(value.get("content", "")) if isinstance(value, dict) else ""
+    found = re.search(r"<thought>\s*(.*?)\s*</thought>", content, re.DOTALL | re.IGNORECASE)
+    return found.group(1).strip() if found else ""
+
+
 def _quality(rows: list[dict[str, Any]]) -> str:
     if not rows:
         return "未知"
@@ -267,6 +287,8 @@ def _annotated_row_payload(
         trajectory_id = PurePosixPath(image.replace("\\", "/")).parent.name
     actions = text(_cell_value(sheet, row_number, headers, "action"))
     task = _trajectory_task(asset_root, trajectory_id, image, task_cache) or trajectory_id
+    summary = text(_cell_value(sheet, row_number, headers, "summary"))
+    thought = text(_cell_value(sheet, row_number, headers, "thought")) or _original_thought(image, asset_root)
     return {
         "excel_row": row_number,
         "step": _step_number(image, row_number - 1),
@@ -280,7 +302,11 @@ def _annotated_row_payload(
         "actions": actions,
         "action": parse_action(actions),
         "sop": "",
-        "summary": text(_cell_value(sheet, row_number, headers, "summary")),
+        "summary": summary,
+        "original_summary": summary,
+        "thought": thought,
+        "original_thought": thought,
+        "cot": {},
         "task_manual_result": "",
         "micro_manual": "",
         "macro_manual": "",

@@ -37,6 +37,7 @@ backend_workspace/*
 backend_workspace/rollout_trajectories/*
 !backend_workspace/rollout_trajectories/.gitkeep
 !backend_workspace/trajectory_correction/
+backend_workspace/trajectory_correction/*
 !backend_workspace/trajectory_correction/inputs/
 !backend_workspace/trajectory_correction/sessions/
 !backend_workspace/trajectory_correction/exports/

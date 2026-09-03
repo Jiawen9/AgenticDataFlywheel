@@ -3,7 +3,7 @@ from __future__ import annotations
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -32,8 +32,8 @@ class TreeUpdateRequest(BaseModel):
 
 
 class ResultPatchRequest(BaseModel):
-    task: str | None = Field(default=None, max_length=4000)
-    deleted: bool | None = None
+    task: Optional[str] = Field(default=None, max_length=4000)
+    deleted: Optional[bool] = None
 
 
 router = APIRouter(prefix="/api/task-generation", tags=["task-generation"])
@@ -57,7 +57,7 @@ def knowledge_bases() -> dict[str, Any]:
 
 
 @router.put("/knowledge-bases/{kind}")
-def upload_knowledge_base(kind: str, file: UploadFile = File(...), base_version: str | None = Form(default=None)) -> dict[str, Any]:
+def upload_knowledge_base(kind: str, file: UploadFile = File(...), base_version: Optional[str] = Form(default=None)) -> dict[str, Any]:
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED_WORKBOOK_SUFFIXES:
         raise HTTPException(status_code=422, detail="知识库只支持 .xlsx 或 .xlsm 文件")

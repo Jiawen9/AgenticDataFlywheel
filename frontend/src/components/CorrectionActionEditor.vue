@@ -31,6 +31,9 @@ const imageShell = ref<HTMLElement | null>(null)
 const canvasSize = ref({ width: 1, height: 1 })
 let resizeObserver: ResizeObserver | null = null
 const bbox = computed<BBox | null>(() => parseBBox(props.row.actions_box))
+const originalBbox = computed<BBox | null>(() => parseBBox(props.row.original_actions_box))
+const bboxText = computed(() => bbox.value ? `[${bbox.value.x1}, ${bbox.value.y1}, ${bbox.value.x2}, ${bbox.value.y2}]` : '未标框')
+const originalBboxText = computed(() => originalBbox.value ? `[${originalBbox.value.x1}, ${originalBbox.value.y1}, ${originalBbox.value.x2}, ${originalBbox.value.y2}]` : '未标框')
 const actionType = computed(() => form.value.action)
 const clickPoint = computed<Point | null>(() => normalized(form.value.x, form.value.y))
 const swipePoints = computed<[Point, Point] | null>(() => {
@@ -217,6 +220,12 @@ onBeforeUnmount(() => resizeObserver?.disconnect())
       <el-select v-else-if="actionType === 'terminate'" v-model="form.status" :disabled="props.saving"><el-option label="success" value="success" /><el-option label="failure" value="failure" /></el-select>
       <el-alert v-else-if="actionType === 'wait'" title="wait 动作无需额外参数" type="info" :closable="false" />
 
+      <div class="bbox-status">
+        <div><span>当前 bbox</span><code>{{ bboxText }}</code></div>
+        <div><span>原始 bbox</span><code>{{ originalBboxText }}</code></div>
+        <small v-if="row.bbox_edited">当前框为专家修改后的结果，将随导出文件保存。</small>
+      </div>
+
       <div class="editor-hint">坐标使用 0–999 归一化值；图片上的修改需要点击保存动作后写入。</div>
       <el-button class="save-action" type="primary" :loading="props.saving" @click="save">保存动作</el-button>
     </fieldset>
@@ -226,4 +235,5 @@ onBeforeUnmount(() => resizeObserver?.disconnect())
 <style scoped>
 .editor-form{margin:0;padding:0;border:0}
 .correction-editor{display:grid;grid-template-columns:minmax(0,1fr) 184px;gap:12px;min-width:0;padding:12px;border:1px solid var(--line);border-radius:14px;background:#f8fafc}.editor-image-shell{display:grid;place-items:center;min-width:0;height:clamp(420px,70vh,720px);padding:12px;border-radius:12px;background:#0b1220;overflow:hidden}.editor-image{position:relative;display:block;line-height:0}.editor-image img{display:block;width:100%;height:100%;border-radius:10px;object-fit:contain}.editor-image.is-clickable{cursor:crosshair}.editor-image.is-draggable{cursor:grab;touch-action:none}.editor-image.is-draggable:active{cursor:grabbing}.editor-overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}.coordinate-badge{position:absolute;top:10px;right:10px;z-index:2;max-width:calc(100% - 20px);padding:6px 9px;border:1px solid rgba(255,255,255,.2);border-radius:7px;background:rgba(2,6,23,.84);color:white;font-size:11px;line-height:1.3;white-space:nowrap}.image-hint{position:absolute;right:10px;bottom:10px;left:10px;z-index:2;padding:6px 9px;border-radius:7px;background:rgba(2,6,23,.72);color:#e2e8f0;font-size:11px;line-height:1.35;text-align:center;pointer-events:none}.editor-form{display:grid;align-content:start;min-width:0;gap:12px;height:100%;padding:14px;border:1px solid var(--line);border-radius:12px;background:white;color:#334155}.editor-heading{display:flex;align-items:center;justify-content:space-between;color:#64748b;font-size:11px;font-weight:900;letter-spacing:.12em}.field-label{color:#64748b;font-size:12px;font-weight:800}.action-select{width:100%}.interaction-hint{display:grid;gap:4px;padding:9px 10px;border-radius:8px;background:#f0fdfa;color:#0f766e;font-size:11px;line-height:1.45}.interaction-hint span{color:#334155;font-variant-numeric:tabular-nums}.editor-hint{color:#64748b;font-size:11px;line-height:1.5}.save-action{width:100%}@media(max-width:850px){.correction-editor{grid-template-columns:1fr}.editor-image-shell{height:clamp(360px,62vh,620px)}.editor-form{height:auto}}
+.bbox-status{display:grid;gap:6px;padding:9px 10px;border:1px solid #dbe3ed;border-radius:8px;background:#f8fafc}.bbox-status>div{display:flex;justify-content:space-between;gap:8px;align-items:baseline;min-width:0}.bbox-status span{color:#64748b;font-size:11px}.bbox-status code{overflow:hidden;color:#0f766e;font:11px ui-monospace,SFMono-Regular,Consolas,monospace;text-overflow:ellipsis;white-space:nowrap}.bbox-status small{color:#0f766e;font-size:10px;line-height:1.4}
 </style>

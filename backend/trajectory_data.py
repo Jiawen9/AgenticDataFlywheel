@@ -317,6 +317,7 @@ def update_action_bbox(
     step: int,
     excel_row: int,
     bbox: tuple[int, int, int, int],
+    action_override: dict[str, Any] | None = None,
     *,
     xlsx_path: Path = ANNOTATED_XLSX,
     trajectory_root: Path = TRAJECTORY_ROOT,
@@ -363,7 +364,7 @@ def update_action_bbox(
                 raise ValueError(f"bbox 超出截图范围 {width}x{height}")
 
             action_text = str(sheet.cell(excel_row, headers["action"]).value or "")
-            actions_box = _format_manual_actions_box(parse_action(action_text), (x1, y1, x2, y2))
+            actions_box = _format_manual_actions_box(action_override or parse_action(action_text), (x1, y1, x2, y2))
             sheet.cell(excel_row, headers["actions_box"]).value = actions_box
             if temporary_path.exists():
                 temporary_path.unlink()

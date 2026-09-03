@@ -63,13 +63,15 @@ Copy-Item backend\.env.example backend\.env
 YUNAI_API_KEY=你的_api_key
 MODEL_URL=https://yunai.chat/v1
 MODEL_NAME=qwen3.6-27b:floor
+COT_MODEL_NAME=qwen3-vl-32b-instruct
 ```
 
-三个变量都是必填项：
+前三个通用变量是必填项，COT 模型可单独配置：
 
 - `YUNAI_API_KEY`：OpenAI-compatible 模型服务的 API key。
 - `MODEL_URL`：模型服务的 base URL。
 - `MODEL_NAME`：预处理和建树使用的模型名称。
+- `COT_MODEL_NAME`：专家纠偏后生成 Thought/Summary 使用的视觉模型；未配置时默认使用 `qwen3-vl-32b-instruct`，不会改变标框和建树模型。
 
 `backend/.env` 已被 Git 忽略，不要把真实密钥写入 `.env.example`、源码或日志。
 
@@ -230,6 +232,26 @@ backend_workspace/trajectory_correction/
 ├─ sessions/     # 草稿 JSON
 └─ exports/      # 导出 Excel
 ```
+
+### 数据发布
+
+进入“专家工作台 → 数据发布”后，可以把 1～N 个尚未发布的纠偏会话登记为一个数据集。发布前，每个会话必须已经通过 COT 工作台右上角的“导出数据集”生成至少一份 `full_dataset` Excel；系统始终选取该会话最新的一份完整导出，不重新生成或合并 Excel。
+
+创建时填写可读的数据集名称，系统生成唯一的 `rel_<随机哈希>` 发布 ID。发布记录保存在：
+
+```text
+backend_workspace/dataset_release/releases.json
+```
+
+记录包含纠偏 Excel 的项目相对路径、SHA256、行数，以及整个 `backend_workspace/rollout_trajectories` 根目录的位置；不会保存显式的纠偏会话 ID，也不会复制、收集或去重轨迹。发布成功的会话会从专家纠偏界面隐藏，但会话草稿和导出文件仍保留在本地。
+
+页面下半部分展示全部历史数据集，支持按名称或发布 ID 搜索、按上传状态筛选、查看路径与哈希、下载发布 Excel。点击“上传训练环境”会启动独立的模拟上传作业：后端遍历发布 Excel 和完整轨迹根目录、统计文件与字节并持续报告进度，但不会向外部网络发送文件。成功后会生成类似下面的模拟地址：
+
+```text
+s3://training-data/gui-agent-datasets/rel_a84f91c25d3e4b67/
+```
+
+目标地址可通过 `backend/.env` 中的 `DATASET_S3_BUCKET` 和 `DATASET_S3_PREFIX` 调整；当前 `DATASET_UPLOAD_MODE` 必须保持为 `mock`。上传作业保存在 `backend_workspace/dataset_release/upload_jobs/`，服务重启后未完成作业会标记为中断，可在页面重新上传。以上发布记录、作业和数据文件均为本地运行产物，不提交到 GitHub。
 
 ## 7. 生产模式运行
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,9 +32,11 @@ from .trajectory_data import (
 from .quality_data import quality_manifest, quality_task, rubric_ready
 from .quality_jobs import QualityJobManager
 from .tree_build_jobs import TreeBuildJobManager
-from .trajectory_correction.router import router as correction_router
+from .trajectory_correction.router import configure_cot_job_manager, router as correction_router
+from .trajectory_correction.cot_jobs import CotJobManager
 from .task_generation.jobs import TaskGenerationJobManager
 from .task_generation.router import configure_job_manager, router as task_generation_router
+from .data_publishing.router import router as data_publishing_router
 
 
 FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
@@ -93,6 +95,7 @@ class QualityJobRequest(BaseModel):
 class BBoxUpdateRequest(BaseModel):
     excel_row: int
     bbox: list[int]
+    action: Optional[dict[str, Any]] = None
 
 
 app = FastAPI(title="Agentic Data Flywheel", version="1.0.0")
@@ -105,11 +108,14 @@ app.add_middleware(
 )
 app.include_router(correction_router)
 app.include_router(task_generation_router)
+app.include_router(data_publishing_router)
 model_job_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="model-job")
 job_manager = TreeBuildJobManager(executor=model_job_executor)
 quality_job_manager = QualityJobManager(executor=model_job_executor)
+cot_job_manager = CotJobManager(executor=model_job_executor)
 task_generation_job_manager = TaskGenerationJobManager(executor=model_job_executor)
 configure_job_manager(task_generation_job_manager)
+configure_cot_job_manager(cot_job_manager)
 
 
 @app.get("/api/health")
@@ -158,6 +164,7 @@ def patch_step_bbox(
             step,
             request.excel_row,
             tuple(request.bbox),
+            action_override=request.action,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

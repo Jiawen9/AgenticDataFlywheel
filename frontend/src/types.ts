@@ -272,6 +272,13 @@ export interface CorrectionRow {
   action: ActionPayload
   sop: string
   summary: string
+  original_summary: string
+  original_thought: string
+  thought: string
+  cot_summary: string
+  cot_status: 'pending' | 'generated' | 'manual' | 'not_needed'
+  cot_action_hash: string
+  cot_generated_at: string | null
   task_manual_result: string
   micro_manual: string
   macro_manual: string
@@ -280,11 +287,17 @@ export interface CorrectionRow {
   Bad_Interval: string
   trajectory_quality_type: string
   actions_box: string
+  original_actions_box: string
   deleted: boolean
   edited: boolean
   action_edited: boolean
+  bbox_edited: boolean
+  bbox_source: 'original' | 'generated' | 'manual'
+  summary_source: 'original' | 'generated' | 'manual'
+  thought_source: 'original' | 'generated' | 'manual'
   sop_edited: boolean
   edit_status: string
+  cot_bbox_hash: string
 }
 
 export interface CorrectionGroupSummary {
@@ -302,6 +315,68 @@ export interface CorrectionGroupSummary {
 
 export interface CorrectionGroup extends CorrectionGroupSummary {
   rows: CorrectionRow[]
+}
+
+export interface CorrectionCotRow {
+  task_id: string
+  trajectory_id: string
+  excel_row: number
+  step: number
+  image: string
+  image_url: string
+  action: string
+  original_action: string
+  actions_box: string
+  original_actions_box: string
+  original_summary: string
+  summary: string
+  original_thought: string
+  thought: string
+  history: string
+  status: 'pending' | 'generated' | 'manual' | 'not_needed'
+  action_edited?: boolean
+  bbox_edited?: boolean
+  bbox_source?: 'original' | 'generated' | 'manual'
+  summary_source?: 'original' | 'generated' | 'manual'
+  thought_source?: 'original' | 'generated' | 'manual'
+  cot_action_hash?: string
+  cot_bbox_hash?: string
+  generated_at?: string | null
+}
+
+export interface CorrectionCotGroup {
+  group_id: string
+  trajectory_id: string
+  task: string
+  rows: CorrectionCotRow[]
+}
+
+export interface CorrectionCotResponse {
+  session_id: string
+  groups: CorrectionCotGroup[]
+}
+
+export interface CorrectionCotJob {
+  job_id: string
+  session_id: string
+  group_ids: string[]
+  row_ids?: number[]
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted'
+  stage: 'queued' | 'generating_bbox' | 'generating_cot' | 'generating' | 'succeeded' | 'failed'
+  created_at: string
+  started_at: string | null
+  completed_at: string | null
+  current_task: string | null
+  current_trajectory: string | null
+  current_step: number | null
+  completed_steps: number
+  total_steps: number
+  completed_bbox?: number
+  completed_cot?: number
+  generate_bbox?: boolean
+  force_overwrite?: boolean
+  percent: number
+  error: string | null
 }
 
 // View models only: the persisted Top-1 selection and API remain unchanged.
@@ -323,11 +398,12 @@ export interface CorrectionTaskItem {
 
 export interface CorrectionExport {
   export_id: string
+  kind?: 'routed' | 'full_dataset'
   filename: string
   created_at: string
   download_url: string
   sheets: Record<string, number>
-  summary?: { rows: number; groups: number }
+  summary?: { rows: number; groups: number; changed_rows?: number }
 }
 
 export interface CorrectionSession {
@@ -445,4 +521,177 @@ export interface TaskGenerationExport {
   created_at: string
   download_url: string
   row_count: number
+}
+
+export interface DatasetReleaseCandidate {
+  session_id: string
+  tree_run_id: string
+  created_at: string | null
+  updated_at: string | null
+  ready: boolean
+  reason: string
+  latest_excel: {
+    filename: string
+    created_at: string | null
+    rows: number
+    path: string
+  }
+  task_count: number
+  trajectory_count: number
+  step_count: number
+}
+
+export interface DatasetReleaseExcel {
+  path: string
+  filename: string
+  sha256: string
+  rows: number
+  created_at: string | null
+  available?: boolean
+}
+
+export type DatasetUploadStatus = 'not_uploaded' | 'queued' | 'uploading' | 'succeeded' | 'failed' | 'interrupted'
+
+export interface DatasetRelease {
+  release_id: string
+  name: string
+  created_at: string
+  excel_paths: DatasetReleaseExcel[]
+  trajectory_paths: string[]
+  source_count: number
+  task_count: number
+  trajectory_count: number
+  step_count: number
+  upload_status: DatasetUploadStatus
+  upload_job_id: string | null
+  upload_error: string | null
+  s3_uri: string | null
+  uploaded_at: string | null
+  uploaded_files: number
+  uploaded_bytes: number
+  local_available: boolean
+}
+
+export interface DatasetUploadJob {
+  job_id: string
+  release_id: string
+  mode: 'mock' | string
+  status: 'queued' | 'uploading' | 'succeeded' | 'failed' | 'interrupted'
+  stage: string
+  created_at: string
+  started_at: string | null
+  completed_at: string | null
+  current_file: string | null
+  completed_files: number
+  total_files: number
+  completed_bytes: number
+  total_bytes: number
+  percent: number
+  s3_uri: string | null
+  error: string | null
+}
+
+export interface ModelTrainingMonitor {
+  monitor_id: string
+  training_name: string
+  target_model: string
+  result_directory: string
+  started_at: string
+  status: 'monitoring'
+  model_artifact_id?: string
+  optimization_algorithm?: 'CHORD' | 'OPSD' | 'GKD' | 'OPD-RL'
+  training_job?: string
+  mixture_job_id?: string
+  train_dataset_path?: string
+  eval_dataset_path?: string
+  cards_per_node?: number
+  instance_count?: number
+}
+
+export interface ModelArtifact {
+  artifact_id: string
+  monitor_id: string
+  training_name: string
+  model_version: string
+  filename: string
+  path?: string
+  file_size: number
+  sha256?: string
+  detected_at: string
+  validation_status: 'pending' | 'passed' | 'failed'
+  release_status: 'detected' | 'publishing' | 'published' | 'failed'
+  published_at?: string | null
+  registry_uri?: string | null
+}
+
+export interface ModelPublishingState {
+  version: 1
+  monitors: ModelTrainingMonitor[]
+  artifacts: ModelArtifact[]
+}
+
+export interface TrainingMixtureJob {
+  job_id: string
+  dataset_release_id: string
+  dataset_name: string
+  student_artifact_id: string
+  student_model_name: string
+  teacher_model_name: string
+  teacher_model_path: string
+  max_workers: number
+  pass_k: number
+  output_directory: string
+  result_filename: string
+  result_path: string
+  train_dataset_filename: string
+  train_dataset_path: string
+  eval_dataset_filename: string
+  eval_dataset_path: string
+  status: 'running' | 'succeeded' | 'failed' | 'interrupted'
+  stage: 'student_pass_at_k' | 'teacher_pass_at_k' | 'writing_result' | 'completed' | 'interrupted'
+  progress: number
+  created_at: string
+  completed_at: string | null
+  error: string | null
+}
+
+export interface TrainingMixtureState {
+  version: 1
+  jobs: TrainingMixtureJob[]
+}
+
+export interface TrainingValidationMetricGroup {
+  teacher: number[]
+  student_before: number[]
+  student_after: number[]
+  improvement: number[]
+}
+
+export interface TrainingValidationReport {
+  report_id: string
+  monitor_id: string
+  artifact_id: string
+  training_name: string
+  trained_model: string
+  checkpoint_version: string
+  checkpoint_filename: string
+  dataset_name: string
+  mixture_result_filename: string
+  mixture_result_path: string
+  pass_k: number
+  optimization_algorithm?: string
+  training_job?: string
+  cards_per_node?: number
+  instance_count?: number
+  output_directory: string
+  sample_counts: number[]
+  pass_at_k: TrainingValidationMetricGroup
+  accuracy: TrainingValidationMetricGroup
+  created_at: string
+  demo: true
+}
+
+export interface TrainingValidationState {
+  version: 1
+  reports: TrainingValidationReport[]
 }

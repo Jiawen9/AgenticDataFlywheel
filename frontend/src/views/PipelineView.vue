@@ -16,7 +16,7 @@ const stages: PipelineStage[] = [
   { id: 'generation', name: '任务生成', icon: DataAnalysis, steps: [{ id: 'badcase-augmentation', name: 'BadCase 扩增' }] },
   { id: 'collection', name: '轨迹采集', icon: Collection, steps: [{ id: 'phone-factory', name: '手机工厂并行采集' }, { id: 'bounding-box', name: '标框' }, { id: 'page-summary', name: '页面总结' }, { id: 'tree-building', name: '轨迹树构建' }] },
   { id: 'quality', name: '轨迹质检', icon: DataAnalysis, steps: [{ id: 'rubrics-generation', name: 'Rubrics 生成' }, { id: 'rubrics-ranking', name: 'Rubrics 相对排序' }] },
-  { id: 'publishing', name: '数据发布', icon: Upload, steps: [{ id: 'dataset-archive', name: '数据集归档' }] },
+  { id: 'publishing', name: '数据发布', icon: Upload, steps: [{ id: 'training-data-archive', name: '训练数据归档' }] },
   { id: 'training', name: '模型训练', icon: Cpu, steps: [{ id: 'data-mixture', name: '训练数据配比' }, { id: 'dataset-split', name: '训练集/验证集划分' }, { id: 'model-training', name: '模型训练' }, { id: 'training-validation', name: '训练有效性验证' }] },
   { id: 'model-publishing', name: '模型发布', icon: Promotion, steps: [{ id: 'trained-model-archive', name: '增训模型归档' }] },
 ]
@@ -145,7 +145,6 @@ onBeforeUnmount(clearTimer)
         </div>
       </div>
 
-      <footer class="legend"><span><i class="pending"></i>等待</span><span><i class="running"></i>执行中</span><span><i class="completed"></i>已完成</span><span><i class="failed"></i>失败</span></footer>
     </section>
 
     <el-dialog v-model="dialogVisible" title="新建自动 Pipeline" width="500px" destroy-on-close>
@@ -210,4 +209,45 @@ onBeforeUnmount(clearTimer)
 .legend{padding:9px 17px;border-top-color:#dce5eb;background:rgba(255,255,255,.82);color:#64748b}.legend .pending{background:#94a3b8}.legend .running{background:#14b8a6;box-shadow:0 0 0 3px rgba(20,184,166,.12)}.legend .completed{background:#10b981}
 @keyframes light-current{from{transform:translateX(-28px)}to{transform:translateX(190px)}}
 @media(max-width:760px){.pipeline-page{padding:24px 20px}.pipeline-hero{align-items:flex-start;flex-direction:column}.circuit-board{padding-left:42px;padding-right:42px}.main-bus{left:42px;width:calc(100% - 84px)}.run-name{display:none}}
+
+/* Keep the pipeline as one platform-style card; the inner surface should not
+   read as a second, differently coloured canvas. */
+.circuit-shell{background:#fff;backdrop-filter:none;box-shadow:0 12px 35px rgba(15,23,42,.06)}
+.circuit-scroll{background:transparent;background-image:none}
+.legend{background:#fff}
+.circuit-board{column-gap:36px}
+.bus-segment{width:168px}
+@keyframes light-current{from{transform:translateX(-28px)}to{transform:translateX(168px)}}
+.stage-node strong{top:-34px;background:transparent;font-size:15px}
+.node-order{top:-52px}
+.branch{margin-top:38px}
+.branch:before{top:-38px;height:48px}
+
+/* Sharper blue-violet engineering palette for the pipeline card. */
+.pipeline-page{background:radial-gradient(circle at 82% 0%,rgba(99,102,241,.1),transparent 28%),radial-gradient(circle at 18% 88%,rgba(14,165,233,.08),transparent 24%)}
+.circuit-shell{border-color:#d7def3;border-radius:8px;background:#fbfcff;box-shadow:none}
+.run-strip{border-bottom-color:#dbe4f5;background:#f8faff}
+.run-signal.is-running,.run-signal.is-paused{color:#4338ca}.run-signal.is-running i{background:#6366f1;box-shadow:0 0 0 4px rgba(99,102,241,.14)}
+.run-signal.is-completed{color:#047857}.run-signal.is-completed i{background:#10b981;box-shadow:0 0 0 4px rgba(16,185,129,.12)}
+.main-bus,.bus-segment,.branch:before,.branch-wire{background:#cbd5e1}
+.bus-segment.is-completed,.branch.is-completed:before,.branch-wire.is-completed{background:#10b981;box-shadow:none}
+.bus-segment.is-running{background:#c7d2fe}.bus-segment.is-running i{background:linear-gradient(90deg,transparent,#6366f1,transparent)}
+.stage-node.is-running{border-color:#6366f1;background:#eef2ff;color:#4338ca;box-shadow:0 0 0 5px rgba(99,102,241,.12),0 8px 20px rgba(79,70,229,.1)}
+.stage-node.is-running .node-core{background:#eef2ff;color:#4338ca}.stage-node.is-running strong{color:#4338ca}
+.stage-node.is-completed{border-color:#10b981;background:#10b981}.stage-node.is-completed .node-core{background:#10b981}
+.branch.is-running:before{background:#6366f1;box-shadow:none}
+.step-node.is-running{border-color:#818cf8;background:#eef2ff;color:#4338ca;box-shadow:0 0 0 3px rgba(99,102,241,.12)}
+.step-node.is-running .step-port,.branch-wire.is-running{border-color:#6366f1;background:#6366f1;box-shadow:0 0 0 3px rgba(99,102,241,.12)}
+.run-signal.is-running,.run-signal.is-paused{color:#0e7490}.run-signal.is-running i{background:#06b6d4;box-shadow:0 0 0 4px rgba(6,182,212,.14)}
+.main-bus,.bus-segment,.branch:before,.branch-wire{background:#cbd5e1}
+.bus-segment.is-completed,.branch.is-completed:before,.branch-wire.is-completed{background:#6366f1}
+.bus-segment.is-running{background:#a5f3fc}.bus-segment.is-running i{background:linear-gradient(90deg,transparent,#06b6d4,transparent)}
+.stage-node.is-running{border-color:#06b6d4;background:#ecfeff;color:#0e7490;box-shadow:0 0 0 5px rgba(6,182,212,.13),0 8px 20px rgba(8,145,178,.1)}
+.stage-node.is-running .node-core{background:#ecfeff;color:#0e7490}.stage-node.is-running strong{color:#0e7490}
+.stage-node.is-completed{border-color:#6366f1;background:#6366f1}.stage-node.is-completed .node-core{background:#6366f1}.stage-node.is-completed strong{color:#4338ca}.stage-node.is-completed .node-state{background:#6366f1}
+.branch.is-running:before{background:#06b6d4}
+.step-node.is-running{border-color:#67e8f9;background:#ecfeff;color:#0e7490;box-shadow:0 0 0 3px rgba(6,182,212,.13)}
+.step-node.is-running .step-port,.branch-wire.is-running{border-color:#06b6d4;background:#06b6d4;box-shadow:0 0 0 3px rgba(6,182,212,.13)}
+.step-node.is-completed{border-color:#a5b4fc;background:#eef2ff;color:#4338ca}.step-node.is-completed .step-port,.branch-wire.is-completed{border-color:#6366f1;background:#6366f1}
+.run-signal.is-paused{color:#b45309}.run-signal.is-paused i{background:#f59e0b;box-shadow:0 0 0 4px rgba(245,158,11,.14)}
 </style>

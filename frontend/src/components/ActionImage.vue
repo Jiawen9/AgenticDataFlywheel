@@ -25,6 +25,7 @@ const props = withDefaults(
   }>(),
   { actionsBox: '', alt: '轨迹步骤截图', showOverlay: true, editable: false, showEditTrigger: true, colorTone: 'deep' },
 )
+const emit = defineEmits<{ 'editing-change': [editing: boolean] }>()
 
 const naturalWidth = ref(1080)
 const naturalHeight = ref(2340)
@@ -65,12 +66,14 @@ watch(() => props.imageUrl, () => {
   failed.value = false
   editing.value = false
   drawing.value = false
+  emit('editing-change', false)
 })
 
 function beginEditing() {
   const current = bbox.value
   draftBBox.value = current ? { ...current } : null
   editing.value = true
+  emit('editing-change', true)
 }
 
 function cancelEditing() {
@@ -78,6 +81,7 @@ function cancelEditing() {
   drawing.value = false
   dragStart.value = null
   draftBBox.value = null
+  emit('editing-change', false)
 }
 
 function eventPoint(event: PointerEvent): Point {
