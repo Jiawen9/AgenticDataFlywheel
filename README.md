@@ -187,6 +187,15 @@ backend_workspace/task_generation/
 
 如需使用不同模型，可在 `backend/.env` 中设置 `TASK_GENERATION_MODEL_NAME`、`TASK_GENERATION_MODEL_URL` 和 `TASK_GENERATION_API_KEY`；未设置时回退到通用 `MODEL_NAME`、`MODEL_URL` 和 `YUNAI_API_KEY`。并发数使用 `TASK_GENERATION_MAX_CONCURRENT`，默认值为 4。
 
+模型输出处理与排查：
+
+- 默认只接受最终答案，不将 `reasoning_content/reasoning` 当作任务。`finish_reason=length` 会明确报截断；纯 JSON、JSONL、单个 Markdown JSON 块和 `</think>` 后的完整答案仍可读取。混杂分析和多个示例块的响应会要求模型重新输出，不再猜测提取第一个 JSON。
+- 生成与扩增统一要求 `{"tasks":[...]}`，每项包含真实 `task`。占位符、空白、非法字段和重复任务不会保存。默认允许一次校验补生成，由 `TASK_GENERATION_VALIDATION_RETRIES` 控制；这是网络重试之外的额外模型调用，设为 `0` 可关闭。数量仍不足时保留有效结果并报部分成功，无有效结果则失败。
+- 依赖枚举必须是 `zero/weak/strong` 中的一个；判定失败或弱依赖前置任务无效时，不再伪装成无依赖，该任务不进入可导出结果，错误中说明原因。历史结果不自动清洗或改写。
+- 初始/扩增输出预算默认 `TASK_GENERATION_GENERATION_MAX_TOKENS=8192`，依赖与分类默认 `TASK_GENERATION_CLASSIFICATION_MAX_TOKENS=2048`。模型名、地址、密钥保持原配置。第三方推理开关用 `TASK_GENERATION_EXTRA_BODY` 配置，只有确认支持后再填；`TASK_GENERATION_JSON_MODE=true` 同理，不默认强制启用。
+- 每次实际请求的 Prompt、参数、模型响应（包含最终内容、推理字段、usage、结束原因）保存在 `runs/<job_id>/model_calls/<trace_id>.json`；错误信息附诊断文件名。非作业直接调用时写入 `logs/model_calls/`。文件原子发布，多个并发请求独立记录，不新增公共下载接口。
+- 诊断日志默认开启，可设 `TASK_GENERATION_TRACE_ENABLED=false` 关闭。记录会隐藏配置密钥及常见认证字段，但仍包含业务任务、先验与模型文本，属于本地敏感数据，不应直接上传或分享；可按需手动归档清理。旧作业只有原来的日志，无法补回过去未记录的原始响应。
+
 ### 轨迹采集
 
 1. 进入“轨迹采集”，查看从工作区发现的任务和轨迹名称。

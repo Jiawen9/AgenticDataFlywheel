@@ -434,6 +434,7 @@ export interface KnowledgeBaseSummary {
 }
 
 export interface TaskTypeAppConfig {
+  id?: string
   app: string
   reference_example: string
   use_resource_prior: boolean
@@ -444,8 +445,14 @@ export interface TaskTypeAppConfig {
 export interface TaskGenerationTreeNode {
   id: string
   label: string
-  kind: 'scene' | 'capability' | 'sub_capability'
+  kind: 'scene' | 'capability' | 'sub_capability' | 'app'
+  description?: string
   children?: TaskGenerationTreeNode[]
+  app?: string
+  reference_example?: string
+  use_resource_prior?: boolean
+  control_prior_available?: boolean
+  resource_count?: number
   app_configs?: TaskTypeAppConfig[]
   generatable?: boolean
   scene?: string
@@ -455,6 +462,7 @@ export interface TaskGenerationTreeNode {
 
 export interface TaskGenerationTree {
   version: string
+  schema_version?: number
   scenes: TaskGenerationTreeNode[]
   leaf_count: number
   execution_unit_count: number
@@ -514,6 +522,14 @@ export interface TaskGenerationJob {
   knowledge_base_version?: string
   task_type_count?: number
   expected_main_tasks?: number
+  execution_units?: Array<{
+    execution_unit_id: string
+    task_type_id: string
+    scene: string
+    capability: string
+    sub_capability: string
+    app: string
+  }>
 }
 
 export interface TaskGenerationExport {

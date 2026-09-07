@@ -88,6 +88,41 @@ class EditableTreeTests(unittest.TestCase):
         self.assertEqual(leaf["id"], flatten(tree_payload(self.kb)["scenes"])[0][0]["id"])
         self.assertEqual(original, source.read_bytes())
 
+    def test_four_level_nodes_keep_l4_identity_and_validate_app_as_leaf(self):
+        first = tree_payload(self.kb)
+        leaf = flatten(first["scenes"])[0][0]
+        apps = leaf["children"]
+        self.assertEqual([app["kind"] for app in apps], ["app", "app"])
+        self.assertEqual(first["leaf_count"], 1)
+        self.assertEqual(first["execution_unit_count"], 2)
+        second = tree_payload(self.kb)
+        second_leaf = flatten(second["scenes"])[0][0]
+        self.assertEqual([app["id"] for app in second_leaf["children"]], [app["id"] for app in apps])
+
+        invalid = copy.deepcopy(first["scenes"])
+        invalid_leaf = flatten(invalid)[0][0]
+        invalid_leaf.pop("app_configs", None)
+        invalid_app = invalid_leaf["children"][0]
+        invalid_app["children"] = [{"id": str(uuid.uuid4()), "kind": "scene", "label": "非法"}]
+        with self.assertRaisesRegex(ValueError, "App 不能包含子节点"):
+            validate_tree(invalid)
+
+    def test_renaming_l4_app_updates_control_prior_and_resource_sheet(self):
+        before = tree_payload(self.kb)
+        scenes = copy.deepcopy(before["scenes"])
+        leaf = flatten(scenes)[0][0]
+        leaf.pop("app_configs", None)
+        app = leaf["children"][0]
+        app["label"] = "AppRenamed"
+        saved = save_tree(scenes, before["version"], root=self.kb)
+        renamed = flatten(saved["scenes"])[0][0]["children"][0]
+        self.assertEqual(renamed["label"], "AppRenamed")
+        self.assertTrue(renamed["control_prior_available"])
+        self.assertEqual(renamed["resource_count"], 2)
+        with pd.ExcelFile(current_root(self.kb) / KNOWLEDGE_BASE_FILES["resource_prior"]) as book:
+            self.assertIn("AppRenamed", book.sheet_names)
+            self.assertNotIn("AppA", book.sheet_names)
+
     def test_rename_preserves_ids_and_control_associations_and_old_snapshot(self):
         before = tree_payload(self.kb)
         old_root = current_root(self.kb)

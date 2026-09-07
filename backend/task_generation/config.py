@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -68,11 +69,29 @@ class TaskGenerationConfig:
     trust_env: bool
     max_retries: int
     max_concurrent: int
+    generation_max_tokens: int = 8192
+    classification_max_tokens: int = 2048
+    validation_retries: int = 1
+    json_mode: bool = False
+    extra_body: dict | None = None
+    trace_enabled: bool = True
+
+
+def _extra_body(raw: str) -> dict:
+    try:
+        value = json.loads(raw or "{}")
+    except json.JSONDecodeError as exc:
+        raise ValueError("TASK_GENERATION_EXTRA_BODY 必须是 JSON 对象") from exc
+    if not isinstance(value, dict):
+        raise ValueError("TASK_GENERATION_EXTRA_BODY 必须是 JSON 对象")
+    if set(value) & {"model", "messages", "max_tokens", "max_completion_tokens", "response_format", "stream", "api_key", "headers"}:
+        raise ValueError("TASK_GENERATION_EXTRA_BODY 不能覆盖模型、消息、输出预算、格式或认证字段")
+    return value
 
 
 def load_model_config() -> TaskGenerationConfig:
     values = load_env_values()
-    api_key = _value(values, "task_generation", "API_KEY")
+    api_key = _value(values, "task_generation", "API_KEY") or os.environ.get("YUNAI_API_KEY") or values.get("YUNAI_API_KEY", "")
     base_url = _value(values, "task_generation", "MODEL_URL", "https://yunai.chat/v1").rstrip("/")
     model = _value(values, "task_generation", "MODEL_NAME")
     proxy = _value(values, "task_generation", "HTTP_PROXY_URL")
@@ -88,4 +107,10 @@ def load_model_config() -> TaskGenerationConfig:
         trust_env=_bool(_value(values, "task_generation", "HTTP_TRUST_ENV", "false"), False),
         max_retries=_int(_value(values, "task_generation", "MAX_RETRIES", "2"), 2, minimum=0),
         max_concurrent=_int(_value(values, "task_generation", "MAX_CONCURRENT", "4"), 4, minimum=1),
+        generation_max_tokens=_int(_value(values, "task_generation", "GENERATION_MAX_TOKENS", "8192"), 8192, minimum=1),
+        classification_max_tokens=_int(_value(values, "task_generation", "CLASSIFICATION_MAX_TOKENS", "2048"), 2048, minimum=1),
+        validation_retries=_int(_value(values, "task_generation", "VALIDATION_RETRIES", "1"), 1),
+        json_mode=_bool(_value(values, "task_generation", "JSON_MODE", "false"), False),
+        extra_body=_extra_body(_value(values, "task_generation", "EXTRA_BODY", "{}")),
+        trace_enabled=_bool(_value(values, "task_generation", "TRACE_ENABLED", "true"), True),
     )

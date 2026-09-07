@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import logging
+import re
 import secrets
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,6 +18,7 @@ except ImportError:  # Keep the API usable before optional dependencies are inst
 from .config import load_model_config
 from .knowledge_base import merged_nodes, node_id, scene_tree_text
 from .model_client import TaskGenerationModel, parse_json_value, parse_jsonl_tasks
+from .response_parser import valid_task_text
 from .prompts import dependency_prompt, flywheel_prompt, scene_classification_prompt, system_prompt
 
 
@@ -34,19 +35,89 @@ def _text(value: Any, default: str = "") -> str:
     return str(value).strip()
 
 
-def _model(model: TaskGenerationModel | None) -> TaskGenerationModel:
-    return model or TaskGenerationModel()
+def _model(model: TaskGenerationModel | None, kb_root: Path) -> TaskGenerationModel:
+    return model or TaskGenerationModel(diagnostics_dir=kb_root.parent / "model_calls")
 
 
-def classify_pre_task_scene(task: str, app: str, *, kb_root: Path, model: TaskGenerationModel) -> dict[str, str]:
-    raw = model.complete(scene_classification_prompt(scene_tree_text(kb_root), task, app), temperature=0.2, max_tokens=600)
-    value = parse_json_value(raw, dict)
-    return {
-        "scene": _text(value.get("scene"), "Unclassified"),
-        "capability": _text(value.get("capability"), "Unclassified"),
-        "sub_capability": _text(value.get("sub_capability"), "Unclassified"),
-        "reason": _text(value.get("reason")),
-    }
+class PartialGenerationError(ValueError):
+    """Keep verified rows from a unit while surfacing every unresolved failure."""
+    def __init__(self, results: list[dict[str, Any]], errors: list[dict[str, Any]]) -> None:
+        super().__init__("；".join(item["error"] for item in errors))
+        self.results, self.errors = results, errors
+
+
+def _model_config(model: TaskGenerationModel):
+    return getattr(model, "config", None) or load_model_config()
+
+
+def _trace_hint(raw: str) -> str:
+    trace = getattr(raw, "trace_id", None)
+    return f"；诊断记录 {trace}.json" if trace else ""
+
+
+def _checked_json(prompt: str, validate: Callable[[dict[str, Any]], Any], *, model: TaskGenerationModel, stage: str, item_id: str = "") -> Any:
+    config = _model_config(model)
+    issue = ""
+    for attempt in range(config.validation_retries + 1):
+        raw = ""
+        try:
+            correction = "" if not attempt else f"\n上次输出未通过校验：{issue[:300]}。请重新给出严格 JSON 最终答案，不要分析过程。"
+            raw = model.complete(prompt + correction, temperature=0.2, max_tokens=config.classification_max_tokens, stage=stage, item_id=item_id)
+            return validate(parse_json_value(raw, dict))
+        except (ValueError, RuntimeError) as exc:
+            issue = f"{exc}{_trace_hint(raw)}"
+    raise ValueError(f"{stage} 输出校验失败：{issue}")
+
+
+def _generate_tasks(prompt: str, count: int, *, model: TaskGenerationModel, item_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    config = _model_config(model)
+    accepted: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    last_issue = ""
+    for attempt in range(config.validation_retries + 1):
+        raw = ""
+        issues = []
+        try:
+            correction = ""
+            if attempt:
+                correction = f"\n# 校验反馈\n上次输出存在问题：{last_issue[:300]}。本次只生成还缺少的 {count - len(accepted)} 条有效任务，不要重复以下已接受任务：\n{json.dumps([item['task'] for item in accepted], ensure_ascii=False)}\n只返回包含 tasks 数组的 JSON 对象，不要思考说明或格式示例。"
+            raw = model.complete(prompt + correction, max_tokens=config.generation_max_tokens, stage="generating", item_id=item_id)
+            values = parse_jsonl_tasks(raw)
+            for index, item in enumerate(values, 1):
+                try:
+                    if not isinstance(item, dict):
+                        raise ValueError("任务条目必须是 JSON 对象")
+                    task = valid_task_text(item.get("task"))
+                    key = re.sub(r"\s+", "", task).casefold()
+                    if key in seen:
+                        raise ValueError("重复任务")
+                    if len(accepted) < count:
+                        seen.add(key)
+                        # Model metadata is not authoritative; context is restored by the caller.
+                        accepted.append({"task": task})
+                except ValueError as exc:
+                    issues.append(f"第 {index} 项：{exc}")
+            last_issue = "；".join(issues[:5]) or "有效任务数量不足"
+        except (ValueError, RuntimeError) as exc:
+            last_issue = str(exc)
+        last_issue += _trace_hint(raw)
+        if len(accepted) == count:
+            return accepted, []
+    return accepted, [{"stage": "validation", "error": f"要求 {count} 条主任务，仅得到 {len(accepted)} 条有效且不重复的任务。{last_issue}"}]
+
+
+def classify_pre_task_scene(task: str, app: str, *, kb_root: Path, model: TaskGenerationModel, item_id: str = "") -> dict[str, str]:
+    from .tree_store import _app_nodes, flatten, read_tree
+    allowed = {labels for leaf, labels in flatten(read_tree(kb_root)["scenes"]) if any(node["label"] == app for node in _app_nodes(leaf))}
+    def validate(value):
+        keys = ("scene", "capability", "sub_capability")
+        if any(not isinstance(value.get(key), str) or not value[key].strip() for key in keys):
+            raise ValueError("场景分类缺少完整的三级名称")
+        labels = tuple(value[key].strip() for key in keys)
+        if labels not in allowed and labels != ("Unclassified",) * 3:
+            raise ValueError("分类路径不属于该 App 的知识库快照")
+        return {**dict(zip(keys, labels)), "reason": _text(value.get("reason"))}
+    return _checked_json(scene_classification_prompt(scene_tree_text(kb_root), task, app), validate, model=model, stage="classifying", item_id=item_id)
 
 
 def _dependency_tasks(item: dict[str, Any], *, kb_root: Path, model: TaskGenerationModel) -> list[dict[str, Any]]:
@@ -57,28 +128,37 @@ def _dependency_tasks(item: dict[str, Any], *, kb_root: Path, model: TaskGenerat
     app = _text(item.get("app") or item.get("target_app"), "未知应用")
     task = _text(item.get("task"))
     group_id = main_uuid
-    try:
-        dependency = parse_json_value(model.complete(dependency_prompt(task, app), temperature=0.2, max_tokens=700), dict)
-        relationship = _text(dependency.get("dependency_relationships"), "zero").lower()
-        if relationship == "weak" and _text(dependency.get("pre_task")).lower() not in {"", "null"}:
-            pre_text = _text(dependency.get("pre_task"))
-            pre_uuid = str(uuid.uuid4())
-            scene = classify_pre_task_scene(pre_text, app, kb_root=kb_root, model=model)
-            pre = dict(item)
-            pre.update({
-                "app": app, "target_app": app, "task": pre_text, "task_uuid": pre_uuid,
-                "pre_task_uuid": None, "pre_dependency": "pre_node", "dependency_group_id": group_id,
-                "status": pre.get("status"), "scene": scene["scene"], "capability": scene["capability"],
-                "sub_capability": scene["sub_capability"], "result_id": pre_uuid, "deleted": False,
-            })
-            main.update({"app": app, "target_app": app, "pre_dependency": "weak", "pre_task_uuid": pre_uuid, "dependency_group_id": group_id, "result_id": main_uuid, "deleted": False})
-            return [pre, main]
-        if relationship == "strong":
-            main.update({"app": app, "target_app": app, "pre_dependency": "strong", "pre_task_uuid": None, "status": "-2", "dependency_group_id": group_id, "result_id": main_uuid, "deleted": False})
-            return [main]
-    except Exception as exc:
-        logging.warning("依赖判定失败，任务回退为 zero：%s", exc)
-        main["dependency_error"] = str(exc)
+    def validate(value):
+        relationship = value.get("dependency_relationships")
+        if not isinstance(relationship, str) or relationship not in {"zero", "weak", "strong"}:
+            raise ValueError("dependency_relationships 必须明确为 zero、weak 或 strong 之一")
+        if relationship == "weak":
+            pre_text = valid_task_text(value.get("pre_task"))
+            if pre_text == task:
+                raise ValueError("前置任务不能与主任务相同")
+            value["pre_task"] = pre_text
+        elif value.get("pre_task") is not None:
+            raise ValueError("zero/strong 的 pre_task 必须为 JSON null")
+        return value
+    unit = _text(item.get("execution_unit_id"))
+    dependency = _checked_json(dependency_prompt(task, app), validate, model=model, stage="dependency", item_id=unit)
+    relationship = dependency["dependency_relationships"]
+    if relationship == "weak":
+        pre_text = dependency["pre_task"]
+        pre_uuid = str(uuid.uuid4())
+        scene = classify_pre_task_scene(pre_text, app, kb_root=kb_root, model=model, item_id=unit)
+        pre = dict(item)
+        pre.update({
+            "app": app, "target_app": app, "task": pre_text, "task_uuid": pre_uuid,
+            "pre_task_uuid": None, "pre_dependency": "pre_node", "dependency_group_id": group_id,
+            "status": pre.get("status"), "scene": scene["scene"], "capability": scene["capability"],
+            "sub_capability": scene["sub_capability"], "result_id": pre_uuid, "deleted": False,
+        })
+        main.update({"app": app, "target_app": app, "pre_dependency": "weak", "pre_task_uuid": pre_uuid, "dependency_group_id": group_id, "result_id": main_uuid, "deleted": False})
+        return [pre, main]
+    if relationship == "strong":
+        main.update({"app": app, "target_app": app, "pre_dependency": "strong", "pre_task_uuid": None, "status": "-2", "dependency_group_id": group_id, "result_id": main_uuid, "deleted": False})
+        return [main]
     main.update({"app": app, "target_app": app, "pre_dependency": "zero", "pre_task_uuid": None, "dependency_group_id": group_id, "result_id": main_uuid, "deleted": False})
     return [main]
 
@@ -88,11 +168,7 @@ def _initial_node(row: dict[str, Any], *, generate_n: int, kb_root: Path, model:
         row["scene"], row["capability"], row["sub_capability"], row["sub_capability_desc"],
         row["target_app"], row["resource_prior"], row.get("reference_example", ""), generate_n,
     )
-    raw = model.complete(prompt, max_tokens=max(2048, generate_n * 450))
-    generated = parse_jsonl_tasks(raw)
-    if not generated:
-        preview = " ".join(raw.split())[:800] if raw else "<空响应>"
-        raise ValueError(f"生成节点没有返回可解析的任务；模型响应片段：{preview}")
+    generated, errors = _generate_tasks(prompt, generate_n, model=model, item_id=row["node_id"])
     results: list[dict[str, Any]] = []
     for task_index, value in enumerate(generated):
         task = _text(value.get("task"))
@@ -111,14 +187,16 @@ def _initial_node(row: dict[str, Any], *, generate_n: int, kb_root: Path, model:
             "task_index": task_index,
             "created_at": _now(),
         })
-        results.extend(_dependency_tasks(normalized, kb_root=kb_root, model=model))
-    if not results:
-        raise ValueError("生成节点未返回非空任务文本")
+        try:
+            results.extend(_dependency_tasks(normalized, kb_root=kb_root, model=model))
+        except Exception as exc:
+            errors.append({"stage": "dependency", "task_index": task_index + 1, "error": f"第 {task_index + 1} 条任务依赖检查失败，未纳入结果：{exc}"})
+    if errors:
+        raise PartialGenerationError(results, errors)
     return results
 
 
-def run_initial_generation(node_ids: list[str], generate_n: int, *, kb_root: Path, progress: Progress, model: TaskGenerationModel | None = None) -> dict[str, Any]:
-    model = _model(model)
+def _run_initial_generation(node_ids: list[str], generate_n: int, *, kb_root: Path, progress: Progress, model: TaskGenerationModel) -> dict[str, Any]:
     rows = merged_nodes(kb_root, sample_num=generate_n)
     selected = [row for row in rows if row["node_id"] in set(node_ids)]
     by_id = {row["node_id"]: row for row in selected}
@@ -126,13 +204,16 @@ def run_initial_generation(node_ids: list[str], generate_n: int, *, kb_root: Pat
         raise ValueError("提交的执行单元不在作业知识库快照中")
     results: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
-    workers = load_model_config().max_concurrent
+    workers = _model_config(model).max_concurrent
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="task-generation-node") as executor:
         futures = {executor.submit(_initial_node, by_id[node_id_value], generate_n=generate_n, kb_root=kb_root, model=model): node_id_value for node_id_value in node_ids if node_id_value in by_id}
         for completed, future in enumerate(as_completed(futures), start=1):
             current_id = futures[future]
             try:
                 results.extend(future.result())
+            except PartialGenerationError as exc:
+                results.extend(exc.results)
+                errors.extend({"item_id": current_id, **error} for error in exc.errors)
             except Exception as exc:
                 errors.append({"item_id": current_id, "error": str(exc)})
             progress({"stage": "generating", "current_item": current_id, "completed_items": completed, "total_items": len(futures), "percent": round(completed / max(1, len(futures)) * 100)})
@@ -187,7 +268,7 @@ def _read_seed_workbook(path: Path) -> list[dict[str, Any]]:
 def _seed_classify(seed: dict[str, Any], *, kb_root: Path, model: TaskGenerationModel) -> dict[str, Any]:
     if all(seed.get(key) for key in ("scene", "capability", "sub_capability")):
         return seed
-    classified = classify_pre_task_scene(seed["task"], seed["app"], kb_root=kb_root, model=model)
+    classified = classify_pre_task_scene(seed["task"], seed["app"], kb_root=kb_root, model=model, item_id=str(seed.get("source_row", "")))
     return {**seed, **classified}
 
 
@@ -200,11 +281,7 @@ def _variant_records(seed: dict[str, Any], *, generate_n: int, kb_root: Path, mo
         prior = node["resource_prior"]
     else:
         prior = []
-    value = parse_json_value(model.complete(flywheel_prompt(context, prior, generate_n), max_tokens=max(2048, generate_n * 350)))
-    if isinstance(value, dict):
-        value = [value]
-    if not isinstance(value, list):
-        raise ValueError("扩增模型返回必须是 JSON 数组")
+    value, errors = _generate_tasks(flywheel_prompt(context, prior, generate_n), generate_n, model=model, item_id=str(seed.get("source_row", "")))
     short_uuid = secrets.token_hex(3)
     records = []
     for sequence, item in enumerate(value, start=1):
@@ -221,18 +298,17 @@ def _variant_records(seed: dict[str, Any], *, generate_n: int, kb_root: Path, mo
             "生成的变体任务": task, "task": task, "run": "flywheel", "审核状态": "待人工Review",
             "deleted": False, "created_at": _now(),
         })
-    if not records:
-        raise ValueError("扩增节点没有返回可解析的变体任务")
+    if errors:
+        raise PartialGenerationError(records, errors)
     return records
 
 
-def run_augmentation(path: Path, generate_n: int, *, kb_root: Path, progress: Progress, model: TaskGenerationModel | None = None) -> dict[str, Any]:
-    model = _model(model)
+def _run_augmentation(path: Path, generate_n: int, *, kb_root: Path, progress: Progress, model: TaskGenerationModel) -> dict[str, Any]:
     seeds = _read_seed_workbook(path)
     total = len(seeds)
     classified: list[dict[str, Any] | None] = [None] * total
     errors: list[dict[str, Any]] = []
-    workers = load_model_config().max_concurrent
+    workers = _model_config(model).max_concurrent
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="task-augmentation-classify") as executor:
         futures = {executor.submit(_seed_classify, seed, kb_root=kb_root, model=model): index for index, seed in enumerate(seeds)}
         for completed, future in enumerate(as_completed(futures), start=1):
@@ -250,8 +326,29 @@ def run_augmentation(path: Path, generate_n: int, *, kb_root: Path, progress: Pr
             seed = futures[future]
             try:
                 records.extend(future.result())
+            except PartialGenerationError as exc:
+                records.extend(exc.results)
+                errors.extend({"item_id": str(seed.get("source_row", "")), **error} for error in exc.errors)
             except Exception as exc:
                 errors.append({"item_id": str(seed.get("source_row", "")), "stage": "generating", "error": str(exc)})
             progress({"stage": "generating", "current_item": str(seed.get("source_row", "")), "completed_items": total + completed, "total_items": total * 2, "percent": 40 + round(completed / max(1, len(valid_seeds)) * 60)})
     records.sort(key=lambda item: (int(item.get("source_row") or 0), item.get("用例编号", "")))
     return {"results": records, "errors": errors, "warnings": [], "total_items": total}
+
+
+def run_initial_generation(node_ids: list[str], generate_n: int, *, kb_root: Path, progress: Progress, model: TaskGenerationModel | None = None) -> dict[str, Any]:
+    active = _model(model, kb_root)
+    try:
+        return _run_initial_generation(node_ids, generate_n, kb_root=kb_root, progress=progress, model=active)
+    finally:
+        if model is None:
+            active.close()
+
+
+def run_augmentation(path: Path, generate_n: int, *, kb_root: Path, progress: Progress, model: TaskGenerationModel | None = None) -> dict[str, Any]:
+    active = _model(model, kb_root)
+    try:
+        return _run_augmentation(path, generate_n, kb_root=kb_root, progress=progress, model=active)
+    finally:
+        if model is None:
+            active.close()

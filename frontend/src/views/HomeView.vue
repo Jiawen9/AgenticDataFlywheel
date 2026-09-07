@@ -38,7 +38,7 @@
 import { Collection, Cpu, DataAnalysis, EditPen, Iphone, Plus, Promotion, TrendCharts, Upload, Operation } from '@element-plus/icons-vue'
 
 const stages = [
-  { name: '任务生成', path: '/task-generation/scenario-tree', icon: Plus },
+  { name: '任务生成', path: '/task-generation/generate', icon: Plus },
   { name: '轨迹采集', path: '/collection/tree-building', icon: Collection },
   { name: '轨迹质检', path: '/quality', icon: DataAnalysis },
   { name: '轨迹纠偏', path: '/correction/expert-action', icon: EditPen },

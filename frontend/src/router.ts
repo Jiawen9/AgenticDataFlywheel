@@ -1,12 +1,15 @@
 import { createRouter, createWebHistory } from 'vue-router'
+import { legacyScenarioStudioQuery } from '@/utils/scenarioStudio'
 export default createRouter({
   history: createWebHistory(),
   routes: [
     { path: '/', redirect: '/home' },
     { path: '/home', component: () => import('@/views/HomeView.vue') },
+    { path: '/scenario-studio', component: () => import('@/views/ScenarioStudioView.vue') },
     { path: '/pipeline', component: () => import('@/views/PipelineView.vue') },
-    { path: '/task-generation', redirect: '/task-generation/scenario-tree' },
-    { path: '/task-generation/scenario-tree', component: () => import('@/views/TaskGenerationView.vue') },
+    { path: '/task-generation', redirect: '/task-generation/generate' },
+    { path: '/task-generation/scenario-tree', redirect: to => ({ path: '/scenario-studio', query: legacyScenarioStudioQuery(to.query) }) },
+    { path: '/task-generation/generate', component: () => import('@/views/TaskGenerationView.vue') },
     { path: '/task-generation/augmentation', component: () => import('@/views/TaskAugmentationView.vue') },
     { path: '/collection', redirect: '/collection/tree-building' },
     { path: '/collection/phone-factory', component: () => import('@/views/PhoneFactoryCollectionView.vue') },

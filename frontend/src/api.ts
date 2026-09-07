@@ -2,6 +2,10 @@ import type { BuildJob, CorrectionBatch, CorrectionCotJob, CorrectionCotResponse
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
 
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number) { super(message); this.name = 'ApiError' }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers)
   if (!(init?.body instanceof FormData)) headers.set('Content-Type', 'application/json')
@@ -17,7 +21,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // Keep the HTTP fallback message.
     }
-    throw new Error(detail)
+    throw new ApiError(detail, response.status)
   }
   return response.json() as Promise<T>
 }

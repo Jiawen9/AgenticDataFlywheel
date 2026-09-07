@@ -22,6 +22,7 @@ from .constants import (
     RUNS_DIR,
 )
 from .knowledge_base import node_id, snapshot_knowledge_base
+from .tree_store import _app_nodes
 from .tree_store import VersionConflict, current_root, flatten, read_tree
 from .service import run_augmentation, run_initial_generation
 
@@ -169,7 +170,7 @@ class TaskGenerationJobManager:
                 raise ValueError(f"任务类型不存在或重复选择：{identifier}")
             seen.add(identifier)
             leaf, labels = available[identifier]
-            configs = {config["app"]: config for config in leaf["app_configs"]}
+            configs = {config["label"]: config for config in _app_nodes(leaf)}
             apps = list(dict.fromkeys(selection["apps"]))
             if not apps or any(app not in configs for app in apps):
                 raise ValueError(f"任务类型 {leaf['label']} 必须选择至少一个适用 App，且不能选择未配置的 App")

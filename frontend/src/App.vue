@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { useRoute } from 'vue-router'
-import { ArrowDown, CircleCheck, Collection, Cpu, DataAnalysis, Document, EditPen, House, Iphone, MagicStick, Operation, PieChart, Promotion, Share, TrendCharts, Upload, VideoPlay } from '@element-plus/icons-vue'
+import { ArrowDown, CircleCheck, Collection, Connection, Cpu, DataAnalysis, Document, EditPen, Files, House, Iphone, MagicStick, Operation, PieChart, Promotion, Share, TrendCharts, Upload, VideoPlay } from '@element-plus/icons-vue'
 
 const expertExpanded = ref(true)
+const taskPoolExpanded = ref(true)
 const collectionExpanded = ref(true)
 const correctionExpanded = ref(true)
 const modelTrainingExpanded = ref(true)
 const route = useRoute()
+const taskPoolActive = computed(() => ['/task-generation/generate', '/task-generation/augmentation'].includes(route.path))
 const collectionActive = computed(() => route.path.startsWith('/collection'))
 const correctionActive = computed(() => route.path.startsWith('/correction'))
 const modelTrainingActive = computed(() => route.path.startsWith('/model-training'))
@@ -31,7 +33,16 @@ const modelTrainingActive = computed(() => route.path.startsWith('/model-trainin
             <el-icon :class="{ 'is-collapsed': !expertExpanded }"><ArrowDown /></el-icon>
           </button>
           <div v-show="expertExpanded" class="nav-group__items">
-            <router-link to="/task-generation/augmentation"><el-icon><MagicStick /></el-icon><span>任务泛化扩增</span></router-link>
+            <div class="nav-subgroup">
+              <button class="nav-subgroup__toggle" :class="{ active: taskPoolActive }" :aria-expanded="taskPoolExpanded" type="button" @click="taskPoolExpanded = !taskPoolExpanded">
+                <span class="nav-group__toggle-label"><el-icon><Files /></el-icon><span>任务池</span></span>
+                <el-icon :class="{ 'is-collapsed': !taskPoolExpanded }"><ArrowDown /></el-icon>
+              </button>
+              <div v-show="taskPoolExpanded" class="nav-tertiary-items">
+                <router-link to="/task-generation/generate"><el-icon><MagicStick /></el-icon><span>任务生成</span></router-link>
+                <router-link to="/task-generation/augmentation"><el-icon><Connection /></el-icon><span>任务泛化扩增</span></router-link>
+              </div>
+            </div>
             <div class="nav-subgroup">
               <button class="nav-subgroup__toggle" :class="{ active: collectionActive }" type="button" @click="collectionExpanded = !collectionExpanded">
                 <span class="nav-group__toggle-label"><el-icon><Collection /></el-icon><span>轨迹采集</span></span>
@@ -70,7 +81,7 @@ const modelTrainingActive = computed(() => route.path.startsWith('/model-trainin
           </div>
         </section>
         <section class="nav-group">
-          <router-link class="nav-primary-link" to="/task-generation/scenario-tree"><el-icon><Share /></el-icon><span>GUI操控场景树</span></router-link>
+          <router-link class="nav-primary-link" to="/scenario-studio"><el-icon><Share /></el-icon><span>GUI操控场景树</span></router-link>
         </section>
         <section class="nav-group">
           <router-link class="nav-primary-link" to="/phone-factory"><el-icon><Iphone /></el-icon><span>手机工厂监控</span></router-link>

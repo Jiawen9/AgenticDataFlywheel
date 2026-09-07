@@ -1,266 +1,664 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
-import { onBeforeRouteLeave } from 'vue-router'
-import { ElMessage, ElMessageBox, ElTree } from 'element-plus'
-import { Download, Edit, Plus, Refresh, Upload } from '@element-plus/icons-vue'
-import { api, sceneTreeDownloadUrl } from '@/api'
-import type { KnowledgeBaseSummary, TaskGenerationJob, TaskGenerationTree, TaskGenerationTreeNode } from '@/types'
-import { appConfigs, editableTree, executionUnitCount, findNode, leaves, nodePath, removeNode, selectionsFor, withInlineAddActions, type ScenarioTreeDisplayNode, type TreeAddActionNode } from '@/utils/scenarioTree'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { Plus } from '@element-plus/icons-vue'
+import { api } from '@/api'
+import type { TaskGenerationTree, TaskGenerationTreeNode } from '@/types'
+import ScenarioAppBindingPopover from '@/components/ScenarioAppBindingPopover.vue'
+import ScenarioColumn, { type ScenarioNodeCommand } from '@/components/ScenarioColumn.vue'
+import type { ScenarioEditorState } from '@/utils/scenarioStudio'
+import { appNodes, canMove, descendantIds, editableTree, findNode, moveNode, NODE_LABELS, NODE_LEVELS, nodePath, normalizeTree, parentOf, removeNode, reorderNode } from '@/utils/scenarioTree'
 
-const emit = defineEmits<{ created: [job: TaskGenerationJob]; countChange: [count: number] }>()
-const treeRef = ref<InstanceType<typeof ElTree>>()
-const tree = ref<TaskGenerationTreeNode[]>([])
+type EditableKind = 'scene' | 'capability' | 'sub_capability'
+interface DetailDraft {
+  id: string
+  kind: TaskGenerationTreeNode['kind']
+  label: string
+  description: string
+  reference_example: string
+  use_resource_prior: boolean
+}
+
+const props = defineProps<{
+  initialTree: TaskGenerationTreeNode[]
+  initialVersion: string
+  initialNodeId?: string
+}>()
+const emit = defineEmits<{
+  (event: 'tree-saved', payload: TaskGenerationTree): void
+  (event: 'state-change', state: ScenarioEditorState): void
+  (event: 'selection-change', sceneId: string): void
+}>()
+
+const savedTree = ref<TaskGenerationTreeNode[]>(normalizeTree(props.initialTree))
 const draft = ref<TaskGenerationTreeNode[]>([])
-const version = ref('')
-const knowledgeBases = ref<KnowledgeBaseSummary[]>([])
-const warnings = ref<string[]>([])
-const focusedId = ref('')
-const checkedIds = ref<string[]>([])
-const selectedApps = ref<Record<string, string[]>>({})
-const filterText = ref('')
+const version = ref(props.initialVersion)
+const selectedL1 = ref('')
+const selectedL2 = ref('')
+const selectedL3 = ref('')
+const selectedApp = ref('')
 const editing = ref(false)
-const loading = ref(false)
 const saving = ref(false)
-const submitting = ref(false)
 const failure = ref('')
-const generateN = ref(5)
-const realTree = computed(() => editing.value ? draft.value : tree.value)
-const displayTree = computed<ScenarioTreeDisplayNode[]>(() => editing.value ? withInlineAddActions(draft.value) : tree.value)
-const focused = computed(() => findNode(realTree.value, focusedId.value))
-const dirty = computed(() => editing.value && JSON.stringify(editableTree(draft.value)) !== JSON.stringify(editableTree(tree.value)))
-const allLeaves = computed(() => leaves(tree.value))
-const selectedLeaves = computed(() => allLeaves.value.filter(node => checkedIds.value.includes(node.id)))
-const selections = computed(() => selectionsFor(tree.value, checkedIds.value, selectedApps.value))
-const unitCount = computed(() => executionUnitCount(selections.value))
-const appOptions = computed(() => [...new Set(leaves(realTree.value).flatMap(node => (node.app_configs || []).map(config => config.app)))])
-const ready = computed(() => version.value && !editing.value && !loading.value && knowledgeBases.value.every(item => item.valid) && unitCount.value > 0 && selections.value.every(item => item.apps.length > 0))
-const kbNames = { scene_tree: '场景树', control_prior: '操控先验', resource_prior: '资源先验' }
-const kindNames = { scene: '场景', capability: '一级能力', sub_capability: '任务类型' }
+const addingKind = ref<TaskGenerationTreeNode['kind'] | ''>('')
+const addingParentId = ref('')
+const addText = ref('')
+const renameId = ref('')
+const renameText = ref('')
+const draggedId = ref('')
+const dropTargetId = ref('')
+const undoStack = ref<string[]>([])
+const redoStack = ref<string[]>([])
+const detailVisible = ref(false)
+const detailDraft = ref<DetailDraft | null>(null)
+const moveVisible = ref(false)
+const moveNodeId = ref('')
+const moveTargetId = ref('')
+const highlightId = ref('')
+let highlightTimer: ReturnType<typeof setTimeout> | undefined
 
+const realTree = computed(() => editing.value ? draft.value : savedTree.value)
+const sceneNodes = computed(() => realTree.value.filter(node => node.kind === 'scene'))
+const selectedScene = computed(() => findNode(realTree.value, selectedL1.value))
+const selectedCapability = computed(() => selectedScene.value?.children?.find(node => node.id === selectedL2.value && node.kind === 'capability'))
+const selectedSubCapability = computed(() => selectedCapability.value?.children?.find(node => node.id === selectedL3.value && node.kind === 'sub_capability'))
+const selectedAppNode = computed(() => selectedSubCapability.value?.children?.find(node => node.id === selectedApp.value && node.kind === 'app'))
+const capabilityNodes = computed(() => selectedScene.value?.children?.filter(node => node.kind === 'capability') || [])
+const subCapabilityNodes = computed(() => selectedCapability.value?.children?.filter(node => node.kind === 'sub_capability') || [])
+const selectedApps = computed(() => selectedSubCapability.value ? appNodes(selectedSubCapability.value).map(node => node.label) : [])
+const dirty = computed(() => editing.value && JSON.stringify(editableTree(draft.value)) !== JSON.stringify(editableTree(savedTree.value)))
+const activeNode = computed(() => selectedAppNode.value || selectedSubCapability.value || selectedCapability.value || selectedScene.value)
+const pathNodes = computed(() => {
+  const target = activeNode.value
+  if (!target) return []
+  const result: TaskGenerationTreeNode[] = []
+  let current: TaskGenerationTreeNode | undefined = target
+  while (current) {
+    result.unshift(current)
+    current = parentOf(realTree.value, current.id)
+  }
+  return result
+})
+const appLibrary = computed(() => {
+  const byLabel = new Map<string, TaskGenerationTreeNode>()
+  const collect = (nodes: TaskGenerationTreeNode[]) => nodes.forEach(node => {
+    if (node.kind === 'sub_capability') {
+      appNodes(node).forEach(app => {
+        if (app.label && !byLabel.has(app.label)) byLabel.set(app.label, app)
+      })
+    }
+    collect(node.children || [])
+  })
+  collect(savedTree.value)
+  collect(draft.value)
+  return [...byLabel.values()].sort((left, right) => left.label.localeCompare(right.label, 'zh-CN'))
+})
+const movingNode = computed(() => findNode(draft.value, moveNodeId.value))
+const moveCandidates = computed(() => {
+  const node = movingNode.value
+  if (!node) return []
+  const result: TaskGenerationTreeNode[] = []
+  const visit = (nodes: TaskGenerationTreeNode[]) => nodes.forEach(item => {
+    if (canMove(node, item)) result.push(item)
+    visit(item.children || [])
+  })
+  visit(draft.value)
+  return result
+})
+const detailTitle = computed(() => detailDraft.value ? `编辑${NODE_LABELS[detailDraft.value.kind]}` : '编辑节点详情')
+
+function clone<T>(value: T): T { return JSON.parse(JSON.stringify(value)) as T }
+function snapshot() {
+  if (editing.value) {
+    undoStack.value.push(JSON.stringify(editableTree(draft.value)))
+    redoStack.value = []
+  }
+}
+function emitState() {
+  emit('state-change', {
+    editing: editing.value,
+    dirty: dirty.value,
+    saving: saving.value,
+    canUndo: undoStack.value.length > 0,
+    canRedo: redoStack.value.length > 0,
+    selectedSceneId: selectedL1.value,
+  })
+}
+function initializeFromProps() {
+  savedTree.value = normalizeTree(props.initialTree)
+  version.value = props.initialVersion
+  syncSelection()
+  if (props.initialNodeId) focusNode(props.initialNodeId)
+  emitState()
+}
+function syncSelection() {
+  const scene = sceneNodes.value.find(node => node.id === selectedL1.value) || sceneNodes.value[0]
+  selectedL1.value = scene?.id || ''
+  const capability = scene?.children?.find(node => node.id === selectedL2.value && node.kind === 'capability')
+  selectedL2.value = capability?.id || ''
+  const sub = capability?.children?.find(node => node.id === selectedL3.value && node.kind === 'sub_capability')
+  selectedL3.value = sub?.id || ''
+  const app = sub?.children?.find(node => node.id === selectedApp.value && node.kind === 'app')
+  selectedApp.value = app?.id || ''
+}
+function selectNode(node: TaskGenerationTreeNode) {
+  const chain: TaskGenerationTreeNode[] = []
+  let current: TaskGenerationTreeNode | undefined = findNode(realTree.value, node.id)
+  while (current) {
+    chain.unshift(current)
+    current = parentOf(realTree.value, current.id)
+  }
+  selectedL1.value = chain.find(item => item.kind === 'scene')?.id || ''
+  selectedL2.value = chain.find(item => item.kind === 'capability')?.id || ''
+  selectedL3.value = chain.find(item => item.kind === 'sub_capability')?.id || ''
+  selectedApp.value = chain.find(item => item.kind === 'app')?.id || ''
+}
+function selectScene(node: TaskGenerationTreeNode) {
+  selectedL1.value = node.id
+  selectedL2.value = ''
+  selectedL3.value = ''
+  selectedApp.value = ''
+}
+function selectCapability(node: TaskGenerationTreeNode) {
+  selectedL2.value = node.id
+  selectedL3.value = ''
+  selectedApp.value = ''
+}
+function selectSubCapability(node: TaskGenerationTreeNode) {
+  selectedL3.value = node.id
+  selectedApp.value = ''
+}
+function selectApp(node: TaskGenerationTreeNode) { selectedApp.value = node.id }
+
+function openAppBinding() {
+  if (!editing.value) beginEdit()
+}
+
+function bindApps(labels: string[]) {
+  const target = selectedSubCapability.value
+  if (!editing.value || !target) return
+  const current = appNodes(target)
+  const currentLabels = current.map(node => node.label)
+  if (JSON.stringify(currentLabels) === JSON.stringify(labels)) return
+  const next = labels.map(label => {
+    const source = current.find(node => node.label === label) || appLibrary.value.find(node => node.label === label)
+    if (source) {
+      const app = clone(source)
+      app.kind = 'app'
+      app.label = label
+      app.app = label
+      app.children = undefined
+      return app
+    }
+    return { id: crypto.randomUUID(), kind: 'app' as const, label, app: label, description: '', reference_example: '', use_resource_prior: false }
+  })
+  snapshot()
+  target.children = next
+  target.app_configs = undefined
+  if (!labels.includes(selectedAppNode.value?.label || '')) selectedApp.value = ''
+  syncSelection()
+}
+
+function restore(serialized: string) {
+  draft.value = normalizeTree(JSON.parse(serialized) as TaskGenerationTreeNode[])
+  syncSelection()
+}
+function undo() {
+  const previous = undoStack.value.pop()
+  if (!previous) return
+  redoStack.value.push(JSON.stringify(editableTree(draft.value)))
+  restore(previous)
+}
+function redo() {
+  const next = redoStack.value.pop()
+  if (!next) return
+  undoStack.value.push(JSON.stringify(editableTree(draft.value)))
+  restore(next)
+}
 function applyTree(payload: TaskGenerationTree) {
-  tree.value = payload.scenes
+  savedTree.value = normalizeTree(payload.scenes)
   version.value = payload.version
-  warnings.value = payload.warnings
-  checkedIds.value = []
-  selectedApps.value = {}
-  treeRef.value?.setCheckedKeys([])
-  if (!findNode(tree.value, focusedId.value)) focusedId.value = tree.value[0]?.id || ''
-  emit('countChange', payload.leaf_count)
-  void nextTick(() => treeRef.value?.filter(filterText.value))
+  syncSelection()
 }
-
-async function refresh() {
-  if (editing.value) return
-  loading.value = true
-  failure.value = ''
-  try {
-    knowledgeBases.value = await api.taskGenerationKnowledgeBases()
-    applyTree(await api.taskGenerationTree())
-  } catch (error) { failure.value = (error as Error).message }
-  finally { loading.value = false }
-}
-
-async function replaceKnowledgeBase(kind: KnowledgeBaseSummary['kind'], event: Event) {
-  const input = event.target as HTMLInputElement
-  const file = input.files?.[0]
-  if (!file || editing.value) return
-  try {
-    await ElMessageBox.confirm(`上传将替换当前${kbNames[kind]}并发布新版本，旧版本和历史作业将保留。确定继续吗？`, '替换知识库', { type: 'warning' })
-    loading.value = true
-    await api.replaceTaskGenerationKnowledgeBase(kind, file, version.value || undefined)
-    await refresh()
-    ElMessage.success('知识库新版本已发布')
-  } catch (error) {
-    if (error !== 'cancel' && error !== 'close') ElMessage.error((error as Error).message)
-  } finally { input.value = ''; loading.value = false }
-}
-
 function beginEdit() {
-  draft.value = JSON.parse(JSON.stringify(tree.value))
+  draft.value = clone(savedTree.value)
   editing.value = true
-  failure.value = ''
-  void nextTick(() => treeRef.value?.filter(filterText.value))
+  undoStack.value = []
+  redoStack.value = []
+  syncSelection()
 }
-
-async function discardAllowed(): Promise<boolean> {
-  if (!dirty.value) return true
-  try {
-    await ElMessageBox.confirm('有尚未保存的场景树修改，确定放弃吗？', '未保存的修改', { type: 'warning', confirmButtonText: '放弃修改', cancelButtonText: '继续编辑' })
-    return true
-  } catch { return false }
-}
-
-async function cancelEdit() {
-  if (!(await discardAllowed())) return
+async function discardChanges(): Promise<boolean> {
+  if (dirty.value) {
+    try {
+      await ElMessageBox.confirm('有尚未保存的场景树修改，确定放弃吗？', '未保存的修改', { type: 'warning', confirmButtonText: '放弃修改', cancelButtonText: '继续编辑' })
+    } catch { return false }
+  }
   editing.value = false
   draft.value = []
-  failure.value = ''
-  await nextTick()
-  treeRef.value?.setCheckedKeys(checkedIds.value)
-  treeRef.value?.filter(filterText.value)
+  undoStack.value = []
+  redoStack.value = []
+  addingKind.value = ''
+  renameId.value = ''
+  detailVisible.value = false
+  syncSelection()
+  return true
 }
-
 async function save() {
+  if (!dirty.value) return
   saving.value = true
   failure.value = ''
   try {
     const payload = await api.saveTaskGenerationTree(editableTree(draft.value), version.value)
+    applyTree(payload)
     editing.value = false
     draft.value = []
-    applyTree(payload)
-    knowledgeBases.value = await api.taskGenerationKnowledgeBases()
-    ElMessage.success('场景树已保存，新作业将使用此版本')
+    undoStack.value = []
+    redoStack.value = []
+    emit('tree-saved', payload)
+    ElMessage.success('场景树已保存并发布新版本')
   } catch (error) {
     failure.value = (error as Error).message
     ElMessage.error(failure.value)
   } finally { saving.value = false }
 }
 
-function addNode(parent?: TaskGenerationTreeNode) {
-  const kind = !parent ? 'scene' : parent.kind === 'scene' ? 'capability' : 'sub_capability'
-  const siblings = parent ? (parent.children ||= []) : draft.value
-  const base = `新${kindNames[kind]}`
+function siblingNodes(parent: TaskGenerationTreeNode | undefined) {
+  if (!parent) return draft.value
+  return (parent.children ||= [])
+}
+function uniqueLabel(parent: TaskGenerationTreeNode | undefined, kind: TaskGenerationTreeNode['kind']) {
+  const siblings = siblingNodes(parent)
+  const base = kind === 'scene' ? '新一级场景' : kind === 'capability' ? '新能力' : '新子能力'
   let label = base
   let suffix = 2
   while (siblings.some(node => node.label === label)) label = `${base}${suffix++}`
-  const node: TaskGenerationTreeNode = { id: crypto.randomUUID(), kind, label, ...(kind === 'sub_capability' ? { app_configs: [] } : { children: [] }) }
-  siblings.push(node)
-  filterText.value = ''
-  focusedId.value = node.id
-  void nextTick(() => {
-    treeRef.value?.filter('')
-    if (parent) { const parentNode = treeRef.value?.getNode(parent.id); if (parentNode) parentNode.expanded = true }
-    treeRef.value?.setCurrentKey(node.id)
-  })
+  return label
 }
-
-function isAddAction(node: ScenarioTreeDisplayNode): node is TreeAddActionNode {
-  return node.kind === 'add_action'
+function startAdd(parent: TaskGenerationTreeNode | undefined, kind: EditableKind) {
+  if (!editing.value) return
+  addingKind.value = kind
+  addingParentId.value = parent?.id || ''
+  addText.value = ''
+  void nextTick(() => document.querySelector<HTMLInputElement>('.inline-creator-input, .scene-creator-input')?.focus())
 }
-
-function activateAddAction(node: TreeAddActionNode) {
-  const parent = findNode(draft.value, node.parent_id)
-  if (parent) addNode(parent)
+function requestAdd(parent: TaskGenerationTreeNode | undefined, kind: EditableKind) {
+  if (!editing.value) beginEdit()
+  startAdd(parent, kind)
 }
-
-function handleTreeNodeClick(node: ScenarioTreeDisplayNode) {
-  if (isAddAction(node)) {
-    activateAddAction(node)
+function commitAdd() {
+  const kind = addingKind.value as EditableKind
+  if (!kind || !editing.value) return
+  const parent = addingParentId.value ? findNode(draft.value, addingParentId.value) : undefined
+  const validParent = kind === 'scene'
+    ? !parent
+    : (kind === 'capability' && parent?.kind === 'scene')
+      || (kind === 'sub_capability' && parent?.kind === 'capability')
+  if (!validParent) { cancelAdd(); return }
+  const requested = addText.value.trim()
+  const siblings = siblingNodes(parent)
+  if (requested && siblings.some(node => node.label === requested)) {
+    ElMessage.warning('同级节点名称不能重复')
     return
   }
-  focusedId.value = node.id
+  snapshot()
+  const label = requested || uniqueLabel(parent, kind)
+  const node: TaskGenerationTreeNode = { id: crypto.randomUUID(), kind, label, description: '', children: [] }
+  siblings.push(node)
+  addingKind.value = ''
+  addingParentId.value = ''
+  addText.value = ''
+  selectNode(node)
+}
+function cancelAdd() {
+  addingKind.value = ''
+  addingParentId.value = ''
+  addText.value = ''
+}
+function beginRename(node: TaskGenerationTreeNode) {
+  if (!editing.value) return
+  renameId.value = node.id
+  renameText.value = node.label
+  void nextTick(() => {
+    const input = [...document.querySelectorAll<HTMLInputElement>('.inline-rename-input')].find(item => item.value === node.label)
+    input?.focus()
+    input?.select()
+  })
+}
+function commitRename(node: TaskGenerationTreeNode) {
+  if (renameId.value !== node.id) return
+  const requested = renameText.value.trim()
+  if (!requested) { ElMessage.warning('名称不能为空'); return }
+  const siblings = siblingNodes(parentOf(draft.value, node.id))
+  if (siblings.some(item => item.id !== node.id && item.label === requested)) { ElMessage.warning('同级节点名称不能重复'); return }
+  if (requested !== node.label) {
+    snapshot()
+    node.label = requested
+    if (node.kind === 'app') node.app = requested
+  }
+  renameId.value = ''
+  renameText.value = ''
+}
+function cancelRename() { renameId.value = ''; renameText.value = '' }
+
+function openDetails(node: TaskGenerationTreeNode) {
+  detailDraft.value = {
+    id: node.id,
+    kind: node.kind,
+    label: node.label,
+    description: node.description || '',
+    reference_example: node.reference_example || '',
+    use_resource_prior: Boolean(node.use_resource_prior),
+  }
+  detailVisible.value = true
+}
+function saveDetails() {
+  const details = detailDraft.value
+  const node = details ? findNode(draft.value, details.id) : undefined
+  if (!details || !node || !editing.value) return
+  const siblings = siblingNodes(parentOf(draft.value, node.id))
+  const label = details.label.trim()
+  if (!label) { ElMessage.warning('名称不能为空'); return }
+  if (siblings.some(item => item.id !== node.id && item.label === label)) { ElMessage.warning('同级节点名称不能重复'); return }
+  const changed = node.label !== label
+    || (node.description || '') !== details.description
+    || (node.kind === 'app' && ((node.reference_example || '') !== details.reference_example || Boolean(node.use_resource_prior) !== details.use_resource_prior))
+  if (!changed) { detailVisible.value = false; return }
+  snapshot()
+  node.label = label
+  node.description = details.description
+  if (node.kind === 'app') {
+    node.app = label
+    node.reference_example = details.reference_example
+    node.use_resource_prior = details.use_resource_prior
+  }
+  detailVisible.value = false
 }
 
-async function deleteFocused() {
-  const node = focused.value
+function handleCommand(node: TaskGenerationTreeNode, command: ScenarioNodeCommand) {
+  if (command === 'details') { openDetails(node); return }
+  if (!editing.value) return
+  if (command === 'rename') beginRename(node)
+  else if (command === 'add' && node.kind === 'scene') startAdd(node, 'capability')
+  else if (command === 'add' && node.kind === 'capability') startAdd(node, 'sub_capability')
+  else if (command === 'bind' && node.kind === 'sub_capability') selectSubCapability(node)
+  else if (command === 'move') openMove(node)
+  else if (command === 'delete' || command === 'unbind') void deleteNode(node)
+}
+function handleColumnCommand(payload: { node: TaskGenerationTreeNode; command: ScenarioNodeCommand }) {
+  handleCommand(payload.node, payload.command)
+}
+function countByKind(node: TaskGenerationTreeNode, kind: TaskGenerationTreeNode['kind']): number {
+  return (node.children || []).reduce((count, child) => count + (child.kind === kind ? 1 : 0) + countByKind(child, kind), 0)
+}
+async function deleteNode(node: TaskGenerationTreeNode) {
+  if (!editing.value) return
+  const descendantCount = descendantIds(node).length
+  const message = node.kind === 'app'
+    ? `取消绑定“${node.label}”？App 本身不会被删除。`
+    : `删除“${node.label}”将移除 ${descendantCount} 个后代节点${node.kind === 'capability' ? `（${countByKind(node, 'sub_capability')} 个子能力、${countByKind(node, 'app')} 个 App 绑定）` : ''}。历史作业和先验记录不会删除。`
+  try {
+    await ElMessageBox.confirm(message, node.kind === 'app' ? '取消绑定 App' : '删除整棵子树', { type: 'warning', confirmButtonText: node.kind === 'app' ? '取消绑定' : '确认删除', cancelButtonText: '取消' })
+  } catch { return }
+  const parent = parentOf(draft.value, node.id)
+  snapshot()
+  removeNode(draft.value, node.id)
+  if (parent) selectNode(parent)
+  else syncSelection()
+}
+function openMove(node: TaskGenerationTreeNode) {
+  if (!editing.value || node.kind === 'scene') return
+  moveNodeId.value = node.id
+  moveTargetId.value = ''
+  moveVisible.value = true
+}
+function confirmMove() {
+  if (!moveNodeId.value || !moveTargetId.value) return
+  const node = findNode(draft.value, moveNodeId.value)
   if (!node) return
-  const count = leaves([node]).length
-  try {
-    await ElMessageBox.confirm(`删除“${node.label}”将移除 ${count} 个任务类型。保存后影响未来作业，历史任务和先验记录不会删除。`, '删除节点', { type: 'warning' })
-    removeNode(draft.value, node.id)
-    focusedId.value = ''
-  } catch { /* Confirmation cancelled. */ }
+  snapshot()
+  if (moveNode(draft.value, moveNodeId.value, moveTargetId.value)) {
+    moveVisible.value = false
+    selectNode(node)
+    ElMessage.success('节点已移动，保存后生效')
+  }
 }
 
-function setApps(apps: string[]) {
-  if (focused.value) focused.value.app_configs = appConfigs(apps, focused.value.app_configs || [])
+function sameParent(node: TaskGenerationTreeNode, target: TaskGenerationTreeNode) {
+  const left = parentOf(draft.value, node.id)
+  const right = parentOf(draft.value, target.id)
+  return (left?.id || '') === (right?.id || '') && node.kind === target.kind
+}
+function handleDragStart(node: TaskGenerationTreeNode) { if (editing.value) draggedId.value = node.id }
+function handleDragOver(node: TaskGenerationTreeNode) {
+  const moving = findNode(draft.value, draggedId.value)
+  dropTargetId.value = moving && (sameParent(moving, node) || canMove(moving, node)) ? node.id : ''
+}
+function handleDrop(node: TaskGenerationTreeNode) {
+  const moving = findNode(draft.value, draggedId.value)
+  if (!moving) return
+  if (sameParent(moving, node)) {
+    snapshot()
+    reorderNode(draft.value, moving.id, node.id)
+    selectNode(moving)
+  } else if (canMove(moving, node)) {
+    snapshot()
+    moveNode(draft.value, moving.id, node.id)
+    selectNode(moving)
+  } else ElMessage.warning('无法移动到该位置，请保持 L1 → L2 → L3 → App 层级')
+  draggedId.value = ''
+  dropTargetId.value = ''
 }
 
-function filterNode(value: string, data: object) {
-  const node = data as ScenarioTreeDisplayNode
-  if (!value.trim()) return true
-  if (isAddAction(node)) return false
-  const realNode = findNode(realTree.value, node.id)
-  if (!realNode) return false
-  const text = [...nodePath(realTree.value, realNode.id), ...leaves([realNode]).flatMap(leaf => [leaf.label, ...(leaf.app_configs || []).map(config => config.app)])].join(' ').toLowerCase()
-  return text.includes(value.trim().toLowerCase())
+function focusNode(target: string | TaskGenerationTreeNode) {
+  const node = typeof target === 'string' ? findNode(realTree.value, target) : target
+  if (!node) return
+  selectNode(node)
+  highlightId.value = node.id
+  if (highlightTimer) clearTimeout(highlightTimer)
+  highlightTimer = setTimeout(() => { highlightId.value = '' }, 1300)
 }
+watch(() => props.initialTree, () => {
+  if (!editing.value) initializeFromProps()
+}, { deep: true })
+watch(() => props.initialVersion, next => {
+  if (!editing.value) version.value = next
+})
+watch(() => props.initialNodeId, next => {
+  if (!editing.value && next) focusNode(next)
+})
+watch([editing, dirty, saving, selectedL1, undoStack, redoStack], emitState, { deep: true })
+watch(selectedL1, sceneId => emit('selection-change', sceneId), { immediate: true })
+onMounted(initializeFromProps)
+onBeforeUnmount(() => {
+  if (highlightTimer) clearTimeout(highlightTimer)
+})
 
-function checkable(data: object) {
-  const node = data as TaskGenerationTreeNode
-  return !leaves([node]).some(leaf => leaf.app_configs?.length)
-}
-
-function onCheck(_node: object, info: { checkedNodes: object[] }) {
-  const selected = (info.checkedNodes as TaskGenerationTreeNode[]).filter(node => node.kind === 'sub_capability' && node.app_configs?.length)
-  const next: Record<string, string[]> = {}
-  for (const node of selected) next[node.id] = selectedApps.value[node.id] ?? node.app_configs!.map(config => config.app)
-  selectedApps.value = next
-  checkedIds.value = selected.map(node => node.id)
-}
-
-async function submit() {
-  if (!ready.value) return
-  submitting.value = true
-  try {
-    emit('created', await api.createTaskGeneration(selections.value, generateN.value, version.value))
-    ElMessage.success('任务生成作业已提交')
-  } catch (error) { ElMessage.error((error as Error).message) }
-  finally { submitting.value = false }
-}
-
-function beforeUnload(event: BeforeUnloadEvent) {
-  if (dirty.value) { event.preventDefault(); event.returnValue = '' }
-}
-onBeforeRouteLeave(() => saving.value || submitting.value ? false : discardAllowed())
-onMounted(() => { void refresh(); window.addEventListener('beforeunload', beforeUnload) })
-onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
+defineExpose({ beginEdit, undo, redo, save, discardChanges, focusNode })
 </script>
 
 <template>
-  <section class="kb-card">
-    <div class="section-heading"><div><span class="eyebrow">KNOWLEDGE BASE</span><h2>知识库与版本</h2></div><div class="toolbar"><el-tag v-if="version" type="info">版本 {{ version.slice(0, 8) }}</el-tag><el-button :icon="Refresh" :disabled="editing || loading" @click="refresh">刷新</el-button><a v-if="version" :href="sceneTreeDownloadUrl()" download class="download-link"><el-icon><Download /></el-icon>下载已保存场景树</a></div></div>
-    <div class="kb-grid"><article v-for="item in knowledgeBases" :key="item.kind"><div><el-tag :type="item.valid ? 'success' : 'danger'" size="small">{{ item.valid ? '可用' : '未就绪' }}</el-tag><strong>{{ kbNames[item.kind] }}</strong></div><p>{{ item.filename }} · {{ item.rows ?? 0 }} 行</p><small v-if="item.error">{{ item.error }}</small><label class="upload" :class="{ disabled: editing || loading }"><el-icon><Upload /></el-icon>替换 Excel<input type="file" accept=".xlsx,.xlsm" :disabled="editing || loading" @change="replaceKnowledgeBase(item.kind, $event)" /></label></article></div>
-  </section>
-  <el-alert v-if="failure" :title="failure" type="error" :closable="false" show-icon class="notice" />
-  <el-alert v-for="warning in warnings" :key="warning" :title="warning" type="warning" :closable="false" class="notice" />
-  <section class="workbench" v-loading="loading || saving">
-    <div class="section-heading"><div><span class="eyebrow">SCENARIO COVERAGE</span><h2>场景能力 · 任务类型</h2><p>场景 → 一级能力 → 任务类型。点击查看详情，勾选用于生成。</p></div><div class="toolbar"><template v-if="editing"><el-tag :type="dirty ? 'warning' : 'info'">{{ dirty ? '有未保存修改' : '编辑模式' }}</el-tag><el-button @click="addNode()" :icon="Plus">新增场景</el-button><el-button @click="cancelEdit">取消</el-button><el-button type="primary" :disabled="!dirty" @click="save">保存场景树</el-button></template><el-button v-else :icon="Edit" :disabled="!version || submitting" @click="beginEdit">编辑场景树</el-button></div></div>
-    <el-alert v-if="editing" title="编辑模式：保存后才影响新作业。修改期间暂停提交生成；先验状态在保存后刷新。" type="info" :closable="false" class="notice" />
-    <div class="editor-layout">
-      <div class="tree-pane">
-        <el-input v-model="filterText" clearable placeholder="搜索场景、能力、任务类型或 App" @input="treeRef?.filter(filterText)" />
-        <el-tree ref="treeRef" :key="editing ? 'edit' : 'browse'" class="scenario-tree" :data="displayTree" node-key="id" :show-checkbox="!editing" highlight-current :expand-on-click-node="false" :filter-node-method="filterNode" :props="{ label: 'label', children: 'children', disabled: checkable }" :current-node-key="focusedId" @node-click="handleTreeNodeClick" @check="onCheck">
-          <template #default="{ data }"><button v-if="isAddAction(data)" type="button" class="tree-add-action" :aria-label="data.label" @click.stop="activateAddAction(data)"><el-icon><Plus /></el-icon><span>{{ data.label.replace('＋ ', '') }}</span></button><span v-else class="tree-label">{{ data.label }}<small v-if="data.kind === 'sub_capability'">{{ data.app_configs?.length ? `${data.app_configs.length} 个 App` : '未配置 App' }}</small></span></template>
-        </el-tree>
-        <el-empty v-if="!displayTree.length" description="暂无场景，可进入编辑模式新增" :image-size="70" />
+  <section class="scenario-editor" v-loading="saving">
+    <el-alert v-if="failure" :title="failure" type="error" :closable="false" show-icon />
+
+    <nav class="scene-strip" aria-label="一级场景">
+      <div class="scene-tabs">
+        <div v-for="scene in sceneNodes" :key="scene.id" class="scene-tab-wrap">
+          <button
+            type="button"
+            class="scene-tab"
+            :class="{ active: selectedL1 === scene.id, 'search-hit': highlightId === scene.id }"
+            :draggable="editing"
+            @click="selectScene(scene)"
+            @dblclick.stop="beginRename(scene)"
+            @dragstart="handleDragStart(scene)"
+            @dragover.prevent="handleDragOver(scene)"
+            @drop.prevent="handleDrop(scene)"
+          >
+            <input v-if="renameId === scene.id" :value="renameText" class="scene-rename-input" autofocus @click.stop @input="renameText = ($event.target as HTMLInputElement).value" @keydown.enter.prevent="commitRename(scene)" @keydown.esc.prevent="cancelRename" @blur="commitRename(scene)" />
+            <span v-else>{{ scene.label }}</span>
+          </button>
+          <el-dropdown v-if="editing" trigger="click" @command="handleCommand(scene, $event as ScenarioNodeCommand)">
+            <button type="button" class="scene-more" aria-label="场景操作" @click.stop>···</button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item command="rename">重命名</el-dropdown-item>
+                <el-dropdown-item command="details">编辑详情</el-dropdown-item>
+                <el-dropdown-item command="add">添加能力</el-dropdown-item>
+                <el-dropdown-item divided command="delete">删除整棵子树</el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+        </div>
+        <div v-if="addingKind === 'scene'" class="scene-creator">
+          <input :value="addText" class="scene-creator-input" autofocus placeholder="输入场景名称" maxlength="200" @input="addText = ($event.target as HTMLInputElement).value" @keydown.enter.prevent="commitAdd" @keydown.esc.prevent="cancelAdd" />
+          <button type="button" @click="cancelAdd">×</button>
+        </div>
+        <button v-if="editing && addingKind !== 'scene'" type="button" class="scene-add" @click="startAdd(undefined, 'scene')"><el-icon><Plus /></el-icon>新增一级场景</button>
+        <button v-if="editing && addingKind === 'scene'" type="button" class="scene-add scene-add--muted" @click="cancelAdd">取消</button>
       </div>
-      <div class="detail-pane">
-        <template v-if="focused">
-          <div class="detail-title"><el-tag>{{ kindNames[focused.kind] }}</el-tag><span>{{ nodePath(realTree, focused.id).join(' / ') }}</span></div>
-          <template v-if="editing">
-            <label class="field-label">{{ kindNames[focused.kind] }}名称</label><el-input v-model="focused.label" maxlength="200" placeholder="请输入节点名称" aria-label="节点名称" />
-            <div class="node-actions"><el-button v-if="focused.kind !== 'sub_capability'" :icon="Plus" @click="addNode(focused)">{{ focused.kind === 'scene' ? '新增一级能力' : '新增任务类型' }}</el-button><el-button type="danger" plain @click="deleteFocused">删除此节点</el-button></div>
-          </template>
-          <h3 v-else>{{ focused.label }}</h3>
-          <template v-if="focused.kind === 'sub_capability'">
-            <label class="field-label">适用 App</label>
-            <el-select v-if="editing" :model-value="(focused.app_configs || []).map(config => config.app)" multiple filterable allow-create default-first-option placeholder="选择或输入 App 名称后按回车" aria-label="适用 App" @update:model-value="setApps"><el-option v-for="app in appOptions" :key="app" :value="app" :label="app" /></el-select>
-            <p v-if="!focused.app_configs?.length" class="empty-note">尚未配置 App，此任务类型暂不可生成。</p>
-            <article v-for="config in focused.app_configs" :key="config.app" class="app-config">
-              <div class="app-heading"><strong>{{ config.app }}</strong><el-tag :type="config.control_prior_available ? 'success' : 'warning'" size="small">{{ config.control_prior_available ? '操控先验已匹配' : '缺少操控先验 · 仍可生成' }}</el-tag></div>
-              <div class="resource-row"><label>使用资源先验</label><el-switch v-model="config.use_resource_prior" :disabled="!editing" :aria-label="`${config.app} 使用资源先验`" /><small>资源 {{ config.resource_count ?? 0 }} 条</small></div>
-              <small v-if="config.use_resource_prior && !config.resource_count" class="warning">该 App 暂无资源数据，生成时将使用空资源先验。</small>
-              <label class="field-label">参考示例</label><el-input v-if="editing" v-model="config.reference_example" type="textarea" :rows="3" maxlength="20000" :aria-label="`${config.app} 参考示例`" placeholder="填写该 App 下的任务参考示例（可选）" /><p v-else class="example">{{ config.reference_example || '未配置参考示例' }}</p>
-            </article>
-          </template>
-          <p v-else class="empty-note">包含 {{ leaves([focused]).length }} 个任务类型。展开子节点查看适用 App 和生成配置。</p>
+    </nav>
+
+    <div class="path-bar">
+      <span class="path-root">场景体系</span>
+      <template v-for="(node, index) in pathNodes" :key="node.id">
+        <span class="path-separator">›</span>
+        <button type="button" :class="{ current: index === pathNodes.length - 1 }" @click="selectNode(node)">{{ node.label }}</button>
+      </template>
+      <span v-if="!pathNodes.length" class="path-placeholder">选择一个场景开始浏览</span>
+    </div>
+
+    <main class="column-browser">
+      <ScenarioColumn
+        title="能力"
+        kind="capability"
+        :nodes="capabilityNodes"
+        :selected-id="selectedL2"
+        :editing="editing"
+        :adding-kind="addingKind"
+        :adding-parent-id="addingParentId"
+        :add-parent-id="selectedL1"
+        :add-text="addText"
+        :rename-id="renameId"
+        :rename-text="renameText"
+        :drop-target-id="dropTargetId"
+        :highlight-id="highlightId"
+        add-label="添加能力"
+        empty-title="当前场景还没有能力"
+        empty-description="添加第一个能力，开始搭建场景体系"
+        :add-disabled="!selectedScene"
+        @select="selectCapability"
+        @command="handleColumnCommand"
+        @start-add="requestAdd(selectedScene, 'capability')"
+        @update-add-text="addText = $event"
+        @commit-add="commitAdd"
+        @cancel-add="cancelAdd"
+        @start-rename="beginRename"
+        @update-rename-text="renameText = $event"
+        @commit-rename="commitRename"
+        @cancel-rename="cancelRename"
+        @drag-start="handleDragStart"
+        @drag-over="handleDragOver"
+        @drop="handleDrop"
+      />
+      <ScenarioColumn
+        title="子能力"
+        kind="sub_capability"
+        :nodes="subCapabilityNodes"
+        :selected-id="selectedL3"
+        :editing="editing"
+        :adding-kind="addingKind"
+        :adding-parent-id="addingParentId"
+        :add-parent-id="selectedL2"
+        :add-text="addText"
+        :rename-id="renameId"
+        :rename-text="renameText"
+        :drop-target-id="dropTargetId"
+        :highlight-id="highlightId"
+        add-label="添加子能力"
+        empty-title="当前能力还没有子能力"
+        empty-description="创建子能力，定义可生成的任务类型"
+        :add-disabled="!selectedCapability"
+        @select="selectSubCapability"
+        @command="handleColumnCommand"
+        @start-add="requestAdd(selectedCapability, 'sub_capability')"
+        @update-add-text="addText = $event"
+        @commit-add="commitAdd"
+        @cancel-add="cancelAdd"
+        @start-rename="beginRename"
+        @update-rename-text="renameText = $event"
+        @commit-rename="commitRename"
+        @cancel-rename="cancelRename"
+        @drag-start="handleDragStart"
+        @drag-over="handleDragOver"
+        @drop="handleDrop"
+      />
+      <ScenarioColumn
+        title="App"
+        kind="app"
+        :nodes="selectedSubCapability ? appNodes(selectedSubCapability) : []"
+        :selected-id="selectedApp"
+        :editing="editing"
+        :adding-kind="addingKind"
+        :adding-parent-id="addingParentId"
+        :add-parent-id="selectedL3"
+        :add-text="addText"
+        :rename-id="renameId"
+        :rename-text="renameText"
+        :drop-target-id="dropTargetId"
+        :highlight-id="highlightId"
+        add-label="新增 App"
+        empty-title="当前子能力还没有 App"
+        empty-description="新增或绑定 App 后，任务生成才会有执行范围"
+        :show-footer-add="false"
+        @select="selectApp"
+        @command="handleColumnCommand"
+        @start-rename="beginRename"
+        @update-rename-text="renameText = $event"
+        @commit-rename="commitRename"
+        @cancel-rename="cancelRename"
+        @drag-start="handleDragStart"
+        @drag-over="handleDragOver"
+        @drop="handleDrop"
+      >
+        <template #footer-extra>
+          <ScenarioAppBindingPopover :apps="appLibrary" :selected-apps="selectedApps" :disabled="!selectedSubCapability" @open="openAppBinding" @confirm="bindApps" />
         </template>
-        <el-empty v-else description="点击左侧节点查看或编辑配置" :image-size="80" />
+      </ScenarioColumn>
+    </main>
+
+    <p v-if="!editing" class="studio-tip">进入编辑模式后可双击名称快速重命名；App 可在“新增 App”入口中绑定已有 App 或直接创建。</p>
+  </section>
+
+  <el-drawer v-model="detailVisible" :title="detailTitle" size="min(420px, 92vw)" destroy-on-close>
+    <template v-if="detailDraft">
+      <div class="detail-form">
+        <div class="detail-path">{{ nodePath(realTree, detailDraft.id).join(' › ') }}</div>
+        <label>名称</label>
+        <el-input v-model="detailDraft.label" :disabled="!editing" maxlength="200" />
+        <label>描述</label>
+        <el-input v-model="detailDraft.description" :disabled="!editing" type="textarea" :rows="6" maxlength="20000" />
+        <template v-if="detailDraft.kind === 'app'">
+          <label>参考示例</label>
+          <el-input v-model="detailDraft.reference_example" :disabled="!editing" type="textarea" :rows="6" maxlength="20000" />
+          <div class="detail-switch"><span>使用资源先验</span><el-switch v-model="detailDraft.use_resource_prior" :disabled="!editing" /></div>
+        </template>
       </div>
-    </div>
-  </section>
-  <section class="generation-card">
-    <div class="section-heading"><div><span class="eyebrow">GENERATION CONTROL</span><h2>生成范围</h2><p>按任务类型选择 App；每个选中 App 独立生成指定数量。</p></div><el-tag>已选 {{ selectedLeaves.length }} / {{ allLeaves.length }} 个任务类型</el-tag></div>
-    <div class="generation-layout">
-      <div class="selected-types"><p v-if="!selectedLeaves.length" class="empty-note">在上方勾选任务类型或整个场景，默认选中其全部适用 App。</p><article v-for="node in selectedLeaves" :key="node.id"><strong>{{ nodePath(tree, node.id).join(' / ') }}</strong><el-checkbox-group v-model="selectedApps[node.id]" :disabled="editing || submitting"><el-checkbox v-for="config in node.app_configs" :key="config.app" :value="config.app">{{ config.app }}</el-checkbox></el-checkbox-group><small v-if="!selectedApps[node.id]?.length" class="warning">至少选择一个 App，或在树中取消此任务类型。</small></article></div>
-      <aside class="submit-panel"><label class="field-label">每个任务类型 / App 生成数量</label><el-input-number v-model="generateN" :min="1" :max="20" :disabled="editing || submitting" /><div class="estimate"><strong>{{ unitCount * generateN }}</strong><span>条预计主任务</span></div><p>{{ selectedLeaves.length }} 个任务类型 · {{ unitCount }} 个类型/App 执行单元 × {{ generateN }} 条<br />弱依赖前置任务另计。</p><el-button type="primary" size="large" :disabled="!ready" :loading="submitting" @click="submit">提交任务生成</el-button><small v-if="editing" class="warning">请先保存或取消场景树编辑。</small></aside>
-    </div>
-  </section>
+    </template>
+    <template #footer>
+      <el-button @click="detailVisible = false">取消</el-button>
+      <el-button v-if="editing" type="primary" @click="saveDetails">完成</el-button>
+    </template>
+  </el-drawer>
+
+  <el-dialog v-model="moveVisible" title="移动节点" width="min(520px, 92vw)">
+    <p class="dialog-copy">选择合法的新父节点，节点身份和子树会保持不变。</p>
+    <el-select v-model="moveTargetId" filterable placeholder="选择新父节点" style="width:100%">
+      <el-option v-for="node in moveCandidates" :key="node.id" :value="node.id" :label="`${NODE_LEVELS[node.kind]} · ${nodePath(realTree, node.id).join(' / ')}`" />
+    </el-select>
+    <template #footer><el-button @click="moveVisible = false">取消</el-button><el-button type="primary" :disabled="!moveTargetId" @click="confirmMove">移动</el-button></template>
+  </el-dialog>
 </template>
 
 <style scoped>
-.kb-card,.workbench,.generation-card{margin-top:20px;padding:22px;border:1px solid var(--line);border-radius:18px;background:rgba(255,255,255,.86);box-shadow:0 12px 35px rgba(15,23,42,.04)}
-.section-heading,.toolbar,.app-heading,.detail-title,.resource-row{display:flex;align-items:center;gap:12px}.section-heading{justify-content:space-between;flex-wrap:wrap;margin-bottom:18px}.section-heading h2{font-size:21px;margin:5px 0}.section-heading p,.submit-panel p{font-size:12px;color:var(--muted);line-height:1.7;margin:5px 0 0}.toolbar{flex-wrap:wrap}.kb-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.kb-grid article{padding:14px;border:1px solid var(--line);border-radius:12px;background:#fff}.kb-grid article>div{display:flex;align-items:center;gap:8px}.kb-grid p{font-size:12px;color:var(--muted)}.kb-grid small{display:block;color:#b91c1c}.upload,.download-link{display:inline-flex;gap:5px;align-items:center;font-size:12px;color:var(--accent-deep);cursor:pointer;text-decoration:none}.upload input{display:none}.upload.disabled{opacity:.45;cursor:not-allowed}.notice{margin:12px 0}.editor-layout{display:grid;grid-template-columns:minmax(290px,.9fr) minmax(0,1.1fr);min-height:380px}.tree-pane{padding-right:20px;border-right:1px solid var(--line);min-width:0}.scenario-tree{margin-top:14px;max-height:600px;overflow:auto}.tree-label{display:flex;align-items:center;gap:10px;font-size:13px}.tree-label small{font-size:11px;color:#94a3b8}.tree-add-action{display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border:1px solid var(--line);border-radius:5px;background:transparent;color:var(--accent-deep);font-size:12px;line-height:1.5;cursor:pointer}.tree-add-action:hover{border-color:var(--accent);background:transparent;color:var(--accent-deep)}.detail-pane{padding-left:24px;min-width:0;max-height:665px;overflow:auto}.detail-title{font-size:12px;color:var(--muted);flex-wrap:wrap;margin-bottom:16px}.detail-pane h3{font-size:22px;margin:8px 0 20px}.field-label{display:block;font-size:12px;font-weight:700;margin:12px 0 8px;color:var(--muted)}.node-actions{display:flex;gap:8px;margin:12px 0 22px}.app-config{border:1px solid var(--line);border-radius:12px;padding:15px;margin-top:12px;background:#fff}.app-heading{justify-content:space-between;flex-wrap:wrap}.resource-row{margin-top:12px;font-size:12px}.resource-row small{color:var(--muted)}.example{white-space:pre-wrap;font-size:13px;line-height:1.8;margin:4px 0;overflow-wrap:anywhere}.empty-note{font-size:13px;color:var(--muted);line-height:1.8}.warning{color:#b45309;font-size:11px}.generation-layout{display:grid;grid-template-columns:minmax(0,1fr) 285px;gap:24px}.selected-types{max-height:390px;overflow:auto}.selected-types article{padding:13px 0;border-bottom:1px solid var(--line)}.selected-types strong{font-size:13px}.submit-panel{padding:0 0 0 22px;border-left:1px solid var(--line);display:flex;align-items:flex-start;flex-direction:column;gap:10px}.submit-panel .field-label{margin-top:0}.submit-panel .el-button{width:100%;margin-top:6px}.estimate{display:flex;gap:10px;align-items:baseline}.estimate strong{font-size:34px;line-height:1.1;color:var(--accent-deep)}.estimate span{font-size:12px;color:var(--muted)}
-@media(max-width:1050px){.kb-grid{grid-template-columns:1fr}.editor-layout{grid-template-columns:1fr}.tree-pane{border-right:0;padding:0 0 18px}.scenario-tree{max-height:360px}.detail-pane{border-top:1px solid var(--line);padding:20px 0 0;max-height:none}.generation-layout{grid-template-columns:1fr}.submit-panel{border-left:0;border-top:1px solid var(--line);padding:20px 0 0}.section-heading{gap:12px}.selected-types{max-height:300px}}
+.scenario-editor{position:relative;margin-top:18px;padding:0 0 18px;border:1px solid var(--line);border-radius:18px;background:rgba(255,255,255,.84);box-shadow:0 12px 35px rgba(15,23,42,.035);overflow:visible}.studio-header{position:relative;display:flex;align-items:flex-end;justify-content:space-between;gap:24px;padding:23px 24px 18px;border-bottom:1px solid var(--line)}.studio-heading h2{margin:5px 0 4px;color:#182535;font-size:22px;letter-spacing:-.025em}.studio-heading p{margin:0;color:var(--muted);font-size:12px}.studio-actions{display:flex;align-items:center;justify-content:flex-end;gap:4px;flex-wrap:wrap}.studio-meta{margin-right:7px;color:#94a3b8;font-size:10px;white-space:nowrap}.studio-search{width:235px}.saved-state{font-size:11px}.search-results-popover{position:absolute;z-index:10;top:78px;right:170px;width:min(420px,calc(100% - 48px));max-height:410px;overflow:auto;padding:9px;border:1px solid #cfdde1;border-radius:12px;background:#fff;box-shadow:0 18px 40px rgba(15,23,42,.14)}.search-results-head{display:flex;justify-content:space-between;padding:6px 8px 9px;color:#334155;font-size:12px}.search-results-head span{color:#94a3b8;font-size:10px}.search-result{display:grid;gap:4px;width:100%;padding:9px 8px;border:0;border-radius:7px;background:transparent;color:#64748b;text-align:left;cursor:pointer}.search-result:hover{background:#f8fafc}.search-result>span:last-child{overflow:hidden;font-size:10px;text-overflow:ellipsis;white-space:nowrap}.search-result-title{display:flex;align-items:center;gap:7px;color:#334155}.search-result-title small{color:#0f766e;font-size:9px;font-weight:900}.search-no-result{padding:20px;color:#94a3b8;font-size:11px;text-align:center}.el-alert{margin:14px 20px 0}.scene-strip{padding:0 20px;border-bottom:1px solid var(--line)}.scene-tabs{display:flex;align-items:center;gap:3px;min-width:0;overflow-x:auto;scrollbar-width:thin}.scene-tab-wrap{display:flex;align-items:center;flex:0 0 auto}.scene-tab{position:relative;display:inline-flex;align-items:center;min-height:51px;padding:0 13px;border:0;border-bottom:2px solid transparent;background:transparent;color:#64748b;font-size:13px;cursor:pointer;white-space:nowrap}.scene-tab:hover{color:#334155;background:#fafdfd}.scene-tab.active{border-bottom-color:var(--accent);color:#1e293b;font-weight:800}.scene-tab.search-hit{animation:search-hit 1.2s ease}.scene-more{align-self:center;margin-left:-8px;padding:3px;border:0;background:transparent;color:#94a3b8;font-size:12px;cursor:pointer}.scene-more:hover{color:var(--accent-deep)}.scene-add{display:inline-flex;align-items:center;gap:4px;flex:0 0 auto;margin-left:7px;padding:6px 8px;border:0;border-radius:6px;background:transparent;color:var(--accent-deep);font-size:11px;cursor:pointer}.scene-add:hover{background:#f0fdfa}.scene-add--muted{color:#94a3b8}.scene-creator{display:flex;align-items:center;gap:3px;flex:0 0 auto;margin-left:7px;padding:5px 5px 5px 9px;border:1px solid #9bd8d0;border-radius:7px;background:#fff}.scene-creator-input{width:115px;border:0;outline:0;color:#334155;font-size:12px}.scene-creator button{border:0;background:transparent;color:#94a3b8;font-size:17px;cursor:pointer}.scene-rename-input{width:90px;border:0;border-bottom:1px solid var(--accent);outline:0;background:transparent;color:inherit;font:inherit}.path-bar{display:flex;align-items:center;gap:8px;min-height:53px;padding:0 24px;color:#64748b;font-size:12px;white-space:nowrap;overflow-x:auto}.path-root{color:#94a3b8;font-size:11px}.path-separator{color:#cbd5e1;font-size:17px}.path-bar button{padding:4px 5px;border:0;border-radius:5px;background:transparent;color:#64748b;font-size:12px;cursor:pointer}.path-bar button:hover{background:#f1f5f9;color:#334155}.path-bar button.current{color:#1e293b;font-weight:800}.path-placeholder{color:#c0cbd0;font-size:11px}.column-browser{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));margin:0 18px;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:#fbfdfd}.column-browser>.scenario-column+ .scenario-column{border-left:1px solid var(--line)}.studio-tip{margin:13px 24px 0;color:#94a3b8;font-size:10px}.detail-form{display:grid;gap:8px}.detail-path{margin-bottom:6px;padding-bottom:10px;border-bottom:1px solid var(--line);color:#94a3b8;font-size:11px;line-height:1.6}.detail-form label{margin-top:8px;color:#64748b;font-size:11px;font-weight:800}.detail-switch{display:flex;align-items:center;justify-content:space-between;margin-top:12px;color:#475569;font-size:12px}.dialog-copy{color:var(--muted);font-size:12px}@keyframes search-hit{0%,100%{box-shadow:none}35%{box-shadow:0 0 0 4px rgba(20,184,166,.2)}}@media(max-width:1180px){.studio-header{align-items:flex-start;flex-direction:column}.studio-actions{justify-content:flex-start}.search-results-popover{top:146px;right:24px}.studio-meta{display:none}}@media(max-width:780px){.studio-header{padding:19px 16px 15px}.studio-heading h2{font-size:19px}.studio-actions{width:100%;align-items:stretch}.studio-search{width:100%}.studio-actions :deep(.el-button){margin-left:0}.scene-strip{padding:0 12px}.path-bar{padding:0 16px}.column-browser{display:block;margin:0 12px}.column-browser>.scenario-column+ .scenario-column{border-top:1px solid var(--line);border-left:0}.scenario-column{min-height:320px}.column-list{min-height:190px}.search-results-popover{right:16px;width:calc(100% - 32px)}}
 </style>

@@ -118,27 +118,31 @@ def snapshot_knowledge_base(destination: Path, *, root: Path = KNOWLEDGE_BASE_DI
 
 
 def scene_tree_text(root: Path) -> str:
-    from .tree_store import flatten, read_tree
+    from .tree_store import _app_nodes, flatten, read_tree
     lines = []
     for leaf, labels in flatten(read_tree(root)["scenes"]):
-        apps = ", ".join(config["app"] for config in leaf["app_configs"])
+        apps = ", ".join(config["label"] for config in _app_nodes(leaf))
         if apps:
             lines.append(f"{' > '.join(labels)} | 涵盖App：{apps}")
     return "\n".join(lines)
 
 
 def merged_nodes(root: Path = KNOWLEDGE_BASE_DIR, *, sample_num: int = 1) -> list[dict[str, Any]]:
-    from .tree_store import current_root, flatten, prior_status, read_tree
+    from .tree_store import _app_nodes, current_root, flatten, prior_status, read_tree
     root = current_root(root)
     controls, _, _ = prior_status(root)
     with pd.ExcelFile(_path("resource_prior", root)) as resource_book:
         resources = {sheet: pd.read_excel(resource_book, sheet_name=sheet) for sheet in resource_book.sheet_names}
     result = []
     for leaf, labels in flatten(read_tree(root)["scenes"]):
-        for config in leaf["app_configs"]:
-            app = config["app"]
+        for config in _app_nodes(leaf):
+            app = config["label"]
             item = dict(zip(("scene", "capability", "sub_capability"), labels))
-            item.update(config)
+            item.update({
+                "app": app,
+                "reference_example": config.get("reference_example", ""),
+                "use_resource_prior": config.get("use_resource_prior", False),
+            })
             item.update({"target_app": app, "task_type_id": leaf["id"], "sub_capability_desc": controls.get((*labels, app)) or "无"})
             selected: list[dict[str, Any]] = []
             if config["use_resource_prior"] and app in resources and not resources[app].empty:

@@ -1,7 +1,8 @@
 """Editable scenario tree and immutable, atomically published knowledge bundles.
 
-Only current.json is replaced during publication. Readers and job snapshots pin
-one immutable directory; legacy workbooks at the root are never overwritten.
+The persisted tree has four semantic levels: scene, capability, task type and
+App. Older versions stored Apps as ``app_configs`` on the task-type node; the
+first read/publication upgrades that shape without changing existing IDs.
 """
 from __future__ import annotations
 
@@ -26,8 +27,9 @@ from .knowledge_base import _clean, _truthy, parse_app_list, validate_workbook
 
 TREE_FILE = "scene_tree.json"
 META_SHEET = "_scene_tree_nodes"
-SCENE_COLUMNS = ["scene", "capability", "sub_capability", "target_app", "use_resource_prior", "reference_example"]
-KINDS = ("scene", "capability", "sub_capability")
+PATH_COLUMNS = ["scene", "capability", "sub_capability"]
+SCENE_COLUMNS = [*PATH_COLUMNS, "target_app", "use_resource_prior", "reference_example", "description"]
+KINDS = ("scene", "capability", "sub_capability", "app")
 _LOCK = threading.RLock()
 
 
@@ -82,13 +84,135 @@ def _pointed_root(root: Path) -> Path | None:
     return target
 
 
+def _app_nodes(task_type: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return App children while accepting the old app_configs shape."""
+    children = task_type.get("children")
+    if isinstance(children, list):
+        result = []
+        for item in children:
+            if isinstance(item, dict) and item.get("kind") == "app":
+                value = dict(item)
+                value.setdefault("app", value.get("label", ""))
+                result.append(value)
+        return result
+    result = []
+    for config in task_type.get("app_configs", []) or []:
+        if not isinstance(config, dict):
+            continue
+        result.append({
+            "id": str(config.get("id") or uuid.uuid4()),
+            "kind": "app",
+            "label": str(config.get("app") or ""),
+            "app": str(config.get("app") or ""),
+            "description": str(config.get("description") or ""),
+            "reference_example": str(config.get("reference_example") or ""),
+            "use_resource_prior": bool(config.get("use_resource_prior", False)),
+        })
+    return result
+
+
 def flatten(scenes: list[dict[str, Any]]) -> list[tuple[dict[str, Any], tuple[str, str, str]]]:
-    return [(leaf, (scene["label"], capability["label"], leaf["label"]))
-            for scene in scenes for capability in scene.get("children", [])
-            for leaf in capability.get("children", [])]
+    """Return L3 task types and their L1/L2/L3 labels."""
+    return [
+        (task_type, (scene["label"], capability["label"], task_type["label"]))
+        for scene in scenes
+        for capability in scene.get("children", [])
+        for task_type in capability.get("children", [])
+    ]
 
 
-def validate_tree(scenes: Any) -> list[dict[str, Any]]:
+def _migrate_legacy_scenes(scenes: Any) -> Any:
+    """Convert legacy L1/L2/L3 + app_configs to L1/L2/L3/App nodes."""
+    migrated = copy.deepcopy(scenes)
+    if not isinstance(migrated, list):
+        return migrated
+    for scene in migrated:
+        if not isinstance(scene, dict):
+            continue
+        scene.setdefault("description", "")
+        for capability in scene.get("children", []) or []:
+            if not isinstance(capability, dict):
+                continue
+            capability.setdefault("description", "")
+            for task_type in capability.get("children", []) or []:
+                if not isinstance(task_type, dict):
+                    continue
+                task_type.setdefault("description", "")
+                if task_type.get("kind") != "sub_capability":
+                    continue
+                if isinstance(task_type.get("children"), list):
+                    for app in task_type["children"]:
+                        if isinstance(app, dict):
+                            app.setdefault("description", "")
+                    task_type.pop("app_configs", None)
+                    continue
+                children = []
+                for config in task_type.pop("app_configs", []) or []:
+                    if not isinstance(config, dict):
+                        continue
+                    children.append({
+                        "id": str(config.get("id") or uuid.uuid4()),
+                        "kind": "app",
+                        "label": str(config.get("app") or "").strip(),
+                        "description": str(config.get("description") or ""),
+                        "reference_example": str(config.get("reference_example") or ""),
+                        "use_resource_prior": bool(config.get("use_resource_prior", False)),
+                    })
+                task_type["children"] = children
+    return migrated
+
+
+def _has_legacy_apps(scenes: Any) -> bool:
+    if not isinstance(scenes, list):
+        return False
+    for scene in scenes:
+        for capability in (scene.get("children", []) if isinstance(scene, dict) else []) or []:
+            for task_type in (capability.get("children", []) if isinstance(capability, dict) else []) or []:
+                if isinstance(task_type, dict) and "app_configs" in task_type:
+                    return True
+    return False
+
+
+def _normalize_tree_payload(scenes: Any) -> Any:
+    """Accept the read-only ``app_configs`` projection from older clients.
+
+    The persisted representation is always four-level.  The API still returns
+    ``app_configs`` for old consumers, so a client that sends that projection
+    back should not accidentally fail just because it has not migrated yet.
+    New clients send real L4 children and take the normal strict validation
+    path below.
+    """
+    value = copy.deepcopy(scenes)
+    if not isinstance(value, list):
+        return value
+    for scene in value:
+        if not isinstance(scene, dict):
+            continue
+        for capability in (scene.get("children", []) or []):
+            if not isinstance(capability, dict):
+                continue
+            for task_type in (capability.get("children", []) or []):
+                if not isinstance(task_type, dict) or "app_configs" not in task_type:
+                    continue
+                configs = task_type.pop("app_configs") or []
+                children = []
+                for config in configs:
+                    if not isinstance(config, dict):
+                        continue
+                    app = str(config.get("app") or config.get("label") or "").strip()
+                    children.append({
+                        "id": str(config.get("id") or uuid.uuid4()),
+                        "kind": "app",
+                        "label": app,
+                        "description": str(config.get("description") or ""),
+                        "reference_example": str(config.get("reference_example") or ""),
+                        "use_resource_prior": config.get("use_resource_prior", False),
+                    })
+                task_type["children"] = children
+    return _migrate_legacy_scenes(value)
+
+
+def _validate_four_level_tree(scenes: Any) -> list[dict[str, Any]]:
     seen_ids: set[str] = set()
 
     def walk(nodes: Any, depth: int) -> list[dict[str, Any]]:
@@ -98,7 +222,7 @@ def validate_tree(scenes: Any) -> list[dict[str, Any]]:
         names: set[str] = set()
         for value in nodes:
             if not isinstance(value, dict) or value.get("kind") != KINDS[depth]:
-                raise ValueError("场景树必须按场景、一级能力、任务类型三级组织")
+                raise ValueError("场景树必须按 L1 场景、L2 场景、L3 任务类型、L4 App 组织")
             name = value.get("label")
             if not isinstance(name, str) or not name.strip() or len(name.strip()) > 200:
                 raise ValueError("节点名称不能为空且不能超过 200 字")
@@ -113,38 +237,33 @@ def validate_tree(scenes: Any) -> list[dict[str, Any]]:
             if identifier in seen_ids:
                 raise ValueError("节点 ID 不能重复")
             seen_ids.add(identifier)
-            node = {"id": identifier, "kind": KINDS[depth], "label": name}
-            if depth < 2:
+            description = value.get("description", "")
+            if not isinstance(description, str) or len(description) > 20000:
+                raise ValueError("节点描述必须是文本（最多 20000 字）")
+            node = {"id": identifier, "kind": KINDS[depth], "label": name, "description": description}
+            if depth < 3:
                 if value.get("app_configs"):
-                    raise ValueError("只能在任务类型节点配置 App")
+                    raise ValueError("App 必须作为 L4 节点配置")
                 node["children"] = walk(value.get("children", []), depth + 1)
             else:
                 if value.get("children"):
-                    raise ValueError("任务类型不能包含子节点")
-                configs = value.get("app_configs", [])
-                if not isinstance(configs, list):
-                    raise ValueError("App 配置必须是数组")
-                apps: set[str] = set()
-                node["app_configs"] = []
-                for config in configs:
-                    if not isinstance(config, dict):
-                        raise ValueError("App 配置格式错误")
-                    app = config.get("app")
-                    example = config.get("reference_example", "")
-                    resource = config.get("use_resource_prior", False)
-                    if not isinstance(app, str) or not app.strip() or len(app.strip()) > 200:
-                        raise ValueError("App 名称不能为空且不能超过 200 字")
-                    app = app.strip()
-                    if app in apps:
-                        raise ValueError(f"任务类型 {name} 的 App 重复：{app}")
-                    if not isinstance(example, str) or len(example) > 20000 or not isinstance(resource, bool):
-                        raise ValueError("参考示例必须是文本（最多 20000 字），资源开关必须是布尔值")
-                    apps.add(app)
-                    node["app_configs"].append({"app": app, "reference_example": example, "use_resource_prior": resource})
+                    raise ValueError("App 不能包含子节点")
+                if value.get("app_configs"):
+                    raise ValueError("App 节点不能包含 app_configs")
+                example = value.get("reference_example", "")
+                resource = value.get("use_resource_prior", False)
+                if not isinstance(example, str) or len(example) > 20000 or not isinstance(resource, bool):
+                    raise ValueError("参考示例必须是文本（最多 20000 字），资源开关必须是布尔值")
+                node.update({"reference_example": example, "use_resource_prior": resource})
             result.append(node)
         return result
 
     return walk(scenes, 0)
+
+
+def validate_tree(scenes: Any) -> list[dict[str, Any]]:
+    """Validate and normalize a tree, including the legacy API projection."""
+    return _validate_four_level_tree(_normalize_tree_payload(scenes))
 
 
 def _paths(scenes: list[dict[str, Any]]) -> dict[tuple[str, ...], dict[str, Any]]:
@@ -161,22 +280,35 @@ def _paths(scenes: list[dict[str, Any]]) -> dict[tuple[str, ...], dict[str, Any]
 
 def import_scene_workbook(path: Path, previous: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     validate_workbook(path, "scene_tree")
-    previous_paths = _paths(previous or [])
+    previous = _migrate_legacy_scenes(previous or [])
+    previous_paths = _paths(previous)
     scenes: list[dict[str, Any]] = []
-    # The optional metadata sheet makes empty branches and UUIDs round-trip.
     with pd.ExcelFile(path) as book:
-        frame = pd.read_excel(book, sheet_name=0)
+        frame = pd.read_excel(book, sheet_name=0).fillna("")
         if META_SHEET in book.sheet_names:
             metadata = pd.read_excel(book, sheet_name=META_SHEET).fillna("")
             required = {"id", "parent_id", "kind", "label"}
             if not required.issubset(metadata.columns):
                 raise ValueError("场景树身份元数据缺少必要列")
-            by_id = {}
+            by_id: dict[str, dict[str, Any]] = {}
             for _, row in metadata.iterrows():
                 identifier = _clean(row["id"])
                 if identifier in by_id:
                     raise ValueError("场景树身份元数据 ID 重复")
-                by_id[identifier] = {"id": identifier, "label": _clean(row["label"]), "kind": row["kind"], "children": [], "app_configs": []}
+                kind = _clean(row["kind"])
+                node: dict[str, Any] = {
+                    "id": identifier,
+                    "label": _clean(row["label"]),
+                    "kind": kind,
+                    "description": _clean(row.get("description")),
+                    "children": [],
+                }
+                if kind == "app":
+                    node.update({
+                        "reference_example": _clean(row.get("reference_example")),
+                        "use_resource_prior": _truthy(row.get("use_resource_prior")),
+                    })
+                by_id[identifier] = node
             for _, row in metadata.iterrows():
                 node = by_id[_clean(row["id"])]
                 parent = _clean(row["parent_id"])
@@ -186,34 +318,49 @@ def import_scene_workbook(path: Path, previous: list[dict[str, Any]] | None = No
                     by_id[parent]["children"].append(node)
                 else:
                     scenes.append(node)
-            scenes = validate_tree(scenes)
             if len(_paths(scenes)) != len(by_id):
                 raise ValueError("场景树身份元数据含有孤立或循环节点")
     path_index = _paths(scenes)
     for row_number, (_, row) in enumerate(frame.iterrows(), start=2):
         if all(not _clean(row.get(key)) for key in SCENE_COLUMNS):
             continue
-        parts = tuple(_clean(row.get(key)) for key in SCENE_COLUMNS[:3])
+        parts = tuple(_clean(row.get(key)) for key in PATH_COLUMNS)
         if not all(parts):
             raise ValueError(f"场景树第 {row_number} 行的场景、能力和任务类型不能为空")
         parent_children = scenes
-        for depth in range(3):
-            key = parts[:depth + 1]
+        for depth, label in enumerate(parts):
+            key = parts[: depth + 1]
             node = path_index.get(key)
             if node is None:
-                node = {"id": previous_paths.get(key, {}).get("id", str(uuid.uuid4())), "label": parts[depth], "kind": KINDS[depth]}
-                node["app_configs" if depth == 2 else "children"] = []
+                node = {
+                    "id": previous_paths.get(key, {}).get("id", str(uuid.uuid4())),
+                    "label": label,
+                    "kind": KINDS[depth],
+                    "description": _clean(row.get("description")) if depth == 2 else "",
+                    "children": [],
+                }
                 parent_children.append(node)
                 path_index[key] = node
             if depth < 2:
-                parent_children = node["children"]
+                parent_children = node.setdefault("children", [])
         for app in dict.fromkeys(parse_app_list(row.get("target_app"))):
-            config = {"app": app, "reference_example": _clean(row.get("reference_example")), "use_resource_prior": _truthy(row.get("use_resource_prior"))}
-            existing = next((item for item in node["app_configs"] if item["app"] == app), None)
-            if existing and existing != config:
-                raise ValueError(f"场景树第 {row_number} 行与同任务类型/App 的配置冲突：{app}；请先合并冲突行")
-            if not existing:
-                node["app_configs"].append(config)
+            existing = next((item for item in node.get("children", []) if item.get("kind") == "app" and item.get("label") == app), None)
+            previous_app = previous_paths.get((*parts, app), {})
+            config = {
+                "id": existing.get("id", str(uuid.uuid4())) if existing else previous_app.get("id", str(uuid.uuid4())),
+                "kind": "app",
+                "label": app,
+                "description": existing.get("description", previous_app.get("description", "")) if existing else previous_app.get("description", ""),
+                "reference_example": _clean(row.get("reference_example")),
+                "use_resource_prior": _truthy(row.get("use_resource_prior")),
+            }
+            if existing:
+                old_config = {key: existing.get(key) for key in ("reference_example", "use_resource_prior")}
+                new_config = {key: config[key] for key in ("reference_example", "use_resource_prior")}
+                if old_config != new_config:
+                    raise ValueError(f"场景树第 {row_number} 行与同任务类型/App 的配置冲突：{app}；请先合并冲突行")
+            else:
+                node.setdefault("children", []).append(config)
     return validate_tree(scenes)
 
 
@@ -233,21 +380,31 @@ def write_scene_workbook(path: Path, scenes: list[dict[str, Any]]) -> None:
         for column, label in enumerate(SCENE_COLUMNS, 1):
             _string_cell(sheet, 1, column, label)
         row_number = 2
-        for leaf, path_labels in flatten(scenes):
-            for config in leaf["app_configs"]:
-                values = [*path_labels, json.dumps([config["app"]], ensure_ascii=False), config["use_resource_prior"], config["reference_example"]]
+        for task_type, path_labels in flatten(scenes):
+            for app in _app_nodes(task_type):
+                values = [
+                    *path_labels,
+                    json.dumps([app["label"]], ensure_ascii=False),
+                    app["use_resource_prior"],
+                    app["reference_example"],
+                    task_type.get("description", ""),
+                ]
                 for column, value in enumerate(values, 1):
                     _string_cell(sheet, row_number, column, value)
                 row_number += 1
         if META_SHEET in book.sheetnames:
             book.remove(book[META_SHEET])
         meta = book.create_sheet(META_SHEET)
-        meta.append(["id", "parent_id", "kind", "label"])
+        meta.append(["id", "parent_id", "kind", "label", "description", "reference_example", "use_resource_prior"])
 
         def visit(nodes: list[dict[str, Any]], parent: str = "") -> None:
             for node in nodes:
                 index = meta.max_row + 1
-                for column, value in enumerate([node["id"], parent, node["kind"], node["label"]], 1):
+                values = [
+                    node["id"], parent, node["kind"], node["label"], node.get("description", ""),
+                    node.get("reference_example", ""), node.get("use_resource_prior", ""),
+                ]
+                for column, value in enumerate(values, 1):
                     _string_cell(meta, index, column, value)
                 visit(node.get("children", []), node["id"])
         visit(scenes)
@@ -257,27 +414,89 @@ def write_scene_workbook(path: Path, scenes: list[dict[str, Any]]) -> None:
         book.close()
 
 
+def _app_paths(scenes: list[dict[str, Any]]) -> dict[tuple[str, str], tuple[tuple[str, str, str], str]]:
+    result: dict[tuple[str, str], tuple[tuple[str, str, str], str]] = {}
+    for task_type, labels in flatten(scenes):
+        for app in _app_nodes(task_type):
+            result[(task_type["id"], app["id"])] = (labels, app["label"])
+    return result
+
+
 def _rename_priors(path: Path, before: list[dict[str, Any]], after: list[dict[str, Any]]) -> None:
     if not path.is_file():
         return
-    old = {leaf["id"]: labels for leaf, labels in flatten(before)}
-    mapping = {old[leaf["id"]]: labels for leaf, labels in flatten(after) if leaf["id"] in old and old[leaf["id"]] != labels}
+    old = _app_paths(before)
+    new = _app_paths(after)
+    mapping = {
+        old[key]: new[key]
+        for key in old.keys() & new.keys()
+        if old[key] != new[key]
+    }
     if not mapping:
         return
     book = load_workbook(path)
     try:
         sheet = book.worksheets[0]
         columns = {cell.value: cell.column for cell in sheet[1]}
-        if not set(SCENE_COLUMNS[:3]).issubset(columns):
+        if not set(PATH_COLUMNS).issubset(columns):
             raise ValueError("操控先验列不完整，无法同步重命名")
+        app_column = columns.get("target_app")
         for row in range(2, sheet.max_row + 1):
-            original = tuple(_clean(sheet.cell(row, columns[key]).value) for key in SCENE_COLUMNS[:3])
-            if original in mapping:
-                for key, value in zip(SCENE_COLUMNS[:3], mapping[original]):
-                    _string_cell(sheet, row, columns[key], value)
+            original_path = tuple(_clean(sheet.cell(row, columns[key]).value) for key in PATH_COLUMNS)
+            apps = parse_app_list(sheet.cell(row, app_column).value) if app_column else []
+            changed = False
+            mapped_path = original_path
+            mapped_apps = []
+            for app in apps:
+                target = mapping.get((original_path, app))
+                if target:
+                    mapped_path, renamed_app = target
+                    mapped_apps.append(renamed_app)
+                    changed = True
+                else:
+                    mapped_apps.append(app)
+            if not changed:
+                continue
+            for key, value in zip(PATH_COLUMNS, mapped_path):
+                _string_cell(sheet, row, columns[key], value)
+            if app_column:
+                value: Any = mapped_apps[0] if len(mapped_apps) == 1 else json.dumps(mapped_apps, ensure_ascii=False)
+                _string_cell(sheet, row, app_column, value)
         book.save(path)
     finally:
         book.close()
+
+
+def _rename_resource_sheets(path: Path, before: list[dict[str, Any]], after: list[dict[str, Any]]) -> list[str]:
+    warnings: list[str] = []
+    if not path.is_file():
+        return warnings
+    old = _app_paths(before)
+    new = _app_paths(after)
+    renames = [
+        (old[key][1], new[key][1])
+        for key in old.keys() & new.keys()
+        if old[key][1] != new[key][1]
+    ]
+    if not renames:
+        return warnings
+    book = load_workbook(path)
+    try:
+        for old_name, new_name in renames:
+            if old_name not in book.sheetnames:
+                warnings.append(f"资源先验缺少原 App sheet：{old_name}；未执行重命名")
+                continue
+            if new_name in book.sheetnames:
+                warnings.append(f"资源先验 sheet 冲突：{old_name} → {new_name}；保留两份且未覆盖")
+                continue
+            if not new_name or len(new_name) > 31 or any(char in new_name for char in "[]:*?/\\"):
+                warnings.append(f"App 名称无法作为 Excel sheet：{new_name}；保留原 sheet {old_name}")
+                continue
+            book[old_name].title = new_name
+        book.save(path)
+    finally:
+        book.close()
+    return warnings
 
 
 def _publish(root: Path, source: Path, scenes: list[dict[str, Any]] | None = None,
@@ -292,7 +511,8 @@ def _publish(root: Path, source: Path, scenes: list[dict[str, Any]] | None = Non
         for filename in KNOWLEDGE_BASE_FILES.values():
             if (source / filename).is_file():
                 shutil.copy2(source / filename, staging / filename)
-        previous = _json(source / TREE_FILE)["scenes"] if (source / TREE_FILE).exists() else []
+        raw_previous = _json(source / TREE_FILE)["scenes"] if (source / TREE_FILE).exists() else []
+        previous = _migrate_legacy_scenes(raw_previous)
         if replacement:
             kind, uploaded = replacement
             shutil.copy2(uploaded, staging / KNOWLEDGE_BASE_FILES[kind])
@@ -302,11 +522,18 @@ def _publish(root: Path, source: Path, scenes: list[dict[str, Any]] | None = Non
                 scenes = previous
             else:
                 scenes = import_scene_workbook(scene_path, previous) if scene_path.exists() else []
-        scenes = validate_tree(scenes)
+        scenes = validate_tree(_migrate_legacy_scenes(scenes))
         _rename_priors(staging / KNOWLEDGE_BASE_FILES["control_prior"], previous, scenes)
+        publication_warnings = _rename_resource_sheets(staging / KNOWLEDGE_BASE_FILES["resource_prior"], previous, scenes)
         if scene_path.exists() or not replacement:
             write_scene_workbook(scene_path, scenes)
-        _write_json(staging / TREE_FILE, {"version": version, "created_at": datetime.now(timezone.utc).isoformat(), "scenes": scenes})
+        _write_json(staging / TREE_FILE, {
+            "version": version,
+            "schema_version": 2,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "scenes": scenes,
+            "warnings": publication_warnings,
+        })
         published = versions / version
         staging.rename(published)
         pointer = root / f".current-{version}.tmp"
@@ -320,10 +547,22 @@ def _publish(root: Path, source: Path, scenes: list[dict[str, Any]] | None = Non
 
 def current_root(root: Path = KNOWLEDGE_BASE_DIR) -> Path:
     root = Path(root)
-    if (root / TREE_FILE).is_file():  # Immutable version or a job snapshot.
+    if (root / TREE_FILE).is_file():
         return root
     current = _pointed_root(root)
     if current:
+        try:
+            tree = _json(current / TREE_FILE)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return current
+        if _has_legacy_apps(tree.get("scenes")):
+            with write_lock(root):
+                current = _pointed_root(root)
+                if current:
+                    tree = _json(current / TREE_FILE)
+                    if _has_legacy_apps(tree.get("scenes")):
+                        _publish(root, current, _migrate_legacy_scenes(tree["scenes"]))
+                return _pointed_root(root) or current
         return current
     with write_lock(root):
         return _pointed_root(root) or _publish(root, root)
@@ -334,26 +573,14 @@ def read_tree(root: Path = KNOWLEDGE_BASE_DIR) -> dict[str, Any]:
 
 
 def save_tree(scenes: Any, base_version: str, *, root: Path = KNOWLEDGE_BASE_DIR) -> dict[str, Any]:
-    clean = validate_tree(scenes)
+    clean = validate_tree(_normalize_tree_payload(scenes))
     current_root(root)
     with write_lock(root):
         source = _pointed_root(root)
         if source is None or source.name != base_version:
             raise VersionConflict("知识库已更新，请保留草稿并刷新最新版本后重试")
-        previous = _json(source / TREE_FILE)["scenes"]
-        old_locations = {node["id"]: (node["kind"], tuple(p["id"] for p in _ancestors(previous, path))) for path, node in _paths(previous).items()}
-        for path, node in _paths(clean).items():
-            if node["id"] in old_locations:
-                location = (node["kind"], tuple(p["id"] for p in _ancestors(clean, path)))
-                if location != old_locations[node["id"]]:
-                    raise ValueError("第一版不支持移动现有节点或改变节点层级")
         published = _publish(root, source, clean)
     return tree_payload(published)
-
-
-def _ancestors(scenes: list[dict[str, Any]], path: tuple[str, ...]) -> list[dict[str, Any]]:
-    index = _paths(scenes)
-    return [index[path[:depth]] for depth in range(1, len(path))]
 
 
 def replace_workbook(kind: str, source: Path, *, root: Path = KNOWLEDGE_BASE_DIR, base_version: str | None = None) -> Path:
@@ -375,7 +602,7 @@ def prior_status(root: Path) -> tuple[dict[tuple[str, str, str, str], str], dict
         frame = pd.read_excel(root / KNOWLEDGE_BASE_FILES["control_prior"])
         for _, row in frame.iterrows():
             for app in parse_app_list(row.get("target_app")):
-                key = (*(_clean(row.get(part)) for part in SCENE_COLUMNS[:3]), app)
+                key = (*(_clean(row.get(part)) for part in PATH_COLUMNS), app)
                 desc = _clean(row.get("sub_capability_desc"))
                 if desc and desc not in controls.setdefault(key, []):
                     controls[key].append(desc)
@@ -393,14 +620,30 @@ def tree_payload(root: Path = KNOWLEDGE_BASE_DIR) -> dict[str, Any]:
     source = current_root(root)
     value = copy.deepcopy(_json(source / TREE_FILE))
     controls, resources, warnings = prior_status(source)
+    warnings = [*value.get("warnings", []), *warnings]
     leaves = flatten(value["scenes"])
     for leaf, labels in leaves:
-        leaf.update(dict(zip(SCENE_COLUMNS[:3], labels)))
-        leaf["generatable"] = bool(leaf["app_configs"])
-        for config in leaf["app_configs"]:
-            config["control_prior_available"] = bool(controls.get((*labels, config["app"])))
-            config["resource_count"] = resources.get(config["app"], 0)
-    value.update({"leaf_count": len(leaves), "execution_unit_count": sum(len(leaf["app_configs"]) for leaf, _ in leaves), "warnings": warnings})
+        leaf.update(dict(zip(PATH_COLUMNS, labels)))
+        apps = []
+        for app in _app_nodes(leaf):
+            app["app"] = app["label"]
+            app["control_prior_available"] = bool(controls.get((*labels, app["label"])))
+            app["resource_count"] = resources.get(app["label"], 0)
+            apps.append(app)
+            if app.get("use_resource_prior") and app["label"] not in resources:
+                warnings.append(f"App {app['label']} 缺少资源先验 sheet，仍允许生成")
+        leaf["children"] = apps
+        leaf["generatable"] = bool(apps)
+        # Keep a read-only compatibility projection for older API consumers.
+        leaf["app_configs"] = [
+            {
+                "id": app["id"], "app": app["label"], "reference_example": app["reference_example"],
+                "use_resource_prior": app["use_resource_prior"],
+                "control_prior_available": app["control_prior_available"], "resource_count": app["resource_count"],
+            }
+            for app in apps
+        ]
+    value.update({"schema_version": 2, "leaf_count": len(leaves), "execution_unit_count": sum(len(_app_nodes(leaf)) for leaf, _ in leaves), "warnings": list(dict.fromkeys(warnings))})
     return value
 
 
