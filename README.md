@@ -175,6 +175,12 @@ backend_workspace/task_generation/KnowledgeBase/
 
 进入“任务扩增”后上传失败任务 Excel。原始表需要包含 `任务`、`涉及APP`，如果存在 `任务结果` 列则只扩增非 `TRUE` 行；也可以直接上传含有 `app/task/scene/capability/sub_capability` 的 `新场景匹配` 表。扩增结果同样可以审核、删除和导出。
 
+扩增页默认展示紧凑的关联场景树，可切换查看全部场景；变体审核按源失败用例分组，展开后再查看和编辑变体。父组每页 20 条，已删除变体仍可展开恢复。分组、折叠与场景筛选仅影响展示，导出及提交采集始终包含全部未删除结果。
+
+普通生成和扩增均提供 `GET /api/task-generation/jobs/{job_id}/collection-input`，读取当前全部未删除任务及最新人工修改，供采集模块后续接入。字段、依赖校验和响应示例见[统一任务读取接口文档](backend/task_generation/COLLECTION_INPUT.md)。
+
+在生成结果中点击“提交轨迹采集”会冻结当前任务为采集批次，并生成规定的 17 列采集 Excel；手机工厂采集页可选择批次运行。每个作业只提交一份批次，后续源任务编辑不改变已提交内容，原有 Excel 导出保留。批次存储、接口和运行接入方式见[采集批次对接文档](backend/task_generation/COLLECTION_BATCHES.md)。
+
 任务生成作业和导出结果保存在：
 
 ```text
@@ -254,7 +260,11 @@ backend_workspace/dataset_release/releases.json
 
 记录包含纠偏 Excel 的项目相对路径、SHA256、行数，以及整个 `backend_workspace/rollout_trajectories` 根目录的位置；不会保存显式的纠偏会话 ID，也不会复制、收集或去重轨迹。发布成功的会话会从专家纠偏界面隐藏，但会话草稿和导出文件仍保留在本地。
 
-页面下半部分展示全部历史数据集，支持按名称或发布 ID 搜索、按上传状态筛选、查看路径与哈希、下载发布 Excel。点击“上传训练环境”会启动独立的模拟上传作业：后端遍历发布 Excel 和完整轨迹根目录、统计文件与字节并持续报告进度，但不会向外部网络发送文件。成功后会生成类似下面的模拟地址：
+页面下半部分展示全部历史数据集，支持按名称或发布 ID 搜索、按云道S3上传状态筛选、查看路径与哈希、下载发布 Excel。点击“云道S3上传”由后端按登记顺序读取全部已发布 Excel、核验 SHA256 并调用上传适配器；浏览器只提交发布编号和目标参数。每份回执立即保存，失败后停止，重试跳过已成功文件；刷新可恢复进度，服务重启后可手动重试中断任务。
+
+默认适配器未配置，页面明确提示“云道S3上传尚未配置”并禁用按钮。同事只需完成 [internal_uploader.py](backend/data_publishing/internal_uploader.py) 的配置检查、登录与上传；参数、回执、幂等规则及无网络自测见 [云道S3上传接入文档](backend/data_publishing/INTERNAL_UPLOAD.md)。无需读取编号或自行拼接路径，不上传原始轨迹目录。
+
+历史无 target 的上传接口继续保留模拟行为：遍历发布 Excel 和完整轨迹根目录、统计进度但不发送文件。旧模拟状态及以下模拟地址仅在详情中明确标注，不计入云道S3成功数量：
 
 ```text
 s3://training-data/gui-agent-datasets/rel_a84f91c25d3e4b67/

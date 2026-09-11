@@ -14,6 +14,7 @@ export interface TaskRow {
   description: string
   filename: string
   status: string
+  source_batch_id?: string
 }
 
 export interface FactoryState {
@@ -77,10 +78,10 @@ export const phoneFactoryApi = {
     return request<FactoryState>('/vla', jsonInit('POST', { value }))
   },
   /** 新增任务：上传文件到 /root/uuupppfffiiillleee 并登记 tasks.json */
-  addTask(description: string, filename: string, contentBase64: string): Promise<FactoryState> {
+  addTask(description: string, filename: string, contentBase64: string, sourceBatchId?: string): Promise<FactoryState> {
     return request<FactoryState>(
       '/tasks',
-      jsonInit('POST', { description, filename, content_base64: contentBase64 }),
+      jsonInit('POST', { description, filename, content_base64: contentBase64, ...(sourceBatchId ? { source_batch_id: sourceBatchId } : {}) }),
     )
   },
   /** 开始运行任务：状态 未运行 -> 运行中 */

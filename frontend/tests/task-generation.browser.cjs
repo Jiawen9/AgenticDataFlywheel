@@ -39,6 +39,7 @@ async function mock(route) {
     tree = { ...tree, version: 'version-replaced' }
     return send({ knowledge_base: { kind: endpoint.split('/').at(-1), valid: true, exists: true, filename: 'replacement.xlsx', rows: 3, size_bytes: 10 } })
   }
+  if (endpoint === '/api/task-generation/collection-batches') return send({ batches: [] })
   if (endpoint === '/api/task-generation/jobs') {
     if (request.method() === 'POST') {
       submissions.push(request.postDataJSON())
@@ -103,6 +104,10 @@ async function run() {
   const shot = name => page.screenshot({ path: path.join(output, `${name}.png`), fullPage: true, animations: 'disabled' })
   const noOverflow = async () => assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'Page must not overflow horizontally')
   const chooseJob = id => page.locator(`[data-job-id="${id}"]`).click()
+  const chooseBatchJob = async id => {
+    await page.getByRole('combobox', { name: '选择生成批次任务' }).click()
+    await page.getByRole('option').filter({ hasText: `· ${id}` }).click()
+  }
   const editMain = async text => { await page.locator('[data-result-id="main"]').getByRole('button', { name: '编辑', exact: true }).click(); await page.getByRole('textbox', { name: '编辑任务文本' }).fill(text) }
   try {
     await page.goto(`${base}/task-generation/generate`)
@@ -138,7 +143,14 @@ async function run() {
     await page.getByRole('tab', { name: '新建生成' }).click()
     assert.equal(await page.locator('.estimate strong').innerText(), '5')
     await page.getByRole('tab', { name: /生成记录/ }).click()
-    await chooseJob('A'); await page.locator('[data-result-id="main"]').waitFor()
+    const batchPicker = page.getByRole('combobox', { name: '选择生成批次任务' })
+    await batchPicker.click()
+    const batchOptions = await page.getByRole('option').allInnerTexts()
+    assert.equal(batchOptions.filter(label => label.includes('条结果')).length, jobs.length)
+    assert.ok(batchOptions.some(label => label.includes('2026-09-07 10:30 · 部分成功 · 5 条结果 · A')))
+    await page.getByRole('option').filter({ hasText: '· A' }).click()
+    await page.locator('[data-result-id="main"]').waitFor()
+    assert.equal(await page.locator('.collection-job-selector + .collection-submission + .records-layout').count(), 1)
     assert.equal(await page.locator('.result-group').count(), 3)
     assert.equal(await page.locator('[data-result-id="pre"]').count(), 0)
     await page.locator('.job-issues summary').click()
@@ -146,19 +158,21 @@ async function run() {
     await page.getByRole('button', { name: /展开 1 条前置任务/ }).click()
     assert.equal(await page.locator('[data-result-id="pre"]').count(), 1)
     await editMain('模拟人工修改')
-    failPatch = true; await chooseJob('B')
+    failPatch = true; await chooseBatchJob('B')
     await page.getByRole('button', { name: '保存后继续', exact: true }).click()
     await page.getByText('模拟保存失败', { exact: true }).waitFor()
     assert.equal(await page.getByRole('textbox', { name: '编辑任务文本' }).inputValue(), '模拟人工修改')
     assert.ok((await page.locator('.job-heading').innerText()).includes('作业 A'))
-    await chooseJob('B'); await page.locator('.el-message-box__headerbtn').click()
+    await chooseBatchJob('B'); await page.locator('.el-message-box__headerbtn').click()
     assert.ok((await page.locator('.job-heading').innerText()).includes('作业 A'))
+    await page.locator('.collection-job-selector .el-select__selected-item').filter({ hasText: '· A' }).waitFor()
     // Filter changes must use the same guard and keep the original filter on cancellation.
     await page.getByText('显示已删除', { exact: true }).click()
     await page.locator('.el-message-box__headerbtn').click()
     assert.equal(await page.locator('[data-result-id="deleted"]').count(), 0)
     await chooseJob('B'); await page.getByRole('button', { name: '保存后继续', exact: true }).click()
     await page.locator('[data-result-id="legacy"]').waitFor()
+    await page.locator('.collection-job-selector .el-select__selected-item').filter({ hasText: '· B' }).waitFor()
     assert.equal(resultSets.A.find(r => r.result_id === 'main').task, '模拟人工修改')
     await chooseJob('A'); await page.locator('[data-result-id="main"]').waitFor()
     await editMain('放弃这次修改'); await page.getByRole('tab', { name: '新建生成' }).click()

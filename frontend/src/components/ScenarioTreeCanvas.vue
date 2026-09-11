@@ -64,7 +64,6 @@ function emitMenu(node: TaskGenerationTreeNode, command: unknown) {
             </template>
           </el-dropdown>
         </div>
-        <p v-if="node.description">{{ node.description }}</p>
         <small v-if="node.kind === 'sub_capability'">{{ node.children?.filter(child => child.kind === 'app').length || 0 }} 个适用 App</small>
       </article>
       <div v-if="hasChildren(node)" class="canvas-children">

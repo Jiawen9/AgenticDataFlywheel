@@ -23,6 +23,31 @@ function deferred<T>() { let resolve!: (value: T) => void; const promise = new P
 afterEach(() => { cleanups.splice(0).forEach(dispose => dispose()); vi.useRealTimers() })
 
 describe('generation records and protected review', () => {
+  it('saves dirty text before acquiring an external batch lock and blocks edits and job switches until it finishes', async () => {
+    const { ws, api } = setup(), pending = deferred<string>()
+    await ws.selectJob(job('A')); await ws.startEdit(ws.results.value[1]!)
+    ws.editingText.value = '提交前修改'
+    const action = vi.fn(async (id: string) => { expect(id).toBe('A'); expect(ws.busy.value).toBe(true); return pending.promise })
+    const submitting = ws.runExternalAction(action)
+    await vi.waitFor(() => expect(action).toHaveBeenCalled())
+    expect(api.patchTaskGenerationResult).toHaveBeenCalledWith('A', 'main', { task: '提交前修改' })
+    expect(await ws.selectJob(job('B'))).toBe(false)
+    await ws.startEdit(ws.results.value[0]!)
+    expect(ws.editingId.value).toBeNull()
+    pending.resolve('batch'); expect(await submitting).toBe('batch')
+    expect(ws.busy.value).toBe(false)
+  })
+  it('releases the external action lock on failure and honours cancelled edit protection', async () => {
+    const { ws, feedback } = setup()
+    await ws.selectJob(job('A'))
+    await expect(ws.runExternalAction(async () => { throw new Error('提交失败') })).rejects.toThrow('提交失败')
+    expect(ws.busy.value).toBe(false)
+    await ws.startEdit(ws.results.value[1]!); ws.editingText.value = '未保存'
+    feedback.decide.mockResolvedValue('cancel')
+    const action = vi.fn(async () => 'batch')
+    expect(await ws.runExternalAction(action)).toBeNull()
+    expect(action).not.toHaveBeenCalled()
+  })
   it('loads persisted summaries and job detail without polling completed jobs', async () => {
     vi.useFakeTimers()
     const { ws, api } = setup()

@@ -23,6 +23,7 @@ from .prompts import dependency_prompt, flywheel_prompt, scene_classification_pr
 
 
 Progress = Callable[[dict[str, Any]], None]
+SeedProgress = Callable[[dict[str, Any], list[dict[str, Any]] | None], None]
 
 
 def _now() -> str:
@@ -290,6 +291,7 @@ def _variant_records(seed: dict[str, Any], *, generate_n: int, kb_root: Path, mo
             continue
         records.append({
             "result_id": uuid.uuid4().hex,
+            "seed_id": seed.get("seed_id"),
             "source_row": seed.get("source_row"),
             "source_task": seed["task"],
             "用例编号": generate_case_id(seed["app"], seed.get("scene", "Unclassified"), short_uuid, sequence),
@@ -303,37 +305,135 @@ def _variant_records(seed: dict[str, Any], *, generate_n: int, kb_root: Path, mo
     return records
 
 
-def _run_augmentation(path: Path, generate_n: int, *, kb_root: Path, progress: Progress, model: TaskGenerationModel) -> dict[str, Any]:
-    seeds = _read_seed_workbook(path)
+def prepare_augmentation_seeds(path: Path) -> list[dict[str, Any]]:
+    """Keep every usable input row, including duplicate tasks, as its own seed."""
+    return [{
+        **seed,
+        "seed_id": uuid.uuid4().hex,
+        "classification_source": "excel" if all(seed.get(key) for key in ("scene", "capability", "sub_capability")) else "model",
+        "classification_status": "pending",
+        "mapping_status": "pending",
+        "node_path_ids": [],
+        "generation_status": "waiting",
+        "result_count": 0,
+    } for seed in _read_seed_workbook(path)]
+
+
+def _augmentation_paths(kb_root: Path) -> dict[tuple[str, ...], list[str]]:
+    from .tree_store import _app_nodes, read_tree
+    paths = {}
+    for scene in read_tree(kb_root)["scenes"]:
+        for capability in scene.get("children", []):
+            for task_type in capability.get("children", []):
+                for app in _app_nodes(task_type):
+                    paths[(scene["label"], capability["label"], task_type["label"], app["label"])] = [
+                        scene["id"], capability["id"], task_type["id"], app["id"],
+                    ]
+    return paths
+
+
+def _run_augmentation_classification(seeds: list[dict[str, Any]], *, kb_root: Path, progress: Progress,
+                                    model: TaskGenerationModel, on_seed: SeedProgress | None = None) -> dict[str, Any]:
     total = len(seeds)
-    classified: list[dict[str, Any] | None] = [None] * total
+    classified = [dict(seed) for seed in seeds]
     errors: list[dict[str, Any]] = []
+    paths = _augmentation_paths(kb_root)
+
+    def classify(seed):
+        current = {**seed, "classification_status": "classifying"}
+        if on_seed:
+            on_seed(current, None)
+        try:
+            current = _seed_classify(current, kb_root=kb_root, model=model)
+            labels = tuple(current.get(key, "") for key in ("scene", "capability", "sub_capability"))
+            identifiers = paths.get((*labels, current["app"]), [])
+            current.update({"classification_status": "classified", "node_path_ids": identifiers,
+                            "mapping_status": "matched" if identifiers else "unclassified" if labels == ("Unclassified",) * 3 else "not_found"})
+        except Exception as exc:
+            current.update({"classification_status": "failed", "mapping_status": "classification_failed",
+                            "node_path_ids": [], "generation_status": "skipped", "error": str(exc)})
+        if on_seed:
+            on_seed(current, None)
+        return current
+
     workers = _model_config(model).max_concurrent
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="task-augmentation-classify") as executor:
-        futures = {executor.submit(_seed_classify, seed, kb_root=kb_root, model=model): index for index, seed in enumerate(seeds)}
+        futures = {executor.submit(classify, seed): index for index, seed in enumerate(seeds)}
         for completed, future in enumerate(as_completed(futures), start=1):
             index = futures[future]
-            try:
-                classified[index] = future.result()
-            except Exception as exc:
-                errors.append({"item_id": str(seeds[index].get("source_row", index)), "stage": "classifying", "error": str(exc)})
+            classified[index] = future.result()
+            if classified[index]["classification_status"] == "failed":
+                errors.append({"seed_id": classified[index]["seed_id"], "item_id": str(seeds[index].get("source_row", index)),
+                               "stage": "classifying", "error": classified[index]["error"]})
             progress({"stage": "classifying", "current_item": str(seeds[index].get("source_row", index)), "completed_items": completed, "total_items": total * 2, "percent": round(completed / max(1, total) * 40)})
-    valid_seeds = [item for item in classified if item is not None]
+    return {"seeds": classified, "errors": errors, "warnings": [], "total_items": total}
+
+
+def _run_augmentation_generation(seeds: list[dict[str, Any]], generate_n: int, *, kb_root: Path, progress: Progress,
+                                model: TaskGenerationModel, on_seed: SeedProgress | None = None) -> dict[str, Any]:
+    total = len(seeds)
+    valid_seeds = [seed for seed in seeds if seed.get("classification_status") == "classified"]
     records: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+
+    def generate(seed):
+        current = {**seed, "generation_status": "generating"}
+        if on_seed:
+            on_seed(current, None)
+        try:
+            rows = _variant_records(current, generate_n=generate_n, kb_root=kb_root, model=model)
+            issues = []
+        except PartialGenerationError as exc:
+            rows, issues = exc.results, exc.errors
+        except Exception as exc:
+            rows, issues = [], [{"stage": "generating", "error": str(exc)}]
+        issues = [{"seed_id": current["seed_id"], "item_id": str(current.get("source_row", "")), **error} for error in issues]
+        current.update({"generation_status": "succeeded" if not issues else "partial" if rows else "failed", "result_count": len(rows)})
+        if issues:
+            current["error"] = "；".join(error["error"] for error in issues)
+        if on_seed:
+            on_seed(current, rows)
+        return rows, issues
+
+    workers = _model_config(model).max_concurrent
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="task-augmentation-generate") as executor:
-        futures = {executor.submit(_variant_records, seed, generate_n=generate_n, kb_root=kb_root, model=model): seed for seed in valid_seeds}
+        futures = {executor.submit(generate, seed): seed for seed in valid_seeds}
         for completed, future in enumerate(as_completed(futures), start=1):
             seed = futures[future]
-            try:
-                records.extend(future.result())
-            except PartialGenerationError as exc:
-                records.extend(exc.results)
-                errors.extend({"item_id": str(seed.get("source_row", "")), **error} for error in exc.errors)
-            except Exception as exc:
-                errors.append({"item_id": str(seed.get("source_row", "")), "stage": "generating", "error": str(exc)})
+            rows, issues = future.result()
+            records.extend(rows)
+            errors.extend(issues)
             progress({"stage": "generating", "current_item": str(seed.get("source_row", "")), "completed_items": total + completed, "total_items": total * 2, "percent": 40 + round(completed / max(1, len(valid_seeds)) * 60)})
     records.sort(key=lambda item: (int(item.get("source_row") or 0), item.get("用例编号", "")))
     return {"results": records, "errors": errors, "warnings": [], "total_items": total}
+
+
+def run_augmentation_classification(seeds: list[dict[str, Any]], *, kb_root: Path, progress: Progress,
+                                   on_seed: SeedProgress | None = None, model: TaskGenerationModel | None = None) -> dict[str, Any]:
+    active = _model(model, kb_root)
+    try:
+        return _run_augmentation_classification(seeds, kb_root=kb_root, progress=progress, model=active, on_seed=on_seed)
+    finally:
+        if model is None:
+            active.close()
+
+
+def run_augmentation_generation(seeds: list[dict[str, Any]], generate_n: int, *, kb_root: Path, progress: Progress,
+                               on_seed: SeedProgress | None = None, model: TaskGenerationModel | None = None) -> dict[str, Any]:
+    active = _model(model, kb_root)
+    try:
+        return _run_augmentation_generation(seeds, generate_n, kb_root=kb_root, progress=progress, model=active, on_seed=on_seed)
+    finally:
+        if model is None:
+            active.close()
+
+
+def _run_augmentation(path: Path, generate_n: int, *, kb_root: Path, progress: Progress, model: TaskGenerationModel) -> dict[str, Any]:
+    """Compatibility entry point for callers that still want one automatic run."""
+    classified = _run_augmentation_classification(prepare_augmentation_seeds(path), kb_root=kb_root, progress=progress, model=model)
+    outcome = _run_augmentation_generation(classified["seeds"], generate_n, kb_root=kb_root, progress=progress, model=model)
+    outcome["errors"] = classified["errors"] + outcome["errors"]
+    return outcome
 
 
 def run_initial_generation(node_ids: list[str], generate_n: int, *, kb_root: Path, progress: Progress, model: TaskGenerationModel | None = None) -> dict[str, Any]:

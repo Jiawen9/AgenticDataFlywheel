@@ -109,6 +109,24 @@
           </el-select>
         </div>
 
+        <h3 class="sub-title">采集任务批次</h3>
+        <div class="row-form">
+          <span class="field-label">采集批次</span>
+          <el-select :model-value="selectedBatchId" filterable clearable :loading="loadingBatches || loadingBatch" :disabled="taskBusy || runDialogVisible" placeholder="选择已提交的采集批次" class="batch-select" @change="selectCollectionBatch">
+            <el-option v-for="batch in collectionBatches" :key="batch.batch_id" :value="batch.batch_id" :label="collectionBatchOptionLabel(batch)" />
+          </el-select>
+          <el-button :loading="loadingBatches" :disabled="taskBusy || runDialogVisible" @click="collection.loadBatches()">刷新批次</el-button>
+        </div>
+        <el-alert v-if="batchError" :title="batchError" type="error" :closable="false" show-icon class="batch-alert" />
+        <div v-if="selectedBatch && selectedBatchRow" class="batch-summary">
+          <p><strong>{{ selectedBatch.task_count }} 条任务</strong> · {{ selectedBatch.apps.join('、') }} · {{ selectedBatch.created_at.slice(0, 19).replace('T', ' ') }}</p>
+          <p>来源作业：{{ selectedBatch.source_job_id }} · {{ selectedBatchRow.status }}</p>
+          <el-button type="primary" :loading="startingTask === selectedBatchRow.filename" :disabled="taskBusy || selectedBatchRow.status === '运行中'" @click="handleStartTask(selectedBatchRow)">开始运行所选批次</el-button>
+          <el-button :disabled="taskBusy || selectedBatchRow.status === '运行中'" @click="openRunDialog(selectedBatchRow)">定制运行</el-button>
+          <el-button :loading="downloadingBatch" :disabled="taskBusy" @click="downloadCollectionBatch">下载采集表</el-button>
+        </div>
+        <p class="empty-hint">选择批次仅查看信息；点击运行后才导入文件并下发。也可以继续手动上传任务。</p>
+
         <!-- 3.2 新增任务 -->
         <div class="row-form">
           <span class="field-label">新增任务</span>
@@ -116,7 +134,7 @@
           <input ref="fileInput" type="file" hidden @change="onFileChange" />
           <el-button @click="fileInput?.click()">选择文件</el-button>
           <span class="file-name" :class="{ 'is-empty': !selectedFile }">{{ selectedFile ? selectedFile.name : '未选择文件' }}</span>
-          <el-button type="primary" :loading="savingTask" @click="handleAddTask">新增</el-button>
+          <el-button type="primary" :loading="savingTask" :disabled="taskBusy" @click="handleAddTask">新增</el-button>
         </div>
 
         <!-- 3.3 任务列表 -->
@@ -131,14 +149,14 @@
           </el-table-column>
           <el-table-column label="操作" width="220" align="center">
             <template #default="{ row }">
-              <el-button link type="danger" :loading="deletingTask === row.filename" @click="handleRemoveTask(row)">
+              <el-button link type="danger" :loading="deletingTask === row.filename" :disabled="taskBusy" @click="handleRemoveTask(row)">
                 删除
               </el-button>
               <el-button
                 link
                 type="primary"
                 :loading="startingTask === row.filename"
-                :disabled="row.status === '运行中'"
+                :disabled="taskBusy || row.status === '运行中'"
                 @click="handleStartTask(row)"
               >
                 {{ row.status === '运行中' ? '运行中' : '开始运行' }}
@@ -147,7 +165,7 @@
                 link
                 type="warning"
                 :loading="customStarting === row.filename"
-                :disabled="row.status === '运行中'"
+                :disabled="taskBusy || row.status === '运行中'"
                 @click="openRunDialog(row)"
               >
                 定制运行
@@ -158,21 +176,21 @@
         <p v-if="!tasks.length" class="empty-hint">暂无任务，请在上方新增。</p>
 
         <!-- 开始运行 / 定制运行 弹窗：选择手机ID 与 运行APP -->
-        <el-dialog v-model="runDialogVisible" title="选择手机运行" width="420px" :close-on-click-modal="false">
+        <el-dialog v-model="runDialogVisible" title="选择手机运行" width="420px" :close-on-click-modal="false" :close-on-press-escape="!confirmingRun" :show-close="!confirmingRun">
           <div class="row-form">
             <span class="field-label">手机ID</span>
-            <el-select v-model="runDialogPhoneId" filterable placeholder="选择手机ID" style="width: 240px">
+            <el-select v-model="runDialogPhoneId" :disabled="confirmingRun" filterable placeholder="选择手机ID" style="width: 240px">
               <el-option v-for="phoneId in phoneIdOptions" :key="phoneId" :label="phoneId" :value="phoneId" />
             </el-select>
           </div>
           <div class="row-form" style="margin-top: 14px">
             <span class="field-label">运行APP</span>
-            <el-select v-model="runDialogApp" filterable placeholder="选择运行APP" style="width: 240px">
+            <el-select v-model="runDialogApp" :disabled="confirmingRun" filterable placeholder="选择运行APP" style="width: 240px">
               <el-option v-for="app in runDialogAppOptions" :key="app" :label="app" :value="app" />
             </el-select>
           </div>
           <template #footer>
-            <el-button @click="runDialogVisible = false">取消</el-button>
+            <el-button :disabled="confirmingRun" @click="runDialogVisible = false">取消</el-button>
             <el-button type="primary" :loading="confirmingRun" @click="confirmRun">确定</el-button>
           </template>
         </el-dialog>
@@ -182,15 +200,19 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { phoneFactoryApi, type FactoryConfig, type PhoneAppRow, type TaskRow } from '@/phoneFactoryApi'
+import { collectionBatchesApi, type CollectionBatchSummary } from '@/collectionBatchesApi'
+import { usePhoneCollectionBatches } from '@/composables/usePhoneCollectionBatches'
 
 // ---------- 状态 ----------
 const apps = ref<string[]>([])
 const phoneApps = ref<PhoneAppRow[]>([])
 const vla = ref<string[]>([])
 const tasks = ref<TaskRow[]>([])
+const loadingFactory = ref(true)
 
 const config = reactive<FactoryConfig>({
   sampling_enabled: false,
@@ -221,6 +243,33 @@ const runDialogVisible = ref(false)
 const runDialogPhoneId = ref('')
 const runDialogApp = ref('')
 const runTargetTask = ref<TaskRow | null>(null)
+const route = useRoute()
+const manualTaskBusy = computed(() => savingTask.value || Boolean(deletingTask.value) || Boolean(startingTask.value) || confirmingRun.value)
+const collection = usePhoneCollectionBatches(collectionBatchesApi, phoneFactoryApi, {
+  setTasks: rows => { tasks.value = rows },
+  isBlocked: () => manualTaskBusy.value || runDialogVisible.value,
+})
+const { batches: collectionBatches, selectedBatchId, selectedBatch, loadingBatches, loadingBatch, downloading: downloadingBatch, error: batchError } = collection
+let disposed = false
+const taskBusy = computed(() => loadingFactory.value || manualTaskBusy.value || collection.busy.value)
+const collectionBatchKindLabel = (kind: CollectionBatchSummary['kind']) => kind === 'augmentation' ? '泛化扩增' : '任务生成'
+const collectionBatchTimeLabel = (createdAt: string) => createdAt.slice(0, 19).replace('T', ' ')
+const collectionBatchOptionLabel = (batch: CollectionBatchSummary) =>
+  `${batch.batch_id} · ${collectionBatchKindLabel(batch.kind)} · ${collectionBatchTimeLabel(batch.created_at)} · ${batch.task_count} 条任务`
+const selectedBatchRow = computed<TaskRow | null>(() => {
+  const batch = selectedBatch.value
+  if (!batch) return null
+  return tasks.value.find(task => task.source_batch_id === batch.batch_id) || {
+    description: `采集批次 ${batch.batch_id}`, filename: batch.filename, source_batch_id: batch.batch_id, status: '未运行',
+  }
+})
+function selectCollectionBatch(value: unknown) { void collection.selectBatch(typeof value === 'string' ? value : '') }
+async function downloadCollectionBatch() {
+  if (taskBusy.value) return
+  try { await collection.downloadBatch() }
+  catch (error) { if (!disposed) ElMessage.error((error as Error).message) }
+}
+watch(() => route.query.collection_batch_id, value => { if (typeof value === 'string') void collection.selectBatch(value) })
 
 const rowKey = (row: PhoneAppRow) => `${row.phone_id}||${row.app}`
 
@@ -327,6 +376,7 @@ function fileToBase64(file: File): Promise<string> {
 
 // ---------- 3.2 新增任务（上传文件 + 登记关联） ----------
 async function handleAddTask() {
+  if (taskBusy.value) return
   const description = newTaskDesc.value.trim()
   if (!description) return ElMessage.warning('请输入任务描述')
   if (!selectedFile.value) return ElMessage.warning('请先选择文件')
@@ -348,6 +398,7 @@ async function handleAddTask() {
 
 // ---------- 3.3 删除任务（界面与关联文件同步删除） ----------
 async function handleRemoveTask(row: TaskRow) {
+  if (taskBusy.value) return
   deletingTask.value = row.filename
   try {
     const state = await phoneFactoryApi.removeTask(row.filename)
@@ -362,6 +413,7 @@ async function handleRemoveTask(row: TaskRow) {
 
 // ---------- 3.3 开始运行/定制运行：打开弹窗选择手机ID与运行APP ----------
 function openRunDialog(row: TaskRow) {
+  if (taskBusy.value || row.status === '运行中') return
   runTargetTask.value = row
   runDialogPhoneId.value = phoneIdOptions.value[0] || ''
   runDialogApp.value = ''
@@ -371,15 +423,21 @@ function openRunDialog(row: TaskRow) {
 // ---------- 3.3 开始运行：不弹窗，把任务文件与 手机ID/运行APP 关联文件 发送到 server 端，
 // 关联文件中的所有手机都执行 ----------
 async function handleStartTask(row: TaskRow) {
+  if (taskBusy.value || row.status === '运行中') return
   startingTask.value = row.filename
   try {
+    if (row.source_batch_id) {
+      const remote = await collection.runBatch(row.source_batch_id)
+      if (!disposed) ElMessage.success(remote.message || `批次「${row.source_batch_id}」已下发全部手机`)
+      return
+    }
     // 不带 phone_id/app：server 端对关联文件中所有手机下发
     const remote = await phoneFactoryApi.remoteStartRun(row.filename, '', '')
     const state = await phoneFactoryApi.startTask(row.filename)
     tasks.value = state.tasks
     ElMessage.success(remote.message || `任务「${row.description}」已下发全部手机`)
   } catch (error) {
-    ElMessage.error((error as Error).message)
+    if (!disposed) ElMessage.error((error as Error).message)
   } finally {
     startingTask.value = ''
   }
@@ -388,7 +446,7 @@ async function handleStartTask(row: TaskRow) {
 // ---------- 3.3 定制运行确认：把任务文件、关联文件 + 手机ID/运行APP 发送到 server 端，
 // 仅指定的 手机ID 执行 ----------
 async function confirmRun() {
-  if (!runTargetTask.value) return
+  if (!runTargetTask.value || taskBusy.value) return
   const phoneId = runDialogPhoneId.value
   const app = runDialogApp.value
   if (!phoneId) return ElMessage.warning('请选择手机ID')
@@ -396,6 +454,14 @@ async function confirmRun() {
   confirmingRun.value = true
   const task = runTargetTask.value
   try {
+    if (task.source_batch_id) {
+      const remote = await collection.runBatch(task.source_batch_id, phoneId, app)
+      if (!disposed) {
+        runDialogVisible.value = false
+        ElMessage.success(remote.message || `已发送批次到手机 ${phoneId}（${app}）`)
+      }
+      return
+    }
     // 先通知 server 端（client 转发，10 秒超时显示“功能不支持或者网络断连”）
     const remote = await phoneFactoryApi.remoteStartRun(task.filename, phoneId, app)
     // 再更新本地任务状态：未运行 -> 运行中
@@ -404,7 +470,7 @@ async function confirmRun() {
     runDialogVisible.value = false
     ElMessage.success(remote.message || `已发送 任务「${task.description}」到手机 ${phoneId}（${app}）`)
   } catch (error) {
-    ElMessage.error((error as Error).message)
+    if (!disposed) ElMessage.error((error as Error).message)
   } finally {
     confirmingRun.value = false
   }
@@ -425,11 +491,14 @@ async function handleConfigChange() {
 }
 
 onMounted(() => {
-  loadState().catch((error) => ElMessage.error(`加载数据失败：${(error as Error).message}`))
+  loadState().catch((error) => ElMessage.error(`加载数据失败：${(error as Error).message}`)).finally(() => { loadingFactory.value = false })
+  void collection.loadBatches(typeof route.query.collection_batch_id === 'string' ? route.query.collection_batch_id : undefined)
 })
+onBeforeUnmount(() => { disposed = true; collection.dispose() })
 </script>
 
 <style scoped>
+.batch-select { width: min(480px, 100%); }.batch-summary { padding: 12px; border: 1px solid #dbe3ed; border-radius: 8px; background: #f8fffd; }.batch-summary p { margin: 0 0 9px; color: #64748b; font-size: 12px; overflow-wrap: anywhere; }.batch-alert { margin: 10px 0; }
 .phone-factory-page { width: min(1680px, 100%); min-height: 100vh; margin: 0 auto; padding: 34px 42px 50px; }
 .page-hero { margin-bottom: 26px; }
 .page-hero h1 { margin: 6px 0 4px; }

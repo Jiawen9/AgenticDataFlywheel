@@ -1,5 +1,7 @@
 import type { BuildJob, CorrectionBatch, CorrectionCotJob, CorrectionCotResponse, CorrectionExport, CorrectionGroup, CorrectionGroupSummary, CorrectionRecommendation, CorrectionSession, DatasetRelease, DatasetReleaseCandidate, DatasetUploadJob, KnowledgeBaseSummary, QualityJob, RunQualitySummary, TaskGenerationExport, TaskGenerationJob, TaskGenerationResult, TaskGenerationTree, TaskGenerationSelection, TaskGenerationTreeNode, TaskQualityResult, TaskSummary, TrajectoryRecord, TrajectorySummary, TrajectoryTreeNode, TreeRun } from './types'
 
+import type { AugmentationPreview, DatasetUploadCapabilities } from './types'
+
 const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
 
 export class ApiError extends Error {
@@ -45,11 +47,18 @@ export const api = {
   async createTaskGeneration(selections: TaskGenerationSelection[], generateN: number, version: string): Promise<TaskGenerationJob> {
     return request('/api/task-generation/jobs', { method: 'POST', body: JSON.stringify({ selections, generate_n: generateN, version }) })
   },
-  async createAugmentation(file: File, generateN: number): Promise<TaskGenerationJob> {
+  async createAugmentation(file: File, generateN: number, autoStart = true): Promise<TaskGenerationJob> {
     const form = new FormData()
     form.append('file', file)
     form.append('generate_n', String(generateN))
+    form.append('auto_start', String(autoStart))
     return request('/api/task-generation/augmentation-jobs', { method: 'POST', body: form })
+  },
+  augmentationPreview(jobId: string, includeTree = true): Promise<AugmentationPreview> {
+    return request(`/api/task-generation/jobs/${encodeURIComponent(jobId)}/augmentation-preview?include_tree=${includeTree}`)
+  },
+  startAugmentation(jobId: string): Promise<TaskGenerationJob> {
+    return request(`/api/task-generation/jobs/${encodeURIComponent(jobId)}/start-augmentation`, { method: 'POST' })
   },
   async taskGenerationJobs(): Promise<TaskGenerationJob[]> {
     return (await request<{ jobs: TaskGenerationJob[] }>('/api/task-generation/jobs')).jobs
@@ -207,8 +216,14 @@ export const api = {
   async datasetRelease(releaseId: string): Promise<DatasetRelease> {
     return (await request<{ release: DatasetRelease }>(`/api/dataset-releases/${encodeURIComponent(releaseId)}`)).release
   },
-  async uploadDatasetRelease(releaseId: string): Promise<DatasetUploadJob> {
-    return (await request<{ job: DatasetUploadJob }>(`/api/dataset-releases/${encodeURIComponent(releaseId)}/upload`, { method: 'POST' })).job
+  async datasetUploadCapabilities(): Promise<DatasetUploadCapabilities> {
+    return request<DatasetUploadCapabilities>('/api/dataset-upload-capabilities')
+  },
+  async uploadDatasetRelease(releaseId: string, target?: 'internal'): Promise<DatasetUploadJob> {
+    return (await request<{ job: DatasetUploadJob }>(`/api/dataset-releases/${encodeURIComponent(releaseId)}/upload`, {
+      method: 'POST',
+      ...(target ? { body: JSON.stringify({ target }) } : {}),
+    })).job
   },
   async datasetUploadJob(jobId: string): Promise<DatasetUploadJob> {
     return (await request<{ job: DatasetUploadJob }>(`/api/dataset-upload-jobs/${encodeURIComponent(jobId)}`)).job

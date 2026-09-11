@@ -26,7 +26,12 @@ export function selectCandidates(selected: AppSelection, nodes: TaskGenerationTr
   return { ...selected, ...Object.fromEntries(nodes.map(n => [n.id, appNodes(n).map(a => a.app || a.label)])) }
 }
 export const jobLabels: Record<TaskGenerationJob['status'], string> = {
+  awaiting_confirmation: '待开始扩增',
   queued: '排队中', running: '生成中', succeeded: '已完成', partial: '部分成功', failed: '失败', interrupted: '已中断',
+}
+export function generationJobOptionLabel(job: TaskGenerationJob) {
+  const createdAt = job.created_at.slice(0, 16).replace('T', ' ')
+  return `${createdAt} · ${jobLabels[job.status]} · ${job.result_count} 条结果 · ${job.job_id.slice(0, 12)}`
 }
 export function stageLabel(stage: string) {
   return ({ ...jobLabels, preparing: '准备知识库快照', generating: '生成任务与判定依赖', validation: '任务输出校验', dependency: '依赖判定', exporting: '生成导出文件', classifying: '匹配场景', augmenting: '扩增任务' } as Record<string, string>)[stage] || stage || '等待执行'

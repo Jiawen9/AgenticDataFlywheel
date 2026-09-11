@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import type { TaskGenerationTreeNode } from '@/types'
-import { appConfigs, appNodes, canMove, editableTree, executionUnitCount, findNode, leaves, moveNode, nodePath, removeNode, reorderNode, selectionsFor, withInlineAddActions } from './scenarioTree'
+import { appConfigs, appNodes, canMove, editableTree, executionUnitCount, findNode, leaves, moveNode, nodePath, normalizeTree, removeNode, reorderNode, selectionsFor, withInlineAddActions } from './scenarioTree'
 
 const fixture = (): TaskGenerationTreeNode[] => [{
   id: 'scene', kind: 'scene', label: '视频娱乐', children: [{
     id: 'cap', kind: 'capability', label: '内容查找', children: [{
-      id: 'leaf', kind: 'sub_capability', label: '搜索节目', description: '任务类型描述', children: [
+      id: 'leaf', kind: 'sub_capability', label: '搜索节目', children: [
         { id: 'app-a', kind: 'app', label: 'AppA', app: 'AppA', reference_example: 'A示例', use_resource_prior: true, resource_count: 2 },
         { id: 'app-b', kind: 'app', label: 'AppB', app: 'AppB', reference_example: 'B示例', use_resource_prior: false },
       ],
@@ -14,6 +14,22 @@ const fixture = (): TaskGenerationTreeNode[] => [{
 }]
 
 describe('scenario tree editor', () => {
+  it('ignores legacy descriptions while preserving the original workbook configuration', () => {
+    const saved = fixture()
+    for (const id of ['scene', 'cap', 'leaf', 'app-a']) {
+      Object.assign(findNode(saved, id)!, { description: 'legacy description' })
+    }
+    const normalized = normalizeTree(saved)
+    const draft = editableTree(normalized)
+    expect(JSON.stringify(normalized)).not.toContain('description')
+    expect(JSON.stringify(draft)).not.toContain('description')
+    expect(JSON.stringify(saved)).toContain('legacy description')
+    expect(nodePath(draft, 'app-a')).toEqual(['视频娱乐', '内容查找', '搜索节目', 'AppA'])
+    expect(findNode(draft, 'app-a')).toMatchObject({
+      id: 'app-a', reference_example: 'A示例', use_resource_prior: true,
+    })
+  })
+
   it('counts L3 task types separately from L4 App execution units', () => {
     const tree = fixture()
     expect(leaves(tree)).toHaveLength(1)

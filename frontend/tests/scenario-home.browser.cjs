@@ -27,6 +27,93 @@ async function settled(page) {
   await page.waitForFunction(() => !document.querySelector('.studio-mode-enter-active, .studio-mode-leave-active'))
 }
 
+const THEME = {
+  ink: 'rgb(15, 23, 42)',
+  muted: 'rgb(100, 116, 139)',
+  line: 'rgb(220, 229, 235)',
+  accent: 'rgb(20, 184, 166)',
+  accentDeep: 'rgb(15, 118, 110)',
+  surface: 'rgb(255, 255, 255)',
+  accentSoft: 'rgb(240, 253, 250)',
+  transparent: 'rgba(0, 0, 0, 0)',
+}
+
+async function assertHomeBackground(page) {
+  const actual = await page.evaluate(() => ({
+    bodyColor: getComputedStyle(document.body).backgroundColor,
+    bodyImage: getComputedStyle(document.body).backgroundImage,
+    layers: [
+      '.scenario-studio-page', '.studio-shell', '.studio-shell-header',
+      '.tree-home', '.home-intro', '.home-metrics', '.tree-frame', '.home-values',
+    ].map(selector => {
+      const style = getComputedStyle(document.querySelector(selector))
+      return { selector, color: style.backgroundColor, image: style.backgroundImage }
+    }),
+  }))
+  assert.equal(actual.bodyColor, 'rgb(238, 243, 246)', 'The overview must reveal the site background')
+  assert.match(actual.bodyImage, /^radial-gradient\(/, 'Keep the existing site gradient')
+  for (const layer of actual.layers) {
+    assert.equal(layer.color, THEME.transparent, `${layer.selector} must not cover the site background`)
+    assert.equal(layer.image, 'none', `${layer.selector} must not add another gradient`)
+  }
+}
+
+async function assertHomeTheme(page) {
+  await assertHomeBackground(page)
+  const actual = await page.evaluate(() => {
+    const style = selector => getComputedStyle(document.querySelector(selector))
+    return {
+      title: style('.studio-shell-title h1').color,
+      eyebrow: style('.studio-shell-title .eyebrow').color,
+      frameBackground: style('.tree-frame').backgroundColor,
+      frameBorder: style('.tree-frame').borderTopColor,
+      nodeFill: style('.tree-node-base').fill,
+      nodeStroke: style('.tree-node-base').stroke,
+      branchStroke: style('.tree-branch').stroke,
+      nodeIcon: style('.node-icon').color,
+      rootFill: style('.tree-root > rect').fill,
+      searchBackground: style('.studio-search .el-input__wrapper').backgroundColor,
+    }
+  })
+  assert.deepEqual(actual, {
+    title: THEME.ink, eyebrow: THEME.accentDeep, frameBackground: THEME.transparent, frameBorder: THEME.line,
+    nodeFill: THEME.surface, nodeStroke: THEME.line, branchStroke: THEME.line, nodeIcon: THEME.accentDeep,
+    rootFill: THEME.surface, searchBackground: THEME.surface,
+  })
+}
+
+async function assertActiveTheme(page) {
+  const actual = await page.evaluate(() => ({
+    nodeFill: getComputedStyle(document.querySelector('.capability-tree-node.is-active .tree-node-base')).fill,
+    nodeStroke: getComputedStyle(document.querySelector('.capability-tree-node.is-active .tree-node-base')).stroke,
+    branchStroke: getComputedStyle(document.querySelector('.tree-branch.is-active')).stroke,
+  }))
+  assert.deepEqual(actual, { nodeFill: THEME.accentSoft, nodeStroke: THEME.accent, branchStroke: THEME.accent })
+}
+
+async function assertEditorTheme(page) {
+  const actual = await page.evaluate(() => ({
+    title: getComputedStyle(document.querySelector('.studio-shell-title h1')).color,
+    shellBackground: getComputedStyle(document.querySelector('.studio-shell')).backgroundColor,
+    editorBackground: getComputedStyle(document.querySelector('.scenario-editor')).backgroundColor,
+    editorBorder: getComputedStyle(document.querySelector('.scenario-editor')).borderTopColor,
+    browserBackground: getComputedStyle(document.querySelector('.column-browser')).backgroundColor,
+    activeTab: getComputedStyle(document.querySelector('.scene-tab.active')).borderBottomColor,
+  }))
+  assert.deepEqual(actual, {
+    title: THEME.ink, shellBackground: THEME.surface, editorBackground: THEME.surface, editorBorder: THEME.line,
+    browserBackground: 'rgb(248, 250, 252)', activeTab: THEME.accent,
+  })
+}
+
+async function assertSelectedEditorItemTheme(page) {
+  const actual = await page.locator('.column-item.selected').first().evaluate(element => {
+    const style = getComputedStyle(element)
+    return { border: style.borderTopColor, background: style.backgroundColor }
+  })
+  assert.deepEqual(actual, { border: THEME.accent, background: THEME.accentSoft })
+}
+
 async function assertCanvas(page, count) {
   await page.waitForFunction(() => {
     const canvas = document.querySelector('.capability-tree')
@@ -71,15 +158,18 @@ async function checkFinal(browser, page, snapshot) {
     await page.locator('.capability-tree-node').first().waitFor()
     await settled(page)
     await assertIdle(page)
+    await assertHomeBackground(page)
   }
   await back()
   await assertCanvas(page, scenes.length)
+  await assertHomeTheme(page)
   assert.equal(await page.locator('.metric-item dd').first().innerText(), String(scenes.length))
   assert.ok(await page.locator('.metric-item dd').first().evaluate(el => parseFloat(getComputedStyle(el).fontSize) <= 32))
   const defaultBox = await page.locator('.capability-tree-node').first().boundingBox()
   await page.locator('.capability-tree-node').first().hover()
   await page.waitForFunction(() => document.querySelector('.capability-tree-node.is-active'))
   assert.equal(await page.locator('.capability-tree-node.is-active').count(), 1)
+  await assertActiveTheme(page)
   assert.ok(await page.locator('.is-active .detail-item').count() <= 3)
   assert.equal(await page.locator('.tree-node-preview').count(), 0)
   const expandedBox = await page.locator('.capability-tree-node').first().boundingBox()
@@ -112,12 +202,26 @@ async function checkFinal(browser, page, snapshot) {
   await page.locator('.column-browser').waitFor()
   await settled(page)
   assert.equal(await page.locator('.column-item.selected .item-label').first().innerText(), capability.label)
+  await assertSelectedEditorItemTheme(page)
   await back()
 
   for (const width of [1440, 1024, 390]) {
     await page.setViewportSize({ width, height: 900 })
     await assertCanvas(page, scenes.length)
+    await assertHomeTheme(page)
     await shot(page, `final-${width}`)
+    await page.locator('.capability-tree-node').first().hover()
+    await page.waitForFunction(() => document.querySelector('.capability-tree-node.is-active'))
+    await assertActiveTheme(page)
+    await assertCanvas(page, scenes.length)
+    await shot(page, `final-hover-${width}`)
+    await assertIdle(page)
+    await page.locator('.home-primary').click()
+    await page.locator('.column-browser').waitFor()
+    await settled(page)
+    await assertEditorTheme(page)
+    await shot(page, `final-editor-${width}`)
+    await back()
   }
 
   const touch = await reviewPage(browser, { viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true, reducedMotion: 'reduce' })
@@ -154,6 +258,11 @@ async function checkFinal(browser, page, snapshot) {
     }
     await shot(test, `final-${variant.name}`)
     if (!variant.scenes.length) {
+      for (const width of [1440, 1024, 390]) {
+        await test.setViewportSize({ width, height: 900 })
+        await assertHomeBackground(test)
+        await shot(test, `final-empty-${width}`)
+      }
       await test.locator('.tree-state button').click()
       await test.locator('.column-browser').waitFor()
     }
@@ -168,11 +277,18 @@ async function checkFinal(browser, page, snapshot) {
   })
   await failed.goto(`${base}/scenario-studio`)
   await failed.locator('.tree-state--error').waitFor()
+  assert.equal(await failed.locator('.tree-state--error strong').evaluate(element => getComputedStyle(element).color), 'rgb(180, 83, 60)')
   await shot(failed, 'final-error')
+  for (const width of [1440, 1024, 390]) {
+    await failed.setViewportSize({ width, height: 900 })
+    await assertHomeBackground(failed)
+    await shot(failed, `final-error-${width}`)
+  }
   await failed.locator('.tree-state--error button').click()
   await failed.locator('.capability-tree-node').first().waitFor()
   assert.equal(attempts, 2)
   await assertCanvas(failed, scenes.length)
+  await assertHomeTheme(failed)
   await failed.close()
 
   // Real animations: rapidly switch hover targets, then resize to a touch-width layout.
@@ -241,22 +357,35 @@ async function main() {
     const payload = await (await responsePromise).json()
     await page.locator('.capability-tree-node').first().waitFor()
     await page.mouse.move(0, 0)
+    if (phase === 'final') await assertHomeTheme(page)
     await shot(page, `${phase}-home`)
     await page.locator('.capability-tree-node').first().click()
     await page.locator('.column-browser').waitFor()
     await page.waitForFunction(() => !document.querySelector('.studio-mode-enter-active, .studio-mode-leave-active'))
+    if (phase === 'final') await assertEditorTheme(page)
     await page.mouse.move(0, 0)
     await page.evaluate(() => window.scrollTo(0, 0))
     await shot(page, `${phase}-editor`)
     const editorLayout = await page.locator('.studio-shell-header, .scenario-editor, .column-browser, .scenario-column').evaluateAll(elements => elements.map(element => {
       const rect = element.getBoundingClientRect()
       const style = getComputedStyle(element)
-      return { x: rect.x, y: rect.y, width: rect.width, height: rect.height, color: style.color, background: style.backgroundColor, border: style.border, radius: style.borderRadius }
+      return { x: rect.x, y: rect.y, width: rect.width, height: rect.height, borderWidth: style.borderWidth, radius: style.borderRadius }
     }))
     await fs.writeFile(path.join(output, `${phase}-editor-layout.json`), JSON.stringify(editorLayout, null, 2))
     if (phase === 'final') {
       const baselineLayout = JSON.parse(await fs.readFile(path.join(output, 'baseline-editor-layout.json'), 'utf8'))
-      assert.deepEqual(editorLayout, baselineLayout, 'Editor geometry and surface styles must remain unchanged')
+      const baselineComparable = baselineLayout.map(item => {
+        const comparable = { x: item.x, y: item.y, width: item.width, height: item.height, radius: item.radius }
+        const legacyBorderWidth = String(item.border || '').trim().split(' ')[0]
+        if (item.borderWidth || legacyBorderWidth) comparable.borderWidth = item.borderWidth || legacyBorderWidth
+        return comparable
+      })
+      const editorComparable = editorLayout.map((item, index) => {
+        const comparable = { x: item.x, y: item.y, width: item.width, height: item.height, radius: item.radius }
+        if ('borderWidth' in baselineComparable[index]) comparable.borderWidth = item.borderWidth
+        return comparable
+      })
+      assert.deepEqual(editorComparable, baselineComparable, 'Editor geometry, border widths, and radii must remain unchanged')
     }
     if (phase === 'final') await checkFinal(browser, page, snapshot)
     assert.equal(treeRequests, 1, 'Entering the editor must reuse the loaded tree')

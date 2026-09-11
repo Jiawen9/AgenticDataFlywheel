@@ -36,15 +36,15 @@ export function appNodes(taskType: TaskGenerationTreeNode): TaskGenerationTreeNo
     use_resource_prior: config.use_resource_prior,
     control_prior_available: config.control_prior_available,
     resource_count: config.resource_count,
-    description: '',
   }))
 }
 
 export function normalizeTree(nodes: TaskGenerationTreeNode[]): TaskGenerationTreeNode[] {
   return nodes.map(node => {
-    const base = { ...node, description: node.description || '' }
+    // Older saved trees may still contain this retired editor-only field.
+    const { description: _legacyDescription, ...base } = node as TaskGenerationTreeNode & { description?: unknown }
     if (node.kind === 'sub_capability') {
-      return { ...base, app_configs: undefined, children: appNodes(node).map(app => ({ ...app, children: undefined })) }
+      return { ...base, app_configs: undefined, children: normalizeTree(appNodes(node)) }
     }
     if (node.kind === 'app') return { ...base, app: node.app || node.label, children: undefined }
     return { ...base, children: normalizeTree(node.children || []) }
@@ -94,7 +94,7 @@ export function parentOf(nodes: TaskGenerationTreeNode[], id: string): TaskGener
 
 export function editableTree(nodes: TaskGenerationTreeNode[]): TaskGenerationTreeNode[] {
   return nodes.map(node => {
-    const base: TaskGenerationTreeNode = { id: node.id, kind: node.kind, label: node.label, description: node.description || '' }
+    const base: TaskGenerationTreeNode = { id: node.id, kind: node.kind, label: node.label }
     if (node.kind === 'app') {
       return { ...base, app: node.label, reference_example: node.reference_example || '', use_resource_prior: Boolean(node.use_resource_prior) }
     }

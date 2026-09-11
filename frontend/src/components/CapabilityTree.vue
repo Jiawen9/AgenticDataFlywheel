@@ -89,14 +89,14 @@ function branchPath(position: CapabilityTreePosition) {
 <style scoped>
 .capability-tree { position: relative; width: 100%; min-width: 0; margin-top: 2px; isolation: isolate; }
 .tree-connections { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
-.tree-branch { fill: none; stroke: #b6bcb0; stroke-width: 1.2; stroke-linecap: round; transition: stroke .2s ease, opacity .2s ease; }
-.tree-branch.is-active { stroke: #3d6555; stroke-width: 1.7; }
+.tree-branch { fill: none; stroke: var(--studio-line, var(--line)); stroke-width: 1.2; stroke-linecap: round; transition: stroke .2s ease, opacity .2s ease; }
+.tree-branch.is-active { stroke: var(--studio-accent, var(--accent)); stroke-width: 1.7; }
 .tree-branch.is-dimmed { opacity: .72; }
-.tree-root>rect { fill: #f8f8f1; stroke: #9eaf9f; stroke-width: 1; }
-.tree-root>.root-inset { fill: none; stroke: #d5ddcf; stroke-width: .8; }
-.root-label { fill: #304d3d; text-anchor: middle; font: 500 18px var(--atlas-serif); }
-.root-caption { fill: #65715f; text-anchor: middle; font-size: 11px; }
-.root-symbol { fill: #fcfbf8; stroke: #597b62; stroke-width: 1.2; }
+.tree-root>rect { fill: var(--studio-surface, #fff); stroke: var(--studio-line, var(--line)); stroke-width: 1; }
+.tree-root>.root-inset { fill: none; stroke: var(--studio-line, var(--line)); stroke-width: .8; }
+.root-label { fill: var(--studio-accent-deep, var(--accent-deep)); text-anchor: middle; font: 500 18px var(--atlas-serif); }
+.root-caption { fill: var(--studio-muted, var(--muted)); text-anchor: middle; font-size: 11px; }
+.root-symbol { fill: var(--studio-surface, #fff); stroke: var(--studio-accent-deep, var(--accent-deep)); stroke-width: 1.2; }
 .root-symbol path { fill: none; }
 @media (prefers-reduced-motion: reduce) { .tree-branch { transition: none; } }
 </style>

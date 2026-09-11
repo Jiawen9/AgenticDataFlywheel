@@ -22,7 +22,7 @@ from backend.task_generation.knowledge_base import merged_nodes, replace_knowled
 from backend.task_generation.router import router
 from backend.task_generation.service import run_augmentation, run_initial_generation
 from backend.task_generation.tree_store import (
-    META_SHEET, VersionConflict, current_root, flatten, import_scene_workbook,
+    META_SHEET, SCENE_COLUMNS, TREE_FILE, VersionConflict, current_root, flatten, import_scene_workbook,
     read_tree, save_tree, validate_tree,
 )
 from backend.tests.test_task_generation import _write_knowledge_base
@@ -106,6 +106,88 @@ class EditableTreeTests(unittest.TestCase):
         invalid_app["children"] = [{"id": str(uuid.uuid4()), "kind": "scene", "label": "非法"}]
         with self.assertRaisesRegex(ValueError, "App 不能包含子节点"):
             validate_tree(invalid)
+
+    def test_retired_descriptions_are_ignored_without_rewriting_existing_bundle(self):
+        before = tree_payload(self.kb)
+        old_root = current_root(self.kb)
+        tree_path = old_root / TREE_FILE
+        legacy = json.loads(tree_path.read_text(encoding="utf-8"))
+
+        def add_descriptions(nodes):
+            for node in nodes:
+                # Retired fields must be ignored, even if an old client sends
+                # values that no longer fit the former text validation.
+                node["description"] = {"obsolete": True}
+                add_descriptions(node.get("children", []))
+
+        add_descriptions(legacy["scenes"])
+        tree_path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+        original_tree = tree_path.read_bytes()
+        original_pointer = (self.kb / "current.json").read_bytes()
+        original_workbook = (old_root / KNOWLEDGE_BASE_FILES["scene_tree"]).read_bytes()
+
+        self.assertEqual(read_tree(self.kb)["scenes"], validate_tree(before["scenes"]))
+        self.assertEqual(tree_payload(self.kb), before)
+        self.assertEqual(tree_path.read_bytes(), original_tree)
+        self.assertEqual((self.kb / "current.json").read_bytes(), original_pointer)
+
+        after = save_tree(legacy["scenes"], before["version"], root=self.kb)
+        self.assertEqual(after["scenes"], before["scenes"])
+        saved = json.loads((current_root(self.kb) / TREE_FILE).read_text(encoding="utf-8"))
+        self.assertEqual(saved["scenes"], validate_tree(before["scenes"]))
+        self.assertEqual(tree_path.read_bytes(), original_tree)
+        self.assertEqual((old_root / KNOWLEDGE_BASE_FILES["scene_tree"]).read_bytes(), original_workbook)
+        self.assertEqual(merged_nodes(self.kb)[0]["sub_capability_desc"], "操控描述")
+
+    def test_legacy_description_columns_are_ignored_and_new_excel_has_original_columns(self):
+        before = tree_payload(self.kb)
+        plain_path = self.base / "legacy-plain.xlsx"
+        frame = pd.read_excel(self.kb / KNOWLEDGE_BASE_FILES["scene_tree"])
+        frame["description"] = "旧任务类型描述"
+        frame.to_excel(plain_path, index=False)
+        book = load_workbook(plain_path)
+        try:
+            book.worksheets[0].append([None] * len(SCENE_COLUMNS) + ["只有废弃描述的空行"])
+            book.save(plain_path)
+        finally:
+            book.close()
+        clean = validate_tree(before["scenes"])
+        self.assertEqual(import_scene_workbook(plain_path, clean), clean)
+
+        metadata_path = self.base / "legacy-metadata.xlsx"
+        source = current_root(self.kb) / KNOWLEDGE_BASE_FILES["scene_tree"]
+        book = load_workbook(source)
+        try:
+            for sheet in (book.worksheets[0], book[META_SHEET]):
+                column = sheet.max_column + 1
+                sheet.cell(1, column, "description")
+                for row in range(2, sheet.max_row + 1):
+                    sheet.cell(row, column, "旧节点描述")
+            book.save(metadata_path)
+        finally:
+            book.close()
+        self.assertEqual(import_scene_workbook(metadata_path), clean)
+
+        replace_knowledge_base("scene_tree", metadata_path, root=self.kb, base_version=before["version"])
+        self.assertEqual(tree_payload(self.kb)["scenes"], before["scenes"])
+        book = load_workbook(current_root(self.kb) / KNOWLEDGE_BASE_FILES["scene_tree"])
+        try:
+            self.assertEqual([cell.value for cell in book.worksheets[0][1]],
+                             ["scene", "capability", "sub_capability", "target_app", "use_resource_prior", "reference_example"])
+            self.assertEqual([cell.value for cell in book.worksheets[0][1]], SCENE_COLUMNS)
+            self.assertNotIn("description", [cell.value for cell in book[META_SHEET][1]])
+            self.assertEqual(book[META_SHEET].sheet_state, "hidden")
+        finally:
+            book.close()
+
+    def test_legacy_app_config_descriptions_are_ignored(self):
+        before = tree_payload(self.kb)
+        scenes = copy.deepcopy(before["scenes"])
+        leaf = flatten(scenes)[0][0]
+        leaf.pop("children")
+        for app in leaf["app_configs"]:
+            app["description"] = "旧 App 描述"
+        self.assertEqual(validate_tree(scenes), validate_tree(before["scenes"]))
 
     def test_renaming_l4_app_updates_control_prior_and_resource_sheet(self):
         before = tree_payload(self.kb)
@@ -321,6 +403,58 @@ class EditableTreeTests(unittest.TestCase):
             aug_rows = manager.results(augmented.json()["job_id"])
             self.assertEqual(aug_rows[0]["scene"], "网页新场景")
             self.assertTrue(any("操控描述" in prompt for prompt in model.prompts))
+
+    def test_api_exports_legacy_bundle_without_descriptions_or_source_changes(self):
+        before = tree_payload(self.kb)
+        source = current_root(self.kb)
+        workbook_path = source / KNOWLEDGE_BASE_FILES["scene_tree"]
+        book = load_workbook(workbook_path)
+        try:
+            for sheet in (book.worksheets[0], book[META_SHEET]):
+                column = sheet.max_column + 1
+                sheet.cell(1, column, "description")
+                for row in range(2, sheet.max_row + 1):
+                    sheet.cell(row, column, "旧节点描述")
+            book.save(workbook_path)
+        finally:
+            book.close()
+        tree_path = source / TREE_FILE
+        legacy = json.loads(tree_path.read_text(encoding="utf-8"))
+        legacy["scenes"][0]["description"] = "旧场景描述"
+        flatten(legacy["scenes"])[0][0]["children"][0]["description"] = "旧 App 描述"
+        tree_path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+        paths = [self.kb / "current.json", tree_path, workbook_path]
+        original_files = {path: path.read_bytes() for path in paths}
+        temporary_paths = []
+        named_temporary_file = tempfile.NamedTemporaryFile
+
+        def tracked_temporary_file(*args, **kwargs):
+            stream = named_temporary_file(*args, **kwargs)
+            temporary_paths.append(Path(stream.name))
+            return stream
+
+        manager = self.make_manager()
+        app = FastAPI()
+        app.include_router(router)
+        with patch("backend.task_generation.router.manager", manager), \
+                patch("backend.task_generation.router.tempfile.NamedTemporaryFile", side_effect=tracked_temporary_file), \
+                TestClient(app) as client:
+            response = client.get("/api/task-generation/tree/export")
+        self.assertEqual(response.status_code, 200)
+        book = load_workbook(io.BytesIO(response.content))
+        try:
+            self.assertEqual([cell.value for cell in book.worksheets[0][1]], SCENE_COLUMNS)
+            self.assertNotIn("description", [cell.value for cell in book[META_SHEET][1]])
+            self.assertEqual(book[META_SHEET].sheet_state, "hidden")
+        finally:
+            book.close()
+        exported = self.base / "downloaded-tree.xlsx"
+        exported.write_bytes(response.content)
+        self.assertEqual(import_scene_workbook(exported), validate_tree(before["scenes"]))
+        self.assertTrue(temporary_paths)
+        self.assertTrue(all(not path.exists() for path in temporary_paths))
+        for path, original in original_files.items():
+            self.assertEqual(path.read_bytes(), original)
 
 
 if __name__ == "__main__":

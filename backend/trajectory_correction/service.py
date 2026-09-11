@@ -112,17 +112,13 @@ def _overlay_row(session_id: str, session: dict[str, Any], base: dict[str, Any])
     row["sop_edited"] = "sop" in edit
     row["original_summary"] = row.get("original_summary", row.get("summary", ""))
     row["original_thought"] = row.get("original_thought", row.get("thought", ""))
-    if "summary" in edit:
-        row["summary"] = str(edit["summary"])
-    if "thought" in edit:
-        row["thought"] = str(edit["thought"])
     row["original_action"] = edit.get("original_actions", row.get("actions", ""))
     row["original_actions_box"] = baseline_box
     row["bbox_edited"] = str(row.get("actions_box", "")) != str(row["original_actions_box"])
     row["bbox_source"] = str(edit.get("bbox_source", "manual" if row["bbox_edited"] else "original"))
-    row["thought"] = str(edit.get("thought", row.get("original_thought", "")))
-    row["summary_source"] = "manual" if "summary" in edit else "original"
-    row["thought_source"] = "manual" if "thought" in edit else "original"
+    row["thought"] = str(row.get("original_thought", ""))
+    row["summary_source"] = "original"
+    row["thought_source"] = "original"
     row["cot_summary"] = ""
     row["cot_status"] = "pending" if row["action_edited"] or row["bbox_edited"] else "not_needed"
     row["cot_action_hash"] = ""
@@ -135,19 +131,23 @@ def _overlay_row(session_id: str, session: dict[str, Any], base: dict[str, Any])
         if (
             cot.get("content_tag") == "thought_summary"
             and cot.get("action_hash") == action_hash
-            and cot.get("summary")
         ):
-            row["summary"] = str(cot.get("summary"))
-            row["cot_summary"] = str(cot.get("summary"))
-            row["thought"] = str(cot.get("thought", ""))
-            row["summary_source"] = "generated"
-            row["thought_source"] = "generated"
-            row["cot_status"] = "generated"
+            for field in ("summary", "thought"):
+                if cot.get(field):
+                    row[field] = str(cot[field])
+                    row[f"{field}_source"] = "generated"
+                    row["cot_status"] = "generated"
+            row["cot_summary"] = str(cot.get("summary") or "")
             row["cot_action_hash"] = action_hash
             row["cot_bbox_hash"] = bbox_hash
             row["cot_generated_at"] = cot.get("generated_at")
-    if row["cot_status"] != "generated" and ("summary" in edit or "thought" in edit):
-        row["cot_status"] = "manual"
+    # Apply each explicit manual value last, including an empty string.
+    # Editing one text field must not discard the other generated field.
+    for field in ("summary", "thought"):
+        if field in edit:
+            row[field] = str(edit[field])
+            row[f"{field}_source"] = "manual"
+            row["cot_status"] = "manual"
     row["edited"] = row["action_edited"] or row["sop_edited"] or row["bbox_edited"] or row["deleted"]
     row["edit_status"] = "、".join(
         label
@@ -416,12 +416,9 @@ def patch_row(session_id: str, excel_row: int, payload: dict[str, Any]) -> dict[
         if payload.get(field) is None:
             continue
         value = str(payload[field]).strip()
-        baseline = str(base.get(field, "") or "")
-        if value == baseline:
-            edit.pop(field, None)
-        else:
-            edit[field] = value
-        session.setdefault("cot", {}).pop(str(excel_row), None)
+        # Saving the original text (or clearing it) is still an explicit
+        # choice and must take precedence over any generated value.
+        edit[field] = value
 
     if payload.get("deleted") is not None:
         if bool(payload["deleted"]):

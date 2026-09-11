@@ -146,6 +146,15 @@ export function useTaskGenerationReview(api: ReviewApi, feedback: Feedback) {
     catch (error) { if (!disposed) feedback.error((error as Error).message); return null }
     finally { busy.value = false }
   }
+  async function runExternalAction<T>(action: (jobId: string) => Promise<T>): Promise<T | null> {
+    const jobId = selectedJob.value?.job_id, ticket = epoch
+    if (!jobId || !(await protect()) || disposed || ticket !== epoch || selectedJob.value?.job_id !== jobId || busy.value) return null
+    busy.value = true
+    try {
+      const result = await action(jobId)
+      return !disposed && ticket === epoch && selectedJob.value?.job_id === jobId ? result : null
+    } finally { if (!disposed && ticket === epoch) busy.value = false }
+  }
   function dispose() { disposed = true; epoch++; if (timer) clearTimeout(timer) }
-  return { jobs, selectedJob, results, errors, listError, detailError, loading, refreshing, busy, editingId, editingText, dirty, protect, cancelEdit, startEdit, saveEdit, selectJob, refreshJobs, acceptJob, toggleDeleted, exportResults, dispose }
+  return { jobs, selectedJob, results, errors, listError, detailError, loading, refreshing, busy, editingId, editingText, dirty, protect, cancelEdit, startEdit, saveEdit, selectJob, refreshJobs, acceptJob, toggleDeleted, exportResults, runExternalAction, dispose }
 }

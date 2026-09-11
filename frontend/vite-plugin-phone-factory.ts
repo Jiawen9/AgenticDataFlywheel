@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { execFile } from 'node:child_process'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Plugin } from 'vite'
+import { createPhoneFactoryTaskStore, PhoneFactoryTaskError, type StoredPhoneFactoryTask } from './phone-factory-task-store'
 
 /**
  * 手机工厂采集页开发期数据服务。
@@ -15,6 +16,7 @@ import type { Plugin } from 'vite'
 const FRONTEND_ROOT = path.dirname(fileURLToPath(import.meta.url))
 const DATA_DIR = path.join(FRONTEND_ROOT, 'data')
 const UPLOAD_DIR = '/root/uuupppfffiiillleee'
+const taskStore = createPhoneFactoryTaskStore(DATA_DIR, UPLOAD_DIR)
 
 interface PhoneAppRow {
   phone_id: string
@@ -22,11 +24,7 @@ interface PhoneAppRow {
   status: string
 }
 
-interface TaskRow {
-  description: string
-  filename: string
-  status: string
-}
+type TaskRow = StoredPhoneFactoryTask
 
 interface FactoryState {
   phones: string[]
@@ -93,7 +91,7 @@ async function loadState(): Promise<FactoryState> {
     readJson<string[]>('apps.json', []),
     readJson<PhoneAppRow[]>('phone_apps.json', []),
     readJson<string[]>('vla.json', []),
-    readJson<TaskRow[]>('tasks.json', []),
+    taskStore.list(),
   ])
   return { phones, apps, phoneApps, vla, tasks }
 }
@@ -238,29 +236,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<boolea
     }
 
     if (route === '/tasks' && method === 'POST') {
-      const description = String(data.description ?? '').trim()
-      const rawFilename = String(data.filename ?? '').trim()
-      const contentBase64 = String(data.content_base64 ?? '')
-      if (!description) return fail(res, '任务描述不能为空'), true
-      if (!rawFilename) return fail(res, '请先选择文件'), true
-      if (!contentBase64) return fail(res, '文件内容为空'), true
-      const filename = path.basename(rawFilename)
-      await fs.writeFile(path.join(UPLOAD_DIR, filename), Buffer.from(contentBase64, 'base64'))
-      const state = await loadState()
-      state.tasks.push({ description, filename, status: '未运行' })
-      await writeJson('tasks.json', state.tasks)
+      await taskStore.add(data)
       send(res, 200, await loadState())
       return true
     }
 
     // 开始运行任务：状态 未运行 -> 运行中
     if (route === '/tasks/start' && method === 'POST') {
-      const filename = path.basename(String(data.filename ?? '').trim())
-      const state = await loadState()
-      const task = state.tasks.find((item) => item.filename === filename)
-      if (!task) return fail(res, `任务 ${filename} 不存在`, 404), true
-      task.status = '运行中'
-      await writeJson('tasks.json', state.tasks)
+      await taskStore.start(data.filename)
       send(res, 200, await loadState())
       return true
     }
@@ -311,16 +294,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<boolea
     }
 
     if (route === '/tasks' && method === 'DELETE') {
-      const filename = path.basename(String(data.filename ?? '').trim())
-      const state = await loadState()
-      state.tasks = state.tasks.filter((task) => task.filename !== filename)
-      await writeJson('tasks.json', state.tasks)
+      await taskStore.remove(data.filename)
       send(res, 200, await loadState())
       return true
     }
 
     send(res, 404, { error: `Unsupported ${method} ${route}` })
   } catch (error) {
+    if (error instanceof PhoneFactoryTaskError) { fail(res, error.message, error.status); return true }
     console.error('[phone-factory]', error)
     send(res, 500, { error: (error as Error).message || '服务器内部错误' })
   }

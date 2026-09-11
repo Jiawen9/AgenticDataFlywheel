@@ -28,7 +28,7 @@ from .knowledge_base import _clean, _truthy, parse_app_list, validate_workbook
 TREE_FILE = "scene_tree.json"
 META_SHEET = "_scene_tree_nodes"
 PATH_COLUMNS = ["scene", "capability", "sub_capability"]
-SCENE_COLUMNS = [*PATH_COLUMNS, "target_app", "use_resource_prior", "reference_example", "description"]
+SCENE_COLUMNS = [*PATH_COLUMNS, "target_app", "use_resource_prior", "reference_example"]
 KINDS = ("scene", "capability", "sub_capability", "app")
 _LOCK = threading.RLock()
 
@@ -92,6 +92,7 @@ def _app_nodes(task_type: dict[str, Any]) -> list[dict[str, Any]]:
         for item in children:
             if isinstance(item, dict) and item.get("kind") == "app":
                 value = dict(item)
+                value.pop("description", None)
                 value.setdefault("app", value.get("label", ""))
                 result.append(value)
         return result
@@ -104,7 +105,6 @@ def _app_nodes(task_type: dict[str, Any]) -> list[dict[str, Any]]:
             "kind": "app",
             "label": str(config.get("app") or ""),
             "app": str(config.get("app") or ""),
-            "description": str(config.get("description") or ""),
             "reference_example": str(config.get("reference_example") or ""),
             "use_resource_prior": bool(config.get("use_resource_prior", False)),
         })
@@ -122,28 +122,28 @@ def flatten(scenes: list[dict[str, Any]]) -> list[tuple[dict[str, Any], tuple[st
 
 
 def _migrate_legacy_scenes(scenes: Any) -> Any:
-    """Convert legacy L1/L2/L3 + app_configs to L1/L2/L3/App nodes."""
+    """Normalize legacy App nodes and discard retired descriptions in memory."""
     migrated = copy.deepcopy(scenes)
     if not isinstance(migrated, list):
         return migrated
     for scene in migrated:
         if not isinstance(scene, dict):
             continue
-        scene.setdefault("description", "")
+        scene.pop("description", None)
         for capability in scene.get("children", []) or []:
             if not isinstance(capability, dict):
                 continue
-            capability.setdefault("description", "")
+            capability.pop("description", None)
             for task_type in capability.get("children", []) or []:
                 if not isinstance(task_type, dict):
                     continue
-                task_type.setdefault("description", "")
+                task_type.pop("description", None)
                 if task_type.get("kind") != "sub_capability":
                     continue
                 if isinstance(task_type.get("children"), list):
                     for app in task_type["children"]:
                         if isinstance(app, dict):
-                            app.setdefault("description", "")
+                            app.pop("description", None)
                     task_type.pop("app_configs", None)
                     continue
                 children = []
@@ -154,7 +154,6 @@ def _migrate_legacy_scenes(scenes: Any) -> Any:
                         "id": str(config.get("id") or uuid.uuid4()),
                         "kind": "app",
                         "label": str(config.get("app") or "").strip(),
-                        "description": str(config.get("description") or ""),
                         "reference_example": str(config.get("reference_example") or ""),
                         "use_resource_prior": bool(config.get("use_resource_prior", False)),
                     })
@@ -204,7 +203,6 @@ def _normalize_tree_payload(scenes: Any) -> Any:
                         "id": str(config.get("id") or uuid.uuid4()),
                         "kind": "app",
                         "label": app,
-                        "description": str(config.get("description") or ""),
                         "reference_example": str(config.get("reference_example") or ""),
                         "use_resource_prior": config.get("use_resource_prior", False),
                     })
@@ -237,10 +235,7 @@ def _validate_four_level_tree(scenes: Any) -> list[dict[str, Any]]:
             if identifier in seen_ids:
                 raise ValueError("节点 ID 不能重复")
             seen_ids.add(identifier)
-            description = value.get("description", "")
-            if not isinstance(description, str) or len(description) > 20000:
-                raise ValueError("节点描述必须是文本（最多 20000 字）")
-            node = {"id": identifier, "kind": KINDS[depth], "label": name, "description": description}
+            node = {"id": identifier, "kind": KINDS[depth], "label": name}
             if depth < 3:
                 if value.get("app_configs"):
                     raise ValueError("App 必须作为 L4 节点配置")
@@ -284,9 +279,12 @@ def import_scene_workbook(path: Path, previous: list[dict[str, Any]] | None = No
     previous_paths = _paths(previous)
     scenes: list[dict[str, Any]] = []
     with pd.ExcelFile(path) as book:
-        frame = pd.read_excel(book, sheet_name=0).fillna("")
+        # Preserve Excel booleans when other rows have empty App settings.
+        frame = pd.read_excel(book, sheet_name=0, dtype=object)
+        frame = frame.where(pd.notna(frame), "")
         if META_SHEET in book.sheet_names:
-            metadata = pd.read_excel(book, sheet_name=META_SHEET).fillna("")
+            metadata = pd.read_excel(book, sheet_name=META_SHEET, dtype=object)
+            metadata = metadata.where(pd.notna(metadata), "")
             required = {"id", "parent_id", "kind", "label"}
             if not required.issubset(metadata.columns):
                 raise ValueError("场景树身份元数据缺少必要列")
@@ -300,7 +298,6 @@ def import_scene_workbook(path: Path, previous: list[dict[str, Any]] | None = No
                     "id": identifier,
                     "label": _clean(row["label"]),
                     "kind": kind,
-                    "description": _clean(row.get("description")),
                     "children": [],
                 }
                 if kind == "app":
@@ -336,7 +333,6 @@ def import_scene_workbook(path: Path, previous: list[dict[str, Any]] | None = No
                     "id": previous_paths.get(key, {}).get("id", str(uuid.uuid4())),
                     "label": label,
                     "kind": KINDS[depth],
-                    "description": _clean(row.get("description")) if depth == 2 else "",
                     "children": [],
                 }
                 parent_children.append(node)
@@ -350,7 +346,6 @@ def import_scene_workbook(path: Path, previous: list[dict[str, Any]] | None = No
                 "id": existing.get("id", str(uuid.uuid4())) if existing else previous_app.get("id", str(uuid.uuid4())),
                 "kind": "app",
                 "label": app,
-                "description": existing.get("description", previous_app.get("description", "")) if existing else previous_app.get("description", ""),
                 "reference_example": _clean(row.get("reference_example")),
                 "use_resource_prior": _truthy(row.get("use_resource_prior")),
             }
@@ -387,7 +382,6 @@ def write_scene_workbook(path: Path, scenes: list[dict[str, Any]]) -> None:
                     json.dumps([app["label"]], ensure_ascii=False),
                     app["use_resource_prior"],
                     app["reference_example"],
-                    task_type.get("description", ""),
                 ]
                 for column, value in enumerate(values, 1):
                     _string_cell(sheet, row_number, column, value)
@@ -395,13 +389,13 @@ def write_scene_workbook(path: Path, scenes: list[dict[str, Any]]) -> None:
         if META_SHEET in book.sheetnames:
             book.remove(book[META_SHEET])
         meta = book.create_sheet(META_SHEET)
-        meta.append(["id", "parent_id", "kind", "label", "description", "reference_example", "use_resource_prior"])
+        meta.append(["id", "parent_id", "kind", "label", "reference_example", "use_resource_prior"])
 
         def visit(nodes: list[dict[str, Any]], parent: str = "") -> None:
             for node in nodes:
                 index = meta.max_row + 1
                 values = [
-                    node["id"], parent, node["kind"], node["label"], node.get("description", ""),
+                    node["id"], parent, node["kind"], node["label"],
                     node.get("reference_example", ""), node.get("use_resource_prior", ""),
                 ]
                 for column, value in enumerate(values, 1):
@@ -569,7 +563,9 @@ def current_root(root: Path = KNOWLEDGE_BASE_DIR) -> Path:
 
 
 def read_tree(root: Path = KNOWLEDGE_BASE_DIR) -> dict[str, Any]:
-    return _json(current_root(root) / TREE_FILE)
+    value = _json(current_root(root) / TREE_FILE)
+    value["scenes"] = _migrate_legacy_scenes(value["scenes"])
+    return value
 
 
 def save_tree(scenes: Any, base_version: str, *, root: Path = KNOWLEDGE_BASE_DIR) -> dict[str, Any]:
@@ -618,7 +614,7 @@ def prior_status(root: Path) -> tuple[dict[tuple[str, str, str, str], str], dict
 
 def tree_payload(root: Path = KNOWLEDGE_BASE_DIR) -> dict[str, Any]:
     source = current_root(root)
-    value = copy.deepcopy(_json(source / TREE_FILE))
+    value = read_tree(source)
     controls, resources, warnings = prior_status(source)
     warnings = [*value.get("warnings", []), *warnings]
     leaves = flatten(value["scenes"])

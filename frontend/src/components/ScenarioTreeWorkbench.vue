@@ -14,7 +14,6 @@ interface DetailDraft {
   id: string
   kind: TaskGenerationTreeNode['kind']
   label: string
-  description: string
   reference_example: string
   use_resource_prior: boolean
 }
@@ -190,7 +189,7 @@ function bindApps(labels: string[]) {
       app.children = undefined
       return app
     }
-    return { id: crypto.randomUUID(), kind: 'app' as const, label, app: label, description: '', reference_example: '', use_resource_prior: false }
+    return { id: crypto.randomUUID(), kind: 'app' as const, label, app: label, reference_example: '', use_resource_prior: false }
   })
   snapshot()
   target.children = next
@@ -302,7 +301,7 @@ function commitAdd() {
   }
   snapshot()
   const label = requested || uniqueLabel(parent, kind)
-  const node: TaskGenerationTreeNode = { id: crypto.randomUUID(), kind, label, description: '', children: [] }
+  const node: TaskGenerationTreeNode = { id: crypto.randomUUID(), kind, label, children: [] }
   siblings.push(node)
   addingKind.value = ''
   addingParentId.value = ''
@@ -345,7 +344,6 @@ function openDetails(node: TaskGenerationTreeNode) {
     id: node.id,
     kind: node.kind,
     label: node.label,
-    description: node.description || '',
     reference_example: node.reference_example || '',
     use_resource_prior: Boolean(node.use_resource_prior),
   }
@@ -360,12 +358,10 @@ function saveDetails() {
   if (!label) { ElMessage.warning('名称不能为空'); return }
   if (siblings.some(item => item.id !== node.id && item.label === label)) { ElMessage.warning('同级节点名称不能重复'); return }
   const changed = node.label !== label
-    || (node.description || '') !== details.description
     || (node.kind === 'app' && ((node.reference_example || '') !== details.reference_example || Boolean(node.use_resource_prior) !== details.use_resource_prior))
   if (!changed) { detailVisible.value = false; return }
   snapshot()
   node.label = label
-  node.description = details.description
   if (node.kind === 'app') {
     node.app = label
     node.reference_example = details.reference_example
@@ -635,8 +631,6 @@ defineExpose({ beginEdit, undo, redo, save, discardChanges, focusNode })
         <div class="detail-path">{{ nodePath(realTree, detailDraft.id).join(' › ') }}</div>
         <label>名称</label>
         <el-input v-model="detailDraft.label" :disabled="!editing" maxlength="200" />
-        <label>描述</label>
-        <el-input v-model="detailDraft.description" :disabled="!editing" type="textarea" :rows="6" maxlength="20000" />
         <template v-if="detailDraft.kind === 'app'">
           <label>参考示例</label>
           <el-input v-model="detailDraft.reference_example" :disabled="!editing" type="textarea" :rows="6" maxlength="20000" />
@@ -661,4 +655,28 @@ defineExpose({ beginEdit, undo, redo, save, discardChanges, focusNode })
 
 <style scoped>
 .scenario-editor{position:relative;margin-top:18px;padding:0 0 18px;border:1px solid var(--line);border-radius:18px;background:rgba(255,255,255,.84);box-shadow:0 12px 35px rgba(15,23,42,.035);overflow:visible}.studio-header{position:relative;display:flex;align-items:flex-end;justify-content:space-between;gap:24px;padding:23px 24px 18px;border-bottom:1px solid var(--line)}.studio-heading h2{margin:5px 0 4px;color:#182535;font-size:22px;letter-spacing:-.025em}.studio-heading p{margin:0;color:var(--muted);font-size:12px}.studio-actions{display:flex;align-items:center;justify-content:flex-end;gap:4px;flex-wrap:wrap}.studio-meta{margin-right:7px;color:#94a3b8;font-size:10px;white-space:nowrap}.studio-search{width:235px}.saved-state{font-size:11px}.search-results-popover{position:absolute;z-index:10;top:78px;right:170px;width:min(420px,calc(100% - 48px));max-height:410px;overflow:auto;padding:9px;border:1px solid #cfdde1;border-radius:12px;background:#fff;box-shadow:0 18px 40px rgba(15,23,42,.14)}.search-results-head{display:flex;justify-content:space-between;padding:6px 8px 9px;color:#334155;font-size:12px}.search-results-head span{color:#94a3b8;font-size:10px}.search-result{display:grid;gap:4px;width:100%;padding:9px 8px;border:0;border-radius:7px;background:transparent;color:#64748b;text-align:left;cursor:pointer}.search-result:hover{background:#f8fafc}.search-result>span:last-child{overflow:hidden;font-size:10px;text-overflow:ellipsis;white-space:nowrap}.search-result-title{display:flex;align-items:center;gap:7px;color:#334155}.search-result-title small{color:#0f766e;font-size:9px;font-weight:900}.search-no-result{padding:20px;color:#94a3b8;font-size:11px;text-align:center}.el-alert{margin:14px 20px 0}.scene-strip{padding:0 20px;border-bottom:1px solid var(--line)}.scene-tabs{display:flex;align-items:center;gap:3px;min-width:0;overflow-x:auto;scrollbar-width:thin}.scene-tab-wrap{display:flex;align-items:center;flex:0 0 auto}.scene-tab{position:relative;display:inline-flex;align-items:center;min-height:51px;padding:0 13px;border:0;border-bottom:2px solid transparent;background:transparent;color:#64748b;font-size:13px;cursor:pointer;white-space:nowrap}.scene-tab:hover{color:#334155;background:#fafdfd}.scene-tab.active{border-bottom-color:var(--accent);color:#1e293b;font-weight:800}.scene-tab.search-hit{animation:search-hit 1.2s ease}.scene-more{align-self:center;margin-left:-8px;padding:3px;border:0;background:transparent;color:#94a3b8;font-size:12px;cursor:pointer}.scene-more:hover{color:var(--accent-deep)}.scene-add{display:inline-flex;align-items:center;gap:4px;flex:0 0 auto;margin-left:7px;padding:6px 8px;border:0;border-radius:6px;background:transparent;color:var(--accent-deep);font-size:11px;cursor:pointer}.scene-add:hover{background:#f0fdfa}.scene-add--muted{color:#94a3b8}.scene-creator{display:flex;align-items:center;gap:3px;flex:0 0 auto;margin-left:7px;padding:5px 5px 5px 9px;border:1px solid #9bd8d0;border-radius:7px;background:#fff}.scene-creator-input{width:115px;border:0;outline:0;color:#334155;font-size:12px}.scene-creator button{border:0;background:transparent;color:#94a3b8;font-size:17px;cursor:pointer}.scene-rename-input{width:90px;border:0;border-bottom:1px solid var(--accent);outline:0;background:transparent;color:inherit;font:inherit}.path-bar{display:flex;align-items:center;gap:8px;min-height:53px;padding:0 24px;color:#64748b;font-size:12px;white-space:nowrap;overflow-x:auto}.path-root{color:#94a3b8;font-size:11px}.path-separator{color:#cbd5e1;font-size:17px}.path-bar button{padding:4px 5px;border:0;border-radius:5px;background:transparent;color:#64748b;font-size:12px;cursor:pointer}.path-bar button:hover{background:#f1f5f9;color:#334155}.path-bar button.current{color:#1e293b;font-weight:800}.path-placeholder{color:#c0cbd0;font-size:11px}.column-browser{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));margin:0 18px;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:#fbfdfd}.column-browser>.scenario-column+ .scenario-column{border-left:1px solid var(--line)}.studio-tip{margin:13px 24px 0;color:#94a3b8;font-size:10px}.detail-form{display:grid;gap:8px}.detail-path{margin-bottom:6px;padding-bottom:10px;border-bottom:1px solid var(--line);color:#94a3b8;font-size:11px;line-height:1.6}.detail-form label{margin-top:8px;color:#64748b;font-size:11px;font-weight:800}.detail-switch{display:flex;align-items:center;justify-content:space-between;margin-top:12px;color:#475569;font-size:12px}.dialog-copy{color:var(--muted);font-size:12px}@keyframes search-hit{0%,100%{box-shadow:none}35%{box-shadow:0 0 0 4px rgba(20,184,166,.2)}}@media(max-width:1180px){.studio-header{align-items:flex-start;flex-direction:column}.studio-actions{justify-content:flex-start}.search-results-popover{top:146px;right:24px}.studio-meta{display:none}}@media(max-width:780px){.studio-header{padding:19px 16px 15px}.studio-heading h2{font-size:19px}.studio-actions{width:100%;align-items:stretch}.studio-search{width:100%}.studio-actions :deep(.el-button){margin-left:0}.scene-strip{padding:0 12px}.path-bar{padding:0 16px}.column-browser{display:block;margin:0 12px}.column-browser>.scenario-column+ .scenario-column{border-top:1px solid var(--line);border-left:0}.scenario-column{min-height:320px}.column-list{min-height:190px}.search-results-popover{right:16px;width:calc(100% - 32px)}}
+.scenario-editor { background: var(--studio-surface, #fff); color: var(--studio-ink, var(--ink)); }
+.studio-heading h2,
+.search-results-head,
+.search-result-title,
+.scene-tab.active,
+.path-bar button.current { color: var(--studio-ink, var(--ink)); }
+.studio-meta,
+.search-results-head span,
+.search-result,
+.search-no-result,
+.scene-tab,
+.scene-more,
+.path-bar,
+.path-root,
+.path-bar button,
+.path-placeholder,
+.studio-tip,
+.detail-path,
+.scene-creator button { color: var(--studio-muted, var(--muted)); }
+.search-results-popover { border-color: var(--studio-line, var(--line)); background: var(--studio-surface, #fff); }
+.search-result:hover, .scene-tab:hover, .path-bar button:hover { background: var(--studio-surface-soft, #f8fafc); }
+.search-result-title small, .scene-more:hover { color: var(--studio-accent-deep, var(--accent-deep)); }
+.scene-creator { border-color: var(--studio-accent, var(--accent)); }
+.column-browser { border-color: var(--studio-line, var(--line)); background: var(--studio-surface-soft, #f8fafc); }
 </style>

@@ -1,8 +1,8 @@
-"""FastAPI routes for local dataset releases and mock uploads."""
+"""FastAPI routes for dataset releases, internal uploads, and legacy mocks."""
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
@@ -10,11 +10,16 @@ from pydantic import BaseModel, Field
 
 from .service import DatasetReleaseRegistry, default_registry
 from .upload_jobs import DatasetUploadJobManager
+from .internal_jobs import InternalUploadConflict
 
 
 class CreateReleaseRequest(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     session_ids: list[str]
+
+
+class UploadReleaseRequest(BaseModel):
+    target: Literal["internal", "mock"] | None = None
 
 
 router = APIRouter(prefix="/api", tags=["data-publishing"])
@@ -74,12 +79,19 @@ def dataset_release_excel(release_id: str, index: int) -> FileResponse:
     )
 
 
+@router.get("/dataset-upload-capabilities")
+def dataset_upload_capabilities() -> dict[str, object]:
+    return upload_manager.internal_capabilities()
+
+
 @router.post("/dataset-releases/{release_id}/upload", status_code=202)
-def upload_dataset_release(release_id: str) -> dict[str, object]:
+def upload_dataset_release(release_id: str, request: Optional[UploadReleaseRequest] = None) -> dict[str, object]:
     try:
-        return {"job": upload_manager.submit(release_id)}
+        return {"job": upload_manager.submit(release_id, target=request.target if request else None)}
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except InternalUploadConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (OSError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

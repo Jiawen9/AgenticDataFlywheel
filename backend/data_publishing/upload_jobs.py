@@ -1,4 +1,4 @@
-"""Persistent mock uploader for published datasets."""
+"""Persistent upload jobs for internal Excel uploads and legacy mock uploads."""
 
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ from typing import Any, Callable, Optional
 from ..trajectory_correction.draft_store import utc_now
 from .constants import BACKEND_DIR, UPLOAD_JOBS_DIR
 from .service import DatasetReleaseRegistry
+from . import internal_uploader
+from .internal_jobs import InternalUploadJobsMixin
 
 
 Progress = Callable[[dict[str, Any]], None]
@@ -36,7 +38,7 @@ def _setting(name: str, default: str) -> str:
     return os.getenv(name) or _load_env().get(name) or default
 
 
-class DatasetUploadJobManager:
+class DatasetUploadJobManager(InternalUploadJobsMixin):
     def __init__(
         self,
         registry: DatasetReleaseRegistry,
@@ -44,6 +46,7 @@ class DatasetUploadJobManager:
         jobs_dir: Path = UPLOAD_JOBS_DIR,
         executor: Optional[Executor] = None,
         step_delay: float = 0.01,
+        internal_adapter: Any = None,
     ) -> None:
         self.registry = registry
         self.jobs_dir = jobs_dir
@@ -52,12 +55,15 @@ class DatasetUploadJobManager:
         self._owns_executor = executor is None
         self._executor = executor or ThreadPoolExecutor(max_workers=1, thread_name_prefix="dataset-upload")
         self.step_delay = step_delay
+        self.internal_adapter = internal_adapter if internal_adapter is not None else internal_uploader
         self.mode = _setting("DATASET_UPLOAD_MODE", "mock")
         self.bucket = _setting("DATASET_S3_BUCKET", "training-data")
         self.prefix = _setting("DATASET_S3_PREFIX", "gui-agent-datasets").strip("/")
         self.mark_interrupted_jobs()
 
     def _path(self, job_id: str) -> Path:
+        if not job_id or any(char not in "0123456789abcdef" for char in job_id) or len(job_id) != 32:
+            return self.jobs_dir / ".invalid-job-id"
         return self.jobs_dir / f"{job_id}.json"
 
     def _write(self, payload: dict[str, Any]) -> None:
@@ -78,12 +84,37 @@ class DatasetUploadJobManager:
             return payload if isinstance(payload, dict) else None
 
     def mark_interrupted_jobs(self) -> None:
+        payloads = []
         for path in self.jobs_dir.glob("*.json"):
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, ValueError, json.JSONDecodeError):
                 continue
-            if not isinstance(payload, dict) or payload.get("status") not in {"queued", "running", "uploading"}:
+            if isinstance(payload, dict):
+                payloads.append(payload)
+        # Reconcile in attempt order so an interrupted registry write can be
+        # repaired from the newest durable receipt, without reviving older jobs.
+        # utc_now has second precision; retries can share a creation timestamp.
+        def internal_order(item):
+            return (int(item.get("attempt", 0)), item.get("created_at", ""))
+
+        for payload in sorted(payloads, key=internal_order):
+            if payload.get("mode") == "internal":
+                release = self.registry.get(str(payload.get("release_id", "")))
+                if release is None:
+                    continue
+                summary = release.get("internal_upload") or {}
+                if internal_order(summary) > internal_order(payload):
+                    continue
+                if payload.get("status") in {"queued", "running", "uploading"}:
+                    for item in payload.get("file_results", []):
+                        if item["status"] == "uploading":
+                            item.update(status="interrupted", error="服务重启导致上传中断")
+                    payload.update(status="interrupted", stage="interrupted", completed_at=utc_now(),
+                                   error="服务重启导致云道S3上传中断，可重试剩余文件")
+                self._save_internal(payload)
+                continue
+            if payload.get("status") not in {"queued", "running", "uploading"}:
                 continue
             payload.update(
                 {
@@ -137,7 +168,11 @@ class DatasetUploadJobManager:
                 payload["percent"] = min(99, round(100 * completed / total)) if total else 0
             self._write(payload)
 
-    def submit(self, release_id: str) -> dict[str, Any]:
+    def submit(self, release_id: str, *, target: Optional[str] = None) -> dict[str, Any]:
+        if target == "internal":
+            return self._submit_internal(release_id)
+        if target not in {None, "mock"}:
+            raise ValueError("未知上传目标")
         if self.mode != "mock":
             raise ValueError("当前版本仅支持 DATASET_UPLOAD_MODE=mock")
         release = self.registry.get(release_id)

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { TaskGenerationJob, TaskGenerationResult, TaskGenerationTreeNode } from '@/types'
-import { dependencyLabel, filterResultGroups, generationCandidates, generationDirectory, groupGenerationResults, reconcileApps, resultCounts, resultTypeKey, selectCandidates, unitLabel } from './taskGeneration'
+import { dependencyLabel, filterResultGroups, generationCandidates, generationDirectory, generationJobOptionLabel, groupGenerationResults, reconcileApps, resultCounts, resultTypeKey, selectCandidates, unitLabel } from './taskGeneration'
 import { executionUnitCount, selectionsFor } from './scenarioTree'
 
 const tree: TaskGenerationTreeNode[] = [
@@ -69,5 +69,9 @@ describe('task generation selection and review selectors', () => {
     expect(unitLabel(job, 'unit')).toBe('旧场景 / 旧能力 / 旧类型 · 甲')
     expect(unitLabel(job, 'legacy')).toBe('legacy')
     expect(unitLabel({} as TaskGenerationJob, 'unit')).toBe('unit')
+  })
+  it('labels generation job options with time, status, result count and a short ID', () => {
+    const value = { created_at: '2026-09-09T14:23:45', status: 'partial', result_count: 18, job_id: '1234567890abcdef' } as TaskGenerationJob
+    expect(generationJobOptionLabel(value)).toBe('2026-09-09 14:23 · 部分成功 · 18 条结果 · 1234567890ab')
   })
 })

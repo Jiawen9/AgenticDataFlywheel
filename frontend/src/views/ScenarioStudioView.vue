@@ -174,15 +174,40 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.scenario-studio-page.is-tree-home { background: #faf9f5; }
-.is-tree-home .studio-shell { border: 0; border-radius: 9px; background: #faf9f5; box-shadow: none; }
-.is-tree-home .studio-shell-header { align-items: center; padding: 20px 26px; border-bottom-color: #d9dbd1; }
-.is-tree-home .studio-shell-title h1 { color: #2d3832; }
-.is-tree-home .studio-shell-title .eyebrow { color: #496c55; letter-spacing: .23em; }
-.is-tree-home .studio-search :deep(.el-input__wrapper) { background: #fcfbf8; box-shadow: 0 0 0 1px #d2d8ca inset; }
+.scenario-studio-page {
+  --studio-ink: var(--ink);
+  --studio-muted: var(--muted);
+  --studio-line: var(--line);
+  --studio-accent: var(--accent);
+  --studio-accent-deep: var(--accent-deep);
+  --studio-surface: #fff;
+  --studio-surface-soft: #f8fafc;
+  --studio-accent-soft: #f0fdfa;
+}
+.scenario-studio-page.is-tree-home { background: transparent; }
+.scenario-studio-page.is-tree-home .studio-shell { border: 0; border-radius: 9px; background: transparent; box-shadow: none; }
+.is-tree-home .studio-shell-header { align-items: center; padding: 20px 26px; border-bottom-color: var(--studio-line); }
+.is-tree-home .studio-shell-title h1 { color: var(--studio-ink); }
+.is-tree-home .studio-shell-title .eyebrow { color: var(--studio-accent-deep); letter-spacing: .23em; }
+.is-tree-home .studio-search :deep(.el-input__wrapper) { background: var(--studio-surface); box-shadow: 0 0 0 1px var(--studio-line) inset; }
 @media (max-width: 780px) {
   .is-tree-home .studio-shell-header { align-items: flex-start; padding: 18px 16px; }
 }
 :global(body.scenario-studio-responsive){min-width:0}
 .scenario-studio-page{width:min(1800px,100%);min-height:100vh;margin:0 auto;padding-top:20px;background:radial-gradient(circle at 94% 0%,rgba(20,184,166,.08),transparent 23%),radial-gradient(circle at 2% 28%,rgba(14,165,233,.05),transparent 20%)}.studio-shell{position:relative;overflow:visible;border:1px solid var(--line);border-radius:18px;background:rgba(255,255,255,.8);box-shadow:0 12px 35px rgba(15,23,42,.035)}.studio-shell-header{position:relative;display:flex;align-items:flex-end;justify-content:space-between;gap:24px;padding:24px 26px 18px;border-bottom:1px solid var(--line)}.studio-shell-title h1{margin:6px 0 0;color:#182535;font-size:23px;letter-spacing:-.035em}.studio-context{display:flex;align-items:center;gap:7px;margin-top:13px;color:#94a3b8;font-size:11px}.studio-context button{display:inline-flex;align-items:center;gap:3px;padding:3px 5px;border:0;border-radius:5px;background:transparent;color:#64748b;font-size:11px;cursor:pointer}.studio-context button:hover{background:#f1f5f9;color:#0f766e}.studio-context strong{color:#334155}.studio-shell-actions{display:flex;align-items:center;justify-content:flex-end;gap:4px;flex-wrap:wrap}.studio-meta{margin-right:7px;color:#94a3b8;font-size:10px;white-space:nowrap}.studio-search{width:235px}.saved-state{font-size:11px}.search-results-popover{position:absolute;top:83px;right:26px;z-index:20;width:min(420px,calc(100% - 52px));max-height:410px;overflow:auto;padding:9px;border:1px solid #cfdde1;border-radius:12px;background:#fff;box-shadow:0 18px 40px rgba(15,23,42,.14)}.search-results-head{display:flex;justify-content:space-between;padding:6px 8px 9px;color:#334155;font-size:12px}.search-results-head span{color:#94a3b8;font-size:10px}.search-result{display:grid;gap:4px;width:100%;padding:9px 8px;border:0;border-radius:7px;background:transparent;color:#64748b;text-align:left;cursor:pointer}.search-result:hover{background:#f8fafc}.search-result>span:last-child{overflow:hidden;font-size:10px;text-overflow:ellipsis;white-space:nowrap}.search-result-title{display:flex;align-items:center;gap:7px;color:#334155}.search-result-title small{color:#0f766e;font-size:9px;font-weight:900}.search-no-result{padding:20px;color:#94a3b8;font-size:11px;text-align:center}.studio-load-error{display:flex;align-items:center;gap:12px;margin:16px 22px 0;padding:12px 15px;border:1px solid #fecdd3;border-radius:10px;background:#fff1f2}.studio-load-error strong{color:#9f1239;font-size:12px}.studio-load-error span{flex:1;color:#be123c;font-size:11px}.studio-editor-placeholder{min-height:420px}.studio-mode-enter-active,.studio-mode-leave-active{transition:opacity .2s ease,transform .2s ease}.studio-mode-enter-from,.studio-mode-leave-to{opacity:0;transform:translateY(7px)}@media(max-width:1180px){.studio-shell-header{align-items:flex-start;flex-direction:column}.studio-shell-actions{justify-content:flex-start}.studio-meta{display:none}.search-results-popover{top:151px;right:26px}}@media(max-width:780px){.scenario-studio-page{padding:12px 0 22px}.studio-shell-header{padding:20px 16px 16px}.studio-shell-title h1{font-size:20px}.studio-shell-actions{width:100%;align-items:stretch}.studio-search{width:100%}.studio-shell-actions :deep(.el-button){margin-left:0}.studio-load-error{margin-inline:16px;align-items:flex-start;flex-wrap:wrap}.studio-load-error span{min-width:100%}.search-results-popover{right:16px;width:calc(100% - 32px)}}
+.scenario-studio-page .studio-shell-title h1 { color: var(--studio-ink); }
+.scenario-studio-page .studio-shell { border-color: var(--studio-line); background: var(--studio-surface); }
+.scenario-studio-page .studio-context,
+.scenario-studio-page .studio-meta,
+.scenario-studio-page .search-results-head span,
+.scenario-studio-page .search-result,
+.scenario-studio-page .search-no-result { color: var(--studio-muted); }
+.scenario-studio-page .studio-context button { color: var(--studio-muted); }
+.scenario-studio-page .studio-context button:hover { background: var(--studio-surface-soft); color: var(--studio-accent-deep); }
+.scenario-studio-page .studio-context strong,
+.scenario-studio-page .search-results-head,
+.scenario-studio-page .search-result-title { color: var(--studio-ink); }
+.scenario-studio-page .search-results-popover { border-color: var(--studio-line); background: var(--studio-surface); }
+.scenario-studio-page .search-result:hover { background: var(--studio-surface-soft); }
+.scenario-studio-page .search-result-title small { color: var(--studio-accent-deep); }
 </style>

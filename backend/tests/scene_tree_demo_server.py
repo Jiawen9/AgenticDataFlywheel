@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from backend.task_generation.constants import KNOWLEDGE_BASE_DIR, KNOWLEDGE_BASE_FILES, PROJECT_ROOT
 from backend.task_generation.jobs import TaskGenerationJobManager
 from backend.task_generation.router import configure_job_manager, router
-from backend.task_generation.service import run_augmentation, run_initial_generation
+from backend.task_generation.service import run_augmentation, run_augmentation_classification, run_augmentation_generation, run_initial_generation
 from backend.tests.test_scene_tree_editing import SimulatedModel
 
 
@@ -44,6 +44,8 @@ def main():
             base / "jobs", base / "runs", base / "exports", kb, base / "logs",
             initial_runner=lambda ids, count, **kwargs: run_initial_generation(ids, count, **kwargs, model=model),
             augmentation_runner=lambda path, count, **kwargs: run_augmentation(path, count, **kwargs, model=model),
+            classification_runner=lambda seeds, **kwargs: run_augmentation_classification(seeds, **kwargs, model=model),
+            generation_runner=lambda seeds, count, **kwargs: run_augmentation_generation(seeds, count, **kwargs, model=model),
         )
         configure_job_manager(manager)
         app = FastAPI(title="Scene tree acceptance — temporary data, simulated model")

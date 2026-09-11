@@ -446,7 +446,6 @@ export interface TaskGenerationTreeNode {
   id: string
   label: string
   kind: 'scene' | 'capability' | 'sub_capability' | 'app'
-  description?: string
   children?: TaskGenerationTreeNode[]
   app?: string
   reference_example?: string
@@ -476,6 +475,7 @@ export interface TaskGenerationSelection {
 
 export interface TaskGenerationResult {
   result_id: string
+  seed_id?: string
   task_uuid?: string
   pre_task_uuid?: string | null
   pre_dependency?: 'pre_node' | 'zero' | 'weak' | 'strong'
@@ -504,7 +504,7 @@ export interface TaskGenerationResult {
 export interface TaskGenerationJob {
   job_id: string
   kind: 'task_generation' | 'augmentation'
-  status: 'queued' | 'running' | 'succeeded' | 'partial' | 'failed' | 'interrupted'
+  status: 'queued' | 'running' | 'awaiting_confirmation' | 'succeeded' | 'partial' | 'failed' | 'interrupted'
   stage: string
   created_at: string
   started_at: string | null
@@ -539,6 +539,38 @@ export interface TaskGenerationExport {
   row_count: number
 }
 
+export interface AugmentationSeed {
+  seed_id: string
+  source_row: number
+  task: string
+  app: string
+  scene?: string
+  capability?: string
+  sub_capability?: string
+  classification_source: 'excel' | 'model'
+  classification_status: 'pending' | 'classifying' | 'classified' | 'failed'
+  mapping_status: 'pending' | 'matched' | 'unclassified' | 'not_found' | 'classification_failed'
+  node_path_ids: string[]
+  reason?: string
+  error?: string
+  generation_status: 'waiting' | 'generating' | 'succeeded' | 'partial' | 'failed' | 'skipped'
+  result_count: number
+}
+
+export interface AugmentationPreview {
+  job_id: string
+  available: boolean
+  tree?: TaskGenerationTree
+  seeds: AugmentationSeed[]
+  stats: {
+    total: number
+    matched: number
+    unmatched: number
+    classification_failed: number
+    eligible: number
+  }
+}
+
 export interface DatasetReleaseCandidate {
   session_id: string
   tree_run_id: string
@@ -568,6 +600,33 @@ export interface DatasetReleaseExcel {
 
 export type DatasetUploadStatus = 'not_uploaded' | 'queued' | 'uploading' | 'succeeded' | 'failed' | 'interrupted'
 
+export interface DatasetUploadCapabilities {
+  internal: { configured: boolean; reason: string | null }
+}
+
+export interface DatasetUploadFileResult {
+  index: number
+  filename: string
+  sha256: string
+  idempotency_key: string
+  status: 'pending' | 'uploading' | 'succeeded' | 'failed' | 'interrupted'
+  remote_id: string | null
+  url: string | null
+  error: string | null
+}
+
+export interface DatasetInternalUpload {
+  job_id: string
+  status: Exclude<DatasetUploadStatus, 'not_uploaded'>
+  completed_at: string | null
+  current_file: string | null
+  completed_files: number
+  total_files: number
+  percent: number
+  error: string | null
+  file_results: DatasetUploadFileResult[]
+}
+
 export interface DatasetRelease {
   release_id: string
   name: string
@@ -579,6 +638,7 @@ export interface DatasetRelease {
   trajectory_count: number
   step_count: number
   upload_status: DatasetUploadStatus
+  internal_upload?: DatasetInternalUpload
   upload_job_id: string | null
   upload_error: string | null
   s3_uri: string | null
@@ -589,6 +649,7 @@ export interface DatasetRelease {
 }
 
 export interface DatasetUploadJob {
+  file_results?: DatasetUploadFileResult[]
   job_id: string
   release_id: string
   mode: 'mock' | string

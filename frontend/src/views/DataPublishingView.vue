@@ -1,11 +1,19 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
 import { CopyDocument, Download, Plus, Refresh, Search, Upload, View } from '@element-plus/icons-vue'
 import { api, datasetReleaseExcelUrl } from '@/api'
-import type { DatasetRelease, DatasetReleaseCandidate, DatasetUploadJob, DatasetUploadStatus } from '@/types'
+import DatasetUploadReceipts from '@/components/DatasetUploadReceipts.vue'
+import { datasetUploadMessage } from '@/utils/datasetUploadMessage'
+import type { DatasetRelease, DatasetReleaseCandidate, DatasetUploadJob, DatasetUploadStatus, DatasetUploadCapabilities } from '@/types'
 
-const ACTIVE_UPLOAD_KEY = 'agentic-data-flywheel.active-dataset-upload'
+const ACTIVE_UPLOAD_KEY = 'agentic-data-flywheel.active-internal-dataset-upload'
+const capabilities = ref<DatasetUploadCapabilities>({ internal: { configured: false, reason: '正在检查云道S3上传配置' } })
+const submitting = ref(false)
+const pollError = ref('')
+let pollEpoch = 0
+let loadEpoch = 0
+let detailEpoch = 0
 const candidates = ref<DatasetReleaseCandidate[]>([])
 const releases = ref<DatasetRelease[]>([])
 const selectedSessionIds = ref<string[]>([])
@@ -23,14 +31,15 @@ let disposed = false
 
 const readyCandidates = computed(() => candidates.value.filter(item => item.ready))
 const selectedReadyCount = computed(() => selectedSessionIds.value.filter(id => readyCandidates.value.some(item => item.session_id === id)).length)
-const uploadedCount = computed(() => releases.value.filter(item => item.upload_status === 'succeeded').length)
-const failedCount = computed(() => releases.value.filter(item => ['failed', 'interrupted'].includes(item.upload_status)).length)
+const internalStatus = (item: DatasetRelease): DatasetUploadStatus => item.internal_upload?.status || 'not_uploaded'
+const uploadedCount = computed(() => releases.value.filter(item => internalStatus(item) === 'succeeded').length)
+const failedCount = computed(() => releases.value.filter(item => ['failed', 'interrupted'].includes(internalStatus(item))).length)
 const uploadRunning = computed(() => activeUpload.value && ['queued', 'uploading'].includes(activeUpload.value.status))
 const filteredReleases = computed(() => {
   const keyword = searchText.value.trim().toLowerCase()
   return releases.value.filter((item) => {
     const matchesText = !keyword || item.name.toLowerCase().includes(keyword) || item.release_id.toLowerCase().includes(keyword)
-    const matchesStatus = statusFilter.value === 'all' || item.upload_status === statusFilter.value
+    const matchesStatus = statusFilter.value === 'all' || internalStatus(item) === statusFilter.value
     return matchesText && matchesStatus
   })
 })
@@ -62,19 +71,29 @@ function statusType(status: DatasetUploadStatus) {
 }
 
 async function loadData(silent = false) {
+  const epoch = ++loadEpoch
   if (!silent) loading.value = true
   pageError.value = ''
   try {
-    const [nextCandidates, nextReleases] = await Promise.all([api.datasetReleaseCandidates(), api.datasetReleases()])
-    if (disposed) return
+    const [nextCandidates, nextReleases, nextCapabilities] = await Promise.all([
+      api.datasetReleaseCandidates(), api.datasetReleases(),
+      api.datasetUploadCapabilities().catch(() => ({ internal: { configured: false, reason: '无法读取云道S3上传配置，请刷新重试' } })),
+    ])
+    if (disposed || epoch !== loadEpoch) return
+    capabilities.value = nextCapabilities
     candidates.value = nextCandidates
     releases.value = nextReleases
+    if (detailRelease.value) detailRelease.value = nextReleases.find(item => item.release_id === detailRelease.value?.release_id) || detailRelease.value
+    const running = nextReleases.find(item => ['queued', 'uploading'].includes(internalStatus(item)))
+    if (running?.internal_upload && !uploadRunning.value && !submitting.value) {
+      void pollUpload(running.internal_upload.job_id, ++pollEpoch)
+    }
     const available = new Set(nextCandidates.filter(item => item.ready).map(item => item.session_id))
     selectedSessionIds.value = selectedSessionIds.value.filter(id => available.has(id))
   } catch (error) {
-    if (!disposed) pageError.value = (error as Error).message
+    if (!disposed && epoch === loadEpoch) pageError.value = (error as Error).message
   } finally {
-    if (!disposed && !silent) loading.value = false
+    if (!disposed && epoch === loadEpoch) loading.value = false
   }
 }
 
@@ -107,45 +126,70 @@ function clearPoll() {
   pollTimer = null
 }
 
-async function pollUpload(jobId: string) {
+async function pollUpload(jobId: string, epoch = pollEpoch) {
   clearPoll()
   try {
     const job = await api.datasetUploadJob(jobId)
-    if (disposed) return
+    if (disposed || epoch !== pollEpoch) return
+    if (job.mode !== 'internal') { localStorage.removeItem(ACTIVE_UPLOAD_KEY); return }
+    pollError.value = ''
     activeUpload.value = job
     if (['queued', 'uploading'].includes(job.status)) {
       localStorage.setItem(ACTIVE_UPLOAD_KEY, jobId)
-      pollTimer = setTimeout(() => void pollUpload(jobId), 800)
+      pollTimer = setTimeout(() => void pollUpload(jobId, epoch), 800)
       return
     }
     localStorage.removeItem(ACTIVE_UPLOAD_KEY)
     await loadData(true)
-    if (job.status === 'succeeded') ElMessage.success('数据集已模拟上传到训练环境')
-    else ElMessage.error(job.error || '上传作业未成功完成')
+    if (disposed || epoch !== pollEpoch) return
+    if (job.status === 'succeeded') ElMessage.success('全部 Excel 已上传到云道S3')
+    else ElMessage.error(datasetUploadMessage(job.error) || '上传作业未成功完成')
   } catch (error) {
-    localStorage.removeItem(ACTIVE_UPLOAD_KEY)
-    ElMessage.error((error as Error).message)
+    if (disposed || epoch !== pollEpoch) return
+    pollError.value = '读取上传进度失败：' + datasetUploadMessage((error as Error).message)
+    // Keep the remembered job: a transient network error must not lose recovery.
+    pollTimer = setTimeout(() => void pollUpload(jobId, epoch), 3000)
   }
 }
 
 async function startUpload(release: DatasetRelease) {
-  if (!release.local_available) { ElMessage.error('本地源文件不完整，无法上传'); return }
-  if (uploadRunning.value) { ElMessage.warning('已有数据集正在上传'); return }
+  if (uploadDisabled(release)) return
+  submitting.value = true
   try {
-    if (release.upload_status === 'succeeded') await ElMessageBox.confirm('该数据集已经上传过，是否重新执行模拟上传？', '重新上传', { type: 'warning' })
-    const job = await api.uploadDatasetRelease(release.release_id)
-    activeUpload.value = job
+    const job = await api.uploadDatasetRelease(release.release_id, 'internal')
     localStorage.setItem(ACTIVE_UPLOAD_KEY, job.job_id)
-    void pollUpload(job.job_id)
+    if (disposed) return
+    activeUpload.value = job
+    void pollUpload(job.job_id, ++pollEpoch)
     await loadData(true)
   } catch (error) {
-    if ((error as Error).message !== 'cancel') ElMessage.error((error as Error).message)
+    if (!disposed) ElMessage.error(datasetUploadMessage((error as Error).message))
+  } finally {
+    submitting.value = false
   }
 }
 
+function uploadDisabled(release: DatasetRelease) {
+  return !capabilities.value.internal.configured || submitting.value || Boolean(uploadRunning.value)
+    || ['queued', 'uploading', 'succeeded'].includes(internalStatus(release))
+    || !release.excel_paths.length || release.excel_paths.some(item => item.available === false)
+}
+
+function uploadLabel(release: DatasetRelease) {
+  const status = internalStatus(release)
+  if (status === 'succeeded') return '已上传云道S3'
+  if (['failed', 'interrupted'].includes(status)) return '重试云道S3上传'
+  return '云道S3上传'
+}
+
 async function showDetails(release: DatasetRelease) {
-  try { detailRelease.value = await api.datasetRelease(release.release_id); detailVisible.value = true }
-  catch (error) { ElMessage.error((error as Error).message) }
+  const epoch = ++detailEpoch
+  try {
+    const next = await api.datasetRelease(release.release_id)
+    if (disposed || epoch !== detailEpoch) return
+    detailRelease.value = next
+    detailVisible.value = true
+  } catch (error) { if (!disposed && epoch === detailEpoch) ElMessage.error((error as Error).message) }
 }
 
 async function copyS3(uri: string | null) {
@@ -158,29 +202,29 @@ onMounted(async () => {
   await loadData()
   if (disposed) return
   const remembered = localStorage.getItem(ACTIVE_UPLOAD_KEY)
-  const running = releases.value.find(item => ['queued', 'uploading'].includes(item.upload_status) && item.upload_job_id)
-  const jobId = remembered || running?.upload_job_id
-  if (jobId) void pollUpload(jobId)
+  if (remembered && !pollEpoch) void pollUpload(remembered, ++pollEpoch)
 })
 
-onBeforeUnmount(() => { disposed = true; clearPoll() })
+onBeforeUnmount(() => { disposed = true; ++pollEpoch; clearPoll() })
 </script>
 
 <template>
   <div class="page release-page">
     <header class="page-hero release-hero">
-      <div><span class="eyebrow">DATASET RELEASE</span><h1>数据发布</h1><p>将专家纠偏后的完整 Excel 与原始轨迹根目录登记为不可变数据集，并上传到训练环境。</p></div>
+      <div><span class="eyebrow">DATASET RELEASE</span><h1>数据发布</h1><p>登记专家纠偏后的完整数据集，将发布记录中的全部 Excel 上传到云道S3。</p></div>
       <el-button :icon="Refresh" :loading="loading" @click="loadData()">刷新</el-button>
     </header>
 
     <section class="metrics" aria-label="发布统计">
       <div class="metric"><b>{{ releases.length }}</b><span>历史数据集</span></div>
       <div class="metric"><b>{{ readyCandidates.length }}</b><span>待发布会话</span></div>
-      <div class="metric"><b>{{ uploadedCount }}</b><span>已上传训练环境</span></div>
+      <div class="metric"><b>{{ uploadedCount }}</b><span>已上传云道S3</span></div>
       <div class="metric"><b>{{ failedCount }}</b><span>失败或中断</span></div>
     </section>
 
     <el-alert v-if="pageError" :title="pageError" type="error" :closable="false" show-icon />
+    <el-alert v-if="!capabilities.internal.configured" :title="datasetUploadMessage(capabilities.internal.reason) || '云道S3上传尚未配置'" type="warning" :closable="false" show-icon />
+    <el-alert v-if="pollError" :title="pollError" type="warning" :closable="false" show-icon />
 
     <section class="panel create-panel" v-loading="loading">
       <div class="section-heading">
@@ -208,7 +252,10 @@ onBeforeUnmount(() => { disposed = true; clearPoll() })
     <section v-if="activeUpload" class="panel upload-progress">
       <div class="upload-progress__head"><div><span class="status-dot" :class="activeUpload.status" /><b>{{ statusText(activeUpload.status) }}</b><span>{{ activeUpload.release_id }}</span></div><strong>{{ activeUpload.percent }}%</strong></div>
       <el-progress :percentage="activeUpload.percent" :status="activeUpload.status === 'failed' ? 'exception' : activeUpload.status === 'succeeded' ? 'success' : undefined" />
-      <div class="upload-progress__meta"><span>{{ activeUpload.completed_files }}/{{ activeUpload.total_files }} 个文件</span><span>{{ formatBytes(activeUpload.completed_bytes) }}/{{ formatBytes(activeUpload.total_bytes) }}</span><span class="current-file" :title="activeUpload.current_file || ''">{{ activeUpload.current_file || activeUpload.error || activeUpload.s3_uri }}</span></div>
+      <div class="upload-progress__meta"><span>已确认 {{ activeUpload.completed_files }}/{{ activeUpload.total_files }} 个 Excel</span><span>{{ formatBytes(activeUpload.completed_bytes) }}/{{ formatBytes(activeUpload.total_bytes) }}</span><span v-if="activeUpload.current_file" class="current-file" :title="activeUpload.current_file">当前文件：{{ activeUpload.current_file }}</span></div>
+      <el-alert v-if="activeUpload.error" :title="datasetUploadMessage(activeUpload.error)" type="error" :closable="false" />
+      <p v-if="['failed', 'interrupted'].includes(activeUpload.status)" class="retry-hint">重试将跳过已确认成功且校验值一致的文件，继续上传剩余表格。</p>
+      <DatasetUploadReceipts :files="activeUpload.file_results" />
     </section>
 
     <section class="panel history-panel">
@@ -220,8 +267,8 @@ onBeforeUnmount(() => { disposed = true; clearPoll() })
         <el-table-column label="数据集" min-width="250"><template #default="{ row }"><div class="release-name"><b>{{ row.name }}</b><code>{{ row.release_id }}</code></div></template></el-table-column>
         <el-table-column label="发布时间" min-width="170"><template #default="{ row }">{{ formatDate(row.created_at) }}</template></el-table-column>
         <el-table-column label="规模" min-width="180"><template #default="{ row }">{{ row.excel_paths.length }} Excel · {{ row.trajectory_count }} 轨迹 · {{ row.step_count }} 步</template></el-table-column>
-        <el-table-column label="训练环境" min-width="130"><template #default="{ row }"><el-tag :type="statusType(row.upload_status)" effect="light">{{ statusText(row.upload_status) }}</el-tag></template></el-table-column>
-        <el-table-column label="操作" width="330" fixed="right"><template #default="{ row }"><el-button text :icon="View" @click="showDetails(row)">详情</el-button><el-button v-if="row.excel_paths.length" text :icon="Download" tag="a" :href="datasetReleaseExcelUrl(row.release_id, 0)" target="_blank">下载 Excel</el-button><el-button text type="primary" :icon="Upload" :disabled="Boolean(uploadRunning) || !row.local_available" @click="startUpload(row)">{{ row.upload_status === 'not_uploaded' ? '上传训练环境' : '重新上传' }}</el-button><el-button v-if="row.s3_uri" text :icon="CopyDocument" @click="copyS3(row.s3_uri)">复制地址</el-button></template></el-table-column>
+        <el-table-column label="云道S3" min-width="130"><template #default="{ row }"><el-tag :type="statusType(internalStatus(row))" effect="light">{{ statusText(internalStatus(row)) }}</el-tag><small v-if="row.internal_upload" class="release-progress">{{ row.internal_upload.completed_files }}/{{ row.internal_upload.total_files }} 个 Excel</small></template></el-table-column>
+        <el-table-column label="操作" width="380" fixed="right"><template #default="{ row }"><el-button text :icon="View" @click="showDetails(row)">详情</el-button><el-button v-if="row.excel_paths.length" text :icon="Download" tag="a" :href="datasetReleaseExcelUrl(row.release_id, 0)" target="_blank">下载 Excel</el-button><el-button text type="primary" :icon="Upload" :disabled="uploadDisabled(row)" @click="startUpload(row)">{{ uploadLabel(row) }}</el-button></template></el-table-column>
       </el-table>
       <el-empty v-else description="暂无匹配的发布记录" :image-size="80" />
     </section>
@@ -230,10 +277,18 @@ onBeforeUnmount(() => { disposed = true; clearPoll() })
       <template v-if="detailRelease">
         <div class="detail-title"><h3>{{ detailRelease.name }}</h3><code>{{ detailRelease.release_id }}</code></div>
         <el-descriptions :column="2" border>
-          <el-descriptions-item label="发布时间">{{ formatDate(detailRelease.created_at) }}</el-descriptions-item><el-descriptions-item label="上传状态"><el-tag :type="statusType(detailRelease.upload_status)">{{ statusText(detailRelease.upload_status) }}</el-tag></el-descriptions-item>
+          <el-descriptions-item label="发布时间">{{ formatDate(detailRelease.created_at) }}</el-descriptions-item><el-descriptions-item label="云道S3上传"><el-tag :type="statusType(internalStatus(detailRelease))">{{ statusText(internalStatus(detailRelease)) }}</el-tag></el-descriptions-item>
           <el-descriptions-item label="会话来源数">{{ detailRelease.source_count }}</el-descriptions-item><el-descriptions-item label="数据规模">{{ detailRelease.task_count }} 任务 / {{ detailRelease.trajectory_count }} 轨迹 / {{ detailRelease.step_count }} 步</el-descriptions-item>
-          <el-descriptions-item label="轨迹根目录" :span="2"><code>{{ detailRelease.trajectory_paths.join('\n') }}</code></el-descriptions-item><el-descriptions-item label="S3 地址" :span="2"><code>{{ detailRelease.s3_uri || '尚未上传' }}</code></el-descriptions-item>
+          <el-descriptions-item label="轨迹根目录（仅登记）" :span="2"><code>{{ detailRelease.trajectory_paths.join('\n') }}</code></el-descriptions-item>
+          <el-descriptions-item label="历史模拟上传"><el-tag type="info">{{ statusText(detailRelease.upload_status) }}</el-tag><span v-if="detailRelease.upload_error">{{ detailRelease.upload_error }}</span></el-descriptions-item>
+          <el-descriptions-item label="模拟 S3 地址"><code>{{ detailRelease.s3_uri || '无' }}</code><el-button v-if="detailRelease.s3_uri" text :icon="CopyDocument" @click="copyS3(detailRelease.s3_uri)">复制</el-button></el-descriptions-item>
         </el-descriptions>
+        <template v-if="detailRelease.internal_upload">
+          <h4>云道S3上传结果 · {{ detailRelease.internal_upload.completed_files }}/{{ detailRelease.internal_upload.total_files }} 个 Excel</h4>
+          <p v-if="detailRelease.internal_upload.completed_at">任务结束时间：{{ formatDate(detailRelease.internal_upload.completed_at) }}</p>
+          <el-alert v-if="detailRelease.internal_upload.error" :title="datasetUploadMessage(detailRelease.internal_upload.error)" type="error" :closable="false" />
+          <DatasetUploadReceipts :files="detailRelease.internal_upload.file_results" />
+        </template>
         <h4>纠偏 Excel</h4>
         <div v-for="(excel, index) in detailRelease.excel_paths" :key="excel.path" class="excel-detail"><div><b>{{ excel.filename }}</b><span>{{ excel.rows }} 行 · {{ excel.available ? '本地可用' : '本地缺失' }}</span></div><code>{{ excel.path }}</code><small>SHA256 {{ excel.sha256 }}</small><el-button text :icon="Download" tag="a" :href="datasetReleaseExcelUrl(detailRelease.release_id, index)" target="_blank" :disabled="excel.available === false">下载</el-button></div>
       </template>
@@ -242,7 +297,7 @@ onBeforeUnmount(() => { disposed = true; clearPoll() })
 </template>
 
 <style scoped>
-.release-page { display: grid; gap: 18px; }
+.release-page { display: grid; grid-template-columns: minmax(0, 1fr); gap: 18px; }
 .release-hero { align-items: flex-start; }
 .release-hero .el-button { margin-top: 4px; }
 .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
@@ -276,6 +331,8 @@ onBeforeUnmount(() => { disposed = true; clearPoll() })
 .status-dot.failed, .status-dot.interrupted { background: #ef4444; }
 .upload-progress__meta { margin-top: 8px; color: var(--muted); font-size: 12px; }
 .current-file { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.release-progress { display: block; color: var(--muted); margin-top: 5px; }
+.retry-hint { color: var(--muted); font-size: 13px; }
 .history-heading { align-items: center; margin-bottom: 16px; }
 .filters { display: grid; grid-template-columns: 240px 130px; gap: 10px; }
 .release-name { display: grid; gap: 4px; }

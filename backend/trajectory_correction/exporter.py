@@ -68,9 +68,9 @@ def _row_values(
             and action_hash
             and cot.get("action_hash") == action_hash
         ):
-            if "summary" in headers and cot.get("summary"):
+            if "summary" in headers and "summary" not in edits and cot.get("summary"):
                 values[headers.index("summary")] = cot["summary"]
-            if "thought" in headers and cot.get("thought"):
+            if "thought" in headers and "thought" not in edits and cot.get("thought"):
                 values[headers.index("thought")] = cot["thought"]
     return values
 
@@ -290,8 +290,10 @@ def export_full_dataset_workbook(
                 and action_hash
                 and cot.get("action_hash") == action_hash
             ):
-                summary_value = cot.get("summary") or summary_value
-                thought_value = cot.get("thought") or thought_value
+                if "summary" not in edits:
+                    summary_value = cot.get("summary") or summary_value
+                if "thought" not in edits:
+                    thought_value = cot.get("thought") or thought_value
 
             sheet.cell(row_number, action_column).value = action_value
             sheet.cell(row_number, bbox_column).value = bbox_value
