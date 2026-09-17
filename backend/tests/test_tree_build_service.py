@@ -13,6 +13,7 @@ from PIL import Image
 from backend.trajectories_tree.intermediate_state_classifier import IntermediateStateResult
 from backend.tree_build_service import build_tree_run
 from backend.quality_input_builder import build_quality_workbook
+from backend.stage_artifacts import workbook_payload, write_sidecar
 
 
 class FakeClassifier:
@@ -89,6 +90,7 @@ def prepare_source(root: Path) -> tuple[Path, Path]:
             ]
         )
     workbook.save(workbook_path)
+    write_sidecar(workbook_path, workbook_payload(workbook_path))
     return trajectory_root, workbook_path
 
 

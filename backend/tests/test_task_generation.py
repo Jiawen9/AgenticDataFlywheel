@@ -176,7 +176,8 @@ class JobManagerTests(unittest.TestCase):
             base = Path(temp)
             jobs = base / "jobs"
             jobs.mkdir()
-            (jobs / "old.json").write_text(json.dumps({"job_id": "old", "status": "running"}), encoding="utf-8")
+            from backend.data_store import RecordStore
+            RecordStore(base / ".data_store").put("task_generation.jobs", "old", {"job_id": "old", "status": "running"})
             manager = TaskGenerationJobManager(jobs, base / "runs", base / "exports", base / "kb")
             self.assertEqual(manager.get("old")["status"], "interrupted")
             manager.shutdown()

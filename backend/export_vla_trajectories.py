@@ -6,6 +6,7 @@ import argparse
 import json
 import re
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -162,8 +163,10 @@ def parse_args() -> argparse.Namespace:
         "-o",
         "--output",
         type=Path,
-        help="Output xlsx path (default: <run_dir>/vla_trajectories.xlsx)",
+        help="Output xlsx path (default: <data-root>/system/preprocessing/<batch-id>/trajectories_to_excel.xlsx)",
     )
+    parser.add_argument("--batch-id")
+    parser.add_argument("--data-root", type=Path)
     return parser.parse_args()
 
 
@@ -174,13 +177,30 @@ def main() -> int:
         print(f"Error: run directory does not exist: {run_dir}", file=sys.stderr)
         return 2
 
-    output_path = (args.output or run_dir / "vla_trajectories.xlsx").expanduser().resolve()
+    if __package__:
+        from .data_store import DATA_ROOT
+    else:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from backend.data_store import DATA_ROOT
+    batch_id = args.batch_id or uuid.uuid4().hex
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", batch_id):
+        raise ValueError("batch ID must contain only letters, digits, underscores, dots and hyphens")
+    data_root = args.data_root or DATA_ROOT
+    output_path = (args.output or data_root / "system" / "preprocessing" / batch_id / "trajectories_to_excel.xlsx").expanduser().resolve()
     rows, warnings = collect_rows(run_dir)
     if not rows:
         print(f"Error: no step*_vla_model_response.json files found under {run_dir}", file=sys.stderr)
         return 1
 
     write_xlsx(rows, output_path)
+    if __package__:
+        from .stage_artifacts import publish_workbook
+    else:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from backend.stage_artifacts import publish_workbook
+    publish_workbook(output_path, batch_id=batch_id, stage="01_conversion",
+                     data_root=data_root, source_refs=[{"kind": "raw_trajectories", "path": str(run_dir)}],
+                     metadata={"warnings": warnings})
     print(f"Exported {len(rows)} steps to: {output_path}")
     if warnings:
         print(f"Warnings ({len(warnings)}):", file=sys.stderr)

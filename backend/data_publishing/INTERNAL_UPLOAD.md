@@ -90,9 +90,11 @@ return UploadResult(
 
 ## 持久化与恢复
 
-- 发布登记及摘要：`backend_workspace/dataset_release/releases.json`
-- 完整任务及逐文件回执：`backend_workspace/dataset_release/upload_jobs/{job_id}.json`
-- Excel 使用登记中的原导出路径，不复制、不覆盖已发布文件。
+- 当前发布登记、摘要、上传任务及逐文件回执仅保存于 `backend_workspace/system/app.sqlite`，不读写可变状态 JSON 镜像。
+- 新发布会将已导出的 Excel 原样冻结到 `backend_workspace/releases/{release_id}/{文件序号}/{原文件名}`，同目录 `manifest.json` 记录源会话、导出版本和校验值。上传使用这份冻结文件，不受后续源文件变化影响。
+- `ADF_DATA_ROOT` 可覆盖默认 `backend_workspace/`；适配器始终接收解析好的绝对路径，无需自行拼接。
+- 当前发布工作目录为 `backend_workspace/system/dataset_release`。原旧 workspace 中的发布、上传任务和旧 JSON 不导入；不可把旧 `dataset_release` 目录并入新目录。
+- 发布前核验导出记录的 SHA256；下载及云道S3上传再次核验冻结 Excel。文件缺失或校验不符时明确失败，不用旧目录文件替代。
 
 提交检查和任务登记使用现有作业管理器锁；该模式适用于现有单后端进程。
 每份成功回执先原子落盘，再更新发布摘要。重启后依据最新任务修复摘要，

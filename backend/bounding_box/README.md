@@ -37,7 +37,7 @@ run_build.cmd
 ```powershell
 $env:TRAJECTORY_API_KEY="你的密钥"
 $env:TRAJECTORY_API_BASE_URL="https://yunai.chat/v1"
-$env:TRAJECTORY_MODEL="qwen3.6-27b:floor"
+$env:TRAJECTORY_MODEL="qwen3.8-max"
 python build_annotations.py
 ```
 

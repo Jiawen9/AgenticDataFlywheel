@@ -41,7 +41,7 @@ class CorrectionTextEditTests(unittest.TestCase):
         workbook.save(self.source)
         workbook.close()
         self.source_bytes = self.source.read_bytes()
-        self.snapshot = load_snapshot(self.source)
+        self.snapshot = load_snapshot(self.source, allow_excel_import=True)
         self.group_id = self.snapshot["groups"][0]["group_id"]
         self.session_id = "abcdef1234567890"
         self.action = {"action": "type", "text": "corrected"}

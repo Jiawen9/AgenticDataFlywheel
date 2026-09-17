@@ -8,11 +8,13 @@ import json
 from pathlib import Path, PurePosixPath
 import secrets
 import threading
+import shutil
 from typing import Any, Callable, Optional
 
 from ..trajectory_correction.constants import CORRECTION_EXPORTS_DIR, FIXED_TRAJECTORY_ROOT
-from ..trajectory_correction.draft_store import list_sessions, load_session, save_session, utc_now
+from ..trajectory_correction.draft_store import list_sessions, load_session, save_session, storage_root, utc_now
 from .constants import PROJECT_ROOT, RELEASES_FILE, ensure_release_dirs
+from ..data_store import RecordStore, DATA_ROOT, rebase_data_path
 
 
 SessionLoader = Callable[[str], Optional[dict[str, Any]]]
@@ -31,8 +33,8 @@ def _sha256(path: Path) -> str:
 class DatasetReleaseRegistry:
     """Atomic local registry for immutable publication records.
 
-    Session identifiers are accepted transiently when a release is created,
-    but are deliberately never persisted in the release registry.
+    New releases own immutable file copies and explicit internal lineage.
+    No filesystem registry is imported into current state.
     """
 
     def __init__(
@@ -45,9 +47,12 @@ class DatasetReleaseRegistry:
         session_loader: SessionLoader = load_session,
         session_lister: SessionLister = list_sessions,
         session_saver: SessionSaver = save_session,
+        data_root: Path | None = None,
     ) -> None:
         self.releases_file = releases_file
         self.project_root = project_root.resolve()
+        self.data_root = Path(data_root or (DATA_ROOT if project_root == PROJECT_ROOT else project_root / "backend_workspace")).resolve()
+        self._records = RecordStore(self.data_root)
         self.trajectory_root = trajectory_root.resolve()
         self.correction_exports_dir = correction_exports_dir.resolve()
         self.session_loader = session_loader
@@ -56,48 +61,34 @@ class DatasetReleaseRegistry:
         self._lock = threading.RLock()
         self.releases_file.parent.mkdir(parents=True, exist_ok=True)
 
-    def _empty(self) -> dict[str, Any]:
-        return {"schema_version": 1, "releases": []}
-
     def _read(self) -> dict[str, Any]:
-        if not self.releases_file.is_file():
-            return self._empty()
-        try:
-            payload = json.loads(self.releases_file.read_text(encoding="utf-8"))
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            raise ValueError(f"发布记录无法读取：{exc}") from exc
-        if not isinstance(payload, dict) or not isinstance(payload.get("releases"), list):
-            raise ValueError("发布记录格式无效")
-        return payload
-
-    def _write(self, payload: dict[str, Any]) -> None:
-        self.releases_file.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.releases_file.with_name(
-            f".{self.releases_file.name}.{secrets.token_hex(6)}.tmp"
-        )
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        temporary.replace(self.releases_file)
+        return {"schema_version": 1, "releases": self._records.list("dataset_releases")}
 
     def project_path(self, path: Path) -> str:
         resolved = path.resolve()
+        if not resolved.is_relative_to(self.data_root):
+            raise ValueError("发布文件必须位于当前数据目录内")
         try:
             relative = resolved.relative_to(self.project_root)
         except ValueError as exc:
-            raise ValueError("发布文件必须位于项目目录内") from exc
+            if resolved.is_relative_to(self.data_root):
+                return "@data/" + resolved.relative_to(self.data_root).as_posix()
+            raise ValueError("发布文件必须位于当前数据目录内") from exc
         return PurePosixPath(self.project_root.name, *relative.parts).as_posix()
 
     def resolve_project_path(self, value: str) -> Path:
         normalized = str(value or "").replace("\\", "/").strip("/")
         parts = PurePosixPath(normalized).parts
+        if parts and parts[0] == "@data":
+            if ".." in parts:
+                raise ValueError("发布文件路径越出数据目录")
+            return rebase_data_path(Path(*parts[1:]), self.data_root)
         if not parts or parts[0] != self.project_root.name or ".." in parts:
             raise ValueError("发布文件路径无效")
-        candidate = self.project_root.joinpath(*parts[1:]).resolve()
         try:
-            candidate.relative_to(self.project_root)
+            candidate = rebase_data_path(self.project_root.joinpath(*parts[1:]), self.data_root)
         except ValueError as exc:
-            raise ValueError("发布文件路径越出项目目录") from exc
+            raise ValueError("发布文件路径越出当前数据目录") from exc
         return candidate
 
     def _latest_full_export(
@@ -122,6 +113,8 @@ class DatasetReleaseRegistry:
             raise ValueError("完整数据集 Excel 路径无效") from exc
         if require_file and not path.is_file():
             raise ValueError(f"完整数据集 Excel 不存在：{filename}")
+        if require_file and (not latest.get("sha256") or _sha256(path) != latest["sha256"]):
+            raise ValueError("完整数据集 Excel 与导出记录的 SHA256 不一致，请重新导出")
         return latest, path
 
     @staticmethod
@@ -234,6 +227,7 @@ class DatasetReleaseRegistry:
         with self._lock:
             sessions: list[dict[str, Any]] = []
             excel_paths: list[dict[str, Any]] = []
+            sources: list[dict[str, Any]] = []
             totals = {"task_count": 0, "trajectory_count": 0, "step_count": 0}
             for session_id in unique_ids:
                 session = self.session_loader(session_id)
@@ -257,6 +251,9 @@ class DatasetReleaseRegistry:
                     }
                 )
                 sessions.append(session)
+                sources.append({"kind": "correction_session", "id": session_id,
+                                "revision": session.get("storage_revision"), "tree_run_id": session.get("tree_run_id"),
+                                "export_id": latest.get("export_id"), "artifact": latest.get("artifact")})
 
             release_id = f"rel_{secrets.token_hex(8)}"
             created_at = utc_now()
@@ -267,6 +264,7 @@ class DatasetReleaseRegistry:
                 "excel_paths": excel_paths,
                 "trajectory_paths": [self.project_path(self.trajectory_root)],
                 "source_count": len(sessions),
+                "source_refs": sources,
                 **totals,
                 "upload_status": "not_uploaded",
                 "upload_job_id": None,
@@ -276,29 +274,54 @@ class DatasetReleaseRegistry:
                 "uploaded_files": 0,
                 "uploaded_bytes": 0,
             }
-            registry = self._read()
-            registry["releases"].append(release)
-            self._write(registry)
-
+            # Finish all immutable files before exposing the release in SQLite.
+            release_root = self.data_root / "releases"
+            release_root.mkdir(parents=True, exist_ok=True)
+            final = release_root / release_id
+            staging = release_root / f".{release_id}.tmp"
+            staging.mkdir()
             originals = [deepcopy(session) for session in sessions]
             try:
+                for index, item in enumerate(excel_paths, start=1):
+                    source = self.resolve_project_path(item["path"])
+                    relative = Path(f"{index:03d}") / item["filename"]
+                    target = staging / relative
+                    target.parent.mkdir()
+                    shutil.copyfile(source, target)
+                    if _sha256(target) != item["sha256"]:
+                        raise ValueError("发布期间源表内容发生变化，请重新导出后重试")
+                    item["source_path"] = item["path"]
+                    item["path"] = self.project_path(final / relative)
+                    item["data_path"] = (Path("releases") / release_id / relative).as_posix()
+                (staging / "manifest.json").write_text(json.dumps(release, ensure_ascii=False, indent=2), encoding="utf-8")
+                staging.rename(final)
                 for session in sessions:
                     session["published"] = True
                     session["published_at"] = created_at
                     session["published_release_id"] = release_id
-                    self.session_saver(session)
+                if self.session_saver is save_session and self.data_root == storage_root().resolve():
+                    entries = [{"namespace": "dataset_releases", "key": release_id, "payload": release, "expected_revision": 0}]
+                    entries.extend({"namespace": "correction_sessions", "key": item["session_id"], "payload": item,
+                                    "expected_revision": item.get("storage_revision", 0)} for item in sessions)
+                    saved = self._records.put_many(entries)
+                    release = saved[0]
+                else:
+                    for session in sessions:
+                        self.session_saver(session)
+                    release = self._records.put("dataset_releases", release_id, release, expected_revision=0)
             except Exception:
-                rollback = self._read()
-                rollback["releases"] = [
-                    item for item in rollback["releases"] if item.get("release_id") != release_id
-                ]
-                self._write(rollback)
-                for original in originals:
-                    try:
-                        self.session_saver(original)
-                    except Exception:
-                        pass
+                if self.session_saver is not save_session:
+                    for original in originals:
+                        try:
+                            self.session_saver(original)
+                        except Exception:
+                            pass
+                if final.exists():
+                    shutil.rmtree(final)
                 raise
+            finally:
+                if staging.exists():
+                    shutil.rmtree(staging)
             return self._with_availability(release)
 
     def update(self, release_id: str, changes: dict[str, Any]) -> dict[str, Any]:
@@ -314,8 +337,8 @@ class DatasetReleaseRegistry:
             )
             if release is None:
                 raise FileNotFoundError("数据集发布记录不存在")
-            release.update(changes)
-            self._write(registry)
+            release = self._records.update("dataset_releases", release_id,
+                                           lambda current: current.update(changes), default=release)
             return self._with_availability(release)
 
     def excel_file(self, release_id: str, index: int) -> tuple[Path, str]:
@@ -329,6 +352,8 @@ class DatasetReleaseRegistry:
         path = self.resolve_project_path(str(item.get("path", "")))
         if not path.is_file() or path.suffix.lower() not in {".xlsx", ".xlsm"}:
             raise FileNotFoundError("数据集 Excel 文件不存在")
+        if not item.get("sha256") or _sha256(path) != item["sha256"]:
+            raise ValueError("数据集 Excel 与发布版本的 SHA256 不一致")
         return path, str(item.get("filename") or path.name)
 
 

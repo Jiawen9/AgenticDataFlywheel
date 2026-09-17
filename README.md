@@ -3,6 +3,8 @@
 一个前后端分离的 GUI Agent 轨迹数据飞轮工程，包含场景任务生成、失败任务扩增、轨迹 Excel
 导出、动作 bbox 标注、受限中间态过滤、任务级轨迹树构建，以及 Vue 轨迹采集与质检界面。
 
+运行数据统一读写项目根目录的 `backend_workspace/`：SQLite 保存当前状态，JSON 在流程间流转，各阶段保留 Excel 核对表。后端不扫描旧目录、不从旧 JSON 恢复状态；必需 JSON 缺失时明确失败，不回退 Excel。目录、命令、显式资源准备和产物读取接口见[统一数据存储说明](DATA_STORAGE.md)。
+
 ## 主要能力
 
 - 递归读取 rollout 轨迹并导出 Excel。
@@ -12,7 +14,7 @@
 - 在网页中按真实场景能力树生成、审核和导出任务。
 - 上传失败任务并自动匹配场景、扩增变体任务。
 - 在网页中浏览任务、轨迹、步骤截图和动作标注。
-- 在线修改 bbox，并将结果更新到标注 Excel。
+- 在线修改 bbox，保存当前标注并形成同版本 JSON/Excel 中间产物。
 - 批量提交任务建树，在质检页面查看分叉、occurrence 和中间态审计。
 - 在网页中直接修正 Action 和步骤，并按 SFT/RL/原生数据分流导出；SOP/COT 由后续模型生成。
 
@@ -29,11 +31,12 @@ AgenticDataFlywheel/
 │  ├─ .env.example               模型配置示例
 │  └─ api.py                     FastAPI 入口
 ├─ frontend/                     Vue 3 + Vite 前端
-├─ backend_workspace/            本地数据与运行结果，不提交 Git
-│  ├─ rollout_trajectories/      原始轨迹放置目录
-│  ├─ task_generation/           任务生成知识库、作业和导出结果
-│  │  └─ KnowledgeBase/         三份任务生成 Excel 知识库
-│  └─ trajectory_correction/     轨迹修正输入、草稿与导出
+├─ backend_workspace/            统一数据根目录，不提交 Git
+│  ├─ system/app.sqlite          当前状态、编辑与产物索引
+│  ├─ raw/rollout_trajectories/   原始轨迹放置目录
+│  ├─ batches/                   按批次、阶段和版本保存 JSON/Excel
+│  ├─ releases/                  发布时冻结的 Excel 副本
+│  └─ resources/                 场景树和先验知识库
 └─ README.md
 ```
 
@@ -77,16 +80,16 @@ COT_MODEL_NAME=qwen3-vl-32b-instruct
 
 ## 3. 放置原始轨迹
 
-把任务目录放入：
+先将本次要处理的原始任务目录显式复制到下面的路径，确认不会覆盖同名输入。保留完整任务／轨迹层级及截图、XML、响应文件；不要复制旧标框结果、作业记录、质检结果或缓存。后端不会自动查找旧目录。
 
 ```text
-backend_workspace/rollout_trajectories/
+backend_workspace/raw/rollout_trajectories/
 ```
 
 预期结构示例：
 
 ```text
-backend_workspace/rollout_trajectories/
+backend_workspace/raw/rollout_trajectories/
 └─ AT-YYSP-AQY-001/
    ├─ AT-YYSP-AQY-001-1/
    │  ├─ step001_vla_input_stability.jpg
@@ -100,18 +103,20 @@ backend_workspace/rollout_trajectories/
 
 ## 4. 预处理轨迹
 
+前端入口为“轨迹采集 → 轨迹预处理与建树”：选择已完成采集登记的批次，点击“开始预处理”，可查看进度、下载初始表、失败重试并继续建树。手机采集端按 [采集完成协议](backend/COLLECTION_RUNS.md) 落盘并登记结果；完整接口及保存规则见 [批次预处理](backend/PREPROCESSING.md)。
+
 在项目根目录运行：
 
 ```powershell
-python backend\trajectories_preprocessing.py
+python backend\trajectories_preprocessing.py --batch-id processing-demo-001
 ```
 
 处理流程为：
 
 1. 递归读取正式轨迹并忽略 `_prefetch_staging` 等临时目录。
-2. 生成 `backend_workspace/trajectories_to_excel.xlsx`。
+2. 在 `backend_workspace/system/preprocessing/<批次号>/<执行编号>/` 生成初始表，并保存转换阶段 JSON/Excel 快照。
 3. 为目标动作生成候选 bbox，并调用 Qwen 复核。
-4. 生成 `backend_workspace/annotated_trajectories.xlsx`。
+4. 在同一执行目录生成标框表，并保存标框阶段 JSON/Excel 快照；各批次与执行互不覆盖。
 
 模型响应会写入本地缓存。调用中断后可再次执行命令续跑；任一目标动作标框失败时，
 不会发布不完整的标注 Excel。
@@ -151,7 +156,7 @@ Vite 默认把 `/api` 代理到 `http://127.0.0.1:8765`。
 任务生成页面读取以下本地知识库：
 
 ```text
-backend_workspace/task_generation/KnowledgeBase/
+backend_workspace/resources/task_generation/KnowledgeBase/
 ├─ VLA场景树.xlsx
 ├─ APP操控先验知识库.xlsx
 └─ APP资源先验知识库.xlsx
@@ -162,14 +167,14 @@ backend_workspace/task_generation/KnowledgeBase/
 - 点击“编辑场景树”可新增、重命名、删除三级节点，并按 App 编辑参考示例、资源先验开关。修改统一保存或取消，离开页面前会提示未保存内容；编辑期间不能提交生成。
 - 每个选中任务类型默认勾选全部适用 App，可逐项取消。例如一个任务类型选择三个 App、数量设为 5，预计生成 15 条主任务；弱依赖前置任务另计。
 - 空场景、空能力和未配置 App 的任务类型可以保存，后者不可生成。缺少操控或资源先验会显示提示，不阻止其他已就绪配置的生成。
-- 生成完成后可编辑任务文本、成组删除/恢复弱依赖任务并导出 Excel。历史作业使用提交时的快照，不受后续编辑影响。
+- 生成完成后可编辑任务文本、成组删除/恢复弱依赖任务并导出 Excel。已有作业使用提交时的快照，不受后续知识库编辑影响。
 
-首次使用时，系统从上述三个 Excel 初始化知识库版本。根目录原文件保留，之后 **`KnowledgeBase/current.json` 指向的 `versions/<版本>/` 才是当前有效知识库**；请通过网页替换文件，不要直接修改根目录旧文件或版本目录。
+首次使用前，显式放入上述三个资源 Excel，或通过页面上传；系统不会从旧目录复制知识库。需要沿用已有节点 UUID 时，可以显式复制完整知识库版本目录及 `current.json`。系统从已提供的资源初始化知识库版本，之后 **`KnowledgeBase/current.json` 指向的 `versions/<版本>/` 才是当前有效知识库**；请通过网页替换文件，不要直接修改根目录原文件或版本目录。
 每个版本保存三份 Excel 和 `scene_tree.json`（稳定 UUID 与树结构），通过原子切换版本指针一起发布。改名同步更新操控先验路径；删除节点或移除 App 不删除已有先验记录。旧版本目录完整保留，作为备份。
 
 知识库卡片支持单文件替换和“下载已保存场景树”。下载文件保留六个业务列，并带有隐藏的 `_scene_tree_nodes` sheet，用于保留节点 UUID、空分支及无 App 的任务类型；回传时请保留该 sheet。普通六列表仍支持导入，相同路径复用当前 UUID。不同 App 的示例/资源配置分别保存，同一任务类型/App 出现冲突行时拒绝导入并提示修正。多个标签页同时保存时，旧版本请求返回 `409`，不会覆盖新版本。
 
-场景树接口：`GET /api/task-generation/tree` 返回 `version/scenes/leaf_count/execution_unit_count/warnings`；`PUT` 同路径接收 `base_version/scenes`；`GET /api/task-generation/tree/export` 下载当前 Excel。生成提交采用 `{version, selections: [{node_id, apps}], generate_n}`，不再使用 App 展开的 `node_ids`；历史作业读取接口不变。
+场景树接口：`GET /api/task-generation/tree` 返回 `version/scenes/leaf_count/execution_unit_count/warnings`；`PUT` 同路径接收 `base_version/scenes`；`GET /api/task-generation/tree/export` 下载当前 Excel。生成提交采用 `{version, selections: [{node_id, apps}], generate_n}`，不再使用 App 展开的 `node_ids`；业务作业读取接口地址不变，只返回新存储中的记录。
 
 如需无模型费用、无业务数据改动的页面验收，先构建前端，再运行 `python -m backend.tests.scene_tree_demo_server --port 8791`，访问 `http://127.0.0.1:8791/task-generation/scenario-tree`。该验收服务把知识库复制到临时目录，并使用模拟模型；按 Ctrl+C 结束后清理临时数据，不应将其作为正式服务运行。
 
@@ -181,15 +186,18 @@ backend_workspace/task_generation/KnowledgeBase/
 
 在生成结果中点击“提交轨迹采集”会冻结当前任务为采集批次，并生成规定的 17 列采集 Excel；手机工厂采集页可选择批次运行。每个作业只提交一份批次，后续源任务编辑不改变已提交内容，原有 Excel 导出保留。批次存储、接口和运行接入方式见[采集批次对接文档](backend/task_generation/COLLECTION_BATCHES.md)。
 
-任务生成作业和导出结果保存在：
+任务生成状态、结果和源用例保存在 `backend_workspace/system/app.sqlite`，不双写作业／结果 JSON。文件产物保存在：
 
 ```text
-backend_workspace/task_generation/
-├─ jobs/       # 作业状态 JSON
-├─ runs/       # 知识库快照、输入文件和结果 JSON
-├─ exports/    # 导出的任务 Excel
-└─ logs/       # 本地日志
+backend_workspace/system/task_generation/
+├─ runs/       # 知识库快照、输入文件和模型调用诊断
+├─ exports/    # 业务接口导出的任务 Excel
+└─ collection_batches/ # 已提交的采集 JSON 和 17 列 Excel
 ```
+
+阶段版本保存到 `backend_workspace/batches/<job_id>/`；日志保存到 `backend_workspace/logs/task_generation/`。生成／扩增仍调用原 `/jobs/{job_id}/export` 业务地址，后端保存到新数据目录；浏览器下载副本的位置由浏览器决定。
+
+手机采集仅读取 SQLite 状态和 `backend_workspace/inputs/phone_factory/` 上传文件。没有状态时返回空列表和默认配置。需要一次性保留设备配置时，显式调用 `PhoneFactoryStore().initialize_settings(...)`，仅接受 `phones/apps/phoneApps/vla/config`，不导入任务或运行记录，也不覆盖已有状态；示例见[统一数据存储说明](DATA_STORAGE.md#手机设备和配置的一次性准备)。
 
 如需使用不同模型，可在 `backend/.env` 中设置 `TASK_GENERATION_MODEL_NAME`、`TASK_GENERATION_MODEL_URL` 和 `TASK_GENERATION_API_KEY`；未设置时回退到通用 `MODEL_NAME`、`MODEL_URL` 和 `YUNAI_API_KEY`。并发数使用 `TASK_GENERATION_MAX_CONCURRENT`，默认值为 4。
 
@@ -204,10 +212,9 @@ backend_workspace/task_generation/
 
 ### 轨迹采集
 
-1. 进入“轨迹采集”，查看从工作区发现的任务和轨迹名称。
+1. 进入“轨迹采集 → 轨迹预处理与建树”，选择已登记的批次，查看其冻结 JSON 中的任务和轨迹；未登记的目录不会自动出现在页面。
 2. 展开任务并选择一条轨迹，按需查看每一步截图、action、summary 和 bbox。
-3. 点击截图右上角的“修改 bbox”，重新绘制并保存当前动作框；系统会更新
-   `annotated_trajectories.xlsx`。
+3. 点击截图右上角的“修改 bbox”，重新绘制并保存当前动作框；系统保存当前标注，更新 JSON/Excel 并登记新的 `02_annotation` 阶段版本。
 4. 勾选一个或多个已预处理任务并提交建树，等待后台作业完成。
 
 ### 轨迹质检
@@ -220,10 +227,10 @@ backend_workspace/task_generation/
 建树结果保存在：
 
 ```text
-backend_workspace/trajectory_tree_runs/<完成时间串>/
+backend_workspace/system/trajectory_tree_runs/<完成时间串>/
 ```
 
-作业状态保存在 `backend_workspace/trajectory_tree_jobs/`。这些都是本地运行产物，
+作业状态只保存到 SQLite，不再写状态 JSON 镜像。阶段树和 Observation 保存在 `backend_workspace/batches/`。这些都是本地运行产物，
 不会提交到 GitHub。
 
 ### 轨迹修正
@@ -242,11 +249,12 @@ backend_workspace/trajectory_tree_runs/<完成时间串>/
 该模块的数据目录为：
 
 ```text
-backend_workspace/trajectory_correction/
-├─ inputs/       # 历史输入目录；当前批次来源为正式 annotated_trajectories.xlsx
-├─ sessions/     # 草稿 JSON
+backend_workspace/system/trajectory_correction/
+├─ inputs/       # 新会话冻结的 JSON/Excel 输入
 └─ exports/      # 导出 Excel
 ```
+
+草稿、人工编辑和 COT 作业状态只保存在 `backend_workspace/system/app.sqlite`，不会从旧会话 JSON 恢复。修正 `/export` 和完整数据集 `/dataset-export` 业务地址不变，导出同时登记对应阶段版本。
 
 ### 数据发布
 
@@ -255,22 +263,23 @@ backend_workspace/trajectory_correction/
 创建时填写可读的数据集名称，系统生成唯一的 `rel_<随机哈希>` 发布 ID。发布记录保存在：
 
 ```text
-backend_workspace/dataset_release/releases.json
+backend_workspace/system/app.sqlite
+backend_workspace/releases/<release_id>/              # 冻结的发布文件
 ```
 
-记录包含纠偏 Excel 的项目相对路径、SHA256、行数，以及整个 `backend_workspace/rollout_trajectories` 根目录的位置；不会保存显式的纠偏会话 ID，也不会复制、收集或去重轨迹。发布成功的会话会从专家纠偏界面隐藏，但会话草稿和导出文件仍保留在本地。
+记录包含冻结 Excel 的路径、SHA256、行数和上游会话/导出版本关系；发布时复制所选表格，不复制原始轨迹目录。发布成功的会话会从专家纠偏界面隐藏，但草稿和阶段快照仍保留。列表和下载只读取当前根目录登记的发布文件，不合并原旧 workspace 的发布记录。
 
-页面下半部分展示全部历史数据集，支持按名称或发布 ID 搜索、按云道S3上传状态筛选、查看路径与哈希、下载发布 Excel。点击“云道S3上传”由后端按登记顺序读取全部已发布 Excel、核验 SHA256 并调用上传适配器；浏览器只提交发布编号和目标参数。每份回执立即保存，失败后停止，重试跳过已成功文件；刷新可恢复进度，服务重启后可手动重试中断任务。
+页面下半部分展示新存储中已登记的数据集，支持按名称或发布 ID 搜索、按云道S3上传状态筛选、查看路径与哈希、下载发布 Excel。点击“云道S3上传”由后端按登记顺序读取全部已发布 Excel、核验 SHA256 并调用上传适配器；浏览器只提交发布编号和目标参数。每份回执立即保存，失败后停止，重试跳过已成功文件；刷新可恢复进度，服务重启后可手动重试中断任务。
 
 默认适配器未配置，页面明确提示“云道S3上传尚未配置”并禁用按钮。同事只需完成 [internal_uploader.py](backend/data_publishing/internal_uploader.py) 的配置检查、登录与上传；参数、回执、幂等规则及无网络自测见 [云道S3上传接入文档](backend/data_publishing/INTERNAL_UPLOAD.md)。无需读取编号或自行拼接路径，不上传原始轨迹目录。
 
-历史无 target 的上传接口继续保留模拟行为：遍历发布 Excel 和完整轨迹根目录、统计进度但不发送文件。旧模拟状态及以下模拟地址仅在详情中明确标注，不计入云道S3成功数量：
+不传 target 的既有上传调用继续保留模拟行为：遍历新存储中已登记的发布 Excel 和轨迹根目录、统计进度但不发送文件。模拟状态及以下模拟地址仅在详情中明确标注，不计入云道S3成功数量；这不启用旧目录读取：
 
 ```text
 s3://training-data/gui-agent-datasets/rel_a84f91c25d3e4b67/
 ```
 
-目标地址可通过 `backend/.env` 中的 `DATASET_S3_BUCKET` 和 `DATASET_S3_PREFIX` 调整；当前 `DATASET_UPLOAD_MODE` 必须保持为 `mock`。上传作业保存在 `backend_workspace/dataset_release/upload_jobs/`，服务重启后未完成作业会标记为中断，可在页面重新上传。以上发布记录、作业和数据文件均为本地运行产物，不提交到 GitHub。
+模拟目标地址可通过 `backend/.env` 中的 `DATASET_S3_BUCKET` 和 `DATASET_S3_PREFIX` 调整；当前 `DATASET_UPLOAD_MODE` 保持为 `mock`。上传作业状态只保存到 SQLite，不写 JSON 镜像或恢复旧上传任务。服务重启后未完成作业会标记为中断，可在页面重新上传。以上数据不提交到 GitHub。
 
 ## 7. 生产模式运行
 
@@ -352,18 +361,20 @@ python backend\DevelopRubrics\run_jiawen.py generate
 python backend\DevelopRubrics\run_jiawen.py all
 ```
 
-默认输入为 `backend_workspace/rollout_trajectories`，输出为：
+默认输入为 `backend_workspace/raw/rollout_trajectories`，目录缺失时明确报错，不扫描旧目录。输出为：
 
 ```text
-backend_workspace/
+backend_workspace/system/
 ├─ rubric_trajectories.xlsx
+├─ rubric_trajectories.json
 └─ rubric_outputs/
-   ├─ cache/qwen_summaries.json
    └─ rubrics/
       ├─ jiawen_gui_initial_rubric.json
       ├─ jiawen_gui_initial_rubric.evidence.md
       └─ jiawen_gui_initial_rubric.raw_response.txt
 ```
+
+模型缓存保存到 `backend_workspace/cache/rubric_outputs/`。
 
 工具会递归发现正式轨迹并忽略 `_prefetch_staging`。截图优先使用
 `input_stability.jpg`，缺失时依次回退到 `input.jpg` 和 `done.jpg`。模型响应逐次写入
@@ -384,11 +395,12 @@ post-action observation。所有步骤完成后，系统再为每条轨迹生成
 质检输入作为建树快照保存在：
 
 ```text
-backend_workspace/trajectory_tree_runs/<run_id>/rubric_trajectories.xlsx
+backend_workspace/system/trajectory_tree_runs/<run_id>/rubric_trajectories.json
+backend_workspace/system/trajectory_tree_runs/<run_id>/rubric_trajectories.xlsx
 ```
 
 因此新任务集进入质检时不会再次生成 observation 和 final answer，只需生成缺失的 Rubric
-并执行评分。旧任务集若没有随附工作簿，仍会回退到全局工作簿及原有自动补齐流程。
+并执行评分。质检必须读取所选任务集随附的 JSON，不回退全局工作簿、旧任务集或旧目录。
 任一 observation、final answer 或工作簿生成失败时，本次建树任务集不会发布；已完成缓存会保留供重新提交续跑。
 
 轨迹质检依赖 Python 3.10 以上版本运行 AdaRubric。后端本身仍可使用原有 Python 环境，
@@ -403,22 +415,28 @@ ADARUBRIC_PYTHON=D:\anaconda3\envs\guigent\python.exe
 1. 在“轨迹采集”页完成建树，形成一个时间串任务集。
 2. 进入“轨迹质检”，选择该任务集；页面会列出其中全部任务。
 3. 勾选一个或多个任务，点击“提交轨迹质检”。后端会全局串行执行模型作业，并显示当前任务、轨迹和完成进度。
-4. 若 observation、final answer 或 Rubric 缺失，作业会自动生成；已完成的模型响应和逐轨迹 checkpoint 会被复用。
+4. 读取该任务集声明的质检 JSON；文件缺失、损坏或缺少所需 observation/final answer 时明确报错，不从 Excel 补读或重新生成视觉结果。缺少 Rubric 时按质检流程生成，已完成的本批次模型响应和逐轨迹 checkpoint 可复用。
 5. 作业成功后点击“查看轨迹树”。已质检的终点叶子会显示 0–5 分：绿色表示通过，红色表示未通过；点击叶子可查看各维度得分、理由和逐步评价。
 
 最新成功结果保存到：
 
 ```text
-backend_workspace/trajectory_quality_results/<建树任务集 ID>/
+backend_workspace/system/trajectory_quality_results/<建树任务集 ID>/
 ```
 
-质检作业状态保存在 `backend_workspace/trajectory_quality_jobs/`。服务重启后，未完成作业会标记为
+质检当前状态只保存在 SQLite，不写作业 JSON 镜像；完整 JSON/Excel 阶段版本位于 `backend_workspace/batches/`。服务重启后，未完成作业会标记为
 `interrupted`；重新提交相同任务即可从缓存和 checkpoint 续跑。批量作业只有在本次所选任务全部成功后才发布，
 失败不会覆盖已有成功结果；重新质检部分任务时也只更新这些任务。
 
 代码仓只保存源码、测试、文档和配置示例。以下内容始终保留在本机：
 
 - `backend/.env` 和其他真实环境变量文件。
-- `backend_workspace` 下的原始轨迹、Excel、任务状态和轨迹树。
+- `backend_workspace/` 下的原始轨迹、Excel、任务状态和轨迹树。
 - Qwen 分类、对齐和 bbox 复核缓存。
 - 所有日志、Python/Node 缓存、依赖和前端构建产物。
+
+## 数据目录迁移与设计文档
+
+当前默认数据根为项目根的 `backend_workspace/`，其内部保留 `system/raw/inputs/resources/batches/releases/cache/logs/tmp` 的统一结构。`ADF_DATA_ROOT` 和现有 API 地址保持原语义。请勿把旧模块目录合并到新目录。
+
+目录切换、回退与路径校验见 [DATA_STORAGE.md](DATA_STORAGE.md)。完整业务流程图和存储设计见 [Word 设计文档](outputs/数据流转与存储设计.docx)。

@@ -12,6 +12,7 @@ from typing import Any
 from openpyxl import Workbook, load_workbook
 
 from .constants import WORKBOOK_SUFFIXES
+from .workbook import open_source_workbook
 
 
 def _edit(session: dict[str, Any], row_number: int) -> dict[str, Any]:
@@ -100,7 +101,7 @@ def export_session_workbook(
 ) -> dict[str, Any]:
     if workbook_path.suffix.lower() not in WORKBOOK_SUFFIXES:
         raise ValueError("仅支持 .xlsx 或 .xlsm 文件")
-    source = load_workbook(workbook_path, data_only=False, keep_vba=workbook_path.suffix.lower() == ".xlsm")
+    source = open_source_workbook(workbook_path, allow_excel_import=True, data_only=False, keep_vba=workbook_path.suffix.lower() == ".xlsm")
     try:
         sheet = source.active
         source_headers = [
@@ -202,7 +203,7 @@ def export_full_dataset_workbook(
     if workbook_path.suffix.lower() not in WORKBOOK_SUFFIXES:
         raise ValueError("仅支持 .xlsx 或 .xlsm 文件")
     keep_vba = workbook_path.suffix.lower() == ".xlsm"
-    workbook = load_workbook(workbook_path, data_only=False, keep_vba=keep_vba)
+    workbook = open_source_workbook(workbook_path, allow_excel_import=True, data_only=False, keep_vba=keep_vba)
     try:
         sheet = workbook.active
         columns = {

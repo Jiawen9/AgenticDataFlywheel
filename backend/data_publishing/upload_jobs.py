@@ -13,6 +13,7 @@ from typing import Any, Callable, Optional
 
 from ..trajectory_correction.draft_store import utc_now
 from .constants import BACKEND_DIR, UPLOAD_JOBS_DIR
+from ..data_store import RecordStore
 from .service import DatasetReleaseRegistry
 from . import internal_uploader
 from .internal_jobs import InternalUploadJobsMixin
@@ -50,6 +51,7 @@ class DatasetUploadJobManager(InternalUploadJobsMixin):
     ) -> None:
         self.registry = registry
         self.jobs_dir = jobs_dir
+        self._records = RecordStore(registry.data_root)
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._owns_executor = executor is None
@@ -67,31 +69,17 @@ class DatasetUploadJobManager(InternalUploadJobsMixin):
         return self.jobs_dir / f"{job_id}.json"
 
     def _write(self, payload: dict[str, Any]) -> None:
-        target = self._path(str(payload["job_id"]))
-        temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
-        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(target)
+        saved = self._records.put("dataset_upload_jobs", str(payload["job_id"]), payload)
+        payload["storage_revision"] = saved["storage_revision"]
 
     def get(self, job_id: str) -> Optional[dict[str, Any]]:
+        if self._path(job_id).name == ".invalid-job-id":
+            return None
         with self._lock:
-            path = self._path(job_id)
-            if not path.is_file():
-                return None
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError, json.JSONDecodeError):
-                return None
-            return payload if isinstance(payload, dict) else None
+            return self._records.get("dataset_upload_jobs", job_id)
 
     def mark_interrupted_jobs(self) -> None:
-        payloads = []
-        for path in self.jobs_dir.glob("*.json"):
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError, json.JSONDecodeError):
-                continue
-            if isinstance(payload, dict):
-                payloads.append(payload)
+        payloads = self._records.list("dataset_upload_jobs")
         # Reconcile in attempt order so an interrupted registry write can be
         # repaired from the newest durable receipt, without reviving older jobs.
         # utc_now has second precision; retries can share a creation timestamp.

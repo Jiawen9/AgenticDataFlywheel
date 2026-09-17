@@ -1,7 +1,7 @@
 /**
  * 手机工厂采集页 API 客户端。
- * 开发期由 vite-plugin-phone-factory 中间件提供服务，
- * 后续接入真实 backend 时替换实现即可。
+ * 由 FastAPI 的 /api/phone-factory/* 提供服务，
+ * 开发环境经 Vite 代理访问同一后端。
  */
 
 export interface PhoneAppRow {
@@ -34,6 +34,16 @@ export interface FactoryConfig {
 
 const BASE = '/api/phone-factory'
 
+// One ID per intentional run; callers that retry a request can reuse the same ID.
+export function newRunRequestId(): string {
+  if (globalThis.crypto.randomUUID) return globalThis.crypto.randomUUID()
+  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16))
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80
+  const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${BASE}${path}`, init)
   const payload = (await response.json().catch(() => null)) as (T & { error?: string }) | null
@@ -57,15 +67,15 @@ export const phoneFactoryApi = {
   state(): Promise<FactoryState> {
     return request<FactoryState>('/state')
   },
-  /** 新增手机ID（追加到 phones.json，不能重复） */
+  /** 新增手机ID（SQLite 登记，不能重复） */
   addPhone(phoneId: string): Promise<FactoryState> {
     return request<FactoryState>('/phones', jsonInit('POST', { phone_id: phoneId }))
   },
-  /** 新增运行APP（追加到 apps.json，不能重复） */
+  /** 新增运行APP（SQLite 登记，不能重复） */
   addApp(app: string): Promise<FactoryState> {
     return request<FactoryState>('/apps', jsonInit('POST', { app }))
   },
-  /** 建立手机ID与运行APP的关联（phone_apps.json；同一手机可多APP，同一对不重复） */
+  /** 建立手机ID与运行APP的关联（SQLite；同一手机可多APP，同一对不重复） */
   addPhoneApp(phoneId: string, app: string): Promise<FactoryState> {
     return request<FactoryState>('/phone-apps', jsonInit('POST', { phone_id: phoneId, app }))
   },
@@ -73,11 +83,11 @@ export const phoneFactoryApi = {
   removePhoneApp(phoneId: string, app: string): Promise<FactoryState> {
     return request<FactoryState>('/phone-apps', jsonInit('DELETE', { phone_id: phoneId, app }))
   },
-  /** 保存VLA接口（追加到 vla.json，不能重复） */
+  /** 保存VLA接口（SQLite 登记，不能重复） */
   saveVla(value: string): Promise<FactoryState> {
     return request<FactoryState>('/vla', jsonInit('POST', { value }))
   },
-  /** 新增任务：上传文件到 /root/uuupppfffiiillleee 并登记 tasks.json */
+  /** 新增任务：后端保存到数据根目录 inputs/phone_factory，并在 SQLite 登记。 */
   addTask(description: string, filename: string, contentBase64: string, sourceBatchId?: string): Promise<FactoryState> {
     return request<FactoryState>(
       '/tasks',
@@ -96,7 +106,7 @@ export const phoneFactoryApi = {
   saveConfig(config: FactoryConfig): Promise<FactoryConfig> {
     return request<FactoryConfig>('/config', jsonInit('POST', config))
   },
-  /** 删除任务（从 tasks.json 移除） */
+  /** 删除任务登记 */
   removeTask(filename: string): Promise<FactoryState> {
     return request<FactoryState>('/tasks', jsonInit('DELETE', { filename }))
   },
@@ -108,10 +118,10 @@ export const phoneFactoryApi = {
     )
   },
   /** 开始运行 -> 把任务文件与 手机ID/运行APP 关联文件 发送到 server 端 */
-  remoteStartRun(filename: string, phoneId: string, app: string): Promise<{ ok: boolean; message?: string; error?: string }> {
+  remoteStartRun(filename: string, phoneId: string, app: string, requestId = newRunRequestId()): Promise<{ ok: boolean; message?: string; error?: string }> {
     return request<{ ok: boolean; message?: string; error?: string }>(
       '/remote/start-run',
-      jsonInit('POST', { filename, phone_id: phoneId, app }),
+      jsonInit('POST', { filename, phone_id: phoneId, app, request_id: requestId }),
     )
   },
 }

@@ -14,12 +14,13 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from .constants import CORRECTION_BBOX_CACHE_DIR, CORRECTION_COT_JOBS_DIR, PROJECT_ROOT
+from ..data_store import RecordStore, DATA_ROOT, rebase_data_path
 from .cot_generator import QwenCotGenerator, read_env
 from ..bounding_box.build_annotations import resolve_action_box
 from ..bounding_box.qwen_reviewer import QwenBoxReviewer
 from ..trajectory_data import _format_manual_actions_box
-from .draft_store import load_session, save_session
-from .service import _snapshot, session_asset
+from .draft_store import load_session, update_session, storage_root
+from .service import _snapshot, session_asset, publish_stage_snapshot, publish_cot_snapshot
 
 
 Progress = Callable[[dict[str, Any]], None]
@@ -60,10 +61,10 @@ def _xml_text(image: Path, row: dict[str, Any]) -> str:
     value = str(row.get("xml", "") or "")
     if value and not value.startswith("embedded:") and not value.startswith("missing"):
         try:
-            path = Path(value)
+            path = rebase_data_path(value, storage_root())
             if path.is_file():
                 return path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        except (OSError, ValueError):
             pass
     path = image.with_name(re.sub(r"_vla_input(?:_stability)?\.jpg$", "_vla_input_ui.xml", image.name, flags=re.IGNORECASE))
     try:
@@ -75,6 +76,7 @@ def _xml_text(image: Path, row: dict[str, Any]) -> str:
 class CotJobManager:
     def __init__(self, jobs_dir: Path = CORRECTION_COT_JOBS_DIR, generator_factory: Callable[[], QwenCotGenerator] = QwenCotGenerator, executor: Executor | None = None) -> None:
         self.jobs_dir = jobs_dir
+        self._records = RecordStore(DATA_ROOT if jobs_dir == CORRECTION_COT_JOBS_DIR else jobs_dir.parent)
         self.generator_factory = generator_factory
         self._lock = threading.RLock()
         self._owns_executor = executor is None
@@ -83,43 +85,26 @@ class CotJobManager:
         self.mark_interrupted_jobs()
 
     def _path(self, job_id: str) -> Path:
+        if not re.fullmatch(r"[a-f0-9]{32}", job_id):
+            return self.jobs_dir / ".invalid-job-id"
         return self.jobs_dir / f"{job_id}.json"
 
     def _write(self, payload: dict[str, Any]) -> None:
-        target = self._path(str(payload["job_id"]))
-        temporary = target.with_name(f".{target.name}.tmp")
-        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(target)
+        saved = self._records.put("correction_cot_jobs", str(payload["job_id"]), payload)
+        payload["storage_revision"] = saved["storage_revision"]
 
     def get(self, job_id: str) -> dict[str, Any] | None:
+        if self._path(job_id).name == ".invalid-job-id":
+            return None
         with self._lock:
-            path = self._path(job_id)
-            if not path.is_file():
-                return None
-            try:
-                value = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError, json.JSONDecodeError):
-                return None
-            return value if isinstance(value, dict) else None
+            return self._records.get("correction_cot_jobs", job_id)
 
     def list_jobs(self) -> list[dict[str, Any]]:
         with self._lock:
-            values: list[dict[str, Any]] = []
-            for path in self.jobs_dir.glob("*.json"):
-                try:
-                    value = json.loads(path.read_text(encoding="utf-8"))
-                except (OSError, ValueError, json.JSONDecodeError):
-                    continue
-                if isinstance(value, dict):
-                    values.append(value)
-            return sorted(values, key=lambda item: str(item.get("created_at", "")), reverse=True)
+            return sorted(self._records.list("correction_cot_jobs"), key=lambda item: str(item.get("created_at", "")), reverse=True)
 
     def mark_interrupted_jobs(self) -> None:
-        for path in self.jobs_dir.glob("*.json"):
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError, json.JSONDecodeError):
-                continue
+        for payload in self.list_jobs():
             if payload.get("status") in {"queued", "running"}:
                 payload.update(status="interrupted", completed_at=_now(), error="服务重启导致 COT 生成中断；重新提交可复用已完成结果。")
                 self._write(payload)
@@ -162,6 +147,8 @@ class CotJobManager:
                     if str(previous.get("summary") or "").strip() and not session.get("row_edits", {}).get(str(previous["excel_row"]), {}).get("deleted")
                 )
                 targets.append({
+                    "base_action": row.get("action") or {},
+                    "edit_baseline": dict(edit),
                     "group_id": group["group_id"],
                     "task": group["task"],
                     "trajectory_id": group["meta_task"],
@@ -192,6 +179,8 @@ class CotJobManager:
             ]
             if conflicts:
                 raise ValueError("批量生成将覆盖人工修改，请确认后重试：" + "、".join(conflicts))
+        session = load_session(session_id)
+        publish_stage_snapshot(session, _snapshot(session), "06_correction")
         payload = {
             "job_id": uuid.uuid4().hex,
             "session_id": session_id,
@@ -239,7 +228,6 @@ class CotJobManager:
                 raise FileNotFoundError("纠偏会话不存在")
             generator = self.generator_factory()
             reviewer = _bbox_reviewer() if payload.get("generate_bbox") else None
-            cot = session.setdefault("cot", {})
             completed = int(payload.get("completed_steps") or 0)
             completed_bbox = int(payload.get("completed_bbox") or 0)
             completed_cot = int(payload.get("completed_cot") or 0)
@@ -258,45 +246,59 @@ class CotJobManager:
                         max_review_rounds=4,
                     )
                     box = _format_manual_actions_box(action, resolution.result.bbox)
-                    edit = session.setdefault("row_edits", {}).setdefault(str(target["excel_row"]), {})
-                    edit["actions_box"] = box
-                    edit["bbox_source"] = "generated"
-                    edit["bbox_generated_at"] = _now()
-                    edit["bbox_model"] = reviewer.model
-                    cot.pop(str(target["excel_row"]), None)
+                    def save_bbox(current):
+                        self._validate_target(current, target)
+                        edit = current.setdefault("row_edits", {}).setdefault(str(target["excel_row"]), {})
+                        baseline = target.get("edit_baseline", {})
+                        if edit.get("actions_box") != baseline.get("actions_box"):
+                            raise RuntimeError("生成期间标框已被修改，请重新提交")
+                        edit.update(actions_box=box, bbox_source="generated", bbox_generated_at=_now(), bbox_model=reviewer.model)
+                        current.setdefault("cot", {}).pop(str(target["excel_row"]), None)
+                    update_session(str(payload["session_id"]), save_bbox)
                     target["reference_answer"] = box
                     target["bbox_hash"] = _bbox_hash(box)
-                    save_session(session)
                     completed_bbox += 1
                     self._progress(job_id, {"stage": "generating_bbox", "completed_bbox": completed_bbox})
                 result = generator.generate(task=target["task"], trajectory_id=target["trajectory_id"], step=int(target["step"]), history=target["history"], action=target["action"], image=image, reference_answer=str(target.get("reference_answer") or ""))
-                current_edit = session.get("row_edits", {}).get(str(target["excel_row"]), {})
-                current_action = json.loads(current_edit.get("actions", json.dumps(target["action"], ensure_ascii=False)))
-                if _action_hash(current_action) != _action_hash(target["action"]):
-                    raise RuntimeError(f"第 {target['step']} 步在生成期间动作发生变化，请重新提交")
-                current_edit = session.get("row_edits", {}).get(str(target["excel_row"]), {})
-                current_bbox = str(current_edit.get("actions_box", target.get("reference_answer", "")))
-                cot[str(target["excel_row"])] = {
-                    "thought": str(result["thought"]),
-                    "summary": str(result["summary"]),
-                    "model": generator.model,
-                    "content_tag": "thought_summary",
-                    "action_hash": _action_hash(target["action"]),
-                    "bbox_hash": _bbox_hash(current_bbox),
-                    "actions_box": current_bbox,
-                    "generated_at": _now(),
-                }
-                current_edit = session.setdefault("row_edits", {}).setdefault(str(target["excel_row"]), {})
-                current_edit.pop("summary", None)
-                current_edit.pop("thought", None)
-                save_session(session)
+                def save_cot(current):
+                    self._validate_target(current, target)
+                    edit = current.setdefault("row_edits", {}).setdefault(str(target["excel_row"]), {})
+                    current_bbox = str(edit.get("actions_box", target.get("reference_answer", "")))
+                    current.setdefault("cot", {})[str(target["excel_row"])] = {
+                        "thought": str(result["thought"]), "summary": str(result["summary"]),
+                        "model": generator.model, "content_tag": "thought_summary",
+                        "action_hash": _action_hash(target["action"]), "bbox_hash": _bbox_hash(current_bbox),
+                        "actions_box": current_bbox, "generated_at": _now(),
+                    }
+                    # Explicit regeneration replaces the values present when
+                    # submitted, but must preserve edits made while it ran.
+                    baseline = target.get("edit_baseline", {})
+                    for field in ("summary", "thought"):
+                        if field in baseline and edit.get(field) == baseline[field]:
+                            edit.pop(field, None)
+                update_session(str(payload["session_id"]), save_cot)
                 completed += 1
                 completed_cot += 1
                 self._progress(job_id, {"stage": "generating_cot", "completed_steps": completed, "completed_cot": completed_cot, "percent": round(completed / len(payload["targets"]) * 100), "error": None})
         except Exception as exc:
             self._progress(job_id, {"status": "failed", "stage": "failed", "completed_at": _now(), "error": str(exc)})
             return
+        try:
+            artifact = publish_cot_snapshot(str(payload["session_id"]))
+            self._progress(job_id, {"artifact": artifact})
+        except Exception as exc:
+            self._progress(job_id, {"status": "failed", "stage": "export_failed", "completed_at": _now(), "error": f"COT 已保存，过程表导出失败；可重新导出，无需重新生成：{exc}"})
+            return
         self._progress(job_id, {"status": "succeeded", "stage": "succeeded", "completed_at": _now(), "percent": 100, "error": None})
+
+    @staticmethod
+    def _validate_target(session, target):
+        edit = session.get("row_edits", {}).get(str(target["excel_row"]), {})
+        if edit.get("deleted"):
+            raise RuntimeError(f"第 {target['step']} 步在生成期间被删除，请重新提交")
+        current_action = json.loads(edit["actions"]) if "actions" in edit else target.get("base_action", target["action"])
+        if _action_hash(current_action) != _action_hash(target["action"]):
+            raise RuntimeError(f"第 {target['step']} 步在生成期间动作发生变化，请重新提交")
 
     def shutdown(self) -> None:
         if self._owns_executor:

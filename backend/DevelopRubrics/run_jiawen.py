@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import importlib.util
 import sys
+import os
 from pathlib import Path
 
 from trajectory_tools.gui_trajectory_excel import QwenSummarizer, export_trajectory_workbook
@@ -14,9 +15,14 @@ from trajectory_tools.settings import DEFAULT_ENV_FILE, configure_model_environm
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 REPOSITORY_ROOT = PROJECT_ROOT.parents[1]
-DEFAULT_SOURCE = REPOSITORY_ROOT / "backend_workspace" / "rollout_trajectories"
-DEFAULT_WORKBOOK = REPOSITORY_ROOT / "backend_workspace" / "rubric_trajectories.xlsx"
-DEFAULT_CACHE = REPOSITORY_ROOT / "backend_workspace" / "rubric_outputs" / "cache" / "qwen_summaries.json"
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+from backend.data_store import DATA_ROOT
+from backend.stage_artifacts import workbook_payload, write_sidecar
+
+DEFAULT_SOURCE = DATA_ROOT / "raw" / "rollout_trajectories"
+DEFAULT_WORKBOOK = DATA_ROOT / "system" / "rubric_trajectories.xlsx"
+DEFAULT_CACHE = DATA_ROOT / "cache" / "rubric_outputs" / "qwen_summaries.json"
 DEFAULT_CONFIG = PROJECT_ROOT / "examples" / "jiawen_rubric_config.json"
 GENERATOR_PATH = PROJECT_ROOT / "examples" / "generate-jiawen-rubrics.py"
 
@@ -56,6 +62,7 @@ def run_export(args: argparse.Namespace) -> None:
             cache_path=args.cache.resolve(),
         )
     counts = export_trajectory_workbook(source, output, summarizer)
+    write_sidecar(output, workbook_payload(output))
     print(f"Exported {counts[0]} task(s), {counts[1]} trajectories and {counts[2]} steps to {output}")
 
 
@@ -63,11 +70,17 @@ def run_generate(args: argparse.Namespace) -> None:
     configure_model_environment(args.env_file.resolve())
     generator = _load_generator()
     original_argv = sys.argv
+    original_workbook = os.environ.get("ADARUBRIC_JIAWEN_WORKBOOK")
     try:
+        os.environ["ADARUBRIC_JIAWEN_WORKBOOK"] = str(args.workbook.resolve())
         sys.argv = [str(GENERATOR_PATH), "--config", str(args.config.resolve())]
         asyncio.run(generator.main())
     finally:
         sys.argv = original_argv
+        if original_workbook is None:
+            os.environ.pop("ADARUBRIC_JIAWEN_WORKBOOK", None)
+        else:
+            os.environ["ADARUBRIC_JIAWEN_WORKBOOK"] = original_workbook
 
 
 def main() -> int:

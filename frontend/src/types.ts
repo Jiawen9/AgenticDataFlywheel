@@ -1,5 +1,61 @@
 export type ActionPayload = Record<string, unknown>
 
+export interface TrajectoryScope {
+  batch_id: string
+  annotation_version: string
+}
+
+export interface StageArtifact {
+  batch_id: string
+  stage: string
+  version: string
+  created_at: string
+  files: Array<{ name: string; kind: string; path: string; sha256: string; size: number }>
+}
+
+export interface PreprocessingJob {
+  job_id: string
+  batch_id: string
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted'
+  stage: string
+  completed_steps: number
+  total_steps: number
+  current_task: string | null
+  current_trajectory: string | null
+  current_step: number | string | null
+  percent: number
+  error: string | null
+  artifacts: StageArtifact[]
+  annotation_version: string | null
+}
+
+export interface PreprocessingBatch {
+  batch_id: string
+  kind: string
+  label: string
+  task_count: number
+  ready_trajectory_count: number
+  ready_step_count: number
+  collection_status: string
+  preprocessing_status: string
+  latest_job: PreprocessingJob | null
+  annotation_version: string | null
+  artifacts: StageArtifact[]
+  can_start: boolean
+  reason: string | null
+}
+
+export interface CollectionSourceTask { task_id: string; collection_case_id: string; task: string; app: string }
+export interface CollectionSourceTrajectory {
+  task_id: string; collection_case_id: string; collection_run_id: string; source_trajectory_id: string;
+  collected_at: string; relative_dir: string
+}
+export interface CollectionSourceRun {
+  collection_run_id: string; batch_id: string; status: string; created_at: string; completed_at: string | null;
+  batch_tasks: Record<string, CollectionSourceTask>; trajectories: CollectionSourceTrajectory[];
+  errors: Array<{ collection_case_id: string | null; error: string }>; dispatch_error: string | null
+}
+
 export interface TaskSummary {
   task_id: string
   goal: string
@@ -30,11 +86,15 @@ export interface TrajectoryRecord {
 
 export interface TrajectorySummary {
   trajectory_id: string
+  source_trajectory_id?: string
+  collected_at?: string | null
   step_count: number
 }
 
 export interface BuildJob {
   job_id: string
+  batch_id?: string
+  annotation_version?: string
   status: 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted'
   stage: string
   task_ids: string[]
@@ -132,6 +192,8 @@ export interface TreeRunTask {
 
 export interface TreeRun {
   run_id: string
+  batch_id?: string
+  annotation_version?: string
   completed_at: string
   model_name: string
   task_ids: string[]

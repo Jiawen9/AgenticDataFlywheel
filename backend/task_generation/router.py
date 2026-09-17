@@ -176,6 +176,17 @@ def task_generation_results(job_id: str) -> dict[str, Any]:
     return {"results": _manager().results(job_id), "errors": job.get("errors", [])}
 
 
+@router.post("/jobs/{job_id}/snapshot", status_code=201)
+def save_task_snapshot(job_id: str) -> dict[str, Any]:
+    """Retry JSON/Excel serialization from saved data without calling a model."""
+    try:
+        return _manager().snapshot(job_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @router.get(
     "/jobs/{job_id}/collection-input",
     response_model=CollectionInput,

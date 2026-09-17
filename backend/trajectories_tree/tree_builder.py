@@ -12,6 +12,7 @@ import argparse
 import json
 import re
 import sys
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 from dataclasses import dataclass, field
@@ -19,6 +20,12 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from openpyxl import load_workbook
+
+if str(Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from backend.data_store import DATA_ROOT
+from backend.stage_artifacts import read_workbook_payload, structured_input_exists
+from backend.trajectory_context import row_task_id, row_trajectory_id
 
 try:
     from ..trajectories_preprocessing import configure_reviewer_environment
@@ -57,16 +64,16 @@ STEP_NUMBER_RE = re.compile(r"step(\d+)", re.IGNORECASE)
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = BACKEND_DIR.parent
-WORKSPACE_DIR = PROJECT_ROOT / "backend_workspace"
+WORKSPACE_DIR = DATA_ROOT / "system" / "preprocessing"
 DEFAULT_XLSX = WORKSPACE_DIR / "annotated_trajectories.xlsx"
-DEFAULT_TRAJECTORY_ROOT = WORKSPACE_DIR / "rollout_trajectories"
+DEFAULT_TRAJECTORY_ROOT = DATA_ROOT / "raw" / "rollout_trajectories"
 DEFAULT_OUTPUT = WORKSPACE_DIR / "trajectory_tree.json"
 DEFAULT_ENV = BACKEND_DIR / ".env"
 DEFAULT_CLASSIFICATION_CACHE = (
-    BACKEND_DIR / "trajectories_tree" / "qwen_intermediate_state_cache.json"
+    DATA_ROOT / "cache" / "trajectories_tree" / "qwen_intermediate_state_cache.json"
 )
 DEFAULT_ALIGNMENT_CACHE = (
-    BACKEND_DIR / "trajectories_tree" / "qwen_state_alignment_cache.json"
+    DATA_ROOT / "cache" / "trajectories_tree" / "qwen_state_alignment_cache.json"
 )
 
 
@@ -184,6 +191,17 @@ class Step:
     alignment_review: dict[str, Any] | None = None
     observation: str = ""
     excluded_intermediate_terminate: bool = False
+    task_id: str = ""
+    source_trajectory_id: str = ""
+    collection_run_id: str = ""
+    collected_at: str = ""
+
+    def identity_dict(self) -> dict[str, Any]:
+        return {key: value for key, value in {
+            "task_id": self.task_id, "trajectory_id": self.trajectory,
+            "source_trajectory_id": self.source_trajectory_id,
+            "collection_run_id": self.collection_run_id, "collected_at": self.collected_at,
+        }.items() if value}
 
     def apply_classification(
         self,
@@ -206,6 +224,7 @@ class Step:
             classification_value["effective_intermediate"] = self.effective_intermediate
             classification_value["policy_candidate"] = self.classification_candidate
         return {
+            **self.identity_dict(),
             "step": self.step_index,
             "excel_row": self.excel_row,
             "image": self.image,
@@ -356,48 +375,40 @@ def _step_number(image: str, fallback: int) -> int:
     return int(match.group(1)) if match else fallback
 
 
-def load_trajectories(path: Path, sheet_name: str | None) -> list[tuple[str, list[Step]]]:
-    workbook = load_workbook(path, read_only=True, data_only=True)
-    try:
-        sheet = workbook[sheet_name] if sheet_name else workbook.active
-        headers = {
-            str(cell.value).strip(): cell.column
-            for cell in sheet[1]
-            if cell.value is not None
-        }
-        required = {"文件夹名", "image", "xml", "action", "summary", "actions_box"}
-        missing = sorted(required - headers.keys())
-        if missing:
-            raise ValueError(f"Excel 缺少必要列: {', '.join(missing)}")
+def load_trajectories(path: Path, sheet_name: str | None, *, allow_excel_import: bool = False) -> list[tuple[str, list[Step]]]:
+    payload = read_workbook_payload(path, allow_excel_import=allow_excel_import)
+    sheets = payload["sheets"]
+    name = sheet_name or next(iter(sheets))
+    rows = sheets[name]
+    headers = set(payload.get("columns", {}).get(name, list(rows[0]) if rows else []))
+    required = {"文件夹名", "image", "xml", "action", "summary", "actions_box"}
+    missing = sorted(required - headers)
+    if missing:
+        raise ValueError(f"Excel 缺少必要列: {', '.join(missing)}")
 
-        grouped: dict[str, list[Step]] = {}
-        for row in range(2, sheet.max_row + 1):
-            raw_trajectory = sheet.cell(row, headers["文件夹名"]).value
-            if raw_trajectory is None or not str(raw_trajectory).strip():
-                continue
-            trajectory = str(raw_trajectory).strip()
-            steps = grouped.setdefault(trajectory, [])
-            image = str(sheet.cell(row, headers["image"]).value or "").strip()
-            action_text = str(sheet.cell(row, headers["action"]).value or "")
-            steps.append(
-                Step(
-                    trajectory=trajectory,
-                    step_index=_step_number(image, len(steps) + 1),
-                    excel_row=row,
-                    image=image,
-                    xml=str(sheet.cell(row, headers["xml"]).value or "").strip(),
-                    action_text=action_text,
-                    action=parse_action(action_text),
-                    summary=str(sheet.cell(row, headers["summary"]).value or ""),
-                    actions_box=str(sheet.cell(row, headers["actions_box"]).value or ""),
-                )
-            )
-    finally:
-        workbook.close()
+    grouped: dict[str, list[Step]] = {}
+    for row, values in enumerate(rows, 2):
+        raw_trajectory = row_trajectory_id(values)
+        if raw_trajectory is None or not str(raw_trajectory).strip():
+            continue
+        trajectory = str(raw_trajectory).strip()
+        steps = grouped.setdefault(trajectory, [])
+        image = str(values.get("image") or "").strip()
+        action_text = str(values.get("action") or "")
+        steps.append(Step(
+            trajectory=trajectory, step_index=_step_number(image, len(steps) + 1), excel_row=row,
+            image=image, xml=str(values.get("xml") or "").strip(),
+            action_text=action_text, action=parse_action(action_text),
+            summary=str(values.get("summary") or ""), actions_box=str(values.get("actions_box") or ""),
+            task_id=row_task_id(values), source_trajectory_id=str(values.get("source_trajectory_id") or ""),
+            collection_run_id=str(values.get("collection_run_id") or ""), collected_at=str(values.get("collected_at") or ""),
+        ))
 
     for trajectory, steps in grouped.items():
         steps.sort(key=lambda step: (step.step_index, step.excel_row))
         indices = [step.step_index for step in steps]
+        if len({step.task_id for step in steps}) != 1:
+            raise ValueError(f"轨迹 {trajectory} 引用了多个任务")
         if len(indices) != len(set(indices)):
             raise ValueError(f"轨迹 {trajectory} 包含重复 step 编号")
     return sorted(grouped.items(), key=lambda item: item[0])
@@ -861,6 +872,7 @@ def build_tree(
             matched.occurrences.append(
                 {
                     "trajectory": trajectory,
+                    **step.identity_dict(),
                     "step": step.step_index,
                     "excel_row": step.excel_row,
                     "image": step.image,
@@ -886,6 +898,7 @@ def build_tree(
             decisions.append(
                 {
                     "trajectory": trajectory,
+                    **step.identity_dict(),
                     "step": step.step_index,
                     "excel_row": step.excel_row,
                     "parent_node": parent_id,
@@ -916,6 +929,7 @@ def source_trajectory_audit(
     return [
         {
             "trajectory": trajectory,
+            **(steps[0].identity_dict() if steps else {}),
             "original_step_count": len(steps),
             "tree_step_count": sum(step.counted_in_tree for step in steps),
             "ignored_incidental_step_count": sum(
@@ -1033,6 +1047,8 @@ def main(argv: list[str] | None = None) -> int:
         help="image/xml 相对路径的资源根目录",
     )
     parser.add_argument("-o", "--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--batch-id")
+    parser.add_argument("--data-root", type=Path, default=DATA_ROOT)
     parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV)
     parser.add_argument(
         "--cache",
@@ -1060,6 +1076,17 @@ def main(argv: list[str] | None = None) -> int:
         help="mismatch 后最多尝试跳过的步骤数（默认 2）",
     )
     args = parser.parse_args(argv)
+    if args.data_root != DATA_ROOT:
+        if args.xlsx == DEFAULT_XLSX:
+            args.xlsx = args.data_root / "system" / "preprocessing" / DEFAULT_XLSX.name
+        if args.output == DEFAULT_OUTPUT:
+            args.output = args.data_root / "system" / "preprocessing" / DEFAULT_OUTPUT.name
+        if args.trajectory_root == DEFAULT_TRAJECTORY_ROOT:
+            args.trajectory_root = args.data_root / "raw" / "rollout_trajectories"
+        if args.cache == DEFAULT_CLASSIFICATION_CACHE:
+            args.cache = args.data_root / "cache" / "trajectories_tree" / DEFAULT_CLASSIFICATION_CACHE.name
+        if args.alignment_cache == DEFAULT_ALIGNMENT_CACHE:
+            args.alignment_cache = args.data_root / "cache" / "trajectories_tree" / DEFAULT_ALIGNMENT_CACHE.name
     if not 0.0 <= args.confidence_threshold <= 1.0:
         parser.error("--confidence-threshold must be between 0 and 1")
 
@@ -1069,8 +1096,8 @@ def main(argv: list[str] | None = None) -> int:
     env_path = _resolved(args.env_file)
     classification_cache = _resolved(args.cache)
     alignment_cache = _resolved(args.alignment_cache)
-    if not xlsx_path.is_file():
-        parser.error(f"xlsx not found: {xlsx_path}")
+    if not structured_input_exists(xlsx_path):
+        parser.error(f"required JSON snapshot not found: {xlsx_path.with_suffix('.json')}")
     if not trajectory_root.is_dir():
         parser.error(f"trajectory root not found: {trajectory_root}")
 
@@ -1106,6 +1133,17 @@ def main(argv: list[str] | None = None) -> int:
         max_incidental_skip=args.max_incidental_skip,
         json_path=output_path,
     )
+    from backend.data_store import ArtifactStore
+    from backend.stage_artifacts import observation_payload
+    source = read_workbook_payload(xlsx_path)
+    source_ref = source.get("source_ref") or {"kind": "annotation_snapshot", "path": str(xlsx_path.with_suffix('.json'))}
+    batch_id = args.batch_id or source_ref.get("batch_id") or uuid.uuid4().hex
+    artifacts = ArtifactStore(args.data_root)
+    observed, rows = observation_payload({"cli": trajectories}, args.confidence_threshold)
+    observation_ref = artifacts.publish(batch_id, "03_observation", observed,
+        tables={"Observation与中间态": rows}, source_refs=[source_ref], metadata={"producer": "tree_builder_cli"})
+    artifacts.publish(batch_id, "04_tree", json.loads(output_path.read_text(encoding="utf-8")),
+        source_refs=[observation_ref], metadata={"producer": "tree_builder_cli", "tree_file": output_path.name})
 
     ignored = sum(item["decision"] == "ignore_intermediate" for item in decisions)
     branches = sum(item["decision"] == "branch" for item in decisions)

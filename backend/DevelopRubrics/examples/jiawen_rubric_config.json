@@ -1,5 +1,4 @@
 {
-  "workbook_path": "../../backend_workspace/rubric_trajectories.xlsx",
   "extra_body": {
     "chat_template_kwargs": {
       "enable_thinking": true
@@ -13,9 +12,6 @@
   "include_calibration_contrast": false,
   "calibration_trajectory_ids": [],
   "calibration_trajectory_ids_by_task": {},
-  "rubric_path": "../../backend_workspace/rubric_outputs/rubrics/jiawen_gui_initial_rubric.json",
-  "evidence_path": "../../backend_workspace/rubric_outputs/rubrics/jiawen_gui_initial_rubric.evidence.md",
-  "raw_response_path": "../../backend_workspace/rubric_outputs/rubrics/jiawen_gui_initial_rubric.raw_response.txt",
   "temperature": 0.0,
   "max_tokens": 4096,
   "repair_invalid_json": true,
@@ -33,8 +29,6 @@
   "evaluation_step_lookahead": 1,
   "evaluation_trajectory_ids": [],
   "evaluation_trajectory_ids_by_task": {},
-  "evaluation_report_path": "../../backend_workspace/rubric_outputs/evaluations/jiawen_gui_eval.md",
-  "evaluation_jsonl_path": "../../backend_workspace/rubric_outputs/evaluations/jiawen_gui_eval.jsonl",
   "evaluation_resume_from_jsonl": true,
   "direct_judge_completion_first": false,
   "direct_judge_raw_response_path": "docs/evaluation_outputs/jiawen_direct_judge_baseline.raw_response.jsonl",

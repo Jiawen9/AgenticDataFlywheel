@@ -116,6 +116,15 @@ def cmd_start_run(args: argparse.Namespace) -> dict:
         "top_p": str(args.top_p),
         "use_experience_lib": "true" if args.exp else "false",
     }
+    collection = {
+        "batch_id": getattr(args, "batch_id", None),
+        "collection_run_id": getattr(args, "collection_run_id", None),
+        "output_dir": getattr(args, "output_dir", None),
+    }
+    if any(collection.values()):
+        if not all(collection.values()):
+            sys.exit("错误：batch_id、collection_run_id 和 output_dir 必须一起提供")
+        fields.update(collection)
     file_fields = [
         ("task_file", task_path.name, task_path.read_bytes()),
         ("apps_file", apps_path.name, apps_path.read_bytes()),
@@ -139,6 +148,9 @@ def build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--temperature", type=float, default=0.7, help="temperature（默认 0.7）")
     p2.add_argument("--top-p", dest="top_p", type=float, default=0.85, help="top_p（默认 0.85）")
     p2.add_argument("--exp", action="store_true", default=False, help="是否使用经验库")
+    p2.add_argument("--batch-id", help="生成侧已提交的采集批次编号")
+    p2.add_argument("--collection-run-id", help="本次采集运行编号；重试时保持不变")
+    p2.add_argument("--output-dir", help="采集原始轨迹的指定输出根目录")
     return parser
 
 

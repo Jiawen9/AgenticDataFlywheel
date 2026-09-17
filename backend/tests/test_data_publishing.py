@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import Future
 from copy import deepcopy
 import json
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -30,9 +31,9 @@ class DatasetPublishingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name) / "AgenticDataFlywheel"
-        self.release_root = self.root / "backend_workspace" / "dataset_release"
-        self.exports_root = self.root / "backend_workspace" / "trajectory_correction" / "exports"
-        self.trajectory_root = self.root / "backend_workspace" / "rollout_trajectories"
+        self.release_root = self.root / "data" / "system" / "dataset_release"
+        self.exports_root = self.root / "data" / "system" / "trajectory_correction" / "exports"
+        self.trajectory_root = self.root / "data" / "raw" / "rollout_trajectories"
         self.trajectory_root.mkdir(parents=True)
         (self.trajectory_root / "TASK-A" / "TASK-A-1").mkdir(parents=True)
         (self.trajectory_root / "TASK-A" / "TASK-A-1" / "trajectory.jsonl").write_text("{}\n", encoding="utf-8")
@@ -52,8 +53,8 @@ class DatasetPublishingTests(unittest.TestCase):
             old.write_bytes(b"old")
             latest.write_bytes(b"latest")
             exports = [
-                {"kind": "full_dataset", "filename": "old.xlsx", "created_at": "2026-01-01T00:00:00+00:00", "sheets": {"Steps": 3}},
-                {"kind": "full_dataset", "filename": "latest.xlsx", "created_at": "2026-01-02T00:00:00+00:00", "sheets": {"Steps": 4}},
+                {"kind": "full_dataset", "filename": "old.xlsx", "sha256": hashlib.sha256(b"old").hexdigest(), "created_at": "2026-01-01T00:00:00+00:00", "sheets": {"Steps": 3}},
+                {"kind": "full_dataset", "filename": "latest.xlsx", "sha256": hashlib.sha256(b"latest").hexdigest(), "created_at": "2026-01-02T00:00:00+00:00", "sheets": {"Steps": 4}},
             ]
         session = {
             "session_id": session_id,
@@ -80,6 +81,7 @@ class DatasetPublishingTests(unittest.TestCase):
         return DatasetReleaseRegistry(
             releases_file=self.release_root / "releases.json",
             project_root=self.root,
+            data_root=self.root / "data",
             trajectory_root=self.trajectory_root,
             correction_exports_dir=self.exports_root,
             session_loader=loader,
@@ -98,13 +100,13 @@ class DatasetPublishingTests(unittest.TestCase):
         self.assertTrue(release["excel_paths"][0]["path"].startswith("AgenticDataFlywheel/"))
         self.assertEqual(
             release["trajectory_paths"],
-            ["AgenticDataFlywheel/backend_workspace/rollout_trajectories"],
+            ["AgenticDataFlywheel/data/raw/rollout_trajectories"],
         )
         self.assertEqual(release["step_count"], 4)
         self.assertTrue(self.sessions[session["session_id"]]["published"])
         self.assertEqual(registry.candidates(), [])
-        persisted = json.loads((self.release_root / "releases.json").read_text(encoding="utf-8"))
-        entry = persisted["releases"][0]
+        entry = registry._records.get("dataset_releases", release["release_id"])
+        self.assertFalse(registry.releases_file.exists())
         self.assertNotIn("session_id", entry)
         self.assertNotIn("session_ids", entry)
         self.assertFalse((self.release_root / release["release_id"]).exists())
@@ -118,6 +120,94 @@ class DatasetPublishingTests(unittest.TestCase):
             registry.create("不可发布", [session["session_id"]])
         self.assertFalse(session.get("published", False))
         self.assertFalse((self.release_root / "releases.json").exists())
+
+    def test_new_release_freezes_excel_and_records_internal_lineage(self):
+        session = self.add_session()
+        registry = self.registry()
+        release = registry.create("frozen", [session["session_id"]])
+        frozen, _ = registry.excel_file(release["release_id"], 0)
+        original_bytes = frozen.read_bytes()
+        self.assertTrue(frozen.is_relative_to(self.root / "data" / "releases" / release["release_id"]))
+        (self.exports_root / session["session_id"] / "latest.xlsx").write_bytes(b"later edits")
+        self.assertEqual(frozen.read_bytes(), original_bytes)
+        self.assertEqual(release["source_refs"][0]["id"], session["session_id"])
+        self.assertTrue((self.root / "data" / "system" / "app.sqlite").is_file())
+        # A stale compatibility index cannot hide an authoritative DB release.
+        registry.releases_file.write_text('{"schema_version":1,"releases":[]}', encoding="utf-8")
+        self.assertIsNotNone(self.registry().get(release["release_id"]))
+
+    def test_legacy_registry_is_invisible_and_untouched(self):
+        old_file = self.release_root / "releases.json"
+        old_file.parent.mkdir(parents=True, exist_ok=True)
+        old_record = {"release_id": "rel_legacy", "excel_paths": [], "trajectory_paths": [], "created_at": "2000"}
+        old_file.write_text(json.dumps({"releases": [old_record]}), encoding="utf-8")
+        before = old_file.read_bytes()
+        registry = self.registry()
+        session = self.add_session()
+        release = registry.create("new", [session["session_id"]])
+        self.assertEqual({item["release_id"] for item in registry.list_releases()}, {release["release_id"]})
+        self.assertIsNone(registry.get("rel_legacy"))
+        self.assertEqual(old_file.read_bytes(), before)
+
+    def test_export_fingerprint_must_match_before_release_and_on_download(self):
+        session = self.add_session()
+        registry = self.registry()
+        latest = self.exports_root / session["session_id"] / "latest.xlsx"
+        latest.write_bytes(b"unregistered edit")
+        with self.assertRaisesRegex(ValueError, "SHA256"):
+            registry.create("mismatch", [session["session_id"]])
+        self.assertEqual(registry.list_releases(), [])
+        latest.write_bytes(b"latest")
+        release = registry.create("valid", [session["session_id"]])
+        frozen, _ = registry.excel_file(release["release_id"], 0)
+        frozen.write_bytes(b"changed release")
+        with self.assertRaisesRegex(ValueError, "SHA256"):
+            registry.excel_file(release["release_id"], 0)
+
+    def test_json_upload_jobs_are_ignored_on_restart(self):
+        registry = self.registry()
+        jobs = self.release_root / "upload_jobs"
+        jobs.mkdir()
+        job_id = "a" * 32
+        path = jobs / f"{job_id}.json"
+        path.write_text(json.dumps({"job_id": job_id, "status": "running"}), encoding="utf-8")
+        before = path.read_bytes()
+        manager = DatasetUploadJobManager(registry, jobs_dir=jobs, executor=ImmediateExecutor())
+        self.assertIsNone(manager.get(job_id))
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_failed_freeze_never_publishes_session_or_release(self):
+        session = self.add_session()
+        registry = self.registry()
+        with patch("backend.data_publishing.service.shutil.copyfile", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                registry.create("failed", [session["session_id"]])
+        self.assertEqual(registry.list_releases(), [])
+        self.assertFalse(self.sessions[session["session_id"]].get("published"))
+        self.assertEqual(list((self.root / "data" / "releases").iterdir()), [])
+
+    def test_external_data_root_release_and_image_paths_are_resolved(self):
+        from backend.trajectory_correction.assets import resolve_asset
+        external = Path(self.temporary.name) / "shared-data"
+        self.exports_root = external / "system" / "correction_exports"
+        self.trajectory_root = external / "raw" / "rollout_trajectories"
+        self.trajectory_root.mkdir(parents=True)
+        image = self.trajectory_root / "TASK" / "step.jpg"
+        image.parent.mkdir()
+        image.write_bytes(b"fake image")
+        session = self.add_session()
+        registry = DatasetReleaseRegistry(
+            releases_file=external / "system" / "releases.json", project_root=self.root,
+            data_root=external, trajectory_root=self.trajectory_root, correction_exports_dir=self.exports_root,
+            session_loader=self.sessions.get, session_lister=lambda: list(self.sessions.values()),
+            session_saver=lambda value: self.sessions.update({value["session_id"]: value}) or value)
+        release = registry.create("external", [session["session_id"]])
+        self.assertTrue(release["excel_paths"][0]["path"].startswith("@data/"))
+        self.assertEqual(registry.excel_file(release["release_id"], 0)[0].read_bytes(), b"latest")
+        self.assertEqual(registry.resolve_project_path(release["trajectory_paths"][0]), self.trajectory_root)
+        self.assertEqual(resolve_asset(self.trajectory_root, "TASK/step.jpg"), image)
+        with self.assertRaises(ValueError):
+            registry.resolve_project_path("@data/../outside.xlsx")
 
     def test_same_name_creates_distinct_append_only_releases(self):
         first = self.add_session("a" * 16)

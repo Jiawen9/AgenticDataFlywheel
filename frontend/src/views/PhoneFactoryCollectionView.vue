@@ -66,7 +66,7 @@
       <section class="panel traj-panel">
         <div class="panel-head">
           <h2>轨迹生产</h2>
-          <span class="panel-tip">上传目录：/root/uuupppfffiiillleee</span>
+          <span class="panel-tip">上传文件由后端统一保存</span>
         </div>
 
         <!-- 3.1 VLA接口 -->
@@ -124,6 +124,7 @@
           <el-button type="primary" :loading="startingTask === selectedBatchRow.filename" :disabled="taskBusy || selectedBatchRow.status === '运行中'" @click="handleStartTask(selectedBatchRow)">开始运行所选批次</el-button>
           <el-button :disabled="taskBusy || selectedBatchRow.status === '运行中'" @click="openRunDialog(selectedBatchRow)">定制运行</el-button>
           <el-button :loading="downloadingBatch" :disabled="taskBusy" @click="downloadCollectionBatch">下载采集表</el-button>
+          <router-link :to="{ path: '/collection/tree-building', query: { collection_batch_id: selectedBatch.batch_id } }" class="preprocessing-link">前往预处理</router-link>
         </div>
         <p class="empty-hint">选择批次仅查看信息；点击运行后才导入文件并下发。也可以继续手动上传任务。</p>
 

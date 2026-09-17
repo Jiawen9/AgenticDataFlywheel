@@ -23,6 +23,8 @@ from backend.trajectory_data import (
 from backend.tree_build_jobs import TreeBuildJobManager
 from backend.quality_data import quality_manifest, quality_task
 from backend.quality_jobs import QualityJobManager
+from backend.data_store import RecordStore
+from backend.stage_artifacts import store_root, workbook_payload, write_sidecar
 
 
 def write_request(path: Path, goal: str) -> None:
@@ -54,6 +56,7 @@ def write_workbook(path: Path, rows: list[list[str]]) -> None:
     for row in rows:
         sheet.append(row)
     workbook.save(path)
+    write_sidecar(path, workbook_payload(path))
 
 
 class TrajectoryDataTests(unittest.TestCase):
@@ -248,11 +251,7 @@ class TreeBuildJobTests(unittest.TestCase):
     def test_startup_marks_incomplete_jobs_interrupted(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            path = root / "existing.json"
-            path.write_text(
-                json.dumps({"job_id": "existing", "status": "running", "stage": "building"}),
-                encoding="utf-8",
-            )
+            RecordStore(store_root(root)).put("tree_jobs", "existing", {"job_id": "existing", "status": "running", "stage": "building"})
 
             manager = TreeBuildJobManager(root, lambda *_args, **_kwargs: ("", {}))
             result = manager.get("existing")
@@ -271,10 +270,7 @@ class QualityJobTests(unittest.TestCase):
                 ("queued", "2026-08-27T12:00:00+08:00", "queued"),
                 ("new", "2026-08-27T13:00:00+08:00", "failed"),
             ):
-                (root / f"{job_id}.json").write_text(
-                    json.dumps({"job_id": job_id, "created_at": created_at, "status": status}),
-                    encoding="utf-8",
-                )
+                RecordStore(store_root(root)).put("quality_jobs", job_id, {"job_id": job_id, "created_at": created_at, "status": status})
             (root / "broken.json").write_text("not json", encoding="utf-8")
 
             manager = QualityJobManager(root, lambda *_args, **_kwargs: {"run_id": ""})
@@ -306,7 +302,7 @@ class QualityJobTests(unittest.TestCase):
             self.assertEqual(result["percent"], 100)
             self.assertEqual(result["current_trajectory"], "TASK-A-1")
 
-    def test_quality_result_readers_handle_missing_and_published_files(self):
+    def test_quality_result_readers_only_use_published_database_records(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.assertEqual(quality_manifest("run-1", root)["tasks"], [])
@@ -314,6 +310,10 @@ class QualityJobTests(unittest.TestCase):
             run.mkdir()
             (run / "manifest.json").write_text(json.dumps({"run_id": "run-1", "tasks": [{"task_id": "TASK-A"}]}), encoding="utf-8")
             (run / "TASK-A.json").write_text(json.dumps({"task_id": "TASK-A", "evaluations": {}}), encoding="utf-8")
+            self.assertIsNone(quality_task("run-1", "TASK-A", root))
+            self.assertEqual(quality_manifest("run-1", root)["tasks"], [])
+            RecordStore(store_root(root)).put("quality_manifests", "run-1", {"run_id": "run-1", "tasks": [{"task_id": "TASK-A"}]})
+            RecordStore(store_root(root)).put("quality_results", "run-1:TASK-A", {"task_id": "TASK-A", "evaluations": {}})
             self.assertEqual(quality_manifest("run-1", root)["run_id"], "run-1")
             self.assertEqual(quality_task("run-1", "TASK-A", root)["task_id"], "TASK-A")
             self.assertIsNone(quality_task("run-1", "../secret", root))

@@ -3,10 +3,11 @@ const { chromium } = require('playwright')
 const assert = require('node:assert/strict')
 const fs = require('node:fs/promises')
 const path = require('node:path')
+const os = require('node:os')
 const http = require('node:http')
 
 const dist = path.resolve(__dirname, '../dist')
-const output = path.resolve(__dirname, '../../backend_workspace/internal-upload-review')
+const output = path.resolve(process.env.ADF_BROWSER_ARTIFACTS || path.join(os.tmpdir(), 'adf-internal-upload-review'))
 const clone = value => JSON.parse(JSON.stringify(value))
 const release = {
   release_id: 'rel_browser_fixture', name: '轨迹发布验收数据集', created_at: '2026-09-10T09:00:00+08:00',

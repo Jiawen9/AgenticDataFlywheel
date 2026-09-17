@@ -1,11 +1,15 @@
 import type { BuildJob, CorrectionBatch, CorrectionCotJob, CorrectionCotResponse, CorrectionExport, CorrectionGroup, CorrectionGroupSummary, CorrectionRecommendation, CorrectionSession, DatasetRelease, DatasetReleaseCandidate, DatasetUploadJob, KnowledgeBaseSummary, QualityJob, RunQualitySummary, TaskGenerationExport, TaskGenerationJob, TaskGenerationResult, TaskGenerationTree, TaskGenerationSelection, TaskGenerationTreeNode, TaskQualityResult, TaskSummary, TrajectoryRecord, TrajectorySummary, TrajectoryTreeNode, TreeRun } from './types'
 
-import type { AugmentationPreview, DatasetUploadCapabilities } from './types'
+import type { AugmentationPreview, CollectionSourceRun, CollectionSourceTask, DatasetUploadCapabilities, PreprocessingBatch, PreprocessingJob, StageArtifact, TrajectoryScope } from './types'
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
 
 export class ApiError extends Error {
   constructor(message: string, readonly status: number) { super(message); this.name = 'ApiError' }
+}
+
+function scopeQuery(scope?: TrajectoryScope): string {
+  return scope ? '?' + new URLSearchParams({ ...scope }).toString() : ''
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -75,15 +79,33 @@ export const api = {
   taskGenerationExport(jobId: string): Promise<TaskGenerationExport> {
     return request(`/api/task-generation/jobs/${encodeURIComponent(jobId)}/export`, { method: 'POST' })
   },
-  async tasks(): Promise<TaskSummary[]> {
-    return (await request<{ tasks: TaskSummary[] }>('/api/tasks')).tasks
+  async preprocessingBatches(): Promise<PreprocessingBatch[]> {
+    return (await request<{ batches: PreprocessingBatch[] }>('/api/trajectory-preprocessing/batches')).batches
   },
-  async trajectories(taskId: string): Promise<{ task: TaskSummary; trajectories: TrajectorySummary[] }> {
-    return request(`/api/tasks/${encodeURIComponent(taskId)}/trajectories`)
+  async collectionSourceRuns(batchId: string): Promise<CollectionSourceRun[]> {
+    return (await request<{ runs: CollectionSourceRun[] }>('/api/phone-factory/collection-runs?batch_id=' + encodeURIComponent(batchId))).runs
   },
-  async trajectory(taskId: string, trajectoryId: string): Promise<TrajectoryRecord> {
+  async collectionSourceTasks(batchId: string): Promise<CollectionSourceTask[]> {
+    return (await request<{ snapshot: { tasks: CollectionSourceTask[] } }>(`/api/task-generation/collection-batches/${encodeURIComponent(batchId)}`)).snapshot.tasks
+  },
+  createPreprocessing(batchId: string): Promise<PreprocessingJob> {
+    return request('/api/trajectory-preprocessing/jobs', { method: 'POST', body: JSON.stringify({ batch_id: batchId }) })
+  },
+  preprocessingJob(jobId: string): Promise<PreprocessingJob> {
+    return request(`/api/trajectory-preprocessing/jobs/${encodeURIComponent(jobId)}`)
+  },
+  retryPreprocessing(jobId: string): Promise<PreprocessingJob> {
+    return request(`/api/trajectory-preprocessing/jobs/${encodeURIComponent(jobId)}/retry`, { method: 'POST' })
+  },
+  async tasks(scope?: TrajectoryScope): Promise<TaskSummary[]> {
+    return (await request<{ tasks: TaskSummary[] }>('/api/tasks' + scopeQuery(scope))).tasks
+  },
+  async trajectories(taskId: string, scope?: TrajectoryScope): Promise<{ task: TaskSummary; trajectories: TrajectorySummary[] }> {
+    return request(`/api/tasks/${encodeURIComponent(taskId)}/trajectories` + scopeQuery(scope))
+  },
+  async trajectory(taskId: string, trajectoryId: string, scope?: TrajectoryScope): Promise<TrajectoryRecord> {
     return (await request<{ trajectory: TrajectoryRecord }>(
-      `/api/tasks/${encodeURIComponent(taskId)}/trajectories/${encodeURIComponent(trajectoryId)}`,
+      `/api/tasks/${encodeURIComponent(taskId)}/trajectories/${encodeURIComponent(trajectoryId)}` + scopeQuery(scope),
     )).trajectory
   },
   async updateBBox(
@@ -92,20 +114,20 @@ export const api = {
     step: number,
     excelRow: number,
     bbox: [number, number, number, number],
-  ): Promise<string> {
-    const result = await request<{ actions_box: string }>(
+    scope: TrajectoryScope,
+  ): Promise<{ actions_box: string; annotation_version: string }> {
+    return request<{ actions_box: string; annotation_version: string }>(
       `/api/tasks/${encodeURIComponent(taskId)}/trajectories/${encodeURIComponent(trajectoryId)}/steps/${step}/bbox`,
       {
         method: 'PATCH',
-        body: JSON.stringify({ excel_row: excelRow, bbox }),
+        body: JSON.stringify({ excel_row: excelRow, bbox, ...scope }),
       },
     )
-    return result.actions_box
   },
-  async createBuild(taskIds: string[]): Promise<BuildJob> {
+  async createBuild(taskIds: string[], scope?: TrajectoryScope): Promise<BuildJob> {
     return request('/api/tree-builds', {
       method: 'POST',
-      body: JSON.stringify({ task_ids: taskIds }),
+      body: JSON.stringify({ task_ids: taskIds, ...scope }),
     })
   },
   build(jobId: string): Promise<BuildJob> {
@@ -219,6 +241,9 @@ export const api = {
   async datasetUploadCapabilities(): Promise<DatasetUploadCapabilities> {
     return request<DatasetUploadCapabilities>('/api/dataset-upload-capabilities')
   },
+  async builds(): Promise<BuildJob[]> {
+    return (await request<{ jobs: BuildJob[] }>('/api/tree-builds')).jobs
+  },
   async uploadDatasetRelease(releaseId: string, target?: 'internal'): Promise<DatasetUploadJob> {
     return (await request<{ job: DatasetUploadJob }>(`/api/dataset-releases/${encodeURIComponent(releaseId)}/upload`, {
       method: 'POST',
@@ -230,9 +255,17 @@ export const api = {
   },
 }
 
-export function imageUrl(relativePath: string): string {
+export function treeRunScope(run: Pick<TreeRun, 'batch_id' | 'annotation_version'> | undefined): TrajectoryScope | undefined {
+  return run?.batch_id && run.annotation_version ? { batch_id: run.batch_id, annotation_version: run.annotation_version } : undefined
+}
+
+export function imageUrl(relativePath: string, scope?: TrajectoryScope): string {
   const normalized = relativePath.replaceAll('\\', '/').replace(/^\/+/, '')
-  return `${API_BASE}/api/assets/${normalized.split('/').map(encodeURIComponent).join('/')}`
+  return `${API_BASE}/api/assets/${normalized.split('/').map(encodeURIComponent).join('/')}` + scopeQuery(scope)
+}
+
+export function stageArtifactDownloadUrl(artifact: StageArtifact, filename: string): string {
+  return `${API_BASE}/api/data-batches/${encodeURIComponent(artifact.batch_id)}/artifacts/${encodeURIComponent(artifact.stage)}/${encodeURIComponent(artifact.version)}/files/${encodeURIComponent(filename)}`
 }
 
 export function correctionAssetUrl(sessionId: string, relativePath: string): string {

@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 from pathlib import Path
+from ..data_store.paths import DATA_ROOT
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 BACKEND_DIR = PROJECT_ROOT / "backend"
-WORKSPACE_DIR = PROJECT_ROOT / "backend_workspace"
-TASK_GENERATION_DIR = WORKSPACE_DIR / "task_generation"
-KNOWLEDGE_BASE_DIR = TASK_GENERATION_DIR / "KnowledgeBase"
+WORKSPACE_DIR = DATA_ROOT
+TASK_GENERATION_DIR = WORKSPACE_DIR / "system" / "task_generation"
+KNOWLEDGE_BASE_DIR = WORKSPACE_DIR / "resources" / "task_generation" / "KnowledgeBase"
 JOBS_DIR = TASK_GENERATION_DIR / "jobs"
 RUNS_DIR = TASK_GENERATION_DIR / "runs"
 EXPORTS_DIR = TASK_GENERATION_DIR / "exports"
-LOGS_DIR = TASK_GENERATION_DIR / "logs"
+LOGS_DIR = WORKSPACE_DIR / "logs" / "task_generation"
 ENV_FILE = BACKEND_DIR / ".env"
 
 KNOWLEDGE_BASE_FILES = {

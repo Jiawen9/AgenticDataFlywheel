@@ -7,26 +7,28 @@ import asyncio
 import importlib.util
 import json
 import os
-import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from trajectory_tools.excel_to_object import load_objects
-from trajectory_tools.gui_trajectory_excel import QwenSummarizer, export_trajectory_workbook
-from trajectory_tools.settings import DEFAULT_ENV_FILE, configure_model_environment, load_repository_env
+from trajectory_tools.settings import DEFAULT_ENV_FILE, configure_model_environment
 
 
 HERE = Path(__file__).resolve().parent
 REPOSITORY_ROOT = HERE.parents[1]
-WORKSPACE = REPOSITORY_ROOT / "backend_workspace"
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+from backend.data_store import DATA_ROOT, ArtifactStore, RecordStore
+from backend.stage_artifacts import load_quality_objects, quality_tables
+from backend.trajectory_data import resolve_tree_run_dir
+from backend.quality_data import quality_manifest
+
+WORKSPACE = DATA_ROOT / "system"
 TREE_RUNS = WORKSPACE / "trajectory_tree_runs"
 RESULTS_ROOT = WORKSPACE / "trajectory_quality_results"
-CHECKPOINT_ROOT = WORKSPACE / "rubric_outputs" / "evaluations" / "checkpoints"
-WORKBOOK = WORKSPACE / "rubric_trajectories.xlsx"
-SUMMARY_CACHE = WORKSPACE / "rubric_outputs" / "cache" / "qwen_summaries.json"
+CHECKPOINT_ROOT = DATA_ROOT / "cache" / "rubric_outputs" / "evaluations" / "checkpoints"
 RUBRIC_DIR = WORKSPACE / "rubric_outputs" / "rubrics"
 CONFIG_PATH = HERE / "examples" / "jiawen_rubric_config.json"
 
@@ -54,7 +56,7 @@ def _now() -> str:
 
 
 def _tree_manifest(run_id: str) -> dict[str, Any]:
-    path = TREE_RUNS / run_id / "manifest.json"
+    path = resolve_tree_run_dir(run_id, TREE_RUNS) / "manifest.json"
     if not path.is_file():
         raise FileNotFoundError(f"tree run not found: {run_id}")
     return json.loads(path.read_text(encoding="utf-8"))
@@ -112,27 +114,24 @@ async def _generate_rubric(task: Any, trajectories: list[Any], config: dict[str,
 
 
 def _ensure_workbook(run_id: str, manifest: dict[str, Any], task_ids: list[str]) -> tuple[Path, dict[str, Any], list[Any]]:
-    run_workbook = TREE_RUNS / run_id / str(manifest.get("quality_input_file", "rubric_trajectories.xlsx"))
-    if manifest.get("quality_input_file") and run_workbook.is_file():
-        tasks, trajectories = load_objects(run_workbook)
-        if all(task_id in tasks for task_id in task_ids):
-            return run_workbook, tasks, trajectories
-    if WORKBOOK.is_file():
-        tasks, trajectories = load_objects(WORKBOOK)
-        selected = [item for item in trajectories if item.task_id in task_ids]
-        observations_ready = all(
-            str(step.observation or "").strip()
-            and not str(step.observation).startswith("未调用视觉模型")
-            for trajectory in selected for step in trajectory.steps
-        )
-        answers_ready = all(str(item.final_answer or "").strip() for item in selected)
-        if all(task_id in tasks for task_id in task_ids) and selected and observations_ready and answers_ready:
-            return WORKBOOK, tasks, trajectories
-    values = load_repository_env(DEFAULT_ENV_FILE)
-    summarizer = QwenSummarizer(values["MODEL_NAME"], values["MODEL_URL"], values["YUNAI_API_KEY"], SUMMARY_CACHE)
-    export_trajectory_workbook(WORKSPACE / "rollout_trajectories", WORKBOOK, summarizer)
-    tasks, trajectories = load_objects(WORKBOOK)
-    return WORKBOOK, tasks, trajectories
+    """Read only the quality JSON frozen by this tree run."""
+    run_root = resolve_tree_run_dir(run_id, TREE_RUNS)
+    name = manifest.get("quality_input_json")
+    if not name:
+        raise ValueError(f"tree run {run_id} has no required quality_input_json")
+    snapshot = (run_root / str(name)).resolve()
+    if not snapshot.is_relative_to(run_root.resolve()):
+        raise ValueError("quality input JSON must belong to its tree run")
+    tasks, trajectories = load_quality_objects(snapshot)
+    if not all(task_id in tasks for task_id in task_ids):
+        raise ValueError("quality JSON snapshot is missing selected tasks")
+    selected = [item for item in trajectories if item.task_id in task_ids]
+    if not selected or any(not str(item.final_answer or "").strip() for item in selected):
+        raise ValueError("quality JSON snapshot is missing final answers")
+    if any(not str(step.observation or "").strip() for item in selected for step in item.steps):
+        raise ValueError("quality JSON snapshot is missing observations")
+    workbook = run_root / str(manifest.get("quality_input_file", "rubric_trajectories.xlsx"))
+    return workbook, tasks, trajectories
 
 
 async def run(run_id: str, task_ids: list[str], job_id: str) -> dict[str, Any]:
@@ -146,19 +145,16 @@ async def run(run_id: str, task_ids: list[str], job_id: str) -> dict[str, Any]:
     progress(stage="preparing", total_trajectories=total, completed_trajectories=0, percent=2)
     workbook, tasks, all_trajectories = _ensure_workbook(run_id, manifest, task_ids)
     config = GEN.load_config(CONFIG_PATH)
-    staging = RESULTS_ROOT / f".{run_id}.{job_id}.tmp"
-    if staging.exists():
-        shutil.rmtree(staging)
-    staging.mkdir(parents=True)
     completed = 0
     summaries: list[dict[str, Any]] = []
+    task_results: list[dict[str, Any]] = []
 
     for task_index, task_id in enumerate(task_ids, 1):
         task = tasks.get(task_id)
         if task is None:
             raise ValueError(f"task missing from rubric workbook: {task_id}")
         trajectories = [item for item in all_trajectories if item.task_id == task_id]
-        tree_path = TREE_RUNS / run_id / str(manifest_tasks[task_id]["tree_file"])
+        tree_path = resolve_tree_run_dir(run_id, TREE_RUNS) / str(manifest_tasks[task_id]["tree_file"])
         terminals = _terminal_ids(json.loads(tree_path.read_text(encoding="utf-8")))
         by_id = {item.trajectory_id: item for item in trajectories}
         if terminals != set(by_id):
@@ -232,25 +228,30 @@ async def run(run_id: str, task_ids: list[str], job_id: str) -> dict[str, Any]:
             "evaluation_settings": settings, "trajectory_count": len(evaluations),
             "average_score": average, "passed_count": passed, "evaluations": serialized,
         }
-        (staging / f"{task_id}.json").write_text(json.dumps(task_result, ensure_ascii=False, indent=2), encoding="utf-8")
+        task_results.append(task_result)
         summaries.append({key: task_result[key] for key in ("task_id", "completed_at", "trajectory_count", "average_score", "passed_count")})
 
     progress(stage="publishing", completed_trajectories=completed, total_trajectories=total, percent=97)
-    target = RESULTS_ROOT / run_id
-    target.mkdir(parents=True, exist_ok=True)
-    previous = {}
-    old_manifest = target / "manifest.json"
-    if old_manifest.is_file():
-        previous = {str(item["task_id"]): item for item in json.loads(old_manifest.read_text(encoding="utf-8")).get("tasks", [])}
+    artifact = ArtifactStore(DATA_ROOT).publish(str(manifest.get("batch_id") or run_id), "05_quality",
+        {"schema_version": 1, "run_id": run_id, "job_id": job_id, "tasks": task_results},
+        tables=quality_tables(task_results),
+        source_refs=[item for item in manifest.get("artifacts", []) if item.get("stage") == "04_tree"]
+            or [{"kind": "tree_run", "run_id": run_id}],
+        metadata={"run_id": run_id, "job_id": job_id, "task_ids": task_ids})
+    records = RecordStore(DATA_ROOT)
+    entries = []
+    for task_result in task_results:
+        task_result["artifact"] = artifact
+        entries.append({"namespace": "quality_results", "key": f"{run_id}:{task_result['task_id']}", "payload": task_result})
+    previous_manifest = quality_manifest(run_id)
+    previous = {str(item["task_id"]): item for item in previous_manifest.get("tasks", [])}
     for summary in summaries:
         previous[summary["task_id"]] = summary
-    for path in staging.glob("*.json"):
-        os.replace(path, target / path.name)
-    payload = {"run_id": run_id, "updated_at": _now(), "tasks": sorted(previous.values(), key=lambda item: item["task_id"])}
-    temporary = target / ".manifest.json.tmp"
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, old_manifest)
-    staging.rmdir()
+    payload = {"run_id": run_id, "updated_at": _now(), "artifact": artifact, "tasks": sorted(previous.values(), key=lambda item: item["task_id"])}
+    entries.append({"namespace": "quality_manifests", "key": run_id, "payload": payload,
+                    "expected_revision": previous_manifest.get("storage_revision", 0)})
+    saved = records.put_many(entries)
+    payload = saved[-1]
     return payload
 
 

@@ -287,10 +287,12 @@ class CollectionInputTests(unittest.TestCase):
 
     def test_missing_malformed_and_non_array_results_are_rejected(self):
         missing = self.job()
-        self.manager._results_path(missing).unlink()
+        self.manager.store.delete("task_generation.results", missing)
         with self.assertRaises(ValueError):
             self.manager.collection_input(missing)
         malformed = self.job()
+        self.manager.store.delete("task_generation.results", malformed)
+        self.manager._results_path(malformed).parent.mkdir(parents=True, exist_ok=True)
         self.manager._results_path(malformed).write_text("not valid JSON", encoding="utf-8")
         with self.assertRaises(ValueError):
             self.manager.collection_input(malformed)

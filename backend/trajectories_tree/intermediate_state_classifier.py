@@ -159,10 +159,15 @@ Observation action：{json.dumps(observation_action, ensure_ascii=False)}
                        {"type": "image_url", "image_url": {"url": _image_data_url(after)}}]
             response = self.client.chat.completions.create(model=self.model,
                 messages=[{"role": "system", "content": "你是移动端 GUI 轨迹清洗和视觉 Observation 生成器，严格返回一个 JSON 对象。"}, {"role": "user", "content": content}],
-                temperature=0.0, max_tokens=700,
-                extra_body={"enable_thinking": False, "chat_template_kwargs": {"enable_thinking": False}})
-            message = response.choices[0].message
-            raw = (message.content or getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None) or "").strip()
+                temperature=0.0, max_tokens=2048 if self.model.strip().lower() == "qwen3.8-max" else 700,
+                extra_body={"enable_thinking": False, "chat_template_kwargs": {"enable_thinking": False}},
+                **({"response_format": {"type": "json_object"}} if self.model.strip().lower() == "qwen3.8-max" else {}))
+            choice = response.choices[0]
+            if getattr(choice, "finish_reason", None) == "length":
+                raise ValueError("Qwen classification response was truncated (finish_reason=length); result was not cached")
+            raw = (choice.message.content or "").strip()
+            if not raw:
+                raise ValueError("Qwen returned an empty classification response")
             parse_classification_response(raw, require_observation=True)
             with self._cache_lock:
                 existing_item = self.cache.get(cache_key)

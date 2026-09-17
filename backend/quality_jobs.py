@@ -14,6 +14,8 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from .trajectory_data import BACKEND_DIR, QUALITY_JOBS_DIR
+from .data_store import RecordStore, DATA_ROOT
+from .stage_artifacts import store_root
 
 
 Progress = Callable[[dict[str, Any]], None]
@@ -55,6 +57,7 @@ def run_quality_subprocess(run_id: str, task_ids: list[str], *, job_id: str, pro
         encoding="utf-8",
         errors="replace",
         bufsize=1,
+        env={**os.environ, "ADF_DATA_ROOT": str(DATA_ROOT)},
     )
     final: dict[str, Any] | None = None
     assert process.stdout is not None
@@ -73,6 +76,7 @@ def run_quality_subprocess(run_id: str, task_ids: list[str], *, job_id: str, pro
 class QualityJobManager:
     def __init__(self, jobs_dir: Path = QUALITY_JOBS_DIR, runner: QualityRunner = run_quality_subprocess, executor: Executor | None = None) -> None:
         self.jobs_dir = jobs_dir
+        self.records = RecordStore(store_root(jobs_dir))
         self.runner = runner
         self._lock = threading.RLock()
         self._owns_executor = executor is None
@@ -80,35 +84,22 @@ class QualityJobManager:
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         self.mark_interrupted_jobs()
 
-    def _path(self, job_id: str) -> Path:
-        return self.jobs_dir / f"{job_id}.json"
-
     def _write(self, payload: dict[str, Any]) -> None:
-        path = self._path(payload["job_id"])
-        temporary = path.with_name(f".{path.name}.tmp")
-        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(path)
+        payload.update(self.records.put("quality_jobs", payload["job_id"], payload))
 
     def get(self, job_id: str) -> dict[str, Any] | None:
-        # Share the writer lock with polling reads.  Without this, Windows
-        # may keep the JSON read handle open while _write() replaces it.
+        # Polling and worker changes share the manager lock; SQLite owns state.
         with self._lock:
-            path = self._path(job_id)
-            if not path.is_file():
-                return None
-            try:
-                value = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError, json.JSONDecodeError):
-                return None
-            return value if isinstance(value, dict) else None
+            return self.records.get("quality_jobs", job_id)
 
     def list_jobs(self) -> list[dict[str, Any]]:
         """Return persisted quality jobs so clients can restore the queue."""
         with self._lock:
             jobs: list[dict[str, Any]] = []
-            for path in self.jobs_dir.glob("*.json"):
+            ids = {item["job_id"] for item in self.records.list("quality_jobs")}
+            for job_id in ids:
                 try:
-                    value = json.loads(path.read_text(encoding="utf-8"))
+                    value = self.get(job_id)
                 except (OSError, ValueError, json.JSONDecodeError):
                     continue
                 if isinstance(value, dict):
@@ -120,9 +111,9 @@ class QualityJobManager:
             )
 
     def mark_interrupted_jobs(self) -> None:
-        for path in self.jobs_dir.glob("*.json"):
+        for payload in self.list_jobs():
             try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
+                payload = dict(payload)
             except (OSError, ValueError, json.JSONDecodeError):
                 continue
             if payload.get("status") in {"queued", "running"}:
@@ -154,11 +145,12 @@ class QualityJobManager:
     def _run(self, job_id: str, run_id: str, task_ids: list[str]) -> None:
         self._progress(job_id, {"status": "running", "stage": "preparing", "started_at": _now()})
         try:
-            self.runner(run_id, task_ids, job_id=job_id, progress=lambda value: self._progress(job_id, value))
+            report = self.runner(run_id, task_ids, job_id=job_id, progress=lambda value: self._progress(job_id, value))
         except Exception as exc:
             self._progress(job_id, {"status": "failed", "stage": "failed", "completed_at": _now(), "error": str(exc)})
             return
-        self._progress(job_id, {"status": "succeeded", "stage": "succeeded", "completed_at": _now(), "percent": 100, "error": None})
+        self._progress(job_id, {"status": "succeeded", "stage": "succeeded", "completed_at": _now(), "percent": 100,
+                                "error": None, "warnings": report.get("warnings", []) if isinstance(report, dict) else []})
 
     def shutdown(self) -> None:
         if self._owns_executor:

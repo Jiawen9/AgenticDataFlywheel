@@ -66,7 +66,8 @@ class CollectionBatchTests(unittest.TestCase):
     def all_source_files(self):
         batch_root = self.manager.collection_batches_dir
         return {str(path.relative_to(self.base)): (path.read_bytes(), path.stat().st_mtime_ns)
-                for path in self.base.rglob("*") if path.is_file() and not path.is_relative_to(batch_root)}
+                for path in self.base.rglob("*") if path.is_file() and not path.is_relative_to(batch_root)
+                and not path.is_relative_to(self.manager.data_root)}
 
     def workbook_rows(self, batch_id):
         workbook = load_workbook(self.manager.collection_batch_workbook(batch_id), data_only=False)
@@ -143,7 +144,7 @@ class CollectionBatchTests(unittest.TestCase):
         job_id = self.job()
         detail, _ = self.manager.submit_collection_batch(job_id)
         expected_workbook = self.manager.collection_batch_workbook(job_id).read_bytes()
-        self.manager._results_path(job_id).write_text("corrupt after submission", encoding="utf-8")
+        self.manager.store.delete("task_generation.results", job_id)
         restored = self.make_manager()
         self.assertEqual(restored.collection_batch(job_id), detail)
         self.assertEqual(restored.collection_batch_workbook(job_id).read_bytes(), expected_workbook)

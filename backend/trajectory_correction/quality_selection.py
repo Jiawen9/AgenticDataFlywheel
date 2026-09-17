@@ -11,8 +11,35 @@ from pathlib import Path
 from typing import Any
 
 from ..trajectory_data import QUALITY_RESULTS_DIR, TREE_RUNS_DIR, task_id_from_resource
-from .constants import FIXED_ANNOTATED_XLSX, FIXED_SOURCE_ID, FIXED_TRAJECTORY_ROOT
-from .workbook import load_snapshot
+from .constants import FIXED_SOURCE_ID, FIXED_TRAJECTORY_ROOT
+from .workbook import load_snapshot, has_workbook_json
+from ..stage_artifacts import sidecar_path, structured_input_exists
+from ..quality_data import quality_manifest as read_quality_manifest, quality_task as read_quality_task
+
+def _tree_dir(run_id: str, tree_root: Path | None = None) -> Path:
+    if run_id and (Path(run_id).name != run_id or run_id in {".", ".."}):
+        raise ValueError("无效的建树批次编号")
+    root = TREE_RUNS_DIR if tree_root is None else tree_root
+    directory = root / run_id
+    return directory
+
+
+def source_for_tree_run(run_id: str, tree_root: Path | None = None) -> tuple[Path, Path]:
+    directory = _tree_dir(run_id, tree_root)
+    manifest = _read_json(directory / "manifest.json") or {}
+    source_name = manifest.get("source_annotated_file")
+    frozen = _safe_task_file(directory, source_name) if source_name else None
+    try:
+        valid = frozen is not None and has_workbook_json(frozen)
+    except (OSError, ValueError) as exc:
+        raise QualitySelectionUnavailable("建树批次的轨迹 JSON 无法读取，请重新构建轨迹树") from exc
+    if not valid:
+        raise QualitySelectionUnavailable("建树批次缺少冻结轨迹 JSON，请重新构建轨迹树")
+    if manifest.get("raw_root"):
+        from .assets import registered_asset_root
+        from .draft_store import storage_root
+        return frozen, registered_asset_root(str(manifest["raw_root"]), storage_root())
+    return frozen, FIXED_TRAJECTORY_ROOT
 
 
 class QualitySelectionError(ValueError):
@@ -154,21 +181,16 @@ def _completed_quality_runs(
         # project-level TREE_RUNS_DIR.
         sibling_tree_root = root / "_tree_runs"
         tree_root = sibling_tree_root if not root_was_default and sibling_tree_root.is_dir() else TREE_RUNS_DIR
-    if not root.is_dir() or not tree_root.is_dir():
-        return []
-
     completed: list[dict[str, Any]] = []
-    for tree_dir in tree_root.iterdir():
+    directories = {path.name: path for path in tree_root.iterdir()} if tree_root.is_dir() else {}
+    for tree_dir in directories.values():
         if not tree_dir.is_dir() or tree_dir.name.startswith("."):
             continue
         tree_manifest = _tree_manifest_for(tree_dir)
         if tree_manifest is None:
             continue
         run_id = tree_dir.name
-        quality_dir = root / run_id
-        if not quality_dir.is_dir() or quality_dir.name.startswith("."):
-            continue
-        quality_manifest = _read_json(quality_dir / "manifest.json")
+        quality_manifest = read_quality_manifest(run_id, root)
         quality_summaries = quality_manifest.get("tasks") if quality_manifest else None
         if not isinstance(quality_summaries, list) or not quality_summaries:
             continue
@@ -177,13 +199,8 @@ def _completed_quality_runs(
             continue
 
         tree_summaries = tree_manifest.get("tasks")
-        # This fallback keeps the selector readable for older hand-built test
-        # fixtures that predate task metadata in the tree manifest.  Real tree
-        # runs always publish their task list.
         if not isinstance(tree_summaries, list) or not tree_summaries:
-            if root_was_default:
-                continue
-            tree_summaries = quality_summaries
+            continue
         tree_by_task = {
             str(item.get("task_id", "")).strip(): item
             for item in tree_summaries
@@ -199,8 +216,7 @@ def _completed_quality_runs(
                 continue
             task_id = str(raw_summary.get("task_id", "")).strip()
             tree_summary = tree_by_task.get(task_id)
-            result_path = _result_path(quality_dir, task_id)
-            result = _read_json(result_path) if result_path is not None else None
+            result = read_quality_task(run_id, task_id, root)
             if (
                 tree_summary is None
                 or (result is not None and str(result.get("run_id") or run_id).strip() != run_id)
@@ -250,6 +266,7 @@ def _batch_summary(run: dict[str, Any], *, default_run_id: str = "") -> dict[str
     tree_tasks = run.get("tree_tasks") or []
     return {
         "tree_run_id": run["tree_run_id"],
+        "storage_batch_id": str(run.get("tree_manifest", {}).get("batch_id") or run["tree_run_id"]),
         "tree_completed_at": run.get("tree_completed_at", ""),
         "quality_completed_at": run.get("quality_completed_at", ""),
         "total_task_count": len(tree_tasks),
@@ -286,20 +303,32 @@ def _verify_source_version(
     *,
     tree_root: Path | None = None,
 ) -> str:
-    if not source_path.is_file():
-        raise QualitySourceMismatch("项目内置标注表不存在，无法进入轨迹修正")
+    if not has_workbook_json(source_path):
+        raise QualitySourceMismatch("轨迹 JSON 输入不存在，无法进入轨迹修正")
     tree_manifest = _read_json(
-        (TREE_RUNS_DIR if tree_root is None else tree_root) / run_id / "manifest.json"
+        _tree_dir(run_id, tree_root) / "manifest.json"
     )
     expected = ((tree_manifest or {}).get("source_xlsx") or {}).get("sha256")
-    actual = _source_sha256(source_path)
+    if has_workbook_json(source_path):
+        structured = sidecar_path(source_path)
+        value = _read_json(structured) or {}
+        json_expected = ((tree_manifest or {}).get("source_json") or {}).get("sha256")
+        if json_expected and _source_sha256(structured) != json_expected:
+            raise QualitySourceMismatch("冻结的轨迹 JSON 与建树版本不一致")
+        # Excel is only a view. Compare the original export fingerprint stored
+        # alongside JSON, without reading a changed or missing Excel file.
+        actual = str(value.get("workbook_sha256") or _source_sha256(structured))
     if expected and str(expected) != actual:
         raise QualitySourceMismatch("当前标注表与该质检结果的数据版本不一致，请重新执行轨迹树构建和质检")
     return actual
 
 
 def _group_task_id(group: dict[str, Any]) -> str:
+    if group.get("task_id"):
+        return str(group["task_id"])
     for row in group.get("rows", []):
+        if row.get("task_id"):
+            return str(row["task_id"])
         task_id = task_id_from_resource(str(row.get("image", "")))
         if task_id:
             return task_id
@@ -394,12 +423,14 @@ def _selection_for_run(
         "total_task_count": len(run.get("tree_tasks") or []),
         "reviewed_task_count": len(selected),
         "source_id": FIXED_SOURCE_ID,
-        "source_path": "backend_workspace/annotated_trajectories.xlsx",
+        "source_path": source_path.as_posix(),
         "source_sha256": _verify_source_version(
             run["run_id"], source_path, tree_root=tree_root
         ),
+        "source_json_sha256": _source_sha256(sidecar_path(source_path)) if has_workbook_json(source_path) else None,
         "tasks": selected,
         "selected_trajectories": selected_trajectories,
+        "storage_batch_id": str(run.get("tree_manifest", {}).get("batch_id") or run["tree_run_id"]),
     }
 
 
@@ -427,8 +458,11 @@ def top1_recommendation(
         )
         if selected_run is None:
             raise QualitySelectionUnavailable(f"批次 {tree_run_id} 没有可用的质检结果")
-    source_path = FIXED_ANNOTATED_XLSX if source_path is None else source_path
-    asset_root = FIXED_TRAJECTORY_ROOT if asset_root is None else asset_root
+    if source_path is None:
+        source_path, default_assets = source_for_tree_run(selected_run["tree_run_id"], tree_root)
+    else:
+        default_assets = FIXED_TRAJECTORY_ROOT
+    asset_root = default_assets if asset_root is None else asset_root
     snapshot = load_snapshot(
         source_path,
         asset_root=asset_root,
@@ -457,8 +491,11 @@ def top1_selection_for_run(
     )
     if selected is None:
         raise QualitySelectionUnavailable("请先完成轨迹质检，再进入轨迹修正")
-    source_path = FIXED_ANNOTATED_XLSX if source_path is None else source_path
-    asset_root = FIXED_TRAJECTORY_ROOT if asset_root is None else asset_root
+    if source_path is None:
+        source_path, default_assets = source_for_tree_run(tree_run_id, tree_root)
+    else:
+        default_assets = FIXED_TRAJECTORY_ROOT
+    asset_root = default_assets if asset_root is None else asset_root
     snapshot = load_snapshot(
         source_path,
         asset_root=asset_root,
@@ -474,8 +511,13 @@ def top1_selection_for_run(
 
 def validate_selection_source(selection: dict[str, Any]) -> None:
     expected = str(selection.get("source_sha256", ""))
-    if expected and FIXED_ANNOTATED_XLSX.is_file() and _source_sha256(FIXED_ANNOTATED_XLSX) != expected:
-        raise QualitySourceMismatch("标注表已发生变化，该修正草稿对应的数据版本已失效")
+    source, _ = source_for_tree_run(str(selection.get("tree_run_id") or selection.get("run_id") or ""))
+    if selection.get("source_json_sha256"):
+        structured = sidecar_path(source)
+        if not structured.is_file() or _source_sha256(structured) != selection["source_json_sha256"]:
+            raise QualitySourceMismatch("轨迹 JSON 已发生变化，该修正草稿对应的数据版本已失效")
+        return
+    raise QualitySourceMismatch("修正选择缺少 JSON 输入版本，请重新创建会话")
 
 
 def filter_snapshot(snapshot: dict[str, Any], selection: dict[str, Any]) -> dict[str, Any]:
@@ -495,6 +537,12 @@ def filter_snapshot(snapshot: dict[str, Any], selection: dict[str, Any]) -> dict
                 f"质检结果中的轨迹 {trajectory_id} 不在当前标注表中，无法进入修正"
             )
         filtered = deepcopy(group)
+        if filtered.get("task_id"):
+            # New collection rows retain their stable identity separately from
+            # the human-readable task goal used by correction and COT.
+            filtered["task"] = str(task.get("goal") or filtered["task"])
+            for row in filtered["rows"]:
+                row["task"] = filtered["task"]
         filtered["group_id"] = f"group_{len(groups)}"
         filtered["quality"] = "未知"
         filtered["prefix"] = "[⚪ 未知]"

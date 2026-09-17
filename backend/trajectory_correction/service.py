@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 import uuid
+import shutil
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -12,17 +13,18 @@ from urllib.parse import quote
 
 from PIL import Image
 
-from .assets import fixed_source, resolve_asset, source_from_id
-from .constants import CORRECTION_EXPORTS_DIR, FIXED_SOURCE_ID, PROJECT_ROOT, ensure_correction_dirs
-from .draft_store import list_sessions, load_session, new_session_id, save_session, utc_now
+from .assets import resolve_asset
+from .constants import CORRECTION_EXPORTS_DIR, CORRECTION_INPUTS_DIR, FIXED_SOURCE_ID, PROJECT_ROOT, ensure_correction_dirs
+from .draft_store import list_sessions, load_session, new_session_id, save_session, update_session, storage_root, utc_now
+from ..data_store import ArtifactStore
 from .exporter import export_full_dataset_workbook, export_session_workbook
 from .quality_selection import (
     QualitySelectionUnavailable,
     filter_snapshot,
     top1_selection_for_run,
-    validate_selection_source,
 )
-from .workbook import load_snapshot, parse_action
+from .workbook import load_snapshot, parse_action, has_workbook_json
+from ..stage_artifacts import read_workbook_payload, write_payload_workbook
 from ..trajectory_data import _format_manual_actions_box
 from ..trajectories_tree.tree_builder import parse_bbox
 
@@ -36,24 +38,41 @@ def _session_or_raise(session_id: str) -> dict[str, Any]:
     return session
 
 
-def _source_for_session(session: dict[str, Any]) -> tuple[Path, Path]:
-    if str(session.get("source_id", "")).replace("\\", "/") != FIXED_SOURCE_ID:
-        raise ValueError("修正会话必须使用项目内置标注表和质检 Top-1 结果")
-    return source_from_id(str(session["source_id"]))
+def _source_for_session(session: dict[str, Any], *, for_export: bool = False) -> tuple[Path, Path]:
+    frozen = session.get("source_snapshot")
+    if isinstance(frozen, dict):
+        path = _frozen_input_path(session, str(frozen.get("workbook", "")))
+        if for_export:
+            if frozen.get("workbook_json_sha256"):
+                structured = path.with_suffix(".json")
+                if not structured.is_file():
+                    raise FileNotFoundError("修正完整表格 JSON 快照不存在，请重新创建会话")
+                if hashlib.sha256(structured.read_bytes()).hexdigest() != frozen["workbook_json_sha256"]:
+                    raise ValueError("修正输入 JSON 快照校验失败")
+            else:
+                raise ValueError("修正会话缺少完整 JSON 输入校验信息")
+        from .assets import registered_asset_root, trajectory_source
+        raw_root = frozen.get("raw_root")
+        return path, registered_asset_root(str(raw_root), storage_root()) if raw_root else trajectory_source()
+    raise ValueError("修正会话缺少冻结 JSON 输入，请重新创建会话")
+
+
+def _frozen_input_path(session: dict[str, Any], filename: str) -> Path:
+    if not filename or Path(filename).name != filename:
+        raise ValueError("修正输入快照文件名无效")
+    return CORRECTION_INPUTS_DIR / str(session["session_id"]) / filename
 
 
 def _snapshot(session: dict[str, Any]) -> dict[str, Any]:
-    workbook_path, asset_root = _source_for_session(session)
-    snapshot = load_snapshot(
-        workbook_path,
-        asset_root=asset_root,
-        source_kind=session.get("source_kind"),
-    )
-    selection = session.get("selection")
-    if not isinstance(selection, dict):
-        raise QualitySelectionUnavailable("旧修正草稿没有绑定质检 Top-1 结果，请重新执行质检")
-    validate_selection_source(selection)
-    return filter_snapshot(snapshot, selection)
+    frozen = session.get("source_snapshot")
+    if isinstance(frozen, dict):
+        path = _frozen_input_path(session, str(frozen.get("json", "")))
+        if not path.is_file():
+            raise FileNotFoundError("修正步骤 JSON 快照不存在，请重新创建会话")
+        if hashlib.sha256(path.read_bytes()).hexdigest() != frozen.get("sha256"):
+            raise ValueError("修正输入快照校验失败")
+        return json.loads(path.read_text(encoding="utf-8"))
+    raise ValueError("修正会话缺少冻结 JSON 输入，请重新创建会话")
 
 
 def _base_row(snapshot: dict[str, Any], excel_row: int) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -190,7 +209,7 @@ def _public_session(session: dict[str, Any], snapshot: dict[str, Any]) -> dict[s
     return {
         "session_id": session["session_id"],
         "source_id": source_id,
-        "source": fixed_source(),
+        "source": _session_source_info(session),
         "tree_run_id": session.get("tree_run_id"),
         "selection": session.get("selection"),
         "created_at": session.get("created_at"),
@@ -200,6 +219,13 @@ def _public_session(session: dict[str, Any], snapshot: dict[str, Any]) -> dict[s
         "groups": groups,
         "exports": session.get("exports", []),
     }
+
+
+def _session_source_info(session: dict[str, Any]) -> dict[str, Any]:
+    workbook, root = _source_for_session(session)
+    return {"source_id": FIXED_SOURCE_ID, "name": "已冻结标注表", "kind": "annotated_workbook",
+            "relative_path": workbook.relative_to(storage_root()).as_posix(),
+            "size_bytes": workbook.stat().st_size if workbook.is_file() else 0, "package_root": root.name}
 
 
 def sessions() -> list[dict[str, Any]]:
@@ -244,7 +270,8 @@ def create_session(tree_run_id: str) -> dict[str, Any]:
     if str(tree_run_id) in published_tree_run_ids():
         raise ValueError("该质检批次的纠偏会话已经发布，不能重新进入纠偏")
     selection = top1_selection_for_run(tree_run_id)
-    workbook_path, package_root = source_from_id(FIXED_SOURCE_ID)
+    from .quality_selection import source_for_tree_run
+    workbook_path, package_root = source_for_tree_run(tree_run_id)
 
     # A batch has one draft.  Reusing it makes the create endpoint safe to
     # retry after navigating away or refreshing the correction page.
@@ -267,15 +294,16 @@ def create_session(tree_run_id: str) -> dict[str, Any]:
     )
     snapshot = filter_snapshot(full_snapshot, selection)
     session_id = new_session_id()
-    package_root_value = package_root.resolve().relative_to(PROJECT_ROOT.resolve()).as_posix()
+    package_root_value = package_root.resolve().relative_to(PROJECT_ROOT.resolve()).as_posix() if package_root.resolve().is_relative_to(PROJECT_ROOT.resolve()) else package_root.name
     session = {
         "session_id": session_id,
         "source_id": normalized_source_id,
         "source_kind": source_kind,
         "tree_run_id": selection["tree_run_id"],
+        "storage_batch_id": str(selection.get("storage_batch_id") or selection["tree_run_id"]),
         "selection": selection,
-        # This is informational session metadata.  The source is resolved
-        # again through the allow-listed source ID on every request.
+        # Informational label; the authoritative resource root is frozen with
+        # source_snapshot and validated against the configured data root.
         "package_root": package_root_value,
         "created_at": utc_now(),
         "updated_at": utc_now(),
@@ -284,6 +312,26 @@ def create_session(tree_run_id: str) -> dict[str, Any]:
         "group_exports": {group["group_id"]: bool(group["export"]) for group in snapshot["groups"]},
         "exports": [],
     }
+    # Snapshot is the stable JSON input for all future UI/processing reads;
+    # the original workbook is retained solely for existing Excel exporters.
+    input_dir = CORRECTION_INPUTS_DIR / session_id
+    temporary = CORRECTION_INPUTS_DIR / f".{session_id}.tmp"
+    temporary.mkdir(parents=True, exist_ok=False)
+    try:
+        table_payload = read_workbook_payload(workbook_path)
+        table_bytes = json.dumps(table_payload, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+        (temporary / "source.json").write_bytes(table_bytes)
+        write_payload_workbook(temporary / "source.xlsx", table_payload)
+        source_bytes = json.dumps(snapshot, ensure_ascii=False, indent=2).encode("utf-8")
+        (temporary / "snapshot.json").write_bytes(source_bytes)
+        temporary.rename(input_dir)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+    session["source_snapshot"] = {"workbook": "source.xlsx", "json": "snapshot.json", "sha256": hashlib.sha256(source_bytes).hexdigest(),
+                                  "raw_root": str(package_root.resolve()),
+                                  "workbook_json_sha256": hashlib.sha256(table_bytes).hexdigest(),
+                                  "workbook_sha256": hashlib.sha256((input_dir / "source.xlsx").read_bytes()).hexdigest()}
     save_session(session)
     return _public_session(session, snapshot)
 
@@ -325,7 +373,7 @@ def get_cot(session_id: str) -> dict[str, Any]:
             "task": group["task"],
             "rows": [
                 {
-                    "task_id": str(row.get("image", "").replace("\\", "/").split("/", 1)[0]),
+                    "task_id": str(row.get("task_id") or group.get("task_id") or str(row.get("image", "")).replace("\\", "/").split("/", 1)[0]),
                     "trajectory_id": group["meta_task"],
                     "excel_row": row["excel_row"],
                     "step": row["step"],
@@ -365,70 +413,71 @@ def patch_row(session_id: str, excel_row: int, payload: dict[str, Any]) -> dict[
     session = _session_or_raise(session_id)
     snapshot = _snapshot(session)
     group, base = _base_row(snapshot, excel_row)
-    edit = _edit_for(session, excel_row)
+    def apply(session: dict[str, Any]) -> None:
+        edit = _edit_for(session, excel_row)
 
-    if payload.get("sop") is not None:
-        sop = str(payload["sop"])
-        if sop == base["sop"]:
-            edit.pop("sop", None)
-        else:
-            edit["sop"] = sop
+        if payload.get("sop") is not None:
+            sop = str(payload["sop"])
+            if sop == base["sop"]:
+                edit.pop("sop", None)
+            else:
+                edit["sop"] = sop
 
-    if payload.get("actions") is not None:
-        actions = str(payload["actions"])
-        parsed = parse_action(actions)
-        if parsed.get("action") == "unknown":
-            raise ValueError("actions 必须是包含合法 action 字段的 JSON")
-        if actions == base["actions"]:
-            edit.pop("actions", None)
-            edit.pop("original_actions", None)
-        else:
-            edit.setdefault("original_actions", base["actions"])
-            edit["actions"] = actions
-        # A changed action invalidates any COT generated for the previous
-        # action.  The result remains available in the cache for audit, but
-        # cannot be displayed or exported for the new action.
-        session.setdefault("cot", {}).pop(str(excel_row), None)
+        if payload.get("actions") is not None:
+            actions = str(payload["actions"])
+            parsed = parse_action(actions)
+            if parsed.get("action") == "unknown":
+                raise ValueError("actions 必须是包含合法 action 字段的 JSON")
+            if actions == base["actions"]:
+                edit.pop("actions", None)
+                edit.pop("original_actions", None)
+            else:
+                edit.setdefault("original_actions", base["actions"])
+                edit["actions"] = actions
+            # A changed action invalidates any COT generated for the previous
+            # action.  The result remains available in the cache for audit, but
+            # cannot be displayed or exported for the new action.
+            session.setdefault("cot", {}).pop(str(excel_row), None)
 
-    if payload.get("actions_box") is not None:
-        actions_box = str(payload["actions_box"])
-        action_value = parse_action(edit.get("actions", base["actions"]))
-        if not isinstance(action_value, dict) or not action_value.get("action"):
-            raise ValueError("请先保存包含合法 action 的动作")
-        _, asset_root = _source_for_session(session)
-        normalized_box = _validate_actions_box(
-            action=action_value,
-            actions_box=actions_box,
-            image=str(base.get("image", "")),
-            asset_root=asset_root,
-        )
-        baseline_box = str(session.get("bbox_baselines", {}).get(str(excel_row), base.get("actions_box", "")))
-        if normalized_box == baseline_box:
-            edit.pop("actions_box", None)
-            edit.pop("bbox_source", None)
-        else:
-            edit["actions_box"] = normalized_box
-            edit["bbox_source"] = "manual"
-        # COT is generated from the expert action JSON and screenshot.  A bbox
-        # edit does not change that semantic input, so keep the generated text.
+        if payload.get("actions_box") is not None:
+            actions_box = str(payload["actions_box"])
+            action_value = parse_action(edit.get("actions", base["actions"]))
+            if not isinstance(action_value, dict) or not action_value.get("action"):
+                raise ValueError("请先保存包含合法 action 的动作")
+            _, asset_root = _source_for_session(session)
+            normalized_box = _validate_actions_box(
+                action=action_value,
+                actions_box=actions_box,
+                image=str(base.get("image", "")),
+                asset_root=asset_root,
+            )
+            baseline_box = str(session.get("bbox_baselines", {}).get(str(excel_row), base.get("actions_box", "")))
+            if normalized_box == baseline_box:
+                edit.pop("actions_box", None)
+                edit.pop("bbox_source", None)
+            else:
+                edit["actions_box"] = normalized_box
+                edit["bbox_source"] = "manual"
+            # COT is generated from the expert action JSON and screenshot.  A bbox
+            # edit does not change that semantic input, so keep the generated text.
 
-    for field in ("summary", "thought"):
-        if payload.get(field) is None:
-            continue
-        value = str(payload[field]).strip()
-        # Saving the original text (or clearing it) is still an explicit
-        # choice and must take precedence over any generated value.
-        edit[field] = value
+        for field in ("summary", "thought"):
+            if payload.get(field) is None:
+                continue
+            value = str(payload[field]).strip()
+            # Saving the original text (or clearing it) is still an explicit
+            # choice and must take precedence over any generated value.
+            edit[field] = value
 
-    if payload.get("deleted") is not None:
-        if bool(payload["deleted"]):
-            edit["deleted"] = True
-        else:
-            edit.pop("deleted", None)
+        if payload.get("deleted") is not None:
+            if bool(payload["deleted"]):
+                edit["deleted"] = True
+            else:
+                edit.pop("deleted", None)
 
-    if not edit:
-        session.setdefault("row_edits", {}).pop(str(excel_row), None)
-    save_session(session)
+        if not edit:
+            session.setdefault("row_edits", {}).pop(str(excel_row), None)
+    session = update_session(session_id, apply)
     return {
         "group": _group_summary(session_id, session, group),
         "row": _overlay_row(session_id, session, base),
@@ -441,15 +490,55 @@ def patch_group_export(session_id: str, group_id: str, export: bool) -> dict[str
     group = next((item for item in snapshot["groups"] if item["group_id"] == group_id), None)
     if group is None:
         raise KeyError(group_id)
-    session.setdefault("group_exports", {})[group_id] = bool(export)
-    save_session(session)
+    session = update_session(session_id, lambda current: current.setdefault("group_exports", {}).__setitem__(group_id, bool(export)))
     return _group_summary(session_id, session, group)
+
+
+def publish_stage_snapshot(session: dict[str, Any], snapshot: dict[str, Any], stage: str, *, workbook: Path | None = None) -> dict[str, Any]:
+    """Archive every selected step, including deleted/unexported rows for audit."""
+    groups = []
+    table = []
+    for group in snapshot["groups"]:
+        rows = [_overlay_row(session["session_id"], session, row) for row in group["rows"]]
+        groups.append({**_group_summary(session["session_id"], session, group), "rows": rows})
+        for row in rows:
+            table.append({"任务": group["task"], "轨迹": group["meta_task"], "源行号": row["excel_row"],
+                          "步骤": row["step"], **row.get("values", {}), "action": row["actions"],
+                          "summary": row.get("summary", ""), "thought": row.get("thought", ""),
+                          "actions_box": row.get("actions_box", ""), "sop": row.get("sop", ""),
+                          "deleted": row["deleted"], "group_export": groups[-1]["export"],
+                          "summary_source": row["summary_source"], "thought_source": row["thought_source"],
+                          "original_action": row.get("original_action", ""), "original_summary": row.get("original_summary", ""),
+                          "original_thought": row.get("original_thought", ""), "original_actions_box": row.get("original_actions_box", ""),
+                          "人工修改": session.get("row_edits", {}).get(str(row["excel_row"]), {}),
+                          "COT元数据": session.get("cot", {}).get(str(row["excel_row"]), {})})
+    payload = {"schema_version": 1, "session_id": session["session_id"], "tree_run_id": session.get("tree_run_id"),
+               "batch_id": session.get("storage_batch_id") or session.get("tree_run_id") or session["session_id"],
+               "storage_revision": session.get("storage_revision"), "selection": session.get("selection"),
+               "groups": groups, "row_edits": session.get("row_edits", {}), "cot": session.get("cot", {})}
+    return ArtifactStore(storage_root()).publish(
+        str(session.get("storage_batch_id") or session.get("tree_run_id") or session["session_id"]), stage, payload,
+        tables={"完整步骤": table}, workbooks={"full_dataset.xlsx": workbook} if workbook else None,
+        source_refs=[{"kind": "correction_session", "id": session["session_id"], "revision": session.get("storage_revision")},
+                     {"kind": "trajectory_tree", "id": session.get("tree_run_id")}],
+        metadata={"session_id": session["session_id"], "row_count": len(table)})
+
+
+def publish_cot_snapshot(session_id: str) -> dict[str, Any]:
+    session = _session_or_raise(session_id)
+    snapshot = _snapshot(session)
+    workbook_path, _ = _source_for_session(session, for_export=True)
+    output_dir = CORRECTION_EXPORTS_DIR / session_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+    result = export_full_dataset_workbook(workbook_path=workbook_path, snapshot=snapshot, session=session,
+                                          output_dir=output_dir, export_id=uuid.uuid4().hex[:16])
+    return publish_stage_snapshot(session, snapshot, "07_cot", workbook=output_dir / result["filename"])
 
 
 def export_session(session_id: str) -> dict[str, Any]:
     session = _session_or_raise(session_id)
     snapshot = _snapshot(session)
-    workbook_path, _ = _source_for_session(session)
+    workbook_path, _ = _source_for_session(session, for_export=True)
     export_id = uuid.uuid4().hex[:16]
     output_dir = CORRECTION_EXPORTS_DIR / session_id
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -463,12 +552,13 @@ def export_session(session_id: str) -> dict[str, Any]:
     history = {
         "export_id": export_id,
         "filename": result["filename"],
+        "sha256": hashlib.sha256((output_dir / result["filename"]).read_bytes()).hexdigest(),
         "created_at": utc_now(),
         "download_url": f"/api/correction/sessions/{session_id}/exports/{quote(result['filename'], safe='')}" ,
         "sheets": result["sheets"],
     }
-    session.setdefault("exports", []).insert(0, history)
-    save_session(session)
+    history["artifact"] = publish_stage_snapshot(session, snapshot, "06_correction")
+    update_session(session_id, lambda current: current.setdefault("exports", []).insert(0, history))
     return {**history, "summary": result["summary"]}
 
 
@@ -476,7 +566,7 @@ def export_dataset_session(session_id: str) -> dict[str, Any]:
     """Publish a full source-shaped workbook with all persisted corrections overlaid."""
     session = _session_or_raise(session_id)
     snapshot = _snapshot(session)
-    workbook_path, _ = _source_for_session(session)
+    workbook_path, _ = _source_for_session(session, for_export=True)
     export_id = uuid.uuid4().hex[:16]
     output_dir = CORRECTION_EXPORTS_DIR / session_id
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -491,6 +581,7 @@ def export_dataset_session(session_id: str) -> dict[str, Any]:
         "export_id": export_id,
         "kind": "full_dataset",
         "filename": result["filename"],
+        "sha256": hashlib.sha256((output_dir / result["filename"]).read_bytes()).hexdigest(),
         "created_at": utc_now(),
         "download_url": (
             f"/api/correction/sessions/{session_id}/exports/"
@@ -498,13 +589,14 @@ def export_dataset_session(session_id: str) -> dict[str, Any]:
         ),
         "sheets": result["sheets"],
     }
-    session.setdefault("exports", []).insert(0, history)
-    save_session(session)
+    publish_stage_snapshot(session, snapshot, "06_correction")
+    history["artifact"] = publish_stage_snapshot(session, snapshot, "07_cot", workbook=output_dir / result["filename"])
+    update_session(session_id, lambda current: current.setdefault("exports", []).insert(0, history))
     return {**history, "summary": result["summary"]}
 
 
 def download_export(session_id: str, filename: str) -> Path:
-    _session_or_raise(session_id)
+    session = _session_or_raise(session_id)
     safe_name = Path(filename).name
     if safe_name != filename or Path(safe_name).suffix.lower() not in {".xlsx", ".xlsm"}:
         raise ValueError("无效的导出文件名")
@@ -515,6 +607,9 @@ def download_export(session_id: str, filename: str) -> Path:
         raise ValueError("导出路径无效") from exc
     if not path.is_file():
         raise FileNotFoundError("导出文件不存在")
+    record = next((item for item in session.get("exports", []) if item.get("filename") == filename), None)
+    if record is None or not record.get("sha256") or hashlib.sha256(path.read_bytes()).hexdigest() != record["sha256"]:
+        raise ValueError("导出文件与已保存版本的 SHA256 不一致，请重新导出")
     return path
 
 

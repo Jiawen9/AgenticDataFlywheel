@@ -55,10 +55,14 @@ from adarubric.generator.llm_generator import LLMRubricGenerator
 from adarubric.llm.openai_client import OpenAIClient
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = PROJECT_ROOT.parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+from backend.data_store import DATA_ROOT
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "examples" / "jiawen_rubric_config.json"
-DEFAULT_REPORT_PATH = PROJECT_ROOT / "docs" / "evaluation_outputs" / "jiawen_gui_eval.md"
+DEFAULT_REPORT_PATH = DATA_ROOT / "system" / "rubric_outputs" / "evaluations" / "jiawen_gui_eval.md"
 DEFAULT_EVALUATIONS_PATH = (
-    PROJECT_ROOT / "docs" / "evaluation_outputs" / "jiawen_gui_eval.jsonl"
+    DATA_ROOT / "system" / "rubric_outputs" / "evaluations" / "jiawen_gui_eval.jsonl"
 )
 GENERATOR_SCRIPT = PROJECT_ROOT / "examples" / "generate-jiawen-rubrics.py"
 

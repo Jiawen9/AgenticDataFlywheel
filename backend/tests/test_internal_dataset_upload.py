@@ -62,6 +62,7 @@ class InternalUploadTests(unittest.TestCase):
             workbook.active.append(["任务", "Thought"])
             workbook.active.append([f"任务 {index}", "已发布的思考"])
             workbook.save(self.exports_root / session["session_id"] / "latest.xlsx")
+            session["exports"][-1]["sha256"] = hashlib.sha256((self.exports_root / session["session_id"] / "latest.xlsx").read_bytes()).hexdigest()
             sessions.append(session["session_id"])
         self.store = self.registry()
         self.release = self.store.create("内部上传测试", sessions)
@@ -80,10 +81,11 @@ class InternalUploadTests(unittest.TestCase):
 
     def test_default_unconfigured_does_not_write_or_call(self):
         self.prepare(adapter=internal_uploader)
-        original = self.store.releases_file.read_bytes()
+        original = self.store.get(self.release_id)
         with self.assertRaisesRegex(InternalUploadConflict, "云道S3上传尚未配置"):
             self.submit()
-        self.assertEqual(original, self.store.releases_file.read_bytes())
+        self.assertEqual(original, self.store.get(self.release_id))
+        self.assertFalse(self.store.releases_file.exists())
         self.assertEqual(list(self.manager.jobs_dir.glob("*.json")), [])
 
     def test_one_and_multiple_excels_keep_original_bytes_and_registration_order(self):
@@ -111,7 +113,7 @@ class InternalUploadTests(unittest.TestCase):
 
     def test_missing_trajectory_root_does_not_block_single_excel(self):
         self.prepare(1)
-        self.store.update(self.release_id, {"trajectory_paths": [self.store.project_path(self.root / "missing-raw")]})
+        self.store.update(self.release_id, {"trajectory_paths": [self.store.project_path(self.store.data_root / "missing-raw")]})
         self.assertFalse(self.store.get(self.release_id)["local_available"])
         self.assertEqual(self.submit()["completed_files"], 1)
 
@@ -121,7 +123,7 @@ class InternalUploadTests(unittest.TestCase):
         for change, message in [
             ({"sha256": "0" * 64}, "SHA256"),
             ({"sha256": ""}, "校验值"),
-            ({"path": self.store.project_path(self.root / "missing.xlsx")}, "文件不存在"),
+            ({"path": self.store.project_path(self.store.data_root / "missing.xlsx")}, "文件不存在"),
             ({"path": "AgenticDataFlywheel/../../secret.xlsx"}, "路径"),
             ({"path": self.store.project_path(self.trajectory_root / "TASK-A" / "_eval_queue.txt")}, "Excel"),
         ]:

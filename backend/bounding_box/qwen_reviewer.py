@@ -52,8 +52,8 @@ def _verify_env(name: str, default: bool = True) -> bool | str:
     return value
 
 
-def qwen_settings() -> dict[str, Any]:
-    api_key = os.environ.get("TRAJECTORY_VLA_API_KEY") or os.environ.get("TRAJECTORY_API_KEY", "")
+def qwen_settings(*, api_key: str | None = None, base_url: str | None = None) -> dict[str, Any]:
+    api_key = api_key if api_key is not None else os.environ.get("TRAJECTORY_VLA_API_KEY") or os.environ.get("TRAJECTORY_API_KEY", "")
     if not api_key:
         raise RuntimeError(
             "Qwen review requires TRAJECTORY_API_KEY or TRAJECTORY_VLA_API_KEY. "
@@ -61,7 +61,7 @@ def qwen_settings() -> dict[str, Any]:
         )
     return {
         "api_key": api_key,
-        "base_url": os.environ.get("TRAJECTORY_VLA_API_BASE_URL")
+        "base_url": base_url or os.environ.get("TRAJECTORY_VLA_API_BASE_URL")
         or os.environ.get("TRAJECTORY_API_BASE_URL", "https://yunai.chat/v1"),
         "proxy": os.environ.get("TRAJECTORY_VLA_HTTP_PROXY_URL")
         or os.environ.get("TRAJECTORY_HTTP_PROXY_URL", ""),
@@ -157,8 +157,8 @@ def _parse_response(
 
 
 class QwenBoxReviewer:
-    def __init__(self, model: str, cache_path: Path) -> None:
-        settings = qwen_settings()
+    def __init__(self, model: str, cache_path: Path, *, client_settings: dict[str, Any] | None = None) -> None:
+        settings = client_settings if client_settings is not None else qwen_settings()
         proxy = settings["proxy"] or None
         http_client = httpx.Client(
             proxy=proxy,
@@ -220,76 +220,86 @@ class QwenBoxReviewer:
                     json.dumps(legacy_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
                 ).hexdigest()
             )
-        cached_key = next((key for key in (cache_key, *legacy_keys) if key in self.cache), None)
-        cached = cached_key is not None
-        if cache_key in self.cache:
-            raw = self.cache[cache_key]
-        elif cached_key is not None:
-            raw = self.cache[cached_key]
-        else:
-            candidate_normalized = [
-                round(candidate_bbox[0] / image_size[0] * 1000),
-                round(candidate_bbox[1] / image_size[1] * 1000),
-                round(candidate_bbox[2] / image_size[0] * 1000),
-                round(candidate_bbox[3] / image_size[1] * 1000),
-            ]
-            prompt = (
-                "你正在复核移动端 GUI action 的唯一可执行区域框。截图上的红框是当前候选框。\n"
-                "黄色十字圆点是实际执行成功的 click 点；swipe 时两个黄色点分别是起点和终点。\n"
-                f"截图尺寸：{image_size[0]}x{image_size[1]}。\n"
-                f"action：{json.dumps(action, ensure_ascii=False)}\n"
-                f"action_summary：{action_summary or '未提供'}\n"
-                f"候选 bbox（横纵轴分别归一化到0～1000）：{candidate_normalized}\n"
-                f"规则依据：{json.dumps(rule_context, ensure_ascii=False)}\n\n"
-                "判断标准：click 框应覆盖完整且安全的目标控件区域；swipe 框应覆盖该手势可安全执行的滚动内容区域；"
-                "type 框应覆盖接收输入的输入控件。最终只能有一个矩形框。不要框动作点、箭头、文字标签或整个屏幕，"
-                "除非整个屏幕确实是唯一可执行区域。必须结合 action_summary 判断动作意图，但 action_summary 与实际位置冲突时，"
-                "以黄色实际执行点和截图可见控件为准。click 框必须包含黄色点击点；swipe 框必须包含两个黄色端点。\n"
-                "若红框合适，decision=accept，bbox 原样返回；若不合适，decision=replace，并给出你重新定位后的归一化 bbox。"
-                "bbox 坐标必须将截图横轴和纵轴分别归一化到0～1000，不能输出原图像素坐标。只输出严格 JSON："
-                '{"decision":"accept|replace","bbox":[x1,y1,x2,y2],"confidence":0.0,"reason":"简短原因"}'
-            )
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "你是精确的移动端 GUI 视觉标框审核器。你必须检查候选框，必要时重新生成一个框，"
-                            "并严格输出一个 JSON 对象。"
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": _boxed_image_data_url(image_path, candidate_bbox, action)
-                                },
-                            },
-                        ],
-                    },
-                ],
-                temperature=0.1,
-                max_tokens=500,
-                extra_body={
-                    "enable_thinking": False,
-                    "chat_template_kwargs": {"enable_thinking": False},
+        for key in (cache_key, *legacy_keys):
+            raw = self.cache.get(key)
+            if not isinstance(raw, str):
+                continue
+            try:
+                result = _parse_response(raw, candidate_bbox, image_size, normalized_output=True)
+            except (ValueError, TypeError, OverflowError):
+                # Earlier versions saved before validation. Leave failed cache
+                # entries untouched until a valid fresh response replaces them.
+                continue
+            result.cached = True
+            return result
+
+        candidate_normalized = [
+            round(candidate_bbox[0] / image_size[0] * 1000),
+            round(candidate_bbox[1] / image_size[1] * 1000),
+            round(candidate_bbox[2] / image_size[0] * 1000),
+            round(candidate_bbox[3] / image_size[1] * 1000),
+        ]
+        prompt = (
+            "你正在复核移动端 GUI action 的唯一可执行区域框。截图上的红框是当前候选框。\n"
+            "黄色十字圆点是实际执行成功的 click 点；swipe 时两个黄色点分别是起点和终点。\n"
+            f"截图尺寸：{image_size[0]}x{image_size[1]}。\n"
+            f"action：{json.dumps(action, ensure_ascii=False)}\n"
+            f"action_summary：{action_summary or '未提供'}\n"
+            f"候选 bbox（横纵轴分别归一化到0～1000）：{candidate_normalized}\n"
+            f"规则依据：{json.dumps(rule_context, ensure_ascii=False)}\n\n"
+            "判断标准：click 框应覆盖完整且安全的目标控件区域；swipe 框应覆盖该手势可安全执行的滚动内容区域；"
+            "type 框应覆盖接收输入的输入控件。最终只能有一个矩形框。不要框动作点、箭头、文字标签或整个屏幕，"
+            "除非整个屏幕确实是唯一可执行区域。必须结合 action_summary 判断动作意图，但 action_summary 与实际位置冲突时，"
+            "以黄色实际执行点和截图可见控件为准。click 框必须包含黄色点击点；swipe 框必须包含两个黄色端点。\n"
+            "若红框合适，decision=accept，bbox 原样返回；若不合适，decision=replace，并给出你重新定位后的归一化 bbox。"
+            "bbox 坐标必须将截图横轴和纵轴分别归一化到0～1000，不能输出原图像素坐标。只输出严格 JSON："
+            '{"decision":"accept|replace","bbox":[x1,y1,x2,y2],"confidence":0.0,"reason":"简短原因"}'
+        )
+        output_settings: dict[str, Any] = {"max_tokens": 500}
+        if self.model == "qwen3.8-max":
+            output_settings = {"max_tokens": 2048, "response_format": {"type": "json_object"}}
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "你是精确的移动端 GUI 视觉标框审核器。你必须检查候选框，必要时重新生成一个框，"
+                        "并严格输出一个 JSON 对象。"
+                    ),
                 },
-            )
-            message = response.choices[0].message
-            raw = (
-                message.content
-                or getattr(message, "reasoning_content", None)
-                or getattr(message, "reasoning", None)
-                or ""
-            ).strip()
-            if not raw:
-                raise ValueError("Qwen returned an empty box review")
-            self.cache[cache_key] = raw
-            self._save_cache()
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": _boxed_image_data_url(image_path, candidate_bbox, action)
+                            },
+                        },
+                    ],
+                },
+            ],
+            temperature=0.1,
+            **output_settings,
+            extra_body={
+                "enable_thinking": False,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+        if not response.choices:
+            raise ValueError("Qwen returned no box review choices")
+        choice = response.choices[0]
+        if getattr(choice, "finish_reason", None) == "length":
+            raise ValueError("Qwen box review was truncated (finish_reason=length)")
+        message = choice.message
+        raw = message.content
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError("Qwen returned an empty box review")
+        raw = raw.strip()
         result = _parse_response(raw, candidate_bbox, image_size, normalized_output=True)
-        result.cached = cached
+        self.cache[cache_key] = raw
+        self._save_cache()
+        result.cached = False
         return result

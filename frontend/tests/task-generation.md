@@ -15,4 +15,4 @@ node tests/task-generation.browser.cjs
 
 覆盖导航分组、目录和搜索联动、局部全选、半选、跨场景选择、资源刷新与替换、409 冲突、提交及终态轮询、历史快照、前置任务分组、保存失败和离开保护、删除恢复、筛选与全量导出、快速切换、加载重试、兼容路由及 1500/1024/390px 布局。
 
-截图和 `acceptance.json` 输出到被 Git 忽略的 `backend_workspace/task-generation-review/`。下载响应仅为模拟字节，不用于验证真实 Excel 内容；Excel 格式和服务端引用校验未在本轮修改。
+截图和 `acceptance.json` 输出到系统临时目录 `adf-task-generation-review/`（可用 `ADF_BROWSER_ARTIFACTS` 指定独立验收目录）。下载响应仅为模拟字节，不用于验证真实 Excel 内容；Excel 格式和服务端引用校验未在本轮修改。

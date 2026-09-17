@@ -7,9 +7,10 @@ import json
 import os
 import re
 import sys
+import uuid
 from copy import copy
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
@@ -18,21 +19,26 @@ try:
     from .bounding_box.build_annotations import resolve_action_box
     from .bounding_box.qwen_reviewer import QwenBoxReviewer
     from .export_vla_trajectories import collect_rows, write_xlsx
+    from .data_store import DATA_ROOT, ArtifactStore
+    from .stage_artifacts import publish_workbook, store_root
 except ImportError:  # Keep direct `python backend/trajectories_preprocessing.py` usage working.
     from bounding_box.build_annotations import resolve_action_box
     from bounding_box.qwen_reviewer import QwenBoxReviewer
     from export_vla_trajectories import collect_rows, write_xlsx
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from backend.data_store import DATA_ROOT, ArtifactStore
+    from backend.stage_artifacts import publish_workbook, store_root
 
 
 BACKEND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BACKEND_DIR.parent
-WORKSPACE_DIR = PROJECT_ROOT / "backend_workspace"
-DEFAULT_SOURCE = WORKSPACE_DIR / "rollout_trajectories"
+WORKSPACE_DIR = DATA_ROOT / "system" / "preprocessing"
+DEFAULT_SOURCE = DATA_ROOT / "raw" / "rollout_trajectories"
 DEFAULT_EXPORT_OUTPUT = WORKSPACE_DIR / "trajectories_to_excel.xlsx"
 DEFAULT_ANNOTATED_OUTPUT = WORKSPACE_DIR / "annotated_trajectories.xlsx"
 DEFAULT_ENV_FILE = BACKEND_DIR / ".env"
-DEFAULT_CACHE_FILE = BACKEND_DIR / "bounding_box" / "qwen_review_cache.json"
-REQUIRED_MODEL = "qwen3.6-27b:floor"
+DEFAULT_CACHE_FILE = DATA_ROOT / "cache" / "bounding_box" / "qwen_review_cache.json"
+REQUIRED_MODEL = "qwen3.8-max"
 TARGET_ACTIONS = {"click", "swipe", "long_press"}
 STEP_IMAGE_RE = re.compile(r"^step(?P<step>\d+)_vla_input\.jpg$", re.IGNORECASE)
 REQUIRED_COLUMNS = ("文件夹名", "image", "xml", "action", "summary")
@@ -184,13 +190,22 @@ def annotate_trajectory_workbook(
     reviewer: Any,
     max_review_rounds: int = 4,
     trajectory_root: Path | None = None,
+    allow_excel_import: bool = True,
+    progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, int]:
     """Append actions_box values, publishing the output only after all rows succeed."""
     source_path = source_path.expanduser().resolve()
     output_path = output_path.expanduser().resolve()
     if trajectory_root is not None:
         trajectory_root = trajectory_root.expanduser().resolve()
-    workbook = load_workbook(source_path)
+    if allow_excel_import:
+        workbook = load_workbook(source_path)
+    else:
+        if __package__:
+            from .stage_artifacts import payload_workbook, read_workbook_payload
+        else:
+            from backend.stage_artifacts import payload_workbook, read_workbook_payload
+        workbook = payload_workbook(read_workbook_payload(source_path))
     sheet = workbook.active
     headers = _header_map(sheet)
     missing_columns = [name for name in REQUIRED_COLUMNS if name not in headers]
@@ -216,6 +231,9 @@ def annotate_trajectory_workbook(
     for row_number in range(2, sheet.max_row + 1):
         counts["rows"] += 1
         row_label = f"Excel row {row_number}"
+        if progress:
+            progress({"phase": "start", "excel_row": row_number,
+                      "completed_steps": row_number - 2, "total_steps": sheet.max_row - 1})
         try:
             raw_action = parse_action_cell(sheet.cell(row_number, headers["action"]).value)
             raw_kind = str(raw_action.get("action", "")).lower()
@@ -223,6 +241,9 @@ def annotate_trajectory_workbook(
             if raw_kind not in TARGET_ACTIONS:
                 box_cell.value = None
                 counts["blank"] += 1
+                if progress:
+                    progress({"phase": "done", "excel_row": row_number, "actions_box": None,
+                              "completed_steps": row_number - 1, "total_steps": sheet.max_row - 1})
                 continue
 
             image_path = resolve_artifact_path(
@@ -265,6 +286,9 @@ def annotate_trajectory_workbook(
             box_cell.value = format_actions_box(executed_action, resolution.result.bbox)
             counts["annotated"] += 1
             print(f"Annotated {row_label}: {box_cell.value}", flush=True)
+            if progress:
+                progress({"phase": "done", "excel_row": row_number, "actions_box": box_cell.value,
+                          "completed_steps": row_number - 1, "total_steps": sheet.max_row - 1})
         except Exception as exc:
             raise RuntimeError(f"failed to annotate {row_label}: {exc}") from exc
 
@@ -285,10 +309,12 @@ def parse_args() -> argparse.Namespace:
         description="Export rollout trajectories and add Qwen-reviewed action boxes."
     )
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
-    parser.add_argument("--export-output", type=Path, default=DEFAULT_EXPORT_OUTPUT)
-    parser.add_argument("--annotated-output", type=Path, default=DEFAULT_ANNOTATED_OUTPUT)
+    parser.add_argument("--export-output", type=Path, help="Explicit initial workbook output; defaults to a batch/run directory.")
+    parser.add_argument("--annotated-output", type=Path, help="Explicit annotated workbook output; defaults to a batch/run directory.")
     parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
     parser.add_argument("--max-review-rounds", type=int, default=4)
+    parser.add_argument("--batch-id", help="Reuse a processing batch ID; each execution creates a new stage version.")
+    parser.add_argument("--data-root", type=Path, default=DATA_ROOT)
     return parser.parse_args()
 
 
@@ -299,38 +325,59 @@ def run_pipeline(
     annotated_output: Path,
     env_file: Path,
     max_review_rounds: int,
+    batch_id: str | None = None,
+    data_root: Path | None = None,
 ) -> dict[str, Any]:
+    batch_id = batch_id or uuid.uuid4().hex
+    root = store_root(export_output, data_root)
     row_count, warnings = export_trajectories(source, export_output)
+    conversion = publish_workbook(export_output, batch_id=batch_id, stage="01_conversion", data_root=root,
+                                  source_refs=[{"kind": "raw_trajectories", "path": str(source.resolve())}],
+                                  metadata={"warnings": warnings})
     print(f"Exported {row_count} steps to: {export_output.expanduser().resolve()}", flush=True)
     for warning in warnings:
         print(f"Warning: {warning}", file=sys.stderr)
 
     model = configure_reviewer_environment(env_file.expanduser().resolve())
-    reviewer = QwenBoxReviewer(model=model, cache_path=DEFAULT_CACHE_FILE)
+    reviewer = QwenBoxReviewer(model=model, cache_path=root / "cache" / "bounding_box" / "qwen_review_cache.json")
     counts = annotate_trajectory_workbook(
         export_output,
         annotated_output,
         reviewer=reviewer,
         max_review_rounds=max(1, max_review_rounds),
         trajectory_root=source,
+        allow_excel_import=False,
     )
+    annotation = publish_workbook(annotated_output, batch_id=batch_id, stage="02_annotation", data_root=root,
+                                  source_refs=[conversion], metadata={"model": model, **counts})
     print(f"Annotated workbook: {annotated_output.expanduser().resolve()}", flush=True)
     print(
         f"Rows={counts['rows']} annotated={counts['annotated']} blank={counts['blank']}",
         flush=True,
     )
-    return {"exported_rows": row_count, "warnings": warnings, **counts}
+    return {"exported_rows": row_count, "warnings": warnings, "batch_id": batch_id,
+            "artifacts": [conversion, annotation], **counts}
 
 
 def main() -> int:
     args = parse_args()
     try:
+        args.batch_id = args.batch_id or uuid.uuid4().hex
+        args.data_root = args.data_root.expanduser().resolve()
+        ArtifactStore(args.data_root).list(batch_id=args.batch_id)
+        if args.source == DEFAULT_SOURCE:
+            args.source = args.data_root / "raw" / "rollout_trajectories"
+        directory = args.data_root / "system" / "preprocessing" / args.batch_id / uuid.uuid4().hex
+        args.export_output = args.export_output or directory / DEFAULT_EXPORT_OUTPUT.name
+        args.annotated_output = args.annotated_output or directory / DEFAULT_ANNOTATED_OUTPUT.name
         run_pipeline(
             source=args.source,
             export_output=args.export_output,
             annotated_output=args.annotated_output,
             env_file=args.env_file,
             max_review_rounds=args.max_review_rounds,
+            batch_id=args.batch_id,
+            data_root=args.data_root,
         )
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)

@@ -99,7 +99,7 @@ def action_step(trajectory: str, index: int, name: str, offset: int) -> Step:
 
 
 class FakeClassifier:
-    model = "qwen3.6-27b:floor"
+    model = "qwen3.8-max"
 
     def __init__(
         self,
@@ -117,7 +117,7 @@ class FakeClassifier:
 
 
 class FakeAlignmentReviewer:
-    model = "qwen3.6-27b:floor"
+    model = "qwen3.8-max"
 
     def __init__(self, response: StateAlignmentResult) -> None:
         self.response = response
@@ -129,7 +129,7 @@ class FakeAlignmentReviewer:
 
 
 class FailingAlignmentReviewer:
-    model = "qwen3.6-27b:floor"
+    model = "qwen3.8-max"
 
     def review(self, **kwargs):
         raise RuntimeError("review failed")
@@ -609,7 +609,7 @@ class OutputAuditTests(unittest.TestCase):
                 decisions,
                 stats,
                 trajectories,
-                model_name="qwen3.6-27b:floor",
+                model_name="qwen3.8-max",
                 confidence_threshold=0.8,
                 max_incidental_skip=2,
                 json_path=output,

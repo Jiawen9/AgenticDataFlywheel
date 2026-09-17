@@ -1,16 +1,17 @@
 // Serves only the built frontend on an ephemeral port; all API calls are intercepted.
 // Build before each comparison; capture before editing with `node tests/scenario-home.browser.cjs baseline`,
-// then run `node tests/scenario-home.browser.cjs final`. Output goes to ignored backend_workspace/.
+// then run `node tests/scenario-home.browser.cjs final`. Both phases share a temporary output directory.
 // NODE_PATH may point to an existing Playwright installation; no model calls are made.
 const { chromium } = require('playwright')
 const assert = require('node:assert/strict')
 const fs = require('node:fs/promises')
 const path = require('node:path')
+const os = require('node:os')
 const http = require('node:http')
 
 let base
 const phase = process.argv[2] || 'final'
-const output = path.resolve(__dirname, '../../backend_workspace/scenario-editorial-review')
+const output = path.resolve(process.env.ADF_BROWSER_ARTIFACTS || path.join(os.tmpdir(), 'adf-scenario-editorial-review'))
 const dist = path.resolve(__dirname, '../dist')
 
 async function reviewPage(browser, options = {}) {
@@ -322,7 +323,7 @@ async function checkFinal(browser, page, snapshot) {
 async function main() {
   await fs.mkdir(output, { recursive: true })
   // Replay the saved tree directly: re-importing Excel is not part of this UI review.
-  const kb = path.resolve(__dirname, '../../backend_workspace/task_generation/KnowledgeBase')
+  const kb = path.join(path.resolve(process.env.ADF_DATA_ROOT || path.join(__dirname, '../../backend_workspace')), 'resources/task_generation/KnowledgeBase')
   const { version } = JSON.parse(await fs.readFile(path.join(kb, 'current.json'), 'utf8'))
   const saved = JSON.parse(await fs.readFile(path.join(kb, 'versions', version, 'scene_tree.json'), 'utf8'))
   const snapshot = { ...saved, version }

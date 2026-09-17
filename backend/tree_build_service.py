@@ -13,12 +13,17 @@ from zoneinfo import ZoneInfo
 
 from .trajectories_preprocessing import configure_reviewer_environment, read_env_file
 from .quality_input_builder import build_quality_workbook
+from .data_store import ArtifactStore
+from .trajectory_context import resolve_batch_context, row_task_id, validate_batch_sources
+from .stage_artifacts import (store_root, read_workbook_payload, write_sidecar,
+                              write_payload_workbook, observation_payload, structured_input_exists, sidecar_path)
 from .trajectory_data import (
     ANNOTATED_XLSX,
     BACKEND_DIR,
     TRAJECTORY_ROOT,
     TREE_RUNS_DIR,
     discover_tasks,
+    batch_task_metadata,
     task_id_from_resource,
 )
 from .trajectories_tree.intermediate_state_classifier import (
@@ -91,7 +96,7 @@ class _ProgressClassifier:
 
 
 def _task_for_trajectory(steps: list[Any]) -> str:
-    return task_id_from_resource(steps[0].image) if steps else ""
+    return (steps[0].task_id or task_id_from_resource(steps[0].image)) if steps else ""
 
 
 def _file_fingerprint(path: Path) -> dict[str, Any]:
@@ -129,10 +134,50 @@ def build_tree_run(
     confidence_threshold: float = 0.8,
     max_incidental_skip: int = MAX_INCIDENTAL_SKIP,
     quality_builder: Callable[..., tuple[int, int, int]] = build_quality_workbook,
+    data_root: Path | None = None,
+    batch_id: str | None = None,
+    annotation_version: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    if not xlsx_path.is_file():
-        raise FileNotFoundError(f"缺少预处理文件：{xlsx_path}")
-    all_trajectories = load_trajectories(xlsx_path, None)
+    if data_root is not None:
+        from .data_store import DATA_ROOT
+        data_root = Path(data_root).resolve()
+        if runs_dir == TREE_RUNS_DIR:
+            runs_dir = data_root / "system" / "trajectory_tree_runs"
+        if classification_cache == DEFAULT_CLASSIFICATION_CACHE:
+            classification_cache = data_root / DEFAULT_CLASSIFICATION_CACHE.relative_to(DATA_ROOT)
+        if alignment_cache == DEFAULT_ALIGNMENT_CACHE:
+            alignment_cache = data_root / DEFAULT_ALIGNMENT_CACHE.relative_to(DATA_ROOT)
+    context = None
+    if batch_id is not None and (annotation_version is not None or xlsx_path == ANNOTATED_XLSX):
+        context = resolve_batch_context(batch_id, annotation_version, data_root)
+        validate_batch_sources(context, data_root)
+        xlsx_path, trajectory_root = context.json_path, context.raw_root
+    source_paths = [xlsx_path]
+    if any(not structured_input_exists(path) for path in source_paths):
+        raise FileNotFoundError(f"缺少预处理 JSON 快照：{[sidecar_path(path) for path in source_paths]}")
+    source_refs = []
+    combined_rows = []
+    columns: list[str] = []
+    for path in source_paths:
+        source = context.payload if context is not None else read_workbook_payload(path)
+        source_file = sidecar_path(path) if sidecar_path(path).is_file() else path
+        source_refs.append(context.annotation_ref if context is not None else source.get("source_ref") or {"kind": "annotation_snapshot", **_file_fingerprint(source_file), "path": str(source_file)})
+        sheet_name = next(iter(source["sheets"]))
+        columns = list(dict.fromkeys(columns + source.get("columns", {}).get(sheet_name, [])))
+        for row in source["sheets"][sheet_name]:
+            task_id = row_task_id(row)
+            if task_id in task_ids:
+                combined_rows.append(row)
+    source_payload = {"schema_version": 1, "columns": {"VLA trajectories": columns}, "sheets": {"VLA trajectories": combined_rows}}
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    temporary_dir = runs_dir / f".building-{job_id}"
+    if temporary_dir.exists():
+        shutil.rmtree(temporary_dir)
+    temporary_dir.mkdir(parents=True)
+    frozen_source = temporary_dir / "source_annotated.xlsx"
+    write_payload_workbook(frozen_source, source_payload)
+    write_sidecar(frozen_source, source_payload)
+    all_trajectories = load_trajectories(frozen_source, None)
     grouped: dict[str, list[tuple[str, list[Any]]]] = {}
     for trajectory, steps in all_trajectories:
         task_id = _task_for_trajectory(steps)
@@ -140,9 +185,10 @@ def build_tree_run(
             grouped.setdefault(task_id, []).append((trajectory, steps))
     missing = [task_id for task_id in task_ids if not grouped.get(task_id)]
     if missing:
+        shutil.rmtree(temporary_dir)
         raise ValueError(f"任务尚未完成轨迹预处理：{', '.join(missing)}")
 
-    metadata = discover_tasks(trajectory_root)
+    metadata = batch_task_metadata(context) if context is not None else discover_tasks(trajectory_root)
     total_steps = sum(
         1
         for task_id in task_ids
@@ -150,11 +196,6 @@ def build_tree_run(
         for position, step in enumerate(steps)
         if not (step.action.get("action") == "terminate" and position < len(steps) - 1)
     )
-    runs_dir.mkdir(parents=True, exist_ok=True)
-    temporary_dir = runs_dir / f".building-{job_id}"
-    if temporary_dir.exists():
-        shutil.rmtree(temporary_dir)
-    temporary_dir.mkdir(parents=True)
     completed_steps = 0
     task_manifests: list[dict[str, Any]] = []
 
@@ -265,8 +306,22 @@ def build_tree_run(
         )
 
         progress({"stage": "publishing", "classified_steps": total_steps, "total_steps": total_steps})
+        if context is not None:
+            validate_batch_sources(context, data_root)
         completed_at = datetime.now(ZoneInfo("Asia/Shanghai"))
         run_id = _new_run_id(runs_dir, completed_at)
+        artifact_store = ArtifactStore(store_root(runs_dir, data_root))
+        input_batches = {ref["batch_id"] for ref in source_refs if ref.get("batch_id")}
+        batch_id = batch_id or (next(iter(input_batches)) if len(input_batches) == 1 else run_id)
+        observation, observation_rows = observation_payload({task_id: grouped[task_id] for task_id in task_ids}, confidence_threshold)
+        observation_artifact = artifact_store.publish(batch_id, "03_observation", observation,
+            tables={"Observation与中间态": observation_rows}, source_refs=source_refs,
+            metadata={"run_id": run_id, "model": model_name, "includes_all_steps": True})
+        tree_payloads = {item["task_id"]: json.loads((temporary_dir / item["tree_file"]).read_text(encoding="utf-8")) for item in task_manifests}
+        quality_input = read_workbook_payload(quality_workbook)
+        tree_artifact = artifact_store.publish(batch_id, "04_tree",
+            {"schema_version": 1, "run_id": run_id, "trees": tree_payloads, "quality_input": quality_input},
+            source_refs=[observation_artifact], metadata={"run_id": run_id, "task_ids": task_ids})
         manifest = {
             "run_id": run_id,
             "completed_at": completed_at.isoformat(),
@@ -275,8 +330,17 @@ def build_tree_run(
             "task_count": len(task_ids),
             "total_original_steps": sum(item["original_step_count"] for item in task_manifests),
             "total_tree_steps": sum(item["tree_step_count"] for item in task_manifests),
-            "source_xlsx": _file_fingerprint(xlsx_path),
+            "source_xlsx": _file_fingerprint(frozen_source),
+            "source_annotated_file": frozen_source.name,
+            "source_annotated_json": frozen_source.with_suffix(".json").name,
+            "source_json": _file_fingerprint(frozen_source.with_suffix(".json")),
+            "batch_id": batch_id,
+            "raw_root": str(trajectory_root.resolve()),
+            "annotation_version": context.annotation_version if context is not None else None,
+            "source_refs": source_refs,
+            "artifacts": [observation_artifact, tree_artifact],
             "quality_input_file": quality_workbook.name,
+            "quality_input_json": quality_workbook.with_suffix(".json").name,
             "quality_input_prompt_version": "trajectory-intermediate-observation-v4",
             "quality_task_count": quality_task_count,
             "quality_observation_count": quality_step_count,

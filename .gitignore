@@ -25,45 +25,17 @@ frontend/.vite/
 frontend/data/
 
 # Runtime logs and generated data
+data/
 *.log
 *.xlsx
 backend/bounding_box/*cache*.json
 backend/trajectories_tree/*cache*.json
 
-# The workspace is local-only. Keep only its empty directory structure.
-backend_workspace/*
-!backend_workspace/.gitkeep
-!backend_workspace/rollout_trajectories/
-backend_workspace/rollout_trajectories/*
-!backend_workspace/rollout_trajectories/.gitkeep
-!backend_workspace/trajectory_correction/
-backend_workspace/trajectory_correction/*
-!backend_workspace/trajectory_correction/inputs/
-!backend_workspace/trajectory_correction/sessions/
-!backend_workspace/trajectory_correction/exports/
-backend_workspace/trajectory_correction/inputs/*
-!backend_workspace/trajectory_correction/inputs/.gitkeep
-backend_workspace/trajectory_correction/sessions/*
-!backend_workspace/trajectory_correction/sessions/.gitkeep
-backend_workspace/trajectory_correction/exports/*
-!backend_workspace/trajectory_correction/exports/.gitkeep
-!backend_workspace/task_generation/
-backend_workspace/task_generation/*
-!backend_workspace/task_generation/KnowledgeBase/
-backend_workspace/task_generation/KnowledgeBase/*
-!backend_workspace/task_generation/KnowledgeBase/.gitkeep
-!backend_workspace/task_generation/jobs/
-backend_workspace/task_generation/jobs/*
-!backend_workspace/task_generation/jobs/.gitkeep
-!backend_workspace/task_generation/runs/
-backend_workspace/task_generation/runs/*
-!backend_workspace/task_generation/runs/.gitkeep
-!backend_workspace/task_generation/exports/
-backend_workspace/task_generation/exports/*
-!backend_workspace/task_generation/exports/.gitkeep
-!backend_workspace/task_generation/logs/
-backend_workspace/task_generation/logs/*
-!backend_workspace/task_generation/logs/.gitkeep
+# Unified runtime data is local-only.
+backend_workspace/
+# One-time relocation backup and manifests are not source code.
+outputs/storage-migration/
+.data-root-migration/
 
 # Editors and operating systems
 .idea/

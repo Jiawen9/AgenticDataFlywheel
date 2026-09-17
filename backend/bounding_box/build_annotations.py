@@ -262,7 +262,7 @@ def main() -> None:
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
     parser.add_argument("--output", type=Path, default=PROJECT_DIR / "annotated")
     parser.add_argument(
-        "--model", default=os.environ.get("TRAJECTORY_MODEL", "qwen3.6-27b:floor")
+        "--model", default=os.environ.get("TRAJECTORY_MODEL", "qwen3.8-max")
     )
     parser.add_argument("--max-review-rounds", type=int, default=4)
     parser.add_argument(

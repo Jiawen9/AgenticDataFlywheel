@@ -50,7 +50,7 @@ const modelTrainingActive = computed(() => route.path.startsWith('/model-trainin
               </button>
               <div v-show="collectionExpanded" class="nav-tertiary-items">
                 <router-link to="/collection/phone-factory"><el-icon><Iphone /></el-icon><span>手机工厂采集</span></router-link>
-                <router-link to="/collection/tree-building"><el-icon><Share /></el-icon><span>轨迹树构建</span></router-link>
+                <router-link to="/collection/tree-building"><el-icon><Share /></el-icon><span>轨迹预处理与建树</span></router-link>
               </div>
             </div>
             <router-link to="/quality"><el-icon><DataAnalysis /></el-icon><span>轨迹质检</span></router-link>

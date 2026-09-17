@@ -13,6 +13,9 @@ from zoneinfo import ZoneInfo
 
 from .trajectory_data import TREE_JOBS_DIR
 from .tree_build_service import build_tree_run
+from .data_store import RecordStore
+from .stage_artifacts import store_root
+from .trajectory_context import resolve_batch_context, row_task_id, validate_batch_sources
 
 
 BuildRunner = Callable[..., tuple[str, dict[str, Any]]]
@@ -28,8 +31,11 @@ class TreeBuildJobManager:
         jobs_dir: Path = TREE_JOBS_DIR,
         runner: BuildRunner = build_tree_run,
         executor: Executor | None = None,
+        data_root: Path | None = None,
     ) -> None:
         self.jobs_dir = jobs_dir
+        self.data_root = store_root(jobs_dir, data_root)
+        self.records = RecordStore(self.data_root)
         self.runner = runner
         self._lock = threading.RLock()
         self._owns_executor = executor is None
@@ -37,36 +43,29 @@ class TreeBuildJobManager:
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         self.mark_interrupted_jobs()
 
-    def _path(self, job_id: str) -> Path:
-        return self.jobs_dir / f"{job_id}.json"
-
     def _write(self, payload: dict[str, Any]) -> None:
-        path = self._path(payload["job_id"])
-        temporary = path.with_name(f".{path.name}.tmp")
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        temporary.replace(path)
+        payload.update(self.records.put("tree_jobs", payload["job_id"], payload))
 
     def get(self, job_id: str) -> dict[str, Any] | None:
-        # The frontend polls this file while the worker replaces it with an
-        # atomic temporary-file rename.  Windows can reject that rename when
-        # the reader still owns an open handle, so reads must share the same
-        # process lock as writes.
+        # Polling and worker changes share the manager lock; SQLite owns state.
         with self._lock:
-            path = self._path(job_id)
-            if not path.is_file():
-                return None
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError, json.JSONDecodeError):
-                return None
-            return payload if isinstance(payload, dict) else None
+            return self.records.get("tree_jobs", job_id)
+
+    def list_jobs(self, batch_id: str | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            jobs = self.records.list("tree_jobs")
+            if batch_id is not None:
+                jobs = [item for item in jobs if item.get("batch_id") == batch_id]
+            return sorted(jobs, key=lambda item: (str(item.get("created_at", "")), str(item.get("job_id", ""))),
+                          reverse=True)
 
     def mark_interrupted_jobs(self) -> None:
-        for path in self.jobs_dir.glob("*.json"):
+        ids = {item["job_id"] for item in self.records.list("tree_jobs")}
+        for job_id in ids:
             try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
+                payload = self.get(job_id)
+                if payload is None:
+                    continue
             except (OSError, ValueError, json.JSONDecodeError):
                 continue
             if payload.get("status") in {"queued", "running"}:
@@ -80,7 +79,14 @@ class TreeBuildJobManager:
                 )
                 self._write(payload)
 
-    def submit(self, task_ids: list[str]) -> dict[str, Any]:
+    def submit(self, task_ids: list[str], *, batch_id: str | None = None,
+               annotation_version: str | None = None) -> dict[str, Any]:
+        context = resolve_batch_context(batch_id, annotation_version, self.data_root) if batch_id is not None else None
+        if context is not None:
+            validate_batch_sources(context, self.data_root)
+            available = {row_task_id(row) for rows in context.payload["sheets"].values() for row in rows}
+            if not task_ids or any(task_id not in available for task_id in task_ids):
+                raise ValueError("所选任务不在该批次的标框版本中")
         job_id = uuid.uuid4().hex
         payload: dict[str, Any] = {
             "job_id": job_id,
@@ -101,6 +107,9 @@ class TreeBuildJobManager:
             "error": None,
             "run_id": None,
         }
+        if context is not None:
+            payload.update({"batch_id": batch_id, "annotation_version": context.annotation_version,
+                            "annotation_ref": context.annotation_ref, "raw_root": str(context.raw_root)})
         with self._lock:
             self._write(payload)
         self._executor.submit(self._run, job_id, task_ids)
@@ -135,10 +144,15 @@ class TreeBuildJobManager:
             payload.update({"status": "running", "stage": "classifying_and_observing", "started_at": _now()})
             self._write(payload)
         try:
+            context_options = {}
+            if payload.get("batch_id"):
+                context_options = {"batch_id": payload["batch_id"], "annotation_version": payload["annotation_version"],
+                                   "data_root": self.data_root}
             run_id, _ = self.runner(
                 task_ids,
                 job_id=job_id,
                 progress=lambda changes: self._progress(job_id, changes),
+                **context_options,
             )
         except Exception as exc:
             with self._lock:

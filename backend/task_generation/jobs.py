@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sqlite3
 import tempfile
 import threading
 import uuid
@@ -14,6 +15,9 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from . import collection_batches as batches
+from ..data_store.paths import DATA_ROOT
+from ..data_store.registry import RecordStore
+from ..data_store.artifacts import ArtifactStore
 from .collection_input import CollectionInputError, build_collection_input
 from .constants import (
     AUGMENTATION_RESULT_COLUMNS,
@@ -34,6 +38,8 @@ from .service import (
 
 
 Runner = Callable[..., dict[str, Any]]
+_MANAGER_LOCKS: dict[str, Any] = {}
+_MANAGER_LOCKS_GUARD = threading.Lock()
 
 
 class AugmentationStateError(ValueError):
@@ -60,18 +66,23 @@ class TaskGenerationJobManager:
         classification_runner: Runner = run_augmentation_classification,
         generation_runner: Runner = run_augmentation_generation,
         collection_batches_dir: Path | None = None,
+        data_root: Path | None = None,
     ) -> None:
         self.jobs_dir = jobs_dir
         self.runs_dir = runs_dir
         self.exports_dir = exports_dir
         self.logs_dir = logs_dir
         self.knowledge_base_dir = knowledge_base_dir
+        self.data_root = Path(data_root) if data_root is not None else DATA_ROOT if jobs_dir == JOBS_DIR else jobs_dir.parent / ".data_store"
+        self.store = RecordStore(self.data_root)
+        self.artifacts = ArtifactStore(self.data_root)
         self.collection_batches_dir = collection_batches_dir if collection_batches_dir is not None else jobs_dir.parent / "collection_batches"
         self.initial_runner = initial_runner
         self.augmentation_runner = augmentation_runner
         self.classification_runner = classification_runner
         self.generation_runner = generation_runner
-        self._lock = threading.RLock()
+        with _MANAGER_LOCKS_GUARD:
+            self._lock = _MANAGER_LOCKS.setdefault(str(self.data_root.resolve()).casefold(), threading.RLock())
         self._owns_executor = executor is None
         self._executor = executor or ThreadPoolExecutor(max_workers=1, thread_name_prefix="task-generation")
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
@@ -92,8 +103,26 @@ class TaskGenerationJobManager:
     def _seeds_path(self, job_id: str) -> Path:
         return self._run_dir(job_id) / "seeds.json"
 
+    def _source_file(self, job_id: str, name: str) -> Path:
+        return self._run_dir(job_id) / name
+
+    def _read_rows(self, job_id: str, name: str) -> list[dict[str, Any]]:
+        stored = self.store.get(f"task_generation.{name}", job_id)
+        if stored is None:
+            raise FileNotFoundError(f"作业{name}记录不存在")
+        value = stored["rows"]
+        if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
+            raise ValueError(f"{name}记录格式无效")
+        return value
+
+    def _execution_library(self, job_id: str) -> Path:
+        target = self._source_file(job_id, "KnowledgeBase")
+        if not target.is_dir():
+            raise FileNotFoundError("作业知识库快照不存在")
+        return target
+
     def _read_seeds(self, job_id: str) -> list[dict[str, Any]]:
-        value = json.loads(self._seeds_path(job_id).read_text(encoding="utf-8"))
+        value = self._read_rows(job_id, "seeds")
         if not isinstance(value, list) or any(not isinstance(seed, dict) for seed in value):
             raise ValueError("扩增分类记录格式无效")
         return value
@@ -124,8 +153,19 @@ class TaskGenerationJobManager:
         return self._seed_stats(seeds)
 
     def _write_json(self, path: Path, value: Any) -> None:
+        # Mutable records exist only in SQLite. Frozen manifests remain JSON.
+        if path.parent == self.jobs_dir and isinstance(value, dict):
+            self.store.put("task_generation.jobs", str(value["job_id"]), value)
+            return
+        elif path.parent.parent == self.runs_dir and path.name in {"results.json", "seeds.json"}:
+            self.store.put(f"task_generation.{path.stem}", path.parent.name, {"job_id": path.parent.name, "rows": value})
+            return
+        self._write_mirror(path, value)
+
+    @staticmethod
+    def _write_mirror(path: Path, value: Any) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(f".{path.name}.tmp")
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(path)
 
@@ -139,34 +179,31 @@ class TaskGenerationJobManager:
 
     def get(self, job_id: str) -> dict[str, Any] | None:
         with self._lock:
-            path = self._job_path(job_id)
-            if not path.is_file():
-                return None
-            try:
-                value = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError, json.JSONDecodeError):
-                return None
-            return value if isinstance(value, dict) else None
+            value = self.store.get("task_generation.jobs", job_id)
+            return self._current_paths(value) if value is not None else None
+
+    def _current_paths(self, job: dict[str, Any]) -> dict[str, Any]:
+        # Execution already resolves this immutable bundle by job ID. Keep the
+        # displayed path in sync without rewriting the saved knowledge snapshot.
+        if isinstance(job.get("knowledge_base"), dict):
+            return {**job, "knowledge_base": {**job["knowledge_base"],
+                    "directory": str(self._source_file(job["job_id"], "KnowledgeBase"))}}
+        return job
 
     def list_jobs(self) -> list[dict[str, Any]]:
         with self._lock:
-            values = []
-            for path in self.jobs_dir.glob("*.json"):
-                try:
-                    value = json.loads(path.read_text(encoding="utf-8"))
-                except (OSError, ValueError, json.JSONDecodeError):
-                    continue
-                if isinstance(value, dict):
-                    value.pop("execution_units", None)
-                    value.pop("selections", None)
-                    values.append(value)
+            records = {item["job_id"]: self._current_paths(item) for item in self.store.list("task_generation.jobs")
+                       if isinstance(item.get("job_id"), str) and item["job_id"]}
+            values = list(records.values())
+            for value in values:
+                value.pop("execution_units", None)
+                value.pop("selections", None)
             return sorted(values, key=lambda item: str(item.get("created_at", "")), reverse=True)
 
     def mark_interrupted_jobs(self) -> None:
-        for path in self.jobs_dir.glob("*.json"):
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError, json.JSONDecodeError):
+        for summary in self.list_jobs():
+            payload = self.get(summary["job_id"])
+            if payload is None:
                 continue
             if isinstance(payload, dict) and payload.get("status") in {"queued", "running"}:
                 # A final seed checkpoint can reach disk immediately before the
@@ -295,11 +332,14 @@ class TaskGenerationJobManager:
                 raise FileNotFoundError("作业不存在")
             if job.get("kind") != "augmentation":
                 raise AugmentationStateError("只有任务扩增作业具有分类预览")
-            available = bool(job.get("augmentation_preview_version")) and self._seeds_path(job_id).is_file()
-            seeds = self._read_seeds(job_id) if available else []
+            available = bool(job.get("augmentation_preview_version"))
+            try:
+                seeds = self._read_seeds(job_id) if available else []
+            except FileNotFoundError:
+                available, seeds = False, []
             preview = {"job_id": job_id, "available": available, "seeds": seeds, "stats": self._seed_stats(seeds)}
         if available and include_tree:
-            preview["tree"] = tree_payload(self._run_dir(job_id) / "KnowledgeBase")
+            preview["tree"] = tree_payload(self._source_file(job_id, "KnowledgeBase"))
         return preview
 
     def start_augmentation(self, job_id: str) -> dict[str, Any]:
@@ -368,7 +408,7 @@ class TaskGenerationJobManager:
         self._log(job_id, "开始匹配失败任务与作业快照场景树")
         try:
             outcome = self.classification_runner(
-                self._read_seeds(job_id), kb_root=self._run_dir(job_id) / "KnowledgeBase",
+                self._read_seeds(job_id), kb_root=self._source_file(job_id, "KnowledgeBase"),
                 progress=lambda value: self._progress(job_id, value),
                 on_seed=lambda seed, rows: self._checkpoint_seed(job_id, seed, rows),
             )
@@ -378,13 +418,19 @@ class TaskGenerationJobManager:
             stats = self._seed_stats(seeds)
             with self._lock:
                 self._write_json(self._seeds_path(job_id), seeds)
-                self._progress(job_id, {"classification_completed": True, "seed_stats": stats,
+                ready = {**(self.get(job_id) or {}), "classification_completed": True, "seed_stats": stats,
                                        "status": "awaiting_confirmation" if stats["eligible"] else "failed",
                                        "stage": "awaiting_confirmation" if stats["eligible"] else "failed",
                                        "percent": 40, "current_item": None, "completed_items": len(seeds),
                                        "errors": outcome.get("errors", []), "warnings": outcome.get("warnings", []),
                                        "completed_at": None if stats["eligible"] else _now(),
-                                       "error": None if stats["eligible"] else "所有种子分类失败，无法扩增"})
+                                       "error": None if stats["eligible"] else "所有种子分类失败，无法扩增"}
+                try:
+                    ready["latest_artifact"] = self._publish_snapshot(ready, stage="00_scene_matching")
+                    ready["artifact_error"] = None
+                except Exception as exc:
+                    ready["artifact_error"] = f"中间产物保存失败，可重试保存：{exc}"
+                self._write_job(ready)
             self._log(job_id, f"分类完成，可扩增={stats['eligible']}，未匹配={stats['unmatched']}，失败={stats['classification_failed']}")
             if stats["eligible"] and (self.get(job_id) or {}).get("auto_start"):
                 self.start_augmentation(job_id)
@@ -399,7 +445,7 @@ class TaskGenerationJobManager:
             if job is None:
                 return
             outcome = self.generation_runner(
-                self._read_seeds(job_id), job["generate_n"], kb_root=self._run_dir(job_id) / "KnowledgeBase",
+                self._read_seeds(job_id), job["generate_n"], kb_root=self._execution_library(job_id),
                 progress=lambda value: self._progress(job_id, value),
                 on_seed=lambda seed, rows: self._checkpoint_seed(job_id, seed, rows),
             )
@@ -437,6 +483,11 @@ class TaskGenerationJobManager:
                 "warnings": outcome.get("warnings", []),
                 "error": None if status in {"succeeded", "partial"} else (errors[0].get("error") if errors else "作业未生成结果"),
             })
+            try:
+                payload["latest_artifact"] = self._publish_snapshot(payload)
+                payload["artifact_error"] = None
+            except Exception as exc:
+                payload["artifact_error"] = f"中间产物保存失败，可重试保存：{exc}"
             self._write_job(payload)
 
     def _run_initial(self, job_id: str, node_ids: list[str], generate_n: int) -> None:
@@ -465,11 +516,10 @@ class TaskGenerationJobManager:
         job = self.get(job_id)
         if job is None:
             raise FileNotFoundError("作业不存在")
-        path = self._results_path(job_id)
-        if not path.is_file():
+        try:
+            return self._read_rows(job_id, "results")
+        except FileNotFoundError:
             return []
-        value = json.loads(path.read_text(encoding="utf-8"))
-        return value if isinstance(value, list) else []
 
     def collection_input(self, job_id: str) -> dict[str, Any]:
         # Share the edit/finish lock for the entire job + result read. No export
@@ -481,7 +531,7 @@ class TaskGenerationJobManager:
             if job.get("status") not in ("succeeded", "partial"):
                 raise CollectionInputError("只有 succeeded 或 partial 作业可以读取采集输入")
             try:
-                records = json.loads(self._results_path(job_id).read_text(encoding="utf-8"))
+                records = self._read_rows(job_id, "results")
             except (OSError, ValueError) as exc:
                 raise CollectionInputError("作业结果文件缺失、无法读取或已损坏") from exc
             return build_collection_input(job, records)
@@ -493,9 +543,12 @@ class TaskGenerationJobManager:
             raise CollectionInputError("采集批次路径无效")
         return path
 
+    def _existing_collection_batch_dir(self, batch_id: str) -> Path:
+        return self._collection_batch_dir(batch_id)
+
     def collection_batch(self, batch_id: str) -> dict[str, Any]:
         with self._lock:
-            directory = self._collection_batch_dir(batch_id)
+            directory = self._existing_collection_batch_dir(batch_id)
             if not directory.is_dir():
                 raise FileNotFoundError("采集批次不存在")
             try:
@@ -521,20 +574,22 @@ class TaskGenerationJobManager:
     def collection_batches(self, job_id: str | None = None) -> list[dict[str, Any]]:
         with self._lock:
             if job_id is not None:
-                paths = [self._collection_batch_dir(job_id)]
+                paths = [self._existing_collection_batch_dir(job_id)]
             elif self.collection_batches_dir.is_dir():
                 paths = list(self.collection_batches_dir.iterdir())
             else:
                 paths = []
             summaries = []
+            seen: set[str] = set()
             for path in paths:
-                if not path.is_dir() or path.name.startswith("."):
+                if not path.is_dir() or path.name.startswith(".") or path.name in seen:
                     continue
                 try:
                     detail = self.collection_batch(path.name)
                 except (FileNotFoundError, CollectionInputError):
                     continue
                 summaries.append({key: value for key, value in detail.items() if key != "snapshot"})
+                seen.add(path.name)
             return sorted(summaries, key=lambda value: (value["created_at"], value["batch_id"]), reverse=True)
 
     def submit_collection_batch(self, job_id: str) -> tuple[dict[str, Any], bool]:
@@ -542,9 +597,10 @@ class TaskGenerationJobManager:
             destination = self._collection_batch_dir(job_id)
             if self.get(job_id) is None:
                 raise FileNotFoundError("作业不存在")
-            if destination.exists():
+            if self._existing_collection_batch_dir(job_id).exists():
                 return self.collection_batch(job_id), False
             payload = batches.collection_batch_payload(self.collection_input(job_id), _now())
+            published_here = False
             try:
                 self.collection_batches_dir.mkdir(parents=True, exist_ok=True)
                 with tempfile.TemporaryDirectory(prefix=f".{job_id}-", dir=self.collection_batches_dir) as temporary:
@@ -556,16 +612,28 @@ class TaskGenerationJobManager:
                     }}
                     self._write_json(staging / "batch.json", stored)
                     staging.rename(destination)
+                    published_here = True
+                self.artifacts.publish(job_id, "00_collection", payload,
+                    workbooks={"result.xlsx": destination / payload["filename"]},
+                    source_refs=[{"kind": "task_generation_job", "id": job_id}],
+                    metadata={"collection_batch_id": job_id})
             except CollectionInputError:
                 raise
-            except (OSError, ValueError) as exc:
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                if published_here:
+                    # Only this invocation's newly created directory is removed.
+                    resolved = destination.resolve()
+                    resolved.relative_to(self.collection_batches_dir.resolve())
+                    if resolved == self.collection_batches_dir.resolve():
+                        raise
+                    shutil.rmtree(resolved)
                 raise CollectionInputError("采集批次保存失败，未发布新批次，请重试") from exc
             return payload, True
 
     def collection_batch_workbook(self, batch_id: str) -> Path:
         with self._lock:
             batch = self.collection_batch(batch_id)
-            return self._collection_batch_dir(batch_id) / batch["filename"]
+            return self._existing_collection_batch_dir(batch_id) / batch["filename"]
 
     def patch_result(self, job_id: str, result_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
@@ -574,26 +642,68 @@ class TaskGenerationJobManager:
                 raise FileNotFoundError("作业不存在")
             if job.get("augmentation_preview_version") and job.get("status") in {"queued", "running", "awaiting_confirmation"}:
                 raise AugmentationStateError("作业执行期间结果只读，请在扩增结束后审核")
-            records = self.results(job_id)
-            record = next((item for item in records if item.get("result_id") == result_id), None)
-            if record is None:
-                raise KeyError(result_id)
-            if "task" in patch:
-                task = str(patch["task"]).strip()
-                if not task:
-                    raise ValueError("任务文本不能为空")
-                record["task"] = task
-                if job.get("kind") == "augmentation":
-                    record["生成的变体任务"] = task
-            if "deleted" in patch:
-                deleted = bool(patch["deleted"])
-                group = record.get("dependency_group_id")
-                for item in records:
-                    if item.get("result_id") == result_id or (group and item.get("dependency_group_id") == group):
-                        item["deleted"] = deleted
-            record["updated_at"] = _now()
-            self._write_json(self._results_path(job_id), records)
-            return record
+            def mutate(saved: dict[str, Any]) -> None:
+                records = saved["rows"]
+                record = next((item for item in records if item.get("result_id") == result_id), None)
+                if record is None:
+                    raise KeyError(result_id)
+                if "task" in patch:
+                    task = str(patch["task"]).strip()
+                    if not task:
+                        raise ValueError("任务文本不能为空")
+                    record["task"] = task
+                    if job.get("kind") == "augmentation":
+                        record["生成的变体任务"] = task
+                if "deleted" in patch:
+                    deleted = bool(patch["deleted"])
+                    group = record.get("dependency_group_id")
+                    for item in records:
+                        if item.get("result_id") == result_id or (group and item.get("dependency_group_id") == group):
+                            item["deleted"] = deleted
+                record["updated_at"] = _now()
+            saved = self.store.update("task_generation.results", job_id, mutate,
+                                      default={"job_id": job_id, "rows": self.results(job_id)})
+            return next(item for item in saved["rows"] if item.get("result_id") == result_id)
+
+    def snapshot(self, job_id: str, *, stage: str | None = None) -> dict[str, Any]:
+        """Publish a reviewable version from saved values, without model calls."""
+        with self._lock:
+            job = self.get(job_id)
+            if job is None:
+                raise FileNotFoundError("作业不存在")
+            if job["status"] in {"queued", "running"}:
+                raise AugmentationStateError("请在本阶段执行结束后保存中间产物")
+            manifest = self._publish_snapshot(job, stage=stage)
+            self._progress(job_id, {"artifact_error": None, "latest_artifact": manifest})
+            return manifest
+
+    def _publish_snapshot(self, job: dict[str, Any], *, stage: str | None = None) -> dict[str, Any]:
+        job_id = job["job_id"]
+        results = self.results(job_id)
+        try:
+            seeds = self._read_seeds(job_id)
+        except FileNotFoundError:
+            seeds = []
+        chosen_stage = stage or ("00_augmentation" if job["kind"] == "augmentation" else "00_task_generation")
+        tables = {"源用例": seeds} if chosen_stage == "00_scene_matching" else {"任务": results}
+        if job.get("errors"):
+            tables["错误"] = job["errors"]
+        payload = {"schema_version": 1, "job_id": job_id, "kind": job["kind"], "status": job["status"],
+                   "knowledge_base_version": job.get("knowledge_base_version"),
+                   "results": results, "seeds": seeds, "errors": job.get("errors", [])}
+        return self.artifacts.publish(job_id, chosen_stage, payload, tables=tables,
+            source_refs=[{"kind": "knowledge_base", "version": job.get("knowledge_base_version")}],
+            metadata={"source_job_id": job_id, "source_status": job["status"]})
+
+    def _save_snapshot_or_warning(self, job_id: str, *, stage: str | None = None) -> None:
+        try:
+            manifest = self.snapshot(job_id, stage=stage)
+        except Exception as exc:
+            # Saved model results remain usable. Retrying the snapshot is a
+            # serialization operation, not a reason to repeat generation.
+            self._progress(job_id, {"artifact_error": f"中间产物保存失败，可重试保存：{exc}"})
+        else:
+            self._progress(job_id, {"artifact_error": None, "latest_artifact": manifest})
 
     def export(self, job_id: str) -> dict[str, Any]:
         with self._lock:
@@ -618,9 +728,15 @@ class TaskGenerationJobManager:
             temporary = destination.with_name(f".{filename}.tmp.xlsx")
             frame.to_excel(temporary, index=False)
             temporary.replace(destination)
+            self.artifacts.publish(job_id, "00_task_export",
+                {"schema_version": 1, "job_id": job_id, "kind": job["kind"], "results": active},
+                workbooks={"result.xlsx": destination},
+                source_refs=[{"kind": "task_generation_job", "id": job_id, "revision": job.get("storage_revision")}])
             return {"filename": filename, "created_at": _now(), "download_url": f"/api/task-generation/jobs/{job_id}/exports/{filename}", "row_count": len(active), "path": str(destination)}
 
     def download(self, job_id: str, filename: str) -> Path:
+        if self.get(job_id) is None:
+            raise FileNotFoundError("作业不存在")
         if Path(filename).name != filename or not filename.endswith(".xlsx"):
             raise ValueError("导出文件名无效")
         path = self.exports_dir / job_id / filename

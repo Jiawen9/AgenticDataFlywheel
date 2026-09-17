@@ -66,10 +66,12 @@ from adarubric.llm.openai_client import OpenAIClient, parse_extra_body
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_ROOT = PROJECT_ROOT.parents[1]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "examples" / "jiawen_rubric_config.json"
-DEFAULT_WORKBOOK = (
-    REPOSITORY_ROOT / "backend_workspace" / "rubric_trajectories.xlsx"
-)
-DEFAULT_OUTPUT_ROOT = REPOSITORY_ROOT / "backend_workspace" / "rubric_outputs"
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+from backend.data_store import DATA_ROOT
+from backend.stage_artifacts import load_quality_objects, structured_input_exists
+DEFAULT_WORKBOOK = DATA_ROOT / "system" / "rubric_trajectories.xlsx"
+DEFAULT_OUTPUT_ROOT = DATA_ROOT / "system" / "rubric_outputs"
 DEFAULT_RUBRIC_PATH = DEFAULT_OUTPUT_ROOT / "rubrics" / "jiawen_gui_initial_rubric.json"
 DEFAULT_EVIDENCE_PATH = (
     DEFAULT_OUTPUT_ROOT / "rubrics" / "jiawen_gui_initial_rubric.evidence.md"
@@ -304,7 +306,7 @@ def _load_jiawen_objects(
         "ADARUBRIC_JIAWEN_WORKBOOK",
         default=DEFAULT_WORKBOOK,
     )
-    tasks_by_id, trajectories = load_objects(workbook_path)
+    tasks_by_id, trajectories = load_quality_objects(workbook_path)
     if not tasks_by_id:
         raise ValueError("jiawen-dataset returned no TaskDescription objects")
 

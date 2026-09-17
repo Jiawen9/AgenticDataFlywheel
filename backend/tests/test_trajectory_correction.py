@@ -16,7 +16,24 @@ from backend.trajectory_correction.exporter import (
 )
 from backend.trajectory_correction import quality_selection
 from backend.trajectory_correction import workbook as correction_workbook
-from backend.trajectory_correction.workbook import load_snapshot
+from backend.trajectory_correction.workbook import load_snapshot as read_snapshot
+from backend.stage_artifacts import workbook_payload, write_sidecar, store_root
+from backend.data_store import RecordStore
+
+
+def load_snapshot(path, **kwargs):
+    # This suite explicitly imports human-script Excel fixtures.
+    return read_snapshot(path, allow_excel_import=True, **kwargs)
+
+
+def register_quality_fixture(root, run_id):
+    store = RecordStore(store_root(root))
+    run = root / run_id
+    store.put("quality_manifests", run_id, json.loads((run / "manifest.json").read_text(encoding="utf-8")))
+    for path in run.glob("*.json"):
+        if path.name != "manifest.json":
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            store.put("quality_results", f"{run_id}:{payload['task_id']}", payload)
 
 
 def write_correction_workbook(path: Path) -> None:
@@ -99,6 +116,8 @@ def write_ranked_workbook(path: Path) -> None:
             "click(bbox=<bbox>[1,2,3,4]</bbox>)",
         ])
     workbook.save(path)
+    workbook.close()
+    write_sidecar(path, workbook_payload(path))
 
 
 def write_ranked_assets(root: Path) -> None:
@@ -132,10 +151,12 @@ def write_quality_run(root: Path, run_id: str, updated_at: str, source_hash: str
         json.dumps({"task_id": "TASK-A", "trajectory_count": 3, "evaluations": evaluations}),
         encoding="utf-8",
     )
+    register_quality_fixture(root, run_id)
     tree_dir = root / "_tree_runs" / run_id
     tree_dir.mkdir(parents=True, exist_ok=True)
+    (tree_dir / "TASK-A.json").write_text('{"task_id":"TASK-A"}', encoding="utf-8")
     (tree_dir / "manifest.json").write_text(
-        json.dumps({"source_xlsx": {"sha256": source_hash}}),
+        json.dumps({"source_xlsx": {"sha256": source_hash}, "tasks": [{"task_id": "TASK-A", "tree_file": "TASK-A.json", "trajectory_count": 3}]}),
         encoding="utf-8",
     )
 
@@ -193,6 +214,8 @@ def write_multi_task_workbook(path: Path) -> None:
                 ]
             )
     workbook.save(path)
+    workbook.close()
+    write_sidecar(path, workbook_payload(path))
 
 
 def write_multi_task_quality(
@@ -235,10 +258,11 @@ def write_multi_task_quality(
         json.dumps({"run_id": run_id, "updated_at": updated_at, "tasks": summaries}),
         encoding="utf-8",
     )
+    register_quality_fixture(quality_root, run_id)
 
 
 class CorrectionWorkbookTests(unittest.TestCase):
-    def test_snapshot_cache_reuses_snapshot_and_invalidates_when_workbook_changes(self):
+    def test_explicit_excel_import_cache_reuses_snapshot_and_invalidates_when_workbook_changes(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             source = Path(temp_dir) / "input.xlsx"
             write_correction_workbook(source)

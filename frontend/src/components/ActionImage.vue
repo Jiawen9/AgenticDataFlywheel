@@ -122,19 +122,21 @@ function finishDrawing(event: PointerEvent) {
 
 async function saveDrawing() {
   const value = draftBBox.value
-  if (!value || value.x2 <= value.x1 || value.y2 <= value.y1 || !props.onSaveBbox) return
+  if (saving.value || !value || value.x2 <= value.x1 || value.y2 <= value.y1 || !props.onSaveBbox) return false
   saving.value = true
   try {
     await props.onSaveBbox([value.x1, value.y1, value.x2, value.y2])
     cancelEditing()
+    return true
   } catch {
     // Parent displays the persistence error; keep edit mode open for retry.
+    return false
   } finally {
     saving.value = false
   }
 }
 
-defineExpose({ beginEditing })
+defineExpose({ beginEditing, cancelEditing, saveDrawing, editing, saving })
 
 function onLoad(event: Event) {
   const image = event.target as HTMLImageElement

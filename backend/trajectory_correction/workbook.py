@@ -1,8 +1,7 @@
-"""Read and interpret the Excel contract used by ``human8.0.py``.
+"""Interpret authoritative trajectory JSON and explicit human8.0 Excel imports.
 
-The desktop tool uses pandas and keeps its edits in memory.  The web module
-uses openpyxl instead, so the original workbook stays untouched while a
-small JSON draft stores only the user's edits.
+Structured rows are adapted in memory for the existing workbook contract;
+current manual edits are stored separately in SQLite.
 """
 
 from __future__ import annotations
@@ -15,7 +14,8 @@ from datetime import date, datetime, time
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
+from ..stage_artifacts import read_workbook_payload, sidecar_path, structured_input_exists
 
 from .constants import ACTION_TYPES, WORKBOOK_SUFFIXES
 
@@ -33,6 +33,40 @@ ANNOTATED_REQUIRED_COLUMNS = {"文件夹名", "image", "action"}
 # workbook at once.
 _SNAPSHOT_CACHE: dict[tuple[str, str, str | None, int, int], dict[str, Any]] = {}
 _SNAPSHOT_CACHE_LOCK = threading.RLock()
+
+
+def has_workbook_json(path: Path) -> bool:
+    candidate = sidecar_path(path)
+    if not candidate.is_file():
+        return False
+    value = json.loads(candidate.read_text(encoding="utf-8"))
+    if isinstance(value, dict) and isinstance(value.get("sheets"), dict):
+        return True
+    raise ValueError("轨迹 JSON 格式无效")
+
+
+def open_source_workbook(path: Path, *, allow_excel_import: bool = False, **kwargs: Any) -> Any:
+    """Build a worksheet from JSON; Excel is accepted only for explicit imports."""
+    if not has_workbook_json(path):
+        if not allow_excel_import:
+            raise FileNotFoundError(f"轨迹 JSON 输入不存在：{sidecar_path(path)}")
+        return load_workbook(path, **kwargs)
+    payload = read_workbook_payload(path)
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    for name, rows in payload["sheets"].items():
+        sheet = workbook.create_sheet(name)
+        columns = payload.get("columns", {}).get(name) or list(dict.fromkeys(key for row in rows for key in row))
+        sheet.append(columns)
+        for row in rows:
+            sheet.append([row.get(column) for column in columns])
+            for cell in sheet[sheet.max_row]:
+                if isinstance(cell.value, str):
+                    cell.data_type = "s"
+    if not workbook.worksheets:
+        workbook.close()
+        raise ValueError("轨迹 JSON 缺少工作表")
+    return workbook
 
 
 def text(value: Any) -> str:
@@ -276,20 +310,28 @@ def _annotated_row_payload(
     *,
     asset_root: Path | None,
     task_cache: dict[str, str],
+    source_row: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     values = {
         name: json_value(sheet.cell(row_number, column).value)
         for name, column in headers.items()
     }
     image = text(_cell_value(sheet, row_number, headers, "image"))
-    trajectory_id = text(_cell_value(sheet, row_number, headers, "文件夹名"))
+    source_row = source_row or {}
+    task_id = text(source_row.get("task_id"))
+    explicit_trajectory_id = text(source_row.get("trajectory_id"))
+    if (image.replace("\\", "/").startswith("runs/") or source_row.get("collection_run_id")) and (not task_id or not explicit_trajectory_id):
+        raise ValueError("采集轨迹 JSON 缺少 task_id 或稳定 trajectory_id")
+    trajectory_id = explicit_trajectory_id or text(_cell_value(sheet, row_number, headers, "文件夹名"))
     if not trajectory_id and image:
         trajectory_id = PurePosixPath(image.replace("\\", "/")).parent.name
     actions = text(_cell_value(sheet, row_number, headers, "action"))
-    task = _trajectory_task(asset_root, trajectory_id, image, task_cache) or trajectory_id
+    task = text(source_row.get("task")) or _trajectory_task(asset_root, trajectory_id, image, task_cache) or task_id or trajectory_id
     summary = text(_cell_value(sheet, row_number, headers, "summary"))
     thought = text(_cell_value(sheet, row_number, headers, "thought")) or _original_thought(image, asset_root)
+    identity = {key: source_row[key] for key in ("task_id", "source_trajectory_id", "collection_run_id", "collection_case_id", "source_result_id", "collected_at") if key in source_row}
     return {
+        **identity,
         "excel_row": row_number,
         "step": _step_number(image, row_number - 1),
         "task": task,
@@ -325,6 +367,7 @@ def _load_annotated_snapshot(
     *,
     asset_root: Path | None,
     workbook_path: Path,
+    source_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     task_cache: dict[str, str] = {}
@@ -335,6 +378,7 @@ def _load_annotated_snapshot(
             headers,
             asset_root=asset_root,
             task_cache=task_cache,
+            source_row=source_rows[row_number - 2] if source_rows is not None and row_number - 2 < len(source_rows) else None,
         )
         if not payload["meta_task"] and not payload["image"] and not payload["actions"]:
             continue
@@ -357,6 +401,10 @@ def _load_annotated_snapshot(
                 "export": False,
                 "rows": [],
             }
+            if row.get("task_id"):
+                group["task_id"] = row["task_id"]
+            if row.get("source_trajectory_id"):
+                group["source_trajectory_id"] = row["source_trajectory_id"]
             groups_by_id[trajectory_id] = group
             groups.append(group)
         group["rows"].append(row)
@@ -378,23 +426,26 @@ def _load_snapshot_uncached(
     *,
     asset_root: Path | None = None,
     source_kind: str | None = None,
+    allow_excel_import: bool = False,
 ) -> dict[str, Any]:
     """Load the first sheet and return a JSON-safe immutable-ish snapshot."""
     if workbook_path.suffix.lower() not in WORKBOOK_SUFFIXES:
         raise ValueError("仅支持 .xlsx 或 .xlsm 文件；旧版 .xls 请先另存为 .xlsx")
-    if not workbook_path.is_file():
+    if not structured_input_exists(workbook_path) and not (allow_excel_import and workbook_path.is_file()):
         raise FileNotFoundError(f"Excel 文件不存在：{workbook_path}")
 
-    workbook = load_workbook(workbook_path, read_only=True, data_only=True)
+    workbook = open_source_workbook(workbook_path, allow_excel_import=allow_excel_import, read_only=True, data_only=True)
     try:
         sheet = workbook.active
         headers = _headers(sheet)
         if ANNOTATED_REQUIRED_COLUMNS.issubset(headers):
+            structured = read_workbook_payload(workbook_path) if has_workbook_json(workbook_path) else None
             return _load_annotated_snapshot(
                 sheet,
                 headers,
                 asset_root=asset_root,
                 workbook_path=workbook_path,
+                source_rows=structured["sheets"].get(sheet.title) if structured else None,
             )
         missing = sorted(REQUIRED_COLUMNS - headers.keys())
         if not _column(headers, *ACTION_COLUMN_NAMES):
@@ -472,6 +523,7 @@ def load_snapshot(
     *,
     asset_root: Path | None = None,
     source_kind: str | None = None,
+    allow_excel_import: bool = False,
 ) -> dict[str, Any]:
     """Load a workbook snapshot with process-local, change-aware caching.
 
@@ -481,8 +533,16 @@ def load_snapshot(
     workbook_path = Path(workbook_path)
     if workbook_path.suffix.lower() not in WORKBOOK_SUFFIXES:
         raise ValueError("仅支持 .xlsx 或 .xlsm 文件；旧版 .xls 请先另存为 .xlsx")
-    if not workbook_path.is_file():
-        raise FileNotFoundError(f"Excel 文件不存在：{workbook_path}")
+    if not structured_input_exists(workbook_path) and not (allow_excel_import and workbook_path.is_file()):
+        raise FileNotFoundError(f"轨迹 JSON 输入不存在：{sidecar_path(workbook_path)}")
+
+    if has_workbook_json(workbook_path):
+        # The sidecar may resolve a newer SQLite annotation revision; do not
+        # key this structured view on a possibly deleted/stale Excel export.
+        return _load_snapshot_uncached(workbook_path, asset_root=asset_root, source_kind=source_kind)
+
+    if not allow_excel_import:
+        raise FileNotFoundError(f"轨迹 JSON 输入不存在：{sidecar_path(workbook_path)}")
 
     key = _snapshot_cache_key(
         workbook_path,
@@ -507,6 +567,7 @@ def load_snapshot(
             workbook_path,
             asset_root=asset_root,
             source_kind=source_kind,
+            allow_excel_import=allow_excel_import,
         )
         _SNAPSHOT_CACHE[key] = deepcopy(snapshot)
         return deepcopy(snapshot)

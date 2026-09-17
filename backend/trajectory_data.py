@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import re
 import threading
+import tempfile
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -14,13 +16,16 @@ from openpyxl import load_workbook
 from PIL import Image
 
 from .trajectories_tree.tree_builder import parse_action
+from .data_store import DATA_ROOT, ArtifactStore
+from .trajectory_context import (resolve_batch_context, row_task_id, row_trajectory_id,
+    row_identity_metadata, annotation_batch_lock, AnnotationVersionConflict, TrajectoryBatchContext)
 
 
 BACKEND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BACKEND_DIR.parent
-WORKSPACE_DIR = PROJECT_ROOT / "backend_workspace"
-TRAJECTORY_ROOT = WORKSPACE_DIR / "rollout_trajectories"
-ANNOTATED_XLSX = WORKSPACE_DIR / "annotated_trajectories.xlsx"
+WORKSPACE_DIR = DATA_ROOT / "system"
+TRAJECTORY_ROOT = DATA_ROOT / "raw" / "rollout_trajectories"
+ANNOTATED_XLSX = WORKSPACE_DIR / "preprocessing" / "annotated_trajectories.xlsx"
 TREE_RUNS_DIR = WORKSPACE_DIR / "trajectory_tree_runs"
 TREE_JOBS_DIR = WORKSPACE_DIR / "trajectory_tree_jobs"
 QUALITY_JOBS_DIR = WORKSPACE_DIR / "trajectory_quality_jobs"
@@ -124,167 +129,96 @@ def _step_number(image: str, fallback: int) -> int:
     return int(match.group(1)) if match else fallback
 
 
-def asset_url(relative_path: str) -> str:
+def asset_url(relative_path: str, batch_id: str | None = None, annotation_version: str | None = None) -> str:
     normalized = relative_path.replace("\\", "/").strip("/")
-    return "/api/assets/" + quote(normalized, safe="/")
+    url = "/api/assets/" + quote(normalized, safe="/")
+    if batch_id:
+        url += "?batch_id=" + quote(batch_id, safe="")
+        if annotation_version:
+            url += "&annotation_version=" + quote(annotation_version, safe="")
+    return url
 
 
-def load_annotated_trajectories(
-    xlsx_path: Path = ANNOTATED_XLSX,
-) -> dict[str, list[dict[str, Any]]]:
-    """Return task -> trajectories, preserving every annotated workbook row."""
-    if not xlsx_path.is_file():
-        return {}
-    workbook = load_workbook(xlsx_path, read_only=True, data_only=True)
-    try:
-        sheet = workbook.active
-        headers = {
-            str(cell.value).strip(): cell.column
-            for cell in sheet[1]
-            if cell.value is not None
-        }
-        required = {"image", "xml", "action", "summary", "actions_box"}
-        missing = sorted(required - headers.keys())
-        if missing:
-            raise ValueError(f"Excel 缺少必要列：{', '.join(missing)}")
-        trajectory_column = headers.get("文件夹名", 1)
-        grouped: dict[str, dict[str, list[dict[str, Any]]]] = {}
-        for row_index in range(2, sheet.max_row + 1):
-            trajectory = str(sheet.cell(row_index, trajectory_column).value or "").strip()
-            image = str(sheet.cell(row_index, headers["image"]).value or "").strip()
-            if not trajectory or not image:
-                continue
-            task_id = task_id_from_resource(image)
-            if not task_id:
-                continue
-            action_text = str(sheet.cell(row_index, headers["action"]).value or "")
-            steps = grouped.setdefault(task_id, {}).setdefault(trajectory, [])
-            steps.append(
-                {
-                    "step": _step_number(image, len(steps) + 1),
-                    "excel_row": row_index,
-                    "image": image,
-                    "image_url": asset_url(image),
-                    "xml": str(sheet.cell(row_index, headers["xml"]).value or "").strip(),
-                    "action_text": action_text,
-                    "action": parse_action(action_text),
-                    "action_summary": str(
-                        sheet.cell(row_index, headers["summary"]).value or ""
-                    ),
-                    "actions_box": str(
-                        sheet.cell(row_index, headers["actions_box"]).value or ""
-                    ),
-                }
-            )
-    finally:
-        workbook.close()
-
-    result: dict[str, list[dict[str, Any]]] = {}
-    for task_id, trajectories in grouped.items():
-        result[task_id] = []
-        for trajectory, steps in sorted(trajectories.items(), key=lambda item: item[0]):
-            steps.sort(key=lambda step: (step["step"], step["excel_row"]))
-            result[task_id].append(
-                {"trajectory_id": trajectory, "step_count": len(steps), "steps": steps}
-            )
-    return result
-
+def _load_annotated_trajectories(xlsx_path: Path = ANNOTATED_XLSX, *, payload: dict[str, Any] | None = None,
+                                 batch_id: str | None = None, annotation_version: str | None = None) -> dict[str, list[dict[str, Any]]]:
+    """Read current steps exclusively from the configured JSON snapshot."""
+    from .stage_artifacts import read_workbook_payload, structured_input_exists
+    if payload is None:
+        if not structured_input_exists(xlsx_path):
+            if xlsx_path.is_file():
+                raise FileNotFoundError(f"Required JSON snapshot is missing: {xlsx_path.with_suffix('.json')}")
+            return {}
+        payload = read_workbook_payload(xlsx_path)
+    name = next(iter(payload["sheets"]))
+    rows = payload["sheets"][name]
+    required = {"image", "xml", "action", "summary", "actions_box"}
+    headers = set(payload.get("columns", {}).get(name) or (rows[0] if rows else {}))
+    missing = sorted(required - headers)
+    if missing:
+        raise ValueError(f"Excel 缺少必要列：{', '.join(missing)}")
+    grouped = {}
+    for row_index, row in enumerate(rows, 2):
+        trajectory = row_trajectory_id(row)
+        image = str(row.get("image") or "").strip()
+        if not trajectory or not image:
+            continue
+        task_id = row_task_id(row)
+        steps = grouped.setdefault(task_id, {}).setdefault(trajectory, [])
+        action_text = str(row.get("action") or "")
+        steps.append({
+            "step": _step_number(image, len(steps) + 1), "excel_row": row_index,
+            "image": image, "image_url": asset_url(image, batch_id, annotation_version),
+            **row_identity_metadata(row),
+            "xml": str(row.get("xml") or "").strip(),
+            "action_text": action_text, "action": parse_action(action_text),
+            "action_summary": str(row.get("summary") or ""),
+            "actions_box": str(row.get("actions_box") or ""),
+        })
+    return {task_id: [{"trajectory_id": trajectory, "step_count": len(steps),
+                      **row_identity_metadata(steps[0]),
+                      "steps": sorted(steps, key=lambda step: (step["step"], step["excel_row"]))}
+                     for trajectory, steps in sorted(trajectories.items())]
+            for task_id, trajectories in grouped.items()}
 
 def trajectory_summaries(
     task_id: str,
     xlsx_path: Path = ANNOTATED_XLSX,
+    *, batch_id: str | None = None, annotation_version: str | None = None, data_root: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Return only trajectory names and counts for the task list UI."""
-    return load_trajectory_index(xlsx_path).get(task_id, [])
+    return load_trajectory_index(xlsx_path, batch_id=batch_id, annotation_version=annotation_version, data_root=data_root).get(task_id, [])
 
 
-def load_trajectory_index(
-    xlsx_path: Path = ANNOTATED_XLSX,
-) -> dict[str, list[dict[str, Any]]]:
-    """Scan only identifiers/counts, avoiding action parsing until a trajectory opens."""
-    if not xlsx_path.is_file():
-        return {}
-    workbook = load_workbook(xlsx_path, read_only=True, data_only=True)
-    try:
-        sheet = workbook.active
-        header_values = next(sheet.iter_rows(min_row=1, max_row=1, values_only=True))
-        headers = {
-            str(value).strip(): index
-            for index, value in enumerate(header_values)
-            if value is not None
-        }
-        image_column = headers.get("image")
-        trajectory_column = headers.get("文件夹名", 0)
-        if image_column is None:
-            raise ValueError("Excel 缺少必要列：image")
-        counts: dict[str, dict[str, int]] = {}
-        for row in sheet.iter_rows(min_row=2, values_only=True):
-            trajectory = str(row[trajectory_column] or "").strip()
-            image = str(row[image_column] or "").strip()
-            task_id = task_id_from_resource(image)
-            if trajectory and task_id:
-                task_counts = counts.setdefault(task_id, {})
-                task_counts[trajectory] = task_counts.get(trajectory, 0) + 1
-    finally:
-        workbook.close()
-    return {
-        task_id: [
-            {"trajectory_id": trajectory, "step_count": count}
-            for trajectory, count in sorted(trajectories.items())
-        ]
-        for task_id, trajectories in counts.items()
-    }
+def _load_trajectory_index(xlsx_path: Path = ANNOTATED_XLSX, *, payload: dict[str, Any] | None = None) -> dict[str, list[dict[str, Any]]]:
+    """Read IDs without parsing actions; JSON remains usable without its Excel."""
+    from .stage_artifacts import read_workbook_payload, structured_input_exists
+    if payload is None:
+        if not structured_input_exists(xlsx_path):
+            if xlsx_path.is_file():
+                raise FileNotFoundError(f"Required JSON snapshot is missing: {xlsx_path.with_suffix('.json')}")
+            return {}
+        payload = read_workbook_payload(xlsx_path)
+    name = next(iter(payload["sheets"]))
+    rows = payload["sheets"][name]
+    headers = payload.get("columns", {}).get(name) or (rows[0] if rows else {})
+    if "image" not in headers:
+        raise ValueError("Excel 缺少必要列：image")
+    counts = {}
+    identities = {}
+    for row in rows:
+        trajectory = row_trajectory_id(row)
+        task_id = row_task_id(row)
+        if trajectory and task_id:
+            values = counts.setdefault(task_id, {})
+            values[trajectory] = values.get(trajectory, 0) + 1
+            identities[(task_id, trajectory)] = row_identity_metadata(row)
+    return {task_id: [{"trajectory_id": trajectory, "step_count": count, **identities[(task_id, trajectory)]}
+                     for trajectory, count in sorted(items.items())]
+            for task_id, items in counts.items()}
 
-
-def load_annotated_trajectory(
-    task_id: str,
-    trajectory_id: str,
-    xlsx_path: Path = ANNOTATED_XLSX,
-) -> dict[str, Any] | None:
-    """Load one trajectory on demand after its name is selected in the UI."""
-    if not xlsx_path.is_file():
-        return None
-    workbook = load_workbook(xlsx_path, read_only=True, data_only=True)
-    steps: list[dict[str, Any]] = []
-    try:
-        sheet = workbook.active
-        header_values = next(sheet.iter_rows(min_row=1, max_row=1, values_only=True))
-        headers = {
-            str(value).strip(): index
-            for index, value in enumerate(header_values)
-            if value is not None
-        }
-        required = {"image", "xml", "action", "summary", "actions_box"}
-        missing = sorted(required - headers.keys())
-        if missing:
-            raise ValueError(f"Excel 缺少必要列：{', '.join(missing)}")
-        trajectory_column = headers.get("文件夹名", 0)
-        for row_index, row in enumerate(sheet.iter_rows(min_row=2, values_only=True), 2):
-            current_trajectory = str(row[trajectory_column] or "").strip()
-            image = str(row[headers["image"]] or "").strip()
-            if current_trajectory != trajectory_id or task_id_from_resource(image) != task_id:
-                continue
-            action_text = str(row[headers["action"]] or "")
-            steps.append(
-                {
-                    "step": _step_number(image, len(steps) + 1),
-                    "excel_row": row_index,
-                    "image": image,
-                    "image_url": asset_url(image),
-                    "xml": str(row[headers["xml"]] or "").strip(),
-                    "action_text": action_text,
-                    "action": parse_action(action_text),
-                    "action_summary": str(row[headers["summary"]] or ""),
-                    "actions_box": str(row[headers["actions_box"]] or ""),
-                }
-            )
-    finally:
-        workbook.close()
-    if not steps:
-        return None
-    steps.sort(key=lambda step: (step["step"], step["excel_row"]))
-    return {"trajectory_id": trajectory_id, "step_count": len(steps), "steps": steps}
-
+def _load_annotated_trajectory(task_id: str, trajectory_id: str, xlsx_path: Path = ANNOTATED_XLSX) -> dict[str, Any] | None:
+    return next((item for item in _load_annotated_trajectories(xlsx_path).get(task_id, [])
+                 if item["trajectory_id"] == trajectory_id), None)
 
 def _format_manual_actions_box(
     action: dict[str, Any], bbox: tuple[int, int, int, int]
@@ -321,10 +255,19 @@ def update_action_bbox(
     *,
     xlsx_path: Path = ANNOTATED_XLSX,
     trajectory_root: Path = TRAJECTORY_ROOT,
-) -> str:
+    batch_id: str | None = None, expected_annotation_version: str | None = None,
+    data_root: Path | None = None,
+) -> str | dict[str, Any]:
     """Validate and atomically persist a manually redrawn action bbox."""
-    if not xlsx_path.is_file():
-        raise FileNotFoundError("标注轨迹 Excel 不存在")
+    if batch_id is not None:
+        return _update_batch_bbox(batch_id, task_id, trajectory_id, step, excel_row, bbox,
+                                  action_override, expected_annotation_version, data_root)
+    if xlsx_path == ANNOTATED_XLSX:
+        xlsx_path = resolve_annotated_path(task_id)
+    from .stage_artifacts import (structured_input_exists, read_workbook_payload, write_payload_workbook,
+                                  publish_workbook, store_root)
+    if not structured_input_exists(xlsx_path):
+        raise FileNotFoundError("标注轨迹 JSON 不存在")
     if excel_row < 2:
         raise ValueError("无效的 Excel 行号")
     x1, y1, x2, y2 = (int(value) for value in bbox)
@@ -332,8 +275,13 @@ def update_action_bbox(
         raise ValueError("bbox 必须是有效的 [x1,y1,x2,y2]")
 
     with BBOX_WRITE_LOCK:
-        workbook = load_workbook(xlsx_path)
         temporary_path = xlsx_path.with_name(f".{xlsx_path.stem}.bbox-edit.tmp{xlsx_path.suffix}")
+        current = read_workbook_payload(xlsx_path)
+        from .stage_artifacts import fingerprint, sidecar_path
+        source_file = sidecar_path(xlsx_path)
+        previous = current.get("source_ref") or {"kind": "annotation_snapshot", "path": str(source_file), "sha256": fingerprint(source_file)}
+        write_payload_workbook(temporary_path, current)
+        workbook = load_workbook(temporary_path)
         try:
             sheet = workbook.active
             headers = {
@@ -371,6 +319,9 @@ def update_action_bbox(
             workbook.save(temporary_path)
             workbook.close()
             temporary_path.replace(xlsx_path)
+            publish_workbook(xlsx_path, batch_id=str(previous.get("batch_id") or "manual-annotation"),
+                             stage="02_annotation", source_refs=[previous] if previous else [],
+                             metadata={"manual_bbox": {"task_id": task_id, "trajectory_id": trajectory_id, "step": step}})
             return actions_box
         finally:
             workbook.close()
@@ -381,9 +332,15 @@ def update_action_bbox(
 def task_summaries(
     trajectory_root: Path = TRAJECTORY_ROOT,
     xlsx_path: Path = ANNOTATED_XLSX,
+    *, batch_id: str | None = None, annotation_version: str | None = None, data_root: Path | None = None,
 ) -> list[dict[str, Any]]:
-    metadata = discover_tasks(trajectory_root)
-    annotated = load_trajectory_index(xlsx_path)
+    if batch_id is not None:
+        context = resolve_batch_context(batch_id, annotation_version, data_root)
+        metadata = batch_task_metadata(context)
+        annotated = _load_trajectory_index(payload=context.payload)
+    else:
+        metadata = discover_tasks(trajectory_root)
+        annotated = load_trajectory_index(xlsx_path)
     values: list[dict[str, Any]] = []
     for task_id, item in metadata.items():
         trajectories = annotated.get(task_id, [])
@@ -401,7 +358,10 @@ def task_summaries(
     return values
 
 
-def resolve_image_asset(relative_path: str, root: Path = TRAJECTORY_ROOT) -> Path:
+def resolve_image_asset(relative_path: str, root: Path = TRAJECTORY_ROOT, *, batch_id: str | None = None,
+                        annotation_version: str | None = None, data_root: Path | None = None) -> Path:
+    if batch_id is not None:
+        root = resolve_batch_context(batch_id, annotation_version, data_root).raw_root
     normalized = relative_path.replace("\\", "/").lstrip("/")
     candidate = (root / Path(normalized)).resolve()
     resolved_root = root.resolve()
@@ -434,3 +394,124 @@ def list_tree_runs(runs_dir: Path = TREE_RUNS_DIR) -> list[dict[str, Any]]:
 
 def find_tree_run(run_id: str, runs_dir: Path = TREE_RUNS_DIR) -> dict[str, Any] | None:
     return next((item for item in list_tree_runs(runs_dir) if item.get("run_id") == run_id), None)
+
+
+def resolve_tree_run_dir(run_id: str, runs_dir: Path = TREE_RUNS_DIR) -> Path:
+    candidate = (runs_dir / run_id).resolve()
+    if not candidate.is_relative_to(runs_dir.resolve()):
+        raise ValueError("无效建树批次编号")
+    return candidate
+
+
+def annotated_sources(xlsx_path: Path = ANNOTATED_XLSX) -> list[Path]:
+    return [xlsx_path]
+
+
+def resolve_annotated_path(task_id: str | None = None) -> Path:
+    from .stage_artifacts import structured_input_exists
+    for path in reversed(annotated_sources()):
+        if structured_input_exists(path) and (task_id is None or task_id in _load_trajectory_index(path)):
+            return path
+    return ANNOTATED_XLSX
+
+
+def load_annotated_trajectories(xlsx_path: Path = ANNOTATED_XLSX, *, batch_id: str | None = None,
+                                annotation_version: str | None = None, data_root: Path | None = None) -> dict[str, list[dict[str, Any]]]:
+    if batch_id is not None:
+        context = resolve_batch_context(batch_id, annotation_version, data_root)
+        return _load_annotated_trajectories(payload=context.payload, batch_id=batch_id,
+                                           annotation_version=context.annotation_version)
+    merged = {}
+    for path in annotated_sources(xlsx_path):
+        merged.update(_load_annotated_trajectories(path))
+    return merged
+
+
+def load_trajectory_index(xlsx_path: Path = ANNOTATED_XLSX, *, batch_id: str | None = None,
+                          annotation_version: str | None = None, data_root: Path | None = None) -> dict[str, list[dict[str, Any]]]:
+    if batch_id is not None:
+        context = resolve_batch_context(batch_id, annotation_version, data_root)
+        return _load_trajectory_index(payload=context.payload)
+    merged = {}
+    for path in annotated_sources(xlsx_path):
+        merged.update(_load_trajectory_index(path))
+    return merged
+
+
+def load_annotated_trajectory(task_id: str, trajectory_id: str, xlsx_path: Path = ANNOTATED_XLSX, *,
+                             batch_id: str | None = None, annotation_version: str | None = None,
+                             data_root: Path | None = None) -> dict[str, Any] | None:
+    if batch_id is not None:
+        return next((item for item in load_annotated_trajectories(batch_id=batch_id,
+                    annotation_version=annotation_version, data_root=data_root).get(task_id, [])
+                    if item["trajectory_id"] == trajectory_id), None)
+    for path in reversed(annotated_sources(xlsx_path)):
+        result = _load_annotated_trajectory(task_id, trajectory_id, path)
+        if result is not None:
+            return result
+    return None
+
+
+def batch_task_metadata(context: TrajectoryBatchContext) -> dict[str, TaskMetadata]:
+    """Discover labels from this snapshot only, including old new-store batches."""
+    tasks = {}
+    for rows in context.payload["sheets"].values():
+        for row in rows:
+            task_id = row_task_id(row)
+            if task_id in tasks:
+                continue
+            goal = context.task_goals.get(task_id, "")
+            warning = ""
+            if not goal:
+                request = (context.raw_root / str(row["image"]).replace("\\", "/")).parent / "turn001_orch_model_request.json"
+                if request.is_file():
+                    try:
+                        goal = extract_original_goal(request)
+                    except (OSError, ValueError):
+                        warning = "无法读取原始目标"
+            tasks[task_id] = TaskMetadata(task_id, goal or task_id, warning,
+                                          str(row.get("source_trajectory_id") or row.get("文件夹名") or row_trajectory_id(row)))
+    return tasks
+
+
+def _update_batch_bbox(batch_id, task_id, trajectory_id, step, excel_row, bbox,
+                       action_override, expected_version, data_root):
+    from .stage_artifacts import write_payload_workbook
+    if not expected_version:
+        raise AnnotationVersionConflict("修改标框必须提供当前 annotation_version")
+    root = Path(data_root or DATA_ROOT).resolve()
+    with annotation_batch_lock(batch_id, root):
+        context = resolve_batch_context(batch_id, root=root)
+        if context.annotation_version != expected_version:
+            raise AnnotationVersionConflict("标框版本已更新，请刷新后重试")
+        if len(bbox) != 4:
+            raise ValueError("bbox 必须包含四个整数")
+        x1, y1, x2, y2 = (int(value) for value in bbox)
+        if x1 < 0 or y1 < 0 or x2 <= x1 or y2 <= y1:
+            raise ValueError("bbox 必须是有效的 [x1,y1,x2,y2]")
+        payload = deepcopy(context.payload)
+        name = next(iter(payload["sheets"]))
+        rows = payload["sheets"][name]
+        if excel_row < 2 or excel_row - 2 >= len(rows):
+            raise ValueError("无效的 Excel 行号")
+        row = rows[excel_row - 2]
+        if row_task_id(row) != task_id or row_trajectory_id(row) != trajectory_id or _step_number(str(row.get("image")), -1) != step:
+            raise ValueError("行与任务、轨迹或步骤不匹配")
+        image = resolve_image_asset(str(row["image"]), context.raw_root)
+        with Image.open(image) as screenshot:
+            width, height = screenshot.size
+        if x2 > width or y2 > height:
+            raise ValueError(f"bbox 超出截图范围 {width}x{height}")
+        value = _format_manual_actions_box(action_override or parse_action(str(row["action"])), (x1, y1, x2, y2))
+        row["actions_box"] = value
+        temporary_root = root / "tmp" / "annotation_edits"
+        temporary_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=temporary_root) as directory:
+            path = Path(directory) / "annotated_trajectories.xlsx"
+            write_payload_workbook(path, payload)
+            artifact = ArtifactStore(root).publish(batch_id, "02_annotation", payload,
+                workbooks={path.name: path}, source_refs=[context.annotation_ref],
+                metadata={"raw_root": str(context.raw_root),
+                          "manual_bbox": {"task_id": task_id, "trajectory_id": trajectory_id, "step": step}})
+        return {"actions_box": value, "batch_id": batch_id,
+                "annotation_version": artifact["version"], "annotation_ref": artifact}

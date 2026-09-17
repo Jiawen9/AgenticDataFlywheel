@@ -3,21 +3,22 @@
 from __future__ import annotations
 
 from pathlib import Path
+from ..data_store.paths import DATA_ROOT
 
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = BACKEND_DIR.parent
-WORKSPACE_DIR = PROJECT_ROOT / "backend_workspace"
-FIXED_ANNOTATED_XLSX = WORKSPACE_DIR / "annotated_trajectories.xlsx"
-FIXED_TRAJECTORY_ROOT = WORKSPACE_DIR / "rollout_trajectories"
+WORKSPACE_DIR = DATA_ROOT
+FIXED_ANNOTATED_XLSX = DATA_ROOT / "system" / "preprocessing" / "annotated_trajectories.xlsx"
+FIXED_TRAJECTORY_ROOT = DATA_ROOT / "raw" / "rollout_trajectories"
 FIXED_SOURCE_ID = "project/annotated_trajectories.xlsx"
-CORRECTION_DATA_DIR = PROJECT_ROOT / "backend_workspace" / "trajectory_correction"
+CORRECTION_DATA_DIR = DATA_ROOT / "system" / "trajectory_correction"
 CORRECTION_INPUTS_DIR = CORRECTION_DATA_DIR / "inputs"
 CORRECTION_SESSIONS_DIR = CORRECTION_DATA_DIR / "sessions"
 CORRECTION_EXPORTS_DIR = CORRECTION_DATA_DIR / "exports"
 CORRECTION_COT_JOBS_DIR = CORRECTION_DATA_DIR / "cot_jobs"
-CORRECTION_COT_CACHE_DIR = CORRECTION_DATA_DIR / "cot_cache"
-CORRECTION_BBOX_CACHE_DIR = CORRECTION_DATA_DIR / "bbox_cache"
+CORRECTION_COT_CACHE_DIR = DATA_ROOT / "cache" / "trajectory_correction" / "cot"
+CORRECTION_BBOX_CACHE_DIR = DATA_ROOT / "cache" / "trajectory_correction" / "bbox"
 
 WORKBOOK_SUFFIXES = {".xlsx", ".xlsm"}
 UPLOAD_SUFFIXES = WORKBOOK_SUFFIXES | {".zip"}

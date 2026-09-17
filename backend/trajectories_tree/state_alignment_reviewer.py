@@ -191,19 +191,17 @@ class QwenStateAlignmentReviewer:
                     {"role": "user", "content": content},
                 ],
                 temperature=0.0,
-                max_tokens=250,
+                max_tokens=2048 if self.model.strip().lower() == "qwen3.8-max" else 250,
                 extra_body={
                     "enable_thinking": False,
                     "chat_template_kwargs": {"enable_thinking": False},
                 },
+                **({"response_format": {"type": "json_object"}} if self.model.strip().lower() == "qwen3.8-max" else {}),
             )
-            message = response.choices[0].message
-            raw = (
-                message.content
-                or getattr(message, "reasoning_content", None)
-                or getattr(message, "reasoning", None)
-                or ""
-            ).strip()
+            choice = response.choices[0]
+            if getattr(choice, "finish_reason", None) == "length":
+                raise ValueError("Qwen state-alignment response was truncated (finish_reason=length); result was not cached")
+            raw = (choice.message.content or "").strip()
             if not raw:
                 raise ValueError("Qwen returned an empty state-alignment review")
             parse_alignment_response(raw)

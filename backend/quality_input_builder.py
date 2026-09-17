@@ -8,9 +8,12 @@ from typing import Any, Callable
 
 from .DevelopRubrics.trajectory_tools.gui_trajectory_excel import (
     QwenSummarizer, StepRecord, TaskRecord, TrajectoryRecord, write_workbook,
+    SYSTEM_PROMPT, DOMAIN, EXPECTED_TOOLS,
 )
+from .data_store import DATA_ROOT
+from .stage_artifacts import write_sidecar
 
-FINAL_ANSWER_CACHE = Path(__file__).resolve().parent.parent / "backend_workspace" / "rubric_outputs" / "cache" / "qwen_tree_final_answers.json"
+FINAL_ANSWER_CACHE = DATA_ROOT / "cache" / "rubric_outputs" / "qwen_tree_final_answers.json"
 
 def _env(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
@@ -47,7 +50,8 @@ def build_quality_workbook(*, grouped: dict[str, list[tuple[str, list[Any]]]], t
                 screenshot = str(Path(step.image))
                 prefix = f"step{step.step_index:03d}_vla"
                 records.append(StepRecord(trajectory_id, task_id, step.step_index, action,
-                    {"summary": step.summary, "screenshot": screenshot}, step.observation,
+                    {"summary": step.summary, "screenshot": screenshot,
+                     "source_identity": step.identity_dict() if hasattr(step, "identity_dict") else {}}, step.observation,
                     str(Path(screenshot).with_name(f"{prefix}_model_request.json")),
                     str(Path(screenshot).with_name(f"{prefix}_model_response.json")), screenshot, ""))
             source_directory = str(Path(retained_steps[0].image).parent)
@@ -92,6 +96,30 @@ def build_quality_workbook(*, grouped: dict[str, list[tuple[str, list[Any]]]], t
             raise RuntimeError(f"missing trajectory summary: {trajectory_id}")
         trajectories.append(TrajectoryRecord(trajectory_id, task_id, source_directory, final_answer,
             {"source_directory": source_directory, "observation_model": values["MODEL_NAME"],
-             "observation_prompt_version": "trajectory-intermediate-observation-v4"}, records))
+             "observation_prompt_version": "trajectory-intermediate-observation-v4",
+             "source_identity": records[0].action_input.get("source_identity", {})}, records))
     write_workbook(output, tasks, trajectories)
+    write_sidecar(output, _quality_payload(tasks, trajectories))
     return len(tasks), len(trajectories), sum(len(item.steps) for item in trajectories)
+
+
+def _quality_payload(tasks: dict[str, TaskRecord], trajectories: list[TrajectoryRecord]) -> dict[str, Any]:
+    """Keep structured identity in memory; Excel is only the corresponding view."""
+    encode = lambda value: json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    columns = {
+        "Tasks": ["task_id", "task_text", "instruction", "domain", "complexity", "context_json", "expected_tools_json"],
+        "Trajectories": ["trajectory_id", "task_id", "source_directory", "step_count", "final_answer", "metadata_json"],
+        "Steps": ["trajectory_id", "task_id", "step_id", "action", "action_input_json", "observation",
+                  "request_file", "response_file", "screenshot_path", "source_warning"],
+    }
+    values = {
+        "Tasks": [[task.task_id, task.task_text, f"{SYSTEM_PROMPT}\n\nTask:\n{task.task_text}", DOMAIN, "complex",
+                   encode({"task_description": task.task_text}), encode(EXPECTED_TOOLS)] for task in tasks.values()],
+        "Trajectories": [[item.trajectory_id, item.task_id, item.source_directory, len(item.steps), item.final_answer,
+                          encode(item.metadata)] for item in trajectories],
+        "Steps": [[step.trajectory_id, step.task_id, step.step_id, step.action, encode(step.action_input), step.observation,
+                   step.request_file, step.response_file, step.screenshot_path, step.source_warning]
+                  for item in trajectories for step in item.steps],
+    }
+    return {"schema_version": 1, "columns": columns,
+            "sheets": {name: [dict(zip(columns[name], row)) for row in rows] for name, rows in values.items()}}
