@@ -58,6 +58,8 @@ class InternalUploadTests(unittest.TestCase):
         sessions = []
         for index in range(count):
             session = self.add_session(f"{index:016x}")
+            # Each uploaded workbook is the sole current session of its own
+            # business batch; multi-file release ordering remains under test.
             workbook = Workbook()
             workbook.active.append(["任务", "Thought"])
             workbook.active.append([f"任务 {index}", "已发布的思考"])

@@ -1,13 +1,15 @@
-"""Shared adapters between trajectory workbooks and immutable stage versions.
+"""Shared adapters between trajectory workbooks and current batch artifacts.
 
-New workbook sidecars are the authoritative structured values. Excel is an
-export and is never implicitly imported after a structured version exists.
+Structured payloads are authoritative. Registered annotation views follow the
+current batch artifact; Excel is an export and is never implicitly reimported.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import uuid
+from copy import deepcopy
+from tempfile import TemporaryDirectory
 from pathlib import Path
 from typing import Any
 
@@ -100,9 +102,16 @@ def read_workbook_payload(path: Path, *, allow_excel_import: bool = False, data_
         if value.get("source_ref", {}).get("stage") == "02_annotation":
             workbook_path = path.with_suffix(".xlsx")
             key = hashlib.sha256(str(workbook_path.resolve()).encode("utf-8")).hexdigest()
-            stored = RecordStore(store_root(workbook_path, data_root)).get("trajectory_annotations", key)
+            root = store_root(workbook_path, data_root)
+            stored = RecordStore(root).get("trajectory_annotations", key)
             if stored is not None:
-                return {**stored["payload"], "source_ref": stored["artifact"]}
+                store = ArtifactStore(root)
+                ref = stored.get("artifact") or value.get("source_ref", {})
+                with store.batch_lock(ref["batch_id"]):
+                    current = store.get(ref["batch_id"], "02_annotation")
+                    if current is None:
+                        raise FileNotFoundError("该批次当前标框结果已失效")
+                    return {**store.read_payload(current), "source_ref": current}
         return value
     candidate = sidecar_path(path)
     if candidate.is_file():
@@ -118,19 +127,92 @@ def structured_input_exists(path: Path) -> bool:
     return sidecar_path(path).is_file()
 
 
+def assert_unmanaged_output(path: Path, data_root: Path) -> None:
+    """CLI exports must not overwrite a store-managed artifact before commit."""
+    resolved, root = Path(path).resolve(), Path(data_root).resolve()
+    if any(resolved.is_relative_to(root / name) for name in ("batches", "releases")):
+        raise ValueError("导出路径不能直接写入受管理的 batches 或 releases 目录")
+
+
+def _same_publication(store: ArtifactStore, ref: dict | None, entry: dict) -> bool:
+    if not ref or store.read_payload(ref) != entry["payload"]:
+        return False
+    metadata = lambda value: {key: item for key, item in (value or {}).items()
+                              if key not in {"job_id", "run_id", "preprocessing_job_id", "updated_at", "created_at"}}
+    return metadata(ref.get("metadata")) == metadata(entry.get("metadata")) and ref.get("source_refs", []) == entry.get("source_refs", [])
+
+
+def publish_workbooks(entries: list[dict], *, batch_id: str, data_root: Path,
+                      expected_annotation_version: str | None = None,
+                      check_annotation_version: bool = False) -> list[dict]:
+    """Commit CLI conversion/annotation together and durably invalidate changed tasks.
+
+    A conversion-only update retains annotations of unchanged tasks. Annotation
+    updates notify the same task-level recovery outbox used by HTTP jobs.
+    """
+    from .batch_results import (annotation_task_fingerprints, _rows_for_tasks,
+                               invalidation_record_entry, drain_batch_invalidations)
+    store = ArtifactStore(data_root)
+    requested = [deepcopy(entry) for entry in entries]
+    with store.batch_lock(batch_id), TemporaryDirectory(prefix="adf-stage-view-") as directory:
+        prior_annotation = store.get(batch_id, "02_annotation")
+        if check_annotation_version and (prior_annotation or {}).get("version") != expected_annotation_version:
+            raise ValueError("处理期间标框已更新，已保留当前结果；请重新处理")
+        before = store.read_payload(prior_annotation) if prior_annotation else {}
+        by_stage = {entry["stage"]: entry for entry in requested}
+        conversion = by_stage.get("01_conversion")
+        old_conversion = store.get(batch_id, "01_conversion")
+        if (conversion is not None and "02_annotation" not in by_stage and prior_annotation
+                and not _same_publication(store, old_conversion, conversion)):
+            old_payload = store.read_payload(old_conversion) if old_conversion else {}
+            old_hashes, new_hashes = annotation_task_fingerprints(old_payload), annotation_task_fingerprints(conversion["payload"])
+            changed = {task for task in set(old_hashes) | set(new_hashes) if old_hashes.get(task) != new_hashes.get(task)}
+            retained = _rows_for_tasks(before, set(annotation_task_fingerprints(before)) - changed)
+            path = Path(directory) / "annotated_trajectories.xlsx"
+            write_payload_workbook(path, retained)
+            by_stage["02_annotation"] = {"stage": "02_annotation", "payload": retained,
+                "workbooks": {path.name: path}, "source_stages": ["01_conversion"],
+                "metadata": {**prior_annotation.get("metadata", {}), "stale_tasks": sorted(changed)}}
+        publications, result = [], {}
+        for stage, entry in sorted(by_stage.items()):
+            entry.setdefault("source_refs", [])
+            entry.setdefault("metadata", {})
+            # A prior stage already reused in this transaction can be referenced directly.
+            source_stages = entry.get("source_stages", [])
+            entry["source_stages"] = [value for value in source_stages if value not in result]
+            entry["source_refs"].extend(result[value] for value in source_stages if value in result)
+            current = store.get(batch_id, stage)
+            if not entry["source_stages"] and _same_publication(store, current, entry):
+                result[stage] = current
+            else:
+                publications.append(entry)
+        annotation_entry = by_stage.get("02_annotation")
+        notifications = []
+        if annotation_entry is not None and any(entry["stage"] == "02_annotation" for entry in publications):
+            old_hashes, new_hashes = annotation_task_fingerprints(before), annotation_task_fingerprints(annotation_entry["payload"])
+            changed = {task for task in set(old_hashes) | set(new_hashes) if old_hashes.get(task) != new_hashes.get(task)}
+            notifications = [invalidation_record_entry(store, batch_id, "annotation", changed)]
+        if publications:
+            result.update({ref["stage"]: ref for ref in store.publish_many(batch_id, publications, record_entries=notifications)})
+            drain_batch_invalidations(batch_id, data_root)
+        return [result[entry["stage"]] for entry in entries]
+
+
+def register_annotation_view(path: Path, payload: dict, artifact: dict, root: Path) -> None:
+    key = hashlib.sha256(str(Path(path).resolve()).encode("utf-8")).hexdigest()
+    RecordStore(root).put("trajectory_annotations", key,
+                         {"path": str(Path(path).resolve()), "payload": payload, "artifact": artifact})
+
+
 def publish_workbook(path: Path, *, batch_id: str, stage: str, data_root: Path | None = None,
                      source_refs: list[dict[str, Any]] | None = None,
                      metadata: dict[str, Any] | None = None) -> dict[str, Any]:
     payload = workbook_payload(path)
     root = store_root(path, data_root)
-    artifact = ArtifactStore(root).publish(
-        batch_id, stage, payload, workbooks={path.name: path},
-        source_refs=source_refs or [], metadata=metadata or {},
-    )
+    artifact = publish_workbooks([{"stage": stage, "payload": payload, "workbooks": {path.name: path},
+        "source_refs": source_refs or [], "metadata": metadata or {}}], batch_id=batch_id, data_root=root)[0]
     if stage == "02_annotation":
-        key = hashlib.sha256(str(Path(path).resolve()).encode("utf-8")).hexdigest()
-        RecordStore(root).put("trajectory_annotations", key,
-                             {"path": str(Path(path).resolve()), "payload": payload, "artifact": artifact})
+        register_annotation_view(path, payload, artifact, root)
     write_sidecar(path, payload, source_ref=artifact)
     return artifact
 

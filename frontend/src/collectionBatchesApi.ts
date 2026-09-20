@@ -1,3 +1,4 @@
+import { activeBatchItems, notifyBatchesPublished } from '@/utils/batchLifecycle'
 /** Immutable collection batches shared by generation and phone collection pages. */
 const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
 const BASE = `${API_BASE}/api/task-generation`
@@ -53,8 +54,9 @@ async function checkedFetch(path: string, init?: RequestInit): Promise<Response>
   if (!response.ok) {
     let message = `${response.status} ${response.statusText}`
     try {
-      const payload = await response.json() as { detail?: string | Array<{ msg: string }> }
-      message = Array.isArray(payload.detail) ? payload.detail.map(item => item.msg).join('；') : payload.detail || message
+      const payload = await response.json()
+      if (payload.detail?.code === 'batch_published') notifyBatchesPublished({ batch_ids: [payload.detail.batch_id], release_id: payload.detail.release_id ?? null, published_at: payload.detail.published_at })
+      message = Array.isArray(payload.detail) ? payload.detail.map((item: { msg: string }) => item.msg).join('；') : typeof payload.detail === 'string' ? payload.detail : payload.detail?.message || message
     } catch { /* Preserve HTTP errors for non-JSON responses. */ }
     throw new Error(message)
   }
@@ -64,7 +66,7 @@ export const collectionBatchDownloadUrl = (batchId: string) => `${BASE}/collecti
 export const collectionBatchesApi = {
   async list(jobId?: string): Promise<CollectionBatchSummary[]> {
     const query = jobId ? `?job_id=${encodeURIComponent(jobId)}` : ''
-    return ((await (await checkedFetch(`/collection-batches${query}`)).json()) as { batches: CollectionBatchSummary[] }).batches
+    return activeBatchItems(((await (await checkedFetch(`/collection-batches${query}`)).json()) as { batches: CollectionBatchSummary[] }).batches)
   },
   async detail(batchId: string): Promise<CollectionBatchDetail> {
     return (await checkedFetch(`/collection-batches/${encodeURIComponent(batchId)}`)).json() as Promise<CollectionBatchDetail>

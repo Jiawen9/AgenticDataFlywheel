@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Callable
 
+from .batch_operations import active_batch_lock
 from .data_store import DATA_ROOT, RecordStore, RevisionConflict, rebase_data_path
 from .data_store.paths import contained_path
 from .task_generation.collection_batches import (
@@ -145,65 +146,74 @@ class CollectionRunStore:
 
     def create(self, batch_id: str, *, dispatch_key: str | None = None,
                metadata: dict | None = None, workbook_sha256: str | None = None) -> tuple[dict, bool]:
-        """Reserve one dispatch. Repeated keys never create or dispatch twice."""
-        batch = self.batch(batch_id, require_workbook=True)
-        if dispatch_key is not None:
-            _identifier(dispatch_key, "request_id")
-        if workbook_sha256 is not None and batch.get("workbook_sha256") != workbook_sha256:
-            raise CollectionRunError("上传文件与冻结的采集批次 Excel 不一致")
-        tasks = batch["snapshot"]["tasks"]
-        by_case = {}
-        seen_paths = set()
-        for task in tasks:
-            case_id = _component(task.get("collection_case_id"), "采集用例编号")
-            if case_id.casefold() in seen_paths:
-                raise CollectionRunError("采集用例编号重复或在文件系统中冲突")
-            seen_paths.add(case_id.casefold())
-            if not isinstance(task.get("task_id"), str) or not task["task_id"].strip() or not task.get("source_result_id"):
-                raise CollectionRunError("采集批次缺少生成任务编号或来源结果编号")
-            by_case[case_id] = task
-        if not by_case:
-            raise CollectionRunError("采集批次没有任务")
-        request = {"batch_id": batch_id, "metadata": metadata or {}, "workbook_sha256": workbook_sha256 or batch.get("workbook_sha256")}
-        run_id = "cr_" + (payload_digest([batch_id, dispatch_key]) if dispatch_key else uuid.uuid4().hex)
-        root = self.run_root(batch_id, run_id)
-        payload = {
-            "schema_version": 1, "batch_id": batch_id, "collection_run_id": run_id, "run_id": run_id,
-            "dispatch_key": dispatch_key, "request_digest": payload_digest(request),
-            "request": request, "created_at": _now(), "completed_at": None,
-            "status": "dispatching", "output_dir": str(root), "batch_tasks": by_case,
-            "batch_snapshot_sha256": payload_digest(batch["snapshot"]),
-            "trajectories": [], "errors": [], "dispatch_error": None,
-        }
-        root.mkdir(parents=True, exist_ok=True)
-        try:
-            saved = self.records.put("collection_runs", run_id, payload, expected_revision=0)
-            return saved, True
-        except RevisionConflict:
-            existing = self.get(run_id)
-            if existing["request_digest"] != payload["request_digest"]:
-                raise CollectionRunError("相同 request_id 对应的运行参数不同")
-            return existing, False
+        with active_batch_lock(batch_id, self.root):
+            """Reserve one dispatch. Repeated keys never create or dispatch twice."""
+            batch = self.batch(batch_id, require_workbook=True)
+            if dispatch_key is not None:
+                _identifier(dispatch_key, "request_id")
+            if workbook_sha256 is not None and batch.get("workbook_sha256") != workbook_sha256:
+                raise CollectionRunError("上传文件与冻结的采集批次 Excel 不一致")
+            tasks = batch["snapshot"]["tasks"]
+            by_case = {}
+            seen_paths = set()
+            for task in tasks:
+                case_id = _component(task.get("collection_case_id"), "采集用例编号")
+                if case_id.casefold() in seen_paths:
+                    raise CollectionRunError("采集用例编号重复或在文件系统中冲突")
+                seen_paths.add(case_id.casefold())
+                if not isinstance(task.get("task_id"), str) or not task["task_id"].strip() or not task.get("source_result_id"):
+                    raise CollectionRunError("采集批次缺少生成任务编号或来源结果编号")
+                by_case[case_id] = task
+            if not by_case:
+                raise CollectionRunError("采集批次没有任务")
+            request = {"batch_id": batch_id, "metadata": metadata or {}, "workbook_sha256": workbook_sha256 or batch.get("workbook_sha256")}
+            run_id = "cr_" + (payload_digest([batch_id, dispatch_key]) if dispatch_key else uuid.uuid4().hex)
+            root = self.run_root(batch_id, run_id)
+            payload = {
+                "schema_version": 1, "batch_id": batch_id, "collection_run_id": run_id, "run_id": run_id,
+                "dispatch_key": dispatch_key, "request_digest": payload_digest(request),
+                "request": request, "created_at": _now(), "completed_at": None,
+                "status": "dispatching", "output_dir": str(root), "batch_tasks": by_case,
+                "batch_snapshot_sha256": payload_digest(batch["snapshot"]),
+                "trajectories": [], "errors": [], "dispatch_error": None,
+            }
+            root.mkdir(parents=True, exist_ok=True)
+            try:
+                saved = self.records.put("collection_runs", run_id, payload, expected_revision=0)
+                return saved, True
+            except RevisionConflict:
+                existing = self.get(run_id)
+                if existing["request_digest"] != payload["request_digest"]:
+                    raise CollectionRunError("相同 request_id 对应的运行参数不同")
+                return existing, False
 
     def retry_dispatch(self, run_id: str) -> tuple[dict, bool]:
         current = self.get(run_id)
         if current is None:
             raise CollectionRunError("采集运行不存在", 404)
-        if current["status"] != "failed":
-            return current, False
-        update = {**current, "status": "dispatching", "dispatch_error": None}
-        try:
-            return self.records.put("collection_runs", run_id, update, expected_revision=current["storage_revision"]), True
-        except RevisionConflict:
-            return self.get(run_id), False
+        with active_batch_lock(current["batch_id"], self.root):
+            current = self.get(run_id)
+            if current is None:
+                raise CollectionRunError("采集运行不存在", 404)
+            if current["status"] != "failed":
+                return current, False
+            update = {**current, "status": "dispatching", "dispatch_error": None}
+            try:
+                return self.records.put("collection_runs", run_id, update, expected_revision=current["storage_revision"]), True
+            except RevisionConflict:
+                return self.get(run_id), False
 
     def dispatched(self, run_id: str, response: dict) -> dict:
-        def mutate(run):
-            # A fast collector may finish before its dispatch response arrives.
-            if run["status"] != "completed":
-                run["status"] = "running"
-            run.update(dispatch_response=response, dispatched_at=_now(), dispatch_error=None)
-        return self.records.update("collection_runs", run_id, mutate)
+        current = self.get(run_id)
+        if current is None:
+            raise CollectionRunError("采集运行不存在", 404)
+        with active_batch_lock(current["batch_id"], self.root):
+            def mutate(run):
+                # A fast collector may finish before its dispatch response arrives.
+                if run["status"] != "completed":
+                    run["status"] = "running"
+                run.update(dispatch_response=response, dispatched_at=_now(), dispatch_error=None)
+            return self.records.update("collection_runs", run_id, mutate)
 
     def dispatch_failed(self, run_id: str, error: str) -> dict:
         def mutate(run):
@@ -322,24 +332,28 @@ class CollectionRunStore:
                 raise CollectionRunError("轨迹缺少完整可转换的步骤文件")
 
     def complete(self, run_id: str, manifest: dict) -> tuple[dict, bool]:
-        while True:
-            run = self.get(run_id)
-            if run is None:
-                raise CollectionRunError("采集运行不存在", 404)
-            completed_at = run.get("completed_at") or _now()
-            normalized = self._normalize(run, manifest, completed_at)
-            self._validate_sources(run, normalized)
-            digest = payload_digest(normalized)
-            if run["status"] == "completed":
-                if digest != run.get("manifest_sha256"):
-                    raise CollectionRunError("已完成采集运行的清单不可修改；请创建新的采集运行")
-                return run, False
-            updated = {**run, **normalized, "status": "completed", "completed_at": completed_at,
-                       "manifest_sha256": digest, "trajectory_count": len(normalized["trajectories"])}
-            try:
-                return self.records.put("collection_runs", run_id, updated, expected_revision=run["storage_revision"]), True
-            except RevisionConflict:
-                continue
+        current = self.get(run_id)
+        if current is None:
+            raise CollectionRunError("采集运行不存在", 404)
+        with active_batch_lock(current["batch_id"], self.root):
+            while True:
+                run = self.get(run_id)
+                if run is None:
+                    raise CollectionRunError("采集运行不存在", 404)
+                completed_at = run.get("completed_at") or _now()
+                normalized = self._normalize(run, manifest, completed_at)
+                self._validate_sources(run, normalized)
+                digest = payload_digest(normalized)
+                if run["status"] == "completed":
+                    if digest != run.get("manifest_sha256"):
+                        raise CollectionRunError("已完成采集运行的清单不可修改；请创建新的采集运行")
+                    return run, False
+                updated = {**run, **normalized, "status": "completed", "completed_at": completed_at,
+                           "manifest_sha256": digest, "trajectory_count": len(normalized["trajectories"])}
+                try:
+                    return self.records.put("collection_runs", run_id, updated, expected_revision=run["storage_revision"]), True
+                except RevisionConflict:
+                    continue
 
     def ready_input(self, batch_id: str) -> dict:
         self.batch(batch_id)

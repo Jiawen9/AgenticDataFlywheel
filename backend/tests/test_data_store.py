@@ -91,7 +91,7 @@ class DataStoreTests(unittest.TestCase):
         self.assertEqual(saved[1]["storage_revision"], 2)
         self.assertEqual(self.records.get("releases", "new")["status"], "ready")
 
-    def test_json_excel_frozen_and_text_literal(self):
+    def test_json_excel_current_replacement_and_text_literal(self):
         rows = [{"用例编号": "001", "任务": "=HYPERLINK(1)", "summary": "", "thought": "原值", "细节": {"广告": False}}]
         manifest = self.artifacts.publish("batch-1", "06_correction", {"steps": rows}, tables={"修正步骤": rows}, source_refs=[{"batch_id": "parent"}])
         json_path = self.artifacts.resolve_file(manifest, "result.json")
@@ -107,13 +107,18 @@ class DataStoreTests(unittest.TestCase):
         finally:
             workbook.close()
         self.assertEqual(ArtifactStore(self.root).get("batch-1", "06_correction", manifest["version"]), manifest)
-        before = {file: file.read_bytes() for file in (json_path, excel_path)}
         rows[0]["thought"] = "新值"
         second = self.artifacts.publish("batch-1", "06_correction", {"steps": rows}, tables={"修正步骤": rows})
         self.assertNotEqual(second["version"], manifest["version"])
-        self.assertEqual(len(self.artifacts.list(batch_id="batch-1", stage="06_correction")), 2)
-        for file, content in before.items():
-            self.assertEqual(file.read_bytes(), content)
+        self.assertEqual(len(self.artifacts.list(batch_id="batch-1", stage="06_correction")), 1)
+        self.assertEqual(second["revision"], 2)
+        self.assertEqual(self.artifacts.read_payload(second), {"steps": rows})
+        self.assertEqual(self.artifacts.resolve_file(second, "result.json"), json_path)
+        self.assertEqual(self.artifacts.resolve_file(second, "result.xlsx"), excel_path)
+        self.assertEqual(json_path.parent, self.root / "batches" / "batch-1" / "06_correction")
+        self.assertIsNone(self.artifacts.get("batch-1", "06_correction", manifest["version"]))
+        with self.assertRaises(FileNotFoundError):
+            self.artifacts.resolve_file(manifest, "result.json")
 
     def test_copy_preserves_bytes_and_download_rejects_tampering(self):
         original = self.artifacts.publish("a", "01_conversion", {}, tables={"轨迹": [{"task": "原始任务"}]})
@@ -128,12 +133,12 @@ class DataStoreTests(unittest.TestCase):
             self.artifacts.resolve_file(original, "other.xlsx")
 
     def test_failure_invisible_and_export_retry_needs_no_model(self):
-        with patch.object(self.artifacts.records, "put", side_effect=RuntimeError("database failure")):
+        with patch.object(self.artifacts.records, "put_many", side_effect=RuntimeError("database failure")):
             with self.assertRaisesRegex(RuntimeError, "database failure"):
                 self.artifacts.publish("batch", "stage", {"task": "kept"}, tables={"表": [{"task": "kept"}]})
         self.assertEqual(self.artifacts.list(), [])
-        self.assertEqual(list(self.root.glob("batches/*/*/*/manifest.json")), [])
-        self.assertEqual(list(self.root.glob("tmp/artifacts/*")), [])
+        self.assertEqual(list(self.root.glob("batches/*/*/manifest.json")), [])
+        self.assertEqual(list(self.root.glob("tmp/artifact_transactions/*/*")), [])
         with patch("backend.data_store.artifacts._write_tables", side_effect=RuntimeError("excel failure")):
             with self.assertRaises(RuntimeError):
                 self.artifacts.publish("batch", "stage", {}, tables={"表": []})
@@ -148,12 +153,13 @@ class DataStoreTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=8) as pool:
             manifests = list(pool.map(publish, range(12)))
         self.assertEqual(len({item["version"] for item in manifests}), 12)
-        self.assertEqual(len(self.artifacts.list()), 12)
+        self.assertEqual(len(self.artifacts.list()), 1)
+        self.assertEqual(self.artifacts.get("batch", "stage")["revision"], 12)
         orphan = self.root / "batches" / "batch" / "stage" / "orphan"
         orphan.mkdir()
         (orphan / "manifest.json").write_text("{}", encoding="utf-8")
         self.assertIsNone(self.artifacts.get("batch", "stage", "orphan"))
-        self.assertEqual(len(self.artifacts.list()), 12)
+        self.assertEqual(len(self.artifacts.list()), 1)
 
     def test_paths_cannot_escape_root_and_excel_cannot_truncate(self):
         for batch in ("../outside", "a/b", "NUL", "bad."):

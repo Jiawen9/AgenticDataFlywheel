@@ -15,6 +15,8 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from . import collection_batches as batches
+from ..batch_operations import active_batch_lock, batch_operation
+from ..batch_lifecycle import is_batch_active
 from ..data_store.paths import DATA_ROOT
 from ..data_store.registry import RecordStore
 from ..data_store.artifacts import ArtifactStore
@@ -139,18 +141,21 @@ class TaskGenerationJobManager:
 
     def _stop_pending_seeds(self, job_id: str, error: str) -> dict[str, int] | None:
         """Close unfinished row states on interruption without restarting work."""
-        try:
-            seeds = self._read_seeds(job_id)
-        except (OSError, ValueError):
-            return None
-        for seed in seeds:
-            if seed.get("classification_status") in {"pending", "classifying"}:
-                seed.update({"classification_status": "failed", "mapping_status": "classification_failed",
-                             "node_path_ids": [], "generation_status": "skipped", "error": error})
-            elif seed.get("classification_status") == "classified" and seed.get("generation_status") in {"waiting", "generating"}:
-                seed.update({"generation_status": "failed", "error": error})
-        self._write_json(self._seeds_path(job_id), seeds)
-        return self._seed_stats(seeds)
+        with self.artifacts.batch_lock(job_id):
+            if not is_batch_active(job_id, self.data_root):
+                return None
+            try:
+                seeds = self._read_seeds(job_id)
+            except (OSError, ValueError):
+                return None
+            for seed in seeds:
+                if seed.get("classification_status") in {"pending", "classifying"}:
+                    seed.update({"classification_status": "failed", "mapping_status": "classification_failed",
+                                 "node_path_ids": [], "generation_status": "skipped", "error": error})
+                elif seed.get("classification_status") == "classified" and seed.get("generation_status") in {"waiting", "generating"}:
+                    seed.update({"generation_status": "failed", "error": error})
+            self._write_json(self._seeds_path(job_id), seeds)
+            return self._seed_stats(seeds)
 
     def _write_json(self, path: Path, value: Any) -> None:
         # Mutable records exist only in SQLite. Frozen manifests remain JSON.
@@ -158,7 +163,8 @@ class TaskGenerationJobManager:
             self.store.put("task_generation.jobs", str(value["job_id"]), value)
             return
         elif path.parent.parent == self.runs_dir and path.name in {"results.json", "seeds.json"}:
-            self.store.put(f"task_generation.{path.stem}", path.parent.name, {"job_id": path.parent.name, "rows": value})
+            with active_batch_lock(path.parent.name, self.data_root):
+                self.store.put(f"task_generation.{path.stem}", path.parent.name, {"job_id": path.parent.name, "rows": value})
             return
         self._write_mirror(path, value)
 
@@ -262,7 +268,7 @@ class TaskGenerationJobManager:
             "knowledge_base_version": snapshot["version"],
             **(parameters or {}),
         }
-        with self._lock:
+        with active_batch_lock(job_id, self.data_root), self._lock:
             self._write_job(payload)
         return payload
 
@@ -343,7 +349,7 @@ class TaskGenerationJobManager:
         return preview
 
     def start_augmentation(self, job_id: str) -> dict[str, Any]:
-        with self._lock:
+        with active_batch_lock(job_id, self.data_root), self._lock:
             job = self.get(job_id)
             if job is None:
                 raise FileNotFoundError("作业不存在")
@@ -373,7 +379,7 @@ class TaskGenerationJobManager:
         return self.get(job_id) or job
 
     def _checkpoint_seed(self, job_id: str, seed: dict[str, Any], rows: list[dict[str, Any]] | None) -> None:
-        with self._lock:
+        with active_batch_lock(job_id, self.data_root), self._lock:
             seeds = self._read_seeds(job_id)
             index = next(index for index, item in enumerate(seeds) if item["seed_id"] == seed["seed_id"])
             seeds[index] = seed
@@ -392,12 +398,12 @@ class TaskGenerationJobManager:
 
     def _fail_augmentation(self, job_id: str, exc: Exception) -> None:
         self._log(job_id, f"任务扩增失败：{exc}")
-        with self._lock:
+        with self.artifacts.batch_lock(job_id), self._lock:
             job = self.get(job_id) or {}
             errors = list(job.get("errors", []))
             errors.append({"stage": job.get("stage", "preparing"), "error": str(exc)})
             changes = {"status": "failed", "stage": "failed", "completed_at": _now(), "error": str(exc), "errors": errors}
-            if job.get("augmentation_preview_version"):
+            if job.get("augmentation_preview_version") and is_batch_active(job_id, self.data_root):
                 stats = self._stop_pending_seeds(job_id, f"作业停止：{exc}")
                 if stats is not None:
                     changes["seed_stats"] = stats
@@ -407,33 +413,34 @@ class TaskGenerationJobManager:
         self._progress(job_id, {"status": "running", "stage": "classifying", "started_at": _now()})
         self._log(job_id, "开始匹配失败任务与作业快照场景树")
         try:
-            outcome = self.classification_runner(
-                self._read_seeds(job_id), kb_root=self._source_file(job_id, "KnowledgeBase"),
-                progress=lambda value: self._progress(job_id, value),
-                on_seed=lambda seed, rows: self._checkpoint_seed(job_id, seed, rows),
-            )
-            seeds = outcome["seeds"]
-            if not seeds or any(seed.get("classification_status") not in {"classified", "failed"} for seed in seeds):
-                raise ValueError("分类未完成全部种子，不能进入确认阶段")
-            stats = self._seed_stats(seeds)
-            with self._lock:
-                self._write_json(self._seeds_path(job_id), seeds)
-                ready = {**(self.get(job_id) or {}), "classification_completed": True, "seed_stats": stats,
-                                       "status": "awaiting_confirmation" if stats["eligible"] else "failed",
-                                       "stage": "awaiting_confirmation" if stats["eligible"] else "failed",
-                                       "percent": 40, "current_item": None, "completed_items": len(seeds),
-                                       "errors": outcome.get("errors", []), "warnings": outcome.get("warnings", []),
-                                       "completed_at": None if stats["eligible"] else _now(),
-                                       "error": None if stats["eligible"] else "所有种子分类失败，无法扩增"}
-                try:
-                    ready["latest_artifact"] = self._publish_snapshot(ready, stage="00_scene_matching")
-                    ready["artifact_error"] = None
-                except Exception as exc:
-                    ready["artifact_error"] = f"中间产物保存失败，可重试保存：{exc}"
-                self._write_job(ready)
-            self._log(job_id, f"分类完成，可扩增={stats['eligible']}，未匹配={stats['unmatched']}，失败={stats['classification_failed']}")
-            if stats["eligible"] and (self.get(job_id) or {}).get("auto_start"):
-                self.start_augmentation(job_id)
+            with batch_operation(job_id, "augmentation_classification", self.data_root):
+                outcome = self.classification_runner(
+                    self._read_seeds(job_id), kb_root=self._source_file(job_id, "KnowledgeBase"),
+                    progress=lambda value: self._progress(job_id, value),
+                    on_seed=lambda seed, rows: self._checkpoint_seed(job_id, seed, rows),
+                )
+                seeds = outcome["seeds"]
+                if not seeds or any(seed.get("classification_status") not in {"classified", "failed"} for seed in seeds):
+                    raise ValueError("分类未完成全部种子，不能进入确认阶段")
+                stats = self._seed_stats(seeds)
+                with active_batch_lock(job_id, self.data_root), self._lock:
+                    self._write_json(self._seeds_path(job_id), seeds)
+                    ready = {**(self.get(job_id) or {}), "classification_completed": True, "seed_stats": stats,
+                                           "status": "awaiting_confirmation" if stats["eligible"] else "failed",
+                                           "stage": "awaiting_confirmation" if stats["eligible"] else "failed",
+                                           "percent": 40, "current_item": None, "completed_items": len(seeds),
+                                           "errors": outcome.get("errors", []), "warnings": outcome.get("warnings", []),
+                                           "completed_at": None if stats["eligible"] else _now(),
+                                           "error": None if stats["eligible"] else "所有种子分类失败，无法扩增"}
+                    try:
+                        ready["latest_artifact"] = self._publish_snapshot(ready, stage="00_scene_matching")
+                        ready["artifact_error"] = None
+                    except Exception as exc:
+                        ready["artifact_error"] = f"中间产物保存失败，可重试保存：{exc}"
+                    self._write_job(ready)
+                self._log(job_id, f"分类完成，可扩增={stats['eligible']}，未匹配={stats['unmatched']}，失败={stats['classification_failed']}")
+                if stats["eligible"] and (self.get(job_id) or {}).get("auto_start"):
+                    self.start_augmentation(job_id)
         except Exception as exc:
             self._fail_augmentation(job_id, exc)
 
@@ -441,18 +448,19 @@ class TaskGenerationJobManager:
         self._progress(job_id, {"status": "running", "stage": "generating"})
         self._log(job_id, "开始从已保存的分类记录扩增任务")
         try:
-            job = self.get(job_id)
-            if job is None:
-                return
-            outcome = self.generation_runner(
-                self._read_seeds(job_id), job["generate_n"], kb_root=self._execution_library(job_id),
-                progress=lambda value: self._progress(job_id, value),
-                on_seed=lambda seed, rows: self._checkpoint_seed(job_id, seed, rows),
-            )
-            outcome["errors"] = list(job.get("errors", [])) + outcome.get("errors", [])
-            outcome["warnings"] = list(job.get("warnings", [])) + outcome.get("warnings", [])
-            self._finish(job_id, outcome)
-            self._log(job_id, f"扩增结束，结果数={len(outcome.get('results', []))}")
+            with batch_operation(job_id, "augmentation_generation", self.data_root):
+                job = self.get(job_id)
+                if job is None:
+                    return
+                outcome = self.generation_runner(
+                    self._read_seeds(job_id), job["generate_n"], kb_root=self._execution_library(job_id),
+                    progress=lambda value: self._progress(job_id, value),
+                    on_seed=lambda seed, rows: self._checkpoint_seed(job_id, seed, rows),
+                )
+                outcome["errors"] = list(job.get("errors", [])) + outcome.get("errors", [])
+                outcome["warnings"] = list(job.get("warnings", [])) + outcome.get("warnings", [])
+                self._finish(job_id, outcome)
+                self._log(job_id, f"扩增结束，结果数={len(outcome.get('results', []))}")
         except Exception as exc:
             self._fail_augmentation(job_id, exc)
 
@@ -467,7 +475,7 @@ class TaskGenerationJobManager:
     def _finish(self, job_id: str, outcome: dict[str, Any]) -> None:
         results = outcome.get("results", [])
         errors = outcome.get("errors", [])
-        with self._lock:
+        with active_batch_lock(job_id, self.data_root), self._lock:
             self._write_json(self._results_path(job_id), results)
             payload = self.get(job_id)
             if payload is None:
@@ -494,9 +502,10 @@ class TaskGenerationJobManager:
         self._progress(job_id, {"status": "running", "stage": "preparing", "started_at": _now()})
         self._log(job_id, f"开始任务生成，节点数={len(node_ids)}，每节点={generate_n}")
         try:
-            outcome = self.initial_runner(node_ids, generate_n, kb_root=self._run_dir(job_id) / "KnowledgeBase", progress=lambda value: self._progress(job_id, value))
-            self._log(job_id, f"任务生成结束，结果数={len(outcome.get('results', []))}，错误数={len(outcome.get('errors', []))}")
-            self._finish(job_id, outcome)
+            with batch_operation(job_id, "initial", self.data_root):
+                outcome = self.initial_runner(node_ids, generate_n, kb_root=self._run_dir(job_id) / "KnowledgeBase", progress=lambda value: self._progress(job_id, value))
+                self._log(job_id, f"任务生成结束，结果数={len(outcome.get('results', []))}，错误数={len(outcome.get('errors', []))}")
+                self._finish(job_id, outcome)
         except Exception as exc:
             self._log(job_id, f"任务生成失败：{exc}")
             self._progress(job_id, {"status": "failed", "stage": "failed", "completed_at": _now(), "error": str(exc), "errors": [{"error": str(exc)}]})
@@ -505,9 +514,10 @@ class TaskGenerationJobManager:
         self._progress(job_id, {"status": "running", "stage": "preparing", "started_at": _now()})
         self._log(job_id, f"开始任务扩增，输入={input_path.name}，每种子={generate_n}")
         try:
-            outcome = self.augmentation_runner(input_path, generate_n, kb_root=self._run_dir(job_id) / "KnowledgeBase", progress=lambda value: self._progress(job_id, value))
-            self._log(job_id, f"任务扩增结束，结果数={len(outcome.get('results', []))}，错误数={len(outcome.get('errors', []))}")
-            self._finish(job_id, outcome)
+            with batch_operation(job_id, "augmentation", self.data_root):
+                outcome = self.augmentation_runner(input_path, generate_n, kb_root=self._run_dir(job_id) / "KnowledgeBase", progress=lambda value: self._progress(job_id, value))
+                self._log(job_id, f"任务扩增结束，结果数={len(outcome.get('results', []))}，错误数={len(outcome.get('errors', []))}")
+                self._finish(job_id, outcome)
         except Exception as exc:
             self._log(job_id, f"任务扩增失败：{exc}")
             self._progress(job_id, {"status": "failed", "stage": "failed", "completed_at": _now(), "error": str(exc), "errors": [{"error": str(exc)}]})
@@ -584,6 +594,8 @@ class TaskGenerationJobManager:
             for path in paths:
                 if not path.is_dir() or path.name.startswith(".") or path.name in seen:
                     continue
+                if not is_batch_active(path.name, self.data_root):
+                    continue
                 try:
                     detail = self.collection_batch(path.name)
                 except (FileNotFoundError, CollectionInputError):
@@ -593,7 +605,7 @@ class TaskGenerationJobManager:
             return sorted(summaries, key=lambda value: (value["created_at"], value["batch_id"]), reverse=True)
 
     def submit_collection_batch(self, job_id: str) -> tuple[dict[str, Any], bool]:
-        with self._lock:
+        with active_batch_lock(job_id, self.data_root), self._lock:
             destination = self._collection_batch_dir(job_id)
             if self.get(job_id) is None:
                 raise FileNotFoundError("作业不存在")
@@ -636,7 +648,7 @@ class TaskGenerationJobManager:
             return self._existing_collection_batch_dir(batch_id) / batch["filename"]
 
     def patch_result(self, job_id: str, result_id: str, patch: dict[str, Any]) -> dict[str, Any]:
-        with self._lock:
+        with active_batch_lock(job_id, self.data_root), self._lock:
             job = self.get(job_id)
             if job is None:
                 raise FileNotFoundError("作业不存在")
@@ -667,7 +679,7 @@ class TaskGenerationJobManager:
 
     def snapshot(self, job_id: str, *, stage: str | None = None) -> dict[str, Any]:
         """Publish a reviewable version from saved values, without model calls."""
-        with self._lock:
+        with active_batch_lock(job_id, self.data_root), self._lock:
             job = self.get(job_id)
             if job is None:
                 raise FileNotFoundError("作业不存在")
@@ -706,7 +718,7 @@ class TaskGenerationJobManager:
             self._progress(job_id, {"artifact_error": None, "latest_artifact": manifest})
 
     def export(self, job_id: str) -> dict[str, Any]:
-        with self._lock:
+        with active_batch_lock(job_id, self.data_root), self._lock:
             job = self.get(job_id)
             if job is None:
                 raise FileNotFoundError("作业不存在")
@@ -744,6 +756,7 @@ class TaskGenerationJobManager:
             raise FileNotFoundError("导出文件不存在")
         return path
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, wait: bool = False) -> None:
+        """Optionally drain workers, including their final operation/audit writes."""
         if self._owns_executor:
-            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor.shutdown(wait=wait, cancel_futures=not wait)

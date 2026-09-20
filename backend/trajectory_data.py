@@ -15,6 +15,8 @@ from urllib.parse import quote
 from openpyxl import load_workbook
 from PIL import Image
 
+from .batch_operations import active_batch_lock
+from .batch_lifecycle import is_batch_active
 from .trajectories_tree.tree_builder import parse_action
 from .data_store import DATA_ROOT, ArtifactStore
 from .trajectory_context import (resolve_batch_context, row_task_id, row_trajectory_id,
@@ -280,53 +282,54 @@ def update_action_bbox(
         from .stage_artifacts import fingerprint, sidecar_path
         source_file = sidecar_path(xlsx_path)
         previous = current.get("source_ref") or {"kind": "annotation_snapshot", "path": str(source_file), "sha256": fingerprint(source_file)}
-        write_payload_workbook(temporary_path, current)
-        workbook = load_workbook(temporary_path)
-        try:
-            sheet = workbook.active
-            headers = {
-                str(cell.value).strip(): cell.column
-                for cell in sheet[1]
-                if cell.value is not None
-            }
-            required = {"文件夹名", "image", "action", "actions_box"}
-            missing = sorted(required - headers.keys())
-            if missing:
-                raise ValueError(f"Excel 缺少必要列：{', '.join(missing)}")
-            if excel_row > sheet.max_row:
-                raise ValueError("Excel 行号超出范围")
+        with active_batch_lock(str(previous.get("batch_id") or "manual-annotation"), data_root or store_root(xlsx_path)):
+            write_payload_workbook(temporary_path, current)
+            workbook = load_workbook(temporary_path)
+            try:
+                sheet = workbook.active
+                headers = {
+                    str(cell.value).strip(): cell.column
+                    for cell in sheet[1]
+                    if cell.value is not None
+                }
+                required = {"文件夹名", "image", "action", "actions_box"}
+                missing = sorted(required - headers.keys())
+                if missing:
+                    raise ValueError(f"Excel 缺少必要列：{', '.join(missing)}")
+                if excel_row > sheet.max_row:
+                    raise ValueError("Excel 行号超出范围")
 
-            row_trajectory = str(sheet.cell(excel_row, headers["文件夹名"]).value or "").strip()
-            image_value = str(sheet.cell(excel_row, headers["image"]).value or "").strip()
-            if row_trajectory != trajectory_id:
-                raise ValueError("Excel 行与轨迹不匹配")
-            if task_id_from_resource(image_value) != task_id:
-                raise ValueError("Excel 行与任务不匹配")
-            if _step_number(image_value, -1) != step:
-                raise ValueError("Excel 行与 step 不匹配")
+                row_trajectory = str(sheet.cell(excel_row, headers["文件夹名"]).value or "").strip()
+                image_value = str(sheet.cell(excel_row, headers["image"]).value or "").strip()
+                if row_trajectory != trajectory_id:
+                    raise ValueError("Excel 行与轨迹不匹配")
+                if task_id_from_resource(image_value) != task_id:
+                    raise ValueError("Excel 行与任务不匹配")
+                if _step_number(image_value, -1) != step:
+                    raise ValueError("Excel 行与 step 不匹配")
 
-            image_path = resolve_image_asset(image_value, trajectory_root)
-            with Image.open(image_path) as image:
-                width, height = image.size
-            if x2 > width or y2 > height:
-                raise ValueError(f"bbox 超出截图范围 {width}x{height}")
+                image_path = resolve_image_asset(image_value, trajectory_root)
+                with Image.open(image_path) as image:
+                    width, height = image.size
+                if x2 > width or y2 > height:
+                    raise ValueError(f"bbox 超出截图范围 {width}x{height}")
 
-            action_text = str(sheet.cell(excel_row, headers["action"]).value or "")
-            actions_box = _format_manual_actions_box(action_override or parse_action(action_text), (x1, y1, x2, y2))
-            sheet.cell(excel_row, headers["actions_box"]).value = actions_box
-            if temporary_path.exists():
-                temporary_path.unlink()
-            workbook.save(temporary_path)
-            workbook.close()
-            temporary_path.replace(xlsx_path)
-            publish_workbook(xlsx_path, batch_id=str(previous.get("batch_id") or "manual-annotation"),
-                             stage="02_annotation", source_refs=[previous] if previous else [],
-                             metadata={"manual_bbox": {"task_id": task_id, "trajectory_id": trajectory_id, "step": step}})
-            return actions_box
-        finally:
-            workbook.close()
-            if temporary_path.exists():
-                temporary_path.unlink()
+                action_text = str(sheet.cell(excel_row, headers["action"]).value or "")
+                actions_box = _format_manual_actions_box(action_override or parse_action(action_text), (x1, y1, x2, y2))
+                sheet.cell(excel_row, headers["actions_box"]).value = actions_box
+                if temporary_path.exists():
+                    temporary_path.unlink()
+                workbook.save(temporary_path)
+                workbook.close()
+                temporary_path.replace(xlsx_path)
+                publish_workbook(xlsx_path, batch_id=str(previous.get("batch_id") or "manual-annotation"),
+                                 data_root=data_root or store_root(xlsx_path), stage="02_annotation", source_refs=[previous] if previous else [],
+                                 metadata={"manual_bbox": {"task_id": task_id, "trajectory_id": trajectory_id, "step": step}})
+                return actions_box
+            finally:
+                workbook.close()
+                if temporary_path.exists():
+                    temporary_path.unlink()
 
 
 def task_summaries(
@@ -377,6 +380,10 @@ def resolve_image_asset(relative_path: str, root: Path = TRAJECTORY_ROOT, *, bat
 
 
 def list_tree_runs(runs_dir: Path = TREE_RUNS_DIR) -> list[dict[str, Any]]:
+    if runs_dir.resolve() == TREE_RUNS_DIR.resolve():
+        from .batch_results import list_current_tree_batches
+        return [item for item in list_current_tree_batches(runs_dir.parent.parent)
+                if is_batch_active(item["batch_id"], runs_dir.parent.parent)]
     if not runs_dir.is_dir():
         return []
     runs: list[dict[str, Any]] = []
@@ -388,11 +395,17 @@ def list_tree_runs(runs_dir: Path = TREE_RUNS_DIR) -> list[dict[str, Any]]:
             except (OSError, ValueError, json.JSONDecodeError):
                 continue
             if isinstance(manifest, dict) and manifest.get("run_id") == directory.name:
-                runs.append(manifest)
+                if is_batch_active(str(manifest.get("batch_id") or manifest["run_id"]), runs_dir.parent.parent):
+                    runs.append(manifest)
     return sorted(runs, key=lambda item: str(item.get("completed_at", "")), reverse=True)
 
 
 def find_tree_run(run_id: str, runs_dir: Path = TREE_RUNS_DIR) -> dict[str, Any] | None:
+    if runs_dir.resolve() == TREE_RUNS_DIR.resolve():
+        from .batch_results import resolve_current_batch_id, current_tree_batch
+        data_root = runs_dir.parent.parent
+        batch_id = resolve_current_batch_id(run_id, data_root)
+        return current_tree_batch(batch_id, data_root) if batch_id else None
     return next((item for item in list_tree_runs(runs_dir) if item.get("run_id") == run_id), None)
 
 
@@ -480,7 +493,7 @@ def _update_batch_bbox(batch_id, task_id, trajectory_id, step, excel_row, bbox,
     if not expected_version:
         raise AnnotationVersionConflict("修改标框必须提供当前 annotation_version")
     root = Path(data_root or DATA_ROOT).resolve()
-    with annotation_batch_lock(batch_id, root):
+    with active_batch_lock(batch_id, root):
         context = resolve_batch_context(batch_id, root=root)
         if context.annotation_version != expected_version:
             raise AnnotationVersionConflict("标框版本已更新，请刷新后重试")
@@ -503,15 +516,23 @@ def _update_batch_bbox(batch_id, task_id, trajectory_id, step, excel_row, bbox,
         if x2 > width or y2 > height:
             raise ValueError(f"bbox 超出截图范围 {width}x{height}")
         value = _format_manual_actions_box(action_override or parse_action(str(row["action"])), (x1, y1, x2, y2))
+        if row.get("actions_box") == value:
+            return {"actions_box": value, "batch_id": batch_id,
+                    "annotation_version": context.annotation_version, "annotation_ref": context.annotation_ref}
         row["actions_box"] = value
         temporary_root = root / "tmp" / "annotation_edits"
         temporary_root.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=temporary_root) as directory:
             path = Path(directory) / "annotated_trajectories.xlsx"
             write_payload_workbook(path, payload)
-            artifact = ArtifactStore(root).publish(batch_id, "02_annotation", payload,
-                workbooks={path.name: path}, source_refs=[context.annotation_ref],
-                metadata={"raw_root": str(context.raw_root),
-                          "manual_bbox": {"task_id": task_id, "trajectory_id": trajectory_id, "step": step}})
+            from .batch_results import invalidation_record_entry, drain_batch_invalidations
+            store = ArtifactStore(root)
+            artifact = store.publish_many(batch_id, [{"stage": "02_annotation", "payload": payload,
+                "workbooks": {path.name: path}, "source_refs": context.annotation_ref.get("source_refs", []),
+                "metadata": {**context.annotation_ref.get("metadata", {}), "raw_root": str(context.raw_root),
+                             "manual_bbox": {"task_id": task_id, "trajectory_id": trajectory_id, "step": step}},
+                "expected_version": context.annotation_version}],
+                record_entries=[invalidation_record_entry(store, batch_id, "annotation", [task_id])])[0]
+        drain_batch_invalidations(batch_id, root)
         return {"actions_box": value, "batch_id": batch_id,
                 "annotation_version": artifact["version"], "annotation_ref": artifact}

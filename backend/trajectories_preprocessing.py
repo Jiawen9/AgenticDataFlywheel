@@ -6,10 +6,12 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 import uuid
 from copy import copy
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Callable
 
 from openpyxl import load_workbook
@@ -19,15 +21,17 @@ try:
     from .bounding_box.build_annotations import resolve_action_box
     from .bounding_box.qwen_reviewer import QwenBoxReviewer
     from .export_vla_trajectories import collect_rows, write_xlsx
+    from .batch_operations import batch_operation, active_batch_lock
     from .data_store import DATA_ROOT, ArtifactStore
-    from .stage_artifacts import publish_workbook, store_root
+    from .stage_artifacts import publish_workbooks, store_root, workbook_payload, write_sidecar, assert_unmanaged_output, register_annotation_view
 except ImportError:  # Keep direct `python backend/trajectories_preprocessing.py` usage working.
     from bounding_box.build_annotations import resolve_action_box
     from bounding_box.qwen_reviewer import QwenBoxReviewer
     from export_vla_trajectories import collect_rows, write_xlsx
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from backend.batch_operations import batch_operation, active_batch_lock
     from backend.data_store import DATA_ROOT, ArtifactStore
-    from backend.stage_artifacts import publish_workbook, store_root
+    from backend.stage_artifacts import publish_workbooks, store_root, workbook_payload, write_sidecar, assert_unmanaged_output, register_annotation_view
 
 
 BACKEND_DIR = Path(__file__).resolve().parent
@@ -309,16 +313,60 @@ def parse_args() -> argparse.Namespace:
         description="Export rollout trajectories and add Qwen-reviewed action boxes."
     )
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
-    parser.add_argument("--export-output", type=Path, help="Explicit initial workbook output; defaults to a batch/run directory.")
-    parser.add_argument("--annotated-output", type=Path, help="Explicit annotated workbook output; defaults to a batch/run directory.")
+    parser.add_argument("--export-output", type=Path, help="Explicit initial workbook output; omitted outputs are temporary and removed after publication.")
+    parser.add_argument("--annotated-output", type=Path, help="Explicit annotated workbook output; omitted outputs are temporary and removed after publication.")
     parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
     parser.add_argument("--max-review-rounds", type=int, default=4)
-    parser.add_argument("--batch-id", help="Reuse a processing batch ID; each execution creates a new stage version.")
+    parser.add_argument("--batch-id", help="Reuse a business batch ID and update its single current result.")
     parser.add_argument("--data-root", type=Path, default=DATA_ROOT)
     return parser.parse_args()
 
 
 def run_pipeline(
+    *, source: Path, export_output: Path, annotated_output: Path,
+    env_file: Path, max_review_rounds: int, batch_id: str | None = None,
+    data_root: Path | None = None, register_annotation_export: bool = True,
+) -> dict[str, Any]:
+    """Keep concurrent CLI model inputs private; publish only completed views."""
+    batch_id = batch_id or uuid.uuid4().hex
+    root = store_root(export_output, data_root)
+    with batch_operation(batch_id, "preprocessing_cli", root):
+        assert_unmanaged_output(export_output, root)
+        assert_unmanaged_output(annotated_output, root)
+        if export_output.resolve() == annotated_output.resolve():
+            raise ValueError("转换和标框的导出路径必须不同")
+        work_parent = root / "tmp" / "preprocessing-cli"
+        work_parent.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix="run-", dir=work_parent) as directory:
+            temporary = Path(directory)
+            conversion_path = temporary / "conversion" / export_output.name
+            annotation_path = temporary / "annotation" / annotated_output.name
+            result = _run_pipeline(source=source, export_output=conversion_path, annotated_output=annotation_path,
+                env_file=env_file, max_review_rounds=max_review_rounds, batch_id=batch_id, data_root=root)
+            store = ArtifactStore(root)
+            with active_batch_lock(batch_id, root):
+                if any((store.get(batch_id, ref["stage"]) or {}).get("version") != ref["version"]
+                       for ref in result["artifacts"]):
+                    raise ValueError("处理完成后批次已有更新，已保留最新结果；请重新导出")
+                for source_path, target in ((conversion_path, export_output), (annotation_path, annotated_output)):
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    staging = target.with_name("." + target.name + "." + uuid.uuid4().hex + ".tmp")
+                    try:
+                        shutil.copyfile(source_path, staging)
+                        staging.replace(target)
+                    finally:
+                        staging.unlink(missing_ok=True)
+                conversion, annotation = result["artifacts"]
+                write_sidecar(export_output, store.read_payload(conversion), source_ref=conversion)
+                payload = store.read_payload(annotation)
+                write_sidecar(annotated_output, payload, source_ref=annotation)
+                if register_annotation_export:
+                    register_annotation_view(annotated_output, payload, annotation, root)
+            print(f"Current batch exports: {export_output.resolve()}; {annotated_output.resolve()}", flush=True)
+            return result
+
+
+def _run_pipeline(
     *,
     source: Path,
     export_output: Path,
@@ -330,33 +378,57 @@ def run_pipeline(
 ) -> dict[str, Any]:
     batch_id = batch_id or uuid.uuid4().hex
     root = store_root(export_output, data_root)
-    row_count, warnings = export_trajectories(source, export_output)
-    conversion = publish_workbook(export_output, batch_id=batch_id, stage="01_conversion", data_root=root,
-                                  source_refs=[{"kind": "raw_trajectories", "path": str(source.resolve())}],
-                                  metadata={"warnings": warnings})
-    print(f"Exported {row_count} steps to: {export_output.expanduser().resolve()}", flush=True)
-    for warning in warnings:
-        print(f"Warning: {warning}", file=sys.stderr)
-
-    model = configure_reviewer_environment(env_file.expanduser().resolve())
-    reviewer = QwenBoxReviewer(model=model, cache_path=root / "cache" / "bounding_box" / "qwen_review_cache.json")
-    counts = annotate_trajectory_workbook(
-        export_output,
-        annotated_output,
-        reviewer=reviewer,
-        max_review_rounds=max(1, max_review_rounds),
-        trajectory_root=source,
-        allow_excel_import=False,
-    )
-    annotation = publish_workbook(annotated_output, batch_id=batch_id, stage="02_annotation", data_root=root,
-                                  source_refs=[conversion], metadata={"model": model, **counts})
-    print(f"Annotated workbook: {annotated_output.expanduser().resolve()}", flush=True)
-    print(
-        f"Rows={counts['rows']} annotated={counts['annotated']} blank={counts['blank']}",
-        flush=True,
-    )
-    return {"exported_rows": row_count, "warnings": warnings, "batch_id": batch_id,
-            "artifacts": [conversion, annotation], **counts}
+    with batch_operation(batch_id, "preprocessing_cli", root):
+        assert_unmanaged_output(export_output, root)
+        assert_unmanaged_output(annotated_output, root)
+        store = ArtifactStore(root)
+        base_annotation = store.get(batch_id, "02_annotation")
+        row_count, warnings = export_trajectories(source, export_output)
+        converted = workbook_payload(export_output)
+        # Model input is a worker snapshot; public 01/02 remain unchanged on failure.
+        write_sidecar(export_output, converted)
+        print(f"Exported {row_count} steps to: {export_output.expanduser().resolve()}", flush=True)
+        for warning in warnings:
+            print(f"Warning: {warning}", file=sys.stderr)
+        model = configure_reviewer_environment(env_file.expanduser().resolve())
+        from backend.preprocessing_service import processing_config
+        configuration = {**processing_config(env_file), "model": model,
+                         "base_url": os.environ.get("TRAJECTORY_VLA_API_BASE_URL")
+                         or os.environ.get("TRAJECTORY_API_BASE_URL", ""),
+                         "max_review_rounds": max(1, max_review_rounds)}
+        current_conversion = store.get(batch_id, "01_conversion")
+        if (base_annotation and current_conversion and store.read_payload(current_conversion) == converted
+                and base_annotation.get("metadata", {}).get("cli_configuration") == configuration):
+            previous = store.read_payload(base_annotation)
+            from backend.stage_artifacts import write_payload_workbook
+            write_payload_workbook(annotated_output, previous)
+            write_sidecar(export_output, converted, source_ref=current_conversion)
+            write_sidecar(annotated_output, previous, source_ref=base_annotation)
+            return {"exported_rows": row_count, "warnings": warnings, "batch_id": batch_id,
+                    "artifacts": [current_conversion, base_annotation], "reused": True,
+                    **{key: base_annotation.get("metadata", {}).get(key, 0) for key in ("rows", "annotated", "blank")}}
+        reviewer = QwenBoxReviewer(model=model, cache_path=root / "cache" / "bounding_box" / "qwen_review_cache.json")
+        counts = annotate_trajectory_workbook(export_output, annotated_output, reviewer=reviewer,
+            max_review_rounds=max(1, max_review_rounds), trajectory_root=source, allow_excel_import=False)
+        converted_ref, annotation = publish_workbooks([
+            {"stage": "01_conversion", "payload": converted, "workbooks": {export_output.name: export_output},
+             "source_refs": [{"kind": "raw_trajectories", "path": str(source.resolve())}], "metadata": {"warnings": warnings}},
+            {"stage": "02_annotation", "payload": workbook_payload(annotated_output),
+             "workbooks": {annotated_output.name: annotated_output}, "source_stages": ["01_conversion"],
+             "metadata": {"model": model, "cli_configuration": configuration, **counts}},
+        ], batch_id=batch_id, data_root=root, expected_annotation_version=(base_annotation or {}).get("version"),
+           check_annotation_version=True)
+        conversion = converted_ref
+        write_sidecar(export_output, converted, source_ref=conversion)
+        annotation_payload = workbook_payload(annotated_output)
+        write_sidecar(annotated_output, annotation_payload, source_ref=annotation)
+        print(f"Annotated workbook: {annotated_output.expanduser().resolve()}", flush=True)
+        print(
+            f"Rows={counts['rows']} annotated={counts['annotated']} blank={counts['blank']}",
+            flush=True,
+        )
+        return {"exported_rows": row_count, "warnings": warnings, "batch_id": batch_id,
+                "artifacts": [conversion, annotation], **counts}
 
 
 def main() -> int:
@@ -367,18 +439,20 @@ def main() -> int:
         ArtifactStore(args.data_root).list(batch_id=args.batch_id)
         if args.source == DEFAULT_SOURCE:
             args.source = args.data_root / "raw" / "rollout_trajectories"
-        directory = args.data_root / "system" / "preprocessing" / args.batch_id / uuid.uuid4().hex
-        args.export_output = args.export_output or directory / DEFAULT_EXPORT_OUTPUT.name
-        args.annotated_output = args.annotated_output or directory / DEFAULT_ANNOTATED_OUTPUT.name
-        run_pipeline(
-            source=args.source,
-            export_output=args.export_output,
-            annotated_output=args.annotated_output,
-            env_file=args.env_file,
-            max_review_rounds=args.max_review_rounds,
-            batch_id=args.batch_id,
-            data_root=args.data_root,
-        )
+        work_parent = args.data_root / "tmp" / "preprocessing-cli-views"
+        work_parent.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix="run-", dir=work_parent) as directory:
+            temporary = Path(directory)
+            run_pipeline(
+                source=args.source,
+                export_output=args.export_output or temporary / DEFAULT_EXPORT_OUTPUT.name,
+                annotated_output=args.annotated_output or temporary / DEFAULT_ANNOTATED_OUTPUT.name,
+                env_file=args.env_file,
+                max_review_rounds=args.max_review_rounds,
+                batch_id=args.batch_id,
+                data_root=args.data_root,
+                register_annotation_export=args.annotated_output is not None,
+            )
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

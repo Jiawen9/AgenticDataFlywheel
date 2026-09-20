@@ -1,14 +1,21 @@
 <script setup lang="ts">
+import BatchPublishedNotice from '@/components/BatchPublishedNotice.vue'
+import { useBatchLifecycle } from '@/composables/useBatchLifecycle'
+import { activeBatchItems, eventMatchesRoute, publishedBatch, withoutBatchQuery, type PublishedBatchEvent } from '@/utils/batchLifecycle'
+
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { onBeforeRouteUpdate, useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { CircleCheck, Document, Refresh } from '@element-plus/icons-vue'
 import { api, correctionDownloadUrl } from '@/api'
 import ActionImage from '@/components/ActionImage.vue'
+import { resolveSessionSelection } from '@/utils/batchSelection'
 import { parseBBox, type BBox } from '@/utils/actionOverlay'
 import type { CorrectionCotJob, CorrectionCotResponse, CorrectionCotRow, CorrectionSession } from '@/types'
 
 type EditableTextField = 'thought' | 'summary'
 
+const route = useRoute(), router = useRouter()
 const sessions = ref<CorrectionSession[]>([])
 const selectedSessionId = ref('')
 const sessionCot = ref<CorrectionCotResponse | null>(null)
@@ -24,13 +31,42 @@ const bboxEditing = ref(false)
 const editingField = ref<EditableTextField | null>(null)
 const textDraft = ref('')
 let timer: number | null = null
+let detailRequest = 0, listRequest = 0, disposed = false, initialized = false, choicesRequest = 0
 
 const groups = computed(() => sessionCot.value?.groups ?? [])
+const eligibleGroups = computed(() => groups.value.filter(group => !group.pending_review))
 const activeGroup = computed(() => groups.value.find((group) => group.group_id === selectedGroupId.value) ?? groups.value[0] ?? null)
 const activeRow = computed<CorrectionCotRow | null>(() => activeGroup.value?.rows.find((row) => `${row.excel_row}` === selectedRowKey.value) ?? activeGroup.value?.rows[0] ?? null)
 const editedRows = computed(() => groups.value.reduce((total, group) => total + group.rows.length, 0))
 const generatedRows = computed(() => groups.value.reduce((total, group) => total + group.rows.filter((row) => row.status === 'generated').length, 0))
 const selectedSession = computed(() => sessions.value.find((item) => item.session_id === selectedSessionId.value) ?? null)
+const selectedBatchId = computed({
+  get: () => selectedSession.value?.batch_id || '',
+  set: (id: string) => { void chooseBatch(id) },
+})
+const lifecycle = useBatchLifecycle({ currentBatch: () => selectedBatchId.value || String(route.query.batch_id ?? ''), onPublished, refreshChoices: loadChoices })
+const { notice: publishedNotice } = lifecycle
+async function chooseBatch(id: string) {
+  if (!await lifecycle.checkBatch(id)) return
+  publishedNotice.value = null
+  selectedSessionId.value = sessions.value.find(item => item.batch_id === id)?.session_id || ''
+}
+async function loadChoices() {
+  const request = ++choicesRequest
+  const values = await api.correctionSessions()
+  if (!disposed && request === choicesRequest) sessions.value = activeBatchItems(values)
+}
+function onPublished(event: PublishedBatchEvent) {
+  const current = eventMatchesRoute(event, selectedBatchId.value, route.query)
+  sessions.value = sessions.value.filter(item => !event.batch_ids.includes(item.batch_id || ''))
+  if (!current) return
+  ++choicesRequest
+  ++detailRequest; ++listRequest; stopPolling(); activeJob.value = null
+  selectedSessionId.value = ''; sessionCot.value = null; selectedGroupId.value = ''; selectedRowKey.value = ''
+  resetLocalEditing(); ElMessageBox.close(); loading.value = false; loadingCot.value = false; error.value = ''; publishedNotice.value = event
+  void router.replace({ query: withoutBatchQuery(route.query) })
+}
+const pendingReview = computed(() => sessionCot.value?.pending_review_count ?? selectedSession.value?.pending_review_count ?? 0)
 const jobRunning = computed(() => Boolean(activeJob.value && ['queued', 'running'].includes(activeJob.value.status)))
 const parsedAction = computed<Record<string, unknown>>(() => {
   try {
@@ -77,27 +113,32 @@ function selectRow(groupId: string, row: CorrectionCotRow) {
 
 async function refreshCot() {
   if (!selectedSessionId.value) { sessionCot.value = null; return }
+  const request = ++detailRequest, sessionId = selectedSessionId.value
   loadingCot.value = true; error.value = ''
   const previousGroupId = selectedGroupId.value
   const previousRowKey = selectedRowKey.value
   try {
-    sessionCot.value = await api.correctionSessionCot(selectedSessionId.value)
+    const current = await api.correctionSessionCot(sessionId)
+    if (disposed || request !== detailRequest || sessionId !== selectedSessionId.value) return
+    sessionCot.value = current
     const group = groups.value.find((item) => item.group_id === previousGroupId) ?? groups.value[0]
     const row = group?.rows.find((item) => String(item.excel_row) === previousRowKey) ?? group?.rows[0] ?? null
     selectedGroupId.value = group?.group_id ?? ''
     selectedRowKey.value = row ? String(row.excel_row) : ''
     resetLocalEditing()
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : String(cause)
+    if (!disposed && request === detailRequest && sessionId === selectedSessionId.value) error.value = cause instanceof Error ? cause.message : String(cause)
   } finally {
-    loadingCot.value = false
+    if (!disposed && request === detailRequest) loadingCot.value = false
   }
 }
 
 async function pollJob() {
   if (!activeJob.value) return
   try {
-    const next = await api.correctionCotJob(activeJob.value.job_id)
+    const jobId = activeJob.value.job_id, sessionId = selectedSessionId.value
+    const next = await api.correctionCotJob(jobId)
+    if (disposed || activeJob.value?.job_id !== jobId || selectedSessionId.value !== sessionId) return
     activeJob.value = next
     if (next.status === 'succeeded') {
       stopPolling()
@@ -113,28 +154,45 @@ async function pollJob() {
 }
 
 function startPolling(job: CorrectionCotJob) {
+  if (disposed || !selectedSessionId.value || job.session_id !== selectedSessionId.value || publishedBatch(selectedBatchId.value)) return
   activeJob.value = job
   stopPolling()
   if (job.status === 'queued' || job.status === 'running') {
     timer = window.setInterval(() => void pollJob(), 1200)
-  }
+  } else if (job.status === 'succeeded') { void refreshCot() }
 }
 
 async function loadSessions() {
+  const request = ++listRequest
   loading.value = true; error.value = ''
   try {
-    sessions.value = await api.correctionSessions()
-    if (!selectedSessionId.value || !sessions.value.some((item) => item.session_id === selectedSessionId.value)) {
-      selectedSessionId.value = sessions.value[0]?.session_id ?? ''
-    }
+    if (typeof route.query.batch_id === 'string' && !await lifecycle.checkBatch(route.query.batch_id)) { await loadChoices(); return }
+    const values = await api.correctionSessions()
+    if (disposed || request !== listRequest) return
+    sessions.value = activeBatchItems(values)
+    const legacySession = typeof route.query.session_id === 'string' ? route.query.session_id : typeof route.query.session === 'string' ? route.query.session : undefined
+    if (route.query.batch_id === undefined && legacySession && !values.some(item => item.session_id === legacySession)) await api.correctionSession(legacySession)
+    if (disposed || request !== listRequest) return
+    const nextSessionId = resolveSessionSelection(values, {
+      batchId: typeof route.query.batch_id === 'string' ? route.query.batch_id : undefined,
+      sessionId: typeof route.query.session_id === 'string' ? route.query.session_id : typeof route.query.session === 'string' ? route.query.session : undefined,
+    })
+    if (!await lifecycle.checkBatch(values.find(item => item.session_id === nextSessionId)?.batch_id || '')) return
+    if (disposed || request !== listRequest) return
+    selectedSessionId.value = nextSessionId
+    initialized = true
     const jobs = selectedSessionId.value ? await api.correctionCotJobs() : []
+    if (disposed || request !== listRequest) return
     const existing = jobs.find((job) => job.session_id === selectedSessionId.value && (job.status === 'queued' || job.status === 'running'))
     if (existing) startPolling(existing)
     await refreshCot()
   } catch (cause) {
+    if (disposed || request !== listRequest) return
+    ++detailRequest; selectedSessionId.value = ''; sessionCot.value = null; activeJob.value = null; loadingCot.value = false
+    stopPolling(); resetLocalEditing(); initialized = true
     error.value = cause instanceof Error ? cause.message : String(cause)
   } finally {
-    loading.value = false
+    if (!disposed && request === listRequest) loading.value = false
   }
 }
 
@@ -161,7 +219,7 @@ async function saveBBox(value: [number, number, number, number]) {
   const box: BBox = { x1: value[0], y1: value[1], x2: value[2], y2: value[3] }
   saving.value = true; error.value = ''
   try {
-    await api.patchCorrectionRow(selectedSessionId.value, row.excel_row, { actions_box: serializeBBox(row, box) })
+    await api.patchCorrectionRow(selectedSessionId.value, row.excel_row, { actions_box: serializeBBox(row, box) }, sessionCot.value?.storage_revision)
     bboxEditing.value = false
     await refreshCot()
     ElMessage.success('bbox 已保存到纠偏草稿')
@@ -189,7 +247,7 @@ async function saveTextField(field: EditableTextField) {
   if (!row || !selectedSessionId.value || editingField.value !== field) return
   saving.value = true; error.value = ''
   try {
-    await api.patchCorrectionRow(selectedSessionId.value, row.excel_row, { [field]: textDraft.value })
+    await api.patchCorrectionRow(selectedSessionId.value, row.excel_row, { [field]: textDraft.value }, sessionCot.value?.storage_revision)
     cancelTextEdit()
     await refreshCot()
     ElMessage.success(field === 'thought' ? 'Thought 已保存' : 'Summary 已保存')
@@ -202,14 +260,14 @@ async function saveTextField(field: EditableTextField) {
 
 async function regenerateCot() {
   const row = activeRow.value
-  if (!row || !selectedSessionId.value || saving.value || hasUnsaved.value) return
+  if (!row || !selectedSessionId.value || saving.value || hasUnsaved.value || activeGroup.value?.pending_review) return
   saving.value = true; error.value = ''
   try {
     startPolling(await api.createCorrectionCotJob(
       selectedSessionId.value,
       [selectedGroupId.value],
       [row.excel_row],
-      { generateBBox: false },
+      { generateBBox: false, expectedRevision: sessionCot.value?.storage_revision },
     ))
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : String(cause)
@@ -220,7 +278,8 @@ async function regenerateCot() {
 
 async function generateAll() {
   if (!selectedSessionId.value || saving.value || hasUnsaved.value) return
-  const rows = groups.value.flatMap((group) => group.rows)
+  const rows = eligibleGroups.value.flatMap((group) => group.rows)
+  if (!rows.length) return
   try {
     await ElMessageBox.confirm(
       `将重新生成 ${rows.length} 个步骤的 bbox、thought 和 summary；已有人工修改会被覆盖。`,
@@ -228,9 +287,10 @@ async function generateAll() {
       { type: 'warning', confirmButtonText: '确认覆盖生成', cancelButtonText: '取消' },
     )
   } catch { return }
+  if (!selectedSessionId.value || publishedNotice.value) return
   saving.value = true; error.value = ''
   try {
-    startPolling(await api.createCorrectionCotJob(selectedSessionId.value, undefined, undefined, { generateBBox: true, forceOverwrite: true }))
+    startPolling(await api.createCorrectionCotJob(selectedSessionId.value, eligibleGroups.value.map(group => group.group_id), undefined, { generateBBox: true, forceOverwrite: true, expectedRevision: sessionCot.value?.storage_revision }))
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : String(cause)
   } finally {
@@ -241,8 +301,11 @@ async function generateAll() {
 async function exportDataset() {
   if (!selectedSessionId.value || hasUnsaved.value || jobRunning.value || exporting.value) return
   exporting.value = true; error.value = ''
+  const sessionId = selectedSessionId.value
   try {
-    const result = await api.correctionDatasetExport(selectedSessionId.value)
+    const result = await api.correctionDatasetExport(sessionId, sessionCot.value?.storage_revision)
+    if (disposed || sessionId !== selectedSessionId.value) return
+    if (result.storage_revision !== undefined && sessionCot.value) sessionCot.value.storage_revision = result.storage_revision
     window.open(correctionDownloadUrl(selectedSessionId.value, result.filename), '_blank', 'noopener')
     ElMessage.success(`完整数据集已导出，替换 ${result.summary?.changed_rows ?? 0} 个步骤`)
   } catch (cause) {
@@ -253,34 +316,50 @@ async function exportDataset() {
 }
 
 watch(selectedSessionId, () => {
+  ++detailRequest
+  sessionCot.value = null
+  if (selectedBatchId.value) void router.replace({ query: { batch_id: selectedBatchId.value } })
   activeJob.value = null
   stopPolling()
   resetLocalEditing()
   void refreshCot()
 })
+onBeforeRouteUpdate((to, from) => {
+  if (publishedNotice.value && to.query.batch_id === undefined && to.query.session_id === undefined && to.query.session === undefined) return true
+  const changed = ['batch_id', 'session_id', 'session'].some(key => to.query[key] !== from.query[key])
+  if (changed && (hasUnsaved.value || saving.value || exporting.value)) { ElMessage.warning('请先保存或取消当前修改'); return false }
+  return true
+})
+watch(() => [route.query.batch_id, route.query.session_id, route.query.session], ([batchId, sessionId, legacySession]) => {
+  if ((publishedNotice.value && batchId === undefined && sessionId === undefined && legacySession === undefined) || !initialized || (batchId === selectedBatchId.value && sessionId === undefined && legacySession === undefined)) return
+  publishedNotice.value = null
+  void loadSessions()
+})
 onMounted(() => { void loadSessions() })
-onBeforeUnmount(() => { stopPolling() })
+onBeforeUnmount(() => { disposed = true; ++detailRequest; ++listRequest; stopPolling() })
 </script>
 
 <template>
   <div class="page cot-page">
+    <BatchPublishedNotice :notice="publishedNotice" />
     <header class="page-hero cot-hero">
       <div><span class="eyebrow">CORRECTED TRAJECTORY COT</span><h1>COT 生成</h1><p>批量生成后直接采用，单步可继续调整 bbox、Thought 和 Summary。</p></div>
       <div class="hero-metrics"><div><b>{{ editedRows }}</b><span>纠偏步骤</span></div><div><b>{{ generatedRows }}</b><span>模型生成</span></div></div>
     </header>
     <section class="toolbar">
-      <div class="toolbar-field"><span>纠偏会话</span><el-select v-model="selectedSessionId" :loading="loading" :disabled="loading || !sessions.length || hasUnsaved || jobRunning" placeholder="选择纠偏会话"><el-option v-for="item in sessions" :key="item.session_id" :label="`${item.session_id} · ${item.tree_run_id}`" :value="item.session_id" /></el-select></div>
+      <div class="toolbar-field"><span>业务批次</span><el-select v-model="selectedBatchId" :loading="loading" :disabled="loading || !sessions.length || hasUnsaved || jobRunning || saving || exporting" placeholder="选择批次"><el-option v-for="item in sessions" :key="item.batch_id" :label="item.batch_id" :value="item.batch_id" /></el-select></div>
       <div class="toolbar-stats"><span>任务 {{ selectedSession?.group_count ?? 0 }}</span><span>修改步骤 {{ editedRows }}</span></div>
-      <el-button type="primary" :loading="saving && jobRunning" :disabled="!selectedSessionId || !editedRows || jobRunning || hasUnsaved" @click="generateAll">批量生成 bbox + COT</el-button>
+      <el-button type="primary" :loading="saving && jobRunning" :disabled="!selectedSessionId || !editedRows || jobRunning || hasUnsaved || !eligibleGroups.length" @click="generateAll">批量生成 bbox + COT</el-button>
       <el-button type="success" :loading="exporting" :disabled="!selectedSessionId || !editedRows || jobRunning || hasUnsaved || saving" @click="exportDataset">导出数据集</el-button>
       <el-button :icon="Refresh" text :disabled="loadingCot || jobRunning || hasUnsaved" @click="refreshCot">刷新</el-button>
     </section>
+    <el-alert v-if="pendingReview" :title="`${pendingReview} 项人工修改待复核；生成和导出会排除这些任务。`" type="warning" :closable="false" show-icon><router-link :to="{ path: '/correction', query: { batch_id: selectedBatchId } }">进入当前批次复核</router-link></el-alert>
     <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />
     <section v-if="activeJob" class="job-status">
       <div><b>{{ activeJob.status === 'succeeded' ? '生成完成' : activeJob.status === 'failed' ? '生成失败' : activeJob.stage === 'generating_bbox' ? '正在生成 bbox' : '正在生成 COT' }}</b><span v-if="activeJob.current_trajectory">{{ activeJob.current_trajectory }} · Step {{ activeJob.current_step }}</span><span v-if="activeJob.generate_bbox">bbox {{ activeJob.completed_bbox ?? 0 }}/{{ activeJob.total_steps }}</span><span>COT {{ activeJob.completed_cot ?? activeJob.completed_steps }}/{{ activeJob.total_steps }}</span><em v-if="activeJob.error">{{ activeJob.error }}</em></div>
       <el-progress :percentage="activeJob.percent" :status="activeJob.status === 'failed' ? 'exception' : activeJob.status === 'succeeded' ? 'success' : undefined" />
     </section>
-    <el-empty v-if="!loading && !sessions.length" description="暂无纠偏会话，请先完成专家动作纠偏" :image-size="90" />
+    <el-empty v-if="!loading && !sessions.length" description="暂无可用批次，请先完成专家动作纠偏" :image-size="90" />
     <section v-else v-loading="loading || loadingCot" class="workspace">
       <aside class="step-panel">
         <div class="panel-title"><b>修改步骤</b><span>{{ editedRows }} 步</span></div>
@@ -321,7 +400,7 @@ onBeforeUnmount(() => { stopPolling() })
             <div class="editable-result"><div class="result-head"><label>新 Summary</label><el-button v-if="editingField !== 'summary'" link type="primary" :disabled="saving || jobRunning || bboxEditing || editingField !== null" @click="beginTextEdit('summary')">编辑</el-button></div><template v-if="editingField === 'summary'"><el-input v-model="textDraft" type="textarea" :rows="4" /><div class="inline-actions"><el-button size="small" @click="cancelTextEdit">取消</el-button><el-button size="small" type="primary" :loading="saving" :disabled="!textDirty" @click="saveTextField('summary')">保存</el-button></div></template><p v-else>{{ activeRow.summary || '暂无' }}</p></div>
           </div>
           <div class="history-card"><label>History</label><pre>{{ activeRow.history || 'Empty' }}</pre></div>
-          <div class="detail-actions"><el-button type="primary" :loading="saving || jobRunning" :disabled="hasUnsaved || jobRunning" @click="regenerateCot">重新生成 COT</el-button></div>
+          <div class="detail-actions"><el-button type="primary" :loading="saving || jobRunning" :disabled="saving || jobRunning || hasUnsaved || activeGroup?.pending_review" @click="regenerateCot">重新生成 COT</el-button></div>
         </template>
       </aside>
     </section>

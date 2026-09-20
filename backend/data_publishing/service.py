@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import ExitStack
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
@@ -14,7 +15,11 @@ from typing import Any, Callable, Optional
 from ..trajectory_correction.constants import CORRECTION_EXPORTS_DIR, FIXED_TRAJECTORY_ROOT
 from ..trajectory_correction.draft_store import list_sessions, load_session, save_session, storage_root, utc_now
 from .constants import PROJECT_ROOT, RELEASES_FILE, ensure_release_dirs
-from ..data_store import RecordStore, DATA_ROOT, rebase_data_path
+from ..data_store import RecordStore, ArtifactStore, DATA_ROOT, rebase_data_path
+from ..data_store.release_provenance import freeze_release_provenance
+from ..trajectory_correction.session_state import session_fingerprint
+from ..batch_lifecycle import (is_batch_active, session_batch_id, ensure_publishable, published_entry,
+                               BatchNotReadyError, BatchPublishedError, ensure_batch_active)
 
 
 SessionLoader = Callable[[str], Optional[dict[str, Any]]]
@@ -103,6 +108,12 @@ class DatasetReleaseRegistry:
         if not exports:
             raise ValueError("尚未导出完整数据集 Excel")
         latest = max(exports, key=lambda item: str(item.get("created_at", "")))
+        current_fingerprint = session_fingerprint(session)
+        if latest.get("content_fingerprint") and latest["content_fingerprint"] != current_fingerprint:
+            raise ValueError("修正内容或来源已更新，请重新导出当前完整数据集")
+        if session.get("published_content_fingerprint") == current_fingerprint or (
+            session.get("published") and not session.get("published_content_fingerprint")):
+            raise ValueError("当前批次内容已经发布，处理已结束")
         filename = str(latest.get("filename", "")).strip()
         if not filename or Path(filename).name != filename:
             raise ValueError("完整数据集 Excel 文件名无效")
@@ -138,7 +149,10 @@ class DatasetReleaseRegistry:
     def candidates(self) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         for session in self.session_lister():
-            if not isinstance(session, dict) or session.get("published"):
+            if not isinstance(session, dict) or session.get("archived"):
+                continue
+            batch_id = session_batch_id(session, self.data_root)
+            if not is_batch_active(batch_id, self.data_root):
                 continue
             ready = True
             reason = ""
@@ -146,16 +160,20 @@ class DatasetReleaseRegistry:
             path: Optional[Path] = None
             try:
                 latest, path = self._latest_full_export(session, require_file=True)
-            except (OSError, ValueError) as exc:
+                ensure_publishable(batch_id, [session], self.data_root)
+            except BatchPublishedError:
+                continue
+            except (OSError, ValueError, BatchNotReadyError) as exc:
                 ready = False
                 reason = str(exc)
             sheets = latest.get("sheets") if isinstance(latest.get("sheets"), dict) else {}
             rows = sum(int(value or 0) for value in sheets.values()) if sheets else 0
-            stats = self._selection_stats(session, rows)
+            stats = self._selection_stats({**session, "selection": latest.get("selection", session.get("selection"))}, rows)
             result.append(
                 {
                     "session_id": str(session.get("session_id", "")),
                     "tree_run_id": str(session.get("tree_run_id", "")),
+                    "batch_id": batch_id,
                     "created_at": session.get("created_at"),
                     "updated_at": session.get("updated_at"),
                     "ready": ready,
@@ -173,6 +191,12 @@ class DatasetReleaseRegistry:
 
     def _with_availability(self, release: dict[str, Any]) -> dict[str, Any]:
         value = deepcopy(release)
+        value.setdefault("source_kind", "workflow")
+        if "batch_ids" not in value:
+            value["batch_ids"] = sorted({str((source.get("artifact") or {}).get("batch_id")
+                or session_batch_id(self.session_loader(str(source.get("id"))) or {}, self.data_root))
+                for source in value.get("source_refs", [])
+                if source.get("kind") in (None, "correction_session")} - {""})
         available = True
         for item in value.get("excel_paths", []):
             try:
@@ -224,7 +248,14 @@ class DatasetReleaseRegistry:
         if not self.trajectory_root.is_dir():
             raise ValueError("原始轨迹根目录不存在，无法创建数据集发布")
 
-        with self._lock:
+        with self._lock, ExitStack() as locks:
+            initial = [self.session_loader(key) for key in unique_ids]
+            if any(item is None for item in initial):
+                raise FileNotFoundError("纠偏会话不存在")
+            expected_batches = {item["session_id"]: session_batch_id(item, self.data_root) for item in initial}
+            for batch_id in sorted(set(expected_batches.values())):
+                locks.enter_context(ArtifactStore(self.data_root).batch_lock(batch_id))
+                ensure_batch_active(batch_id, self.data_root)
             sessions: list[dict[str, Any]] = []
             excel_paths: list[dict[str, Any]] = []
             sources: list[dict[str, Any]] = []
@@ -233,12 +264,16 @@ class DatasetReleaseRegistry:
                 session = self.session_loader(session_id)
                 if session is None:
                     raise FileNotFoundError(f"纠偏会话不存在：{session_id}")
-                if session.get("published"):
-                    raise ValueError("所选纠偏会话已经发布")
+                if session.get("archived"):
+                    raise ValueError("所选纠偏会话已归档")
+                batch_id = session_batch_id(session, self.data_root)
+                if expected_batches[session_id] != batch_id:
+                    raise ValueError("会话来源已变化，请刷新后重试")
+                ensure_publishable(batch_id, [session], self.data_root)
                 latest, path = self._latest_full_export(session, require_file=True)
                 sheets = latest.get("sheets") if isinstance(latest.get("sheets"), dict) else {}
                 rows = sum(int(value or 0) for value in sheets.values()) if sheets else 0
-                stats = self._selection_stats(session, rows)
+                stats = self._selection_stats({**session, "selection": latest.get("selection", session.get("selection"))}, rows)
                 for key in totals:
                     totals[key] += stats[key]
                 excel_paths.append(
@@ -255,6 +290,9 @@ class DatasetReleaseRegistry:
                                 "revision": session.get("storage_revision"), "tree_run_id": session.get("tree_run_id"),
                                 "export_id": latest.get("export_id"), "artifact": latest.get("artifact")})
 
+            batch_ids = [session_batch_id(item, self.data_root) for item in sessions]
+            if len(set(batch_ids)) != len(batch_ids):
+                raise ValueError("同一业务批次只能选择一次")
             release_id = f"rel_{secrets.token_hex(8)}"
             created_at = utc_now()
             release: dict[str, Any] = {
@@ -263,6 +301,7 @@ class DatasetReleaseRegistry:
                 "created_at": created_at,
                 "excel_paths": excel_paths,
                 "trajectory_paths": [self.project_path(self.trajectory_root)],
+                "batch_ids": batch_ids,
                 "source_count": len(sessions),
                 "source_refs": sources,
                 **totals,
@@ -293,22 +332,23 @@ class DatasetReleaseRegistry:
                     item["source_path"] = item["path"]
                     item["path"] = self.project_path(final / relative)
                     item["data_path"] = (Path("releases") / release_id / relative).as_posix()
+                release = freeze_release_provenance(self.data_root, release, staging)
                 (staging / "manifest.json").write_text(json.dumps(release, ensure_ascii=False, indent=2), encoding="utf-8")
                 staging.rename(final)
                 for session in sessions:
                     session["published"] = True
+                    session["published_content_fingerprint"] = session_fingerprint(session)
                     session["published_at"] = created_at
                     session["published_release_id"] = release_id
-                if self.session_saver is save_session and self.data_root == storage_root().resolve():
-                    entries = [{"namespace": "dataset_releases", "key": release_id, "payload": release, "expected_revision": 0}]
-                    entries.extend({"namespace": "correction_sessions", "key": item["session_id"], "payload": item,
-                                    "expected_revision": item.get("storage_revision", 0)} for item in sessions)
-                    saved = self._records.put_many(entries)
-                    release = saved[0]
-                else:
+                entries = [{"namespace": "dataset_releases", "key": release_id, "payload": release, "expected_revision": 0}]
+                entries.extend({"namespace": "correction_sessions", "key": item["session_id"], "payload": item,
+                                "expected_revision": item.get("storage_revision", 0)} for item in sessions)
+                entries.extend(published_entry(batch_id, release_id, created_at, self.data_root) for batch_id in batch_ids)
+                # Injected mirrors are retained for embedded consumers; SQLite owns the atomic state.
+                if self.session_saver is not save_session:
                     for session in sessions:
                         self.session_saver(session)
-                    release = self._records.put("dataset_releases", release_id, release, expected_revision=0)
+                release = self._records.put_many(entries)[0]
             except Exception:
                 if self.session_saver is not save_session:
                     for original in originals:

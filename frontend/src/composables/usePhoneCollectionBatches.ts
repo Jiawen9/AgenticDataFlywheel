@@ -1,3 +1,4 @@
+import { activeBatchItems, publishedBatch } from '@/utils/batchLifecycle'
 import { computed, ref } from 'vue'
 import type { CollectionBatchDetail, CollectionBatchSummary } from '@/collectionBatchesApi'
 import type { FactoryState, TaskRow } from '@/phoneFactoryApi'
@@ -35,6 +36,7 @@ export function usePhoneCollectionBatches(batchApi: BatchApi, factoryApi: Factor
   isBlocked?: () => boolean
   downloadFile?: (blob: Blob, filename: string) => void
 }) {
+  const retiredIds = new Set<string>()
   const batches = ref<CollectionBatchSummary[]>([])
   const selectedBatchId = ref('')
   const selectedBatch = ref<CollectionBatchDetail | null>(null)
@@ -49,6 +51,7 @@ export function usePhoneCollectionBatches(batchApi: BatchApi, factoryApi: Factor
   const blocked = computed(() => busy.value || Boolean(options.isBlocked?.()))
 
   async function selectBatch(id: string): Promise<boolean> {
+    if (publishedBatch(id) || retiredIds.has(id)) { retireBatches([id]); return false }
     if (disposed || blocked.value) return false
     const revision = ++selectionRevision
     selectedBatchId.value = id
@@ -77,7 +80,7 @@ export function usePhoneCollectionBatches(batchApi: BatchApi, factoryApi: Factor
     try {
       const rows = await batchApi.list()
       if (disposed || revision !== listRevision) return
-      batches.value = rows
+      batches.value = activeBatchItems(rows).filter(batch => !retiredIds.has(batch.batch_id))
       if (preferredId && selection === selectionRevision) await selectBatch(preferredId)
     } catch (cause) {
       if (!disposed && revision === listRevision) error.value = (cause as Error).message
@@ -131,6 +134,13 @@ export function usePhoneCollectionBatches(batchApi: BatchApi, factoryApi: Factor
     }
   }
 
+  function retireBatches(ids: string[], forceReset = false) {
+    ids.forEach(id => retiredIds.add(id))
+    batches.value = batches.value.filter(batch => !ids.includes(batch.batch_id))
+    if (!forceReset && !ids.includes(selectedBatchId.value)) return
+    ++listRevision; loadingBatches.value = false
+    ++selectionRevision; selectedBatchId.value = ''; selectedBatch.value = null; loadingBatch.value = false; error.value = ''
+  }
   function dispose() { disposed = true; selectionRevision += 1; listRevision += 1 }
-  return { batches, selectedBatchId, selectedBatch, loadingBatches, loadingBatch, busy, downloading, error, blocked, selectBatch, loadBatches, runBatch, downloadBatch, dispose }
+  return { batches, selectedBatchId, selectedBatch, loadingBatches, loadingBatch, busy, downloading, error, blocked, selectBatch, loadBatches, runBatch, downloadBatch, retireBatches, dispose }
 }

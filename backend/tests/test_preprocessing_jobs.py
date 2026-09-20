@@ -137,13 +137,14 @@ class PreprocessingJobTests(unittest.TestCase):
         self.assertEqual(done["status"], "succeeded", done.get("error"))
         self.assertEqual(done["artifacts"][0]["version"], original["version"])
         self.assertEqual(len(self.payload(done["artifacts"][1])["sheets"][SHEET]), 1)
+        prior_trajectory = self.payload(done["artifacts"][1])["sheets"][SHEET][0]["trajectory_id"]
         newest = self.start()
         rows = self.payload(newest["artifacts"][1])["sheets"][SHEET]
         self.assertEqual(len(rows), 2)
         self.assertEqual(len({row["trajectory_id"] for row in rows}), 2)
         self.assertEqual(len({row["文件夹名"] for row in rows}), 1)
-        self.assertIn(self.payload(done["artifacts"][1])["sheets"][SHEET][0]["trajectory_id"],
-                      {row["trajectory_id"] for row in rows})
+        self.assertIn(prior_trajectory, {row["trajectory_id"] for row in rows})
+        self.assertIsNone(self.store.get("batch-one", "02_annotation", done["artifacts"][1]["version"]))
 
     def test_concurrent_start_creates_one_job(self):
         self.complete()
@@ -264,13 +265,20 @@ class PreprocessingJobTests(unittest.TestCase):
         self.assertNotEqual(before["pipeline_revision"], after["pipeline_revision"])
         self.assertNotIn("hidden", json.dumps(after))
 
-    def test_cli_default_outputs_are_isolated_by_batch_and_execution(self):
+    def test_cli_default_outputs_are_temporary_and_removed_after_publication(self):
         calls = []
-        with patch("backend.trajectories_preprocessing.run_pipeline", side_effect=lambda **kwargs: calls.append(kwargs)):
+        def fake_pipeline(**kwargs):
+            calls.append(kwargs)
+            kwargs["export_output"].write_text("temporary conversion")
+            kwargs["annotated_output"].write_text("temporary annotation")
+        with patch("backend.trajectories_preprocessing.run_pipeline", side_effect=fake_pipeline):
             for _ in range(2):
                 with patch("sys.argv", ["preprocess", "--batch-id", "cli-batch", "--data-root", str(self.root)]):
                     self.assertEqual(trajectories_preprocessing.main(), 0)
         for call in calls:
             self.assertEqual(call["export_output"].parent, call["annotated_output"].parent)
-            self.assertTrue(call["export_output"].is_relative_to(self.root / "system/preprocessing/cli-batch"))
+            self.assertTrue(call["export_output"].is_relative_to(self.root / "tmp/preprocessing-cli-views"))
+            self.assertFalse(call["register_annotation_export"])
+            self.assertFalse(call["export_output"].parent.exists())
         self.assertNotEqual(calls[0]["export_output"], calls[1]["export_output"])
+        self.assertEqual(list((self.root / "tmp/preprocessing-cli-views").iterdir()), [])

@@ -62,7 +62,7 @@ class PreprocessingDownstreamIntegrationTests(unittest.TestCase):
         self.assertFalse(f.queue.calls)
         self.assertEqual(len(f.store.list("batch-one", "02_annotation")), 1)
 
-    def test_real_annotation_payload_progress_and_pinned_downstream_tree(self):
+    def test_real_annotation_payload_progress_and_current_downstream_tree(self):
         f = self.fixture
         f.complete()
         f.complete()
@@ -86,19 +86,23 @@ class PreprocessingDownstreamIntegrationTests(unittest.TestCase):
         edit = update_action_bbox("task-one", rows[0]["trajectory_id"], 1, 2, (5, 6, 35, 45),
             batch_id="batch-one", expected_annotation_version=context.annotation_version, data_root=f.root)
         self.assertNotEqual(edit["annotation_version"], context.annotation_version)
+        with self.assertRaises(FileNotFoundError):
+            resolve_batch_context("batch-one", context.annotation_version, f.root)
+        current = resolve_batch_context("batch-one", edit["annotation_version"], f.root)
         with patch("backend.tree_build_service.configure_reviewer_environment", return_value="fake-model"), \
              patch("backend.tree_build_service.QwenIntermediateStateClassifier", FakeClassifier), \
              patch("backend.tree_build_service.QwenStateAlignmentReviewer", FakeAlignmentReviewer):
             run_id, manifest = build_tree_run(["task-one"], job_id="integration-tree", progress=lambda _: None,
-                batch_id="batch-one", annotation_version=context.annotation_version, data_root=f.root,
+                batch_id="batch-one", annotation_version=current.annotation_version, data_root=f.root,
                 env_path=f.root / "unused.env",
                 quality_builder=partial(build_quality_workbook, summarizer=FakeSummarizer()))
         self.assertEqual(manifest["batch_id"], "batch-one")
-        self.assertEqual(manifest["annotation_version"], context.annotation_version)
-        run = f.root / "system" / "trajectory_tree_runs" / run_id
-        snapshot = json.loads((run / manifest["source_annotated_json"]).read_text(encoding="utf-8"))
-        self.assertEqual(snapshot["sheets"]["VLA trajectories"], rows)
-        quality = json.loads((run / manifest["quality_input_json"]).read_text(encoding="utf-8"))
+        self.assertEqual(manifest["annotation_version"], current.annotation_version)
+        self.assertEqual(run_id, "batch-one")
+        tree_payload = f.store.read_payload(f.store.get("batch-one", "04_tree"))
+        snapshot = tree_payload["source_annotation"]
+        self.assertEqual(snapshot["sheets"]["VLA trajectories"], current.payload["sheets"]["VLA trajectories"])
+        quality = tree_payload["quality_input"]
         self.assertEqual(len(quality["sheets"]["Trajectories"]), 2)
         for row in quality["sheets"]["Steps"]:
             source = json.loads(row["action_input_json"])["source_identity"]
@@ -187,7 +191,8 @@ class PreprocessingDownstreamIntegrationTests(unittest.TestCase):
         self.assertTrue(result["error"])
         self.assertEqual(resolve_batch_context("batch-one", root=f.root).annotation_version,
                          changed["annotation_version"])
-        self.assertEqual([item["stage"] for item in result["artifacts"]], ["01_conversion"])
+        self.assertEqual(result["artifacts"], [])
+        self.assertEqual(f.store.get("batch-one", "01_conversion")["version"], initial["artifacts"][0]["version"])
 
 
 if __name__ == "__main__":

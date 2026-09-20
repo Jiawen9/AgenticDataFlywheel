@@ -15,6 +15,8 @@ from fastapi.testclient import TestClient
 from backend.data_publishing.router import router
 from backend.data_publishing.service import DatasetReleaseRegistry
 from backend.data_publishing.upload_jobs import DatasetUploadJobManager
+from backend.tests.lifecycle_fixtures import seed_publishable_batch
+from backend.batch_lifecycle import lifecycle
 
 
 class ImmediateExecutor:
@@ -58,12 +60,14 @@ class DatasetPublishingTests(unittest.TestCase):
             ]
         session = {
             "session_id": session_id,
-            "tree_run_id": "run-1",
+            "tree_run_id": f"batch-{session_id}",
+            "batch_id": f"batch-{session_id}", "storage_batch_id": f"batch-{session_id}",
             "created_at": "2026-01-01T00:00:00+00:00",
             "updated_at": "2026-01-02T00:00:00+00:00",
             "selection": {"tasks": [{"task_id": "TASK-A", "trajectory_count": 2}]},
             "exports": exports,
         }
+        seed_publishable_batch(self.trajectory_root.parents[1], session["batch_id"], session)
         self.sessions[session_id] = session
         return session
 
@@ -89,7 +93,7 @@ class DatasetPublishingTests(unittest.TestCase):
             session_saver=saver,
         )
 
-    def test_release_uses_latest_export_and_hides_session(self):
+    def test_release_uses_latest_export_and_closes_batch(self):
         session = self.add_session()
         registry = self.registry()
 
@@ -105,6 +109,8 @@ class DatasetPublishingTests(unittest.TestCase):
         self.assertEqual(release["step_count"], 4)
         self.assertTrue(self.sessions[session["session_id"]]["published"])
         self.assertEqual(registry.candidates(), [])
+        self.assertEqual(release["batch_ids"], [session["batch_id"]])
+        self.assertEqual(lifecycle(session["batch_id"], self.root / "data")["release_id"], release["release_id"])
         entry = registry._records.get("dataset_releases", release["release_id"])
         self.assertFalse(registry.releases_file.exists())
         self.assertNotIn("session_id", entry)

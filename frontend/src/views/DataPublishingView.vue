@@ -1,12 +1,21 @@
 <script setup lang="ts">
+import BatchPublishedNotice from '@/components/BatchPublishedNotice.vue'
+import { useBatchLifecycle } from '@/composables/useBatchLifecycle'
+import { activeBatchItems, type PublishedBatchEvent } from '@/utils/batchLifecycle'
+import { notifyBatchesPublished } from '@/utils/batchLifecycle'
+import { useRoute } from 'vue-router'
+
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { CopyDocument, Download, Plus, Refresh, Search, Upload, View } from '@element-plus/icons-vue'
 import { api, datasetReleaseExcelUrl } from '@/api'
 import DatasetUploadReceipts from '@/components/DatasetUploadReceipts.vue'
+import ReleaseOverviewStatus from '@/components/ReleaseOverviewStatus.vue'
+import ExternalDatasetImport from '@/components/ExternalDatasetImport.vue'
 import { datasetUploadMessage } from '@/utils/datasetUploadMessage'
 import type { DatasetRelease, DatasetReleaseCandidate, DatasetUploadJob, DatasetUploadStatus, DatasetUploadCapabilities } from '@/types'
 
+const route = useRoute()
 const ACTIVE_UPLOAD_KEY = 'agentic-data-flywheel.active-internal-dataset-upload'
 const capabilities = ref<DatasetUploadCapabilities>({ internal: { configured: false, reason: '正在检查云道S3上传配置' } })
 const submitting = ref(false)
@@ -14,6 +23,7 @@ const pollError = ref('')
 let pollEpoch = 0
 let loadEpoch = 0
 let detailEpoch = 0
+let historyEpoch = 0
 const candidates = ref<DatasetReleaseCandidate[]>([])
 const releases = ref<DatasetRelease[]>([])
 const selectedSessionIds = ref<string[]>([])
@@ -29,8 +39,19 @@ const activeUpload = ref<DatasetUploadJob | null>(null)
 let pollTimer: ReturnType<typeof setTimeout> | null = null
 let disposed = false
 
+const lifecycle = useBatchLifecycle({ currentBatch: () => '', onPublished, refreshChoices: () => loadData(true) })
+const { notice: publishedNotice } = lifecycle
+function onPublished(event: PublishedBatchEvent) {
+  // External releases have no active editing workspace to retire on this page.
+  if (event.batch_ids.length && event.batch_ids.every(id => id.startsWith('external_'))) return
+  candidates.value = candidates.value.filter(item => !event.batch_ids.includes(item.batch_id || ''))
+  const remaining = new Set(candidates.value.map(item => item.session_id))
+  selectedSessionIds.value = selectedSessionIds.value.filter(id => remaining.has(id))
+  publishedNotice.value = event; loading.value = false
+}
 const readyCandidates = computed(() => candidates.value.filter(item => item.ready))
 const selectedReadyCount = computed(() => selectedSessionIds.value.filter(id => readyCandidates.value.some(item => item.session_id === id)).length)
+const isExternalRelease = (item: DatasetRelease) => item.source_kind === 'external_manual'
 const internalStatus = (item: DatasetRelease): DatasetUploadStatus => item.internal_upload?.status || 'not_uploaded'
 const uploadedCount = computed(() => releases.value.filter(item => internalStatus(item) === 'succeeded').length)
 const failedCount = computed(() => releases.value.filter(item => ['failed', 'interrupted'].includes(internalStatus(item))).length)
@@ -72,6 +93,7 @@ function statusType(status: DatasetUploadStatus) {
 
 async function loadData(silent = false) {
   const epoch = ++loadEpoch
+  const history = ++historyEpoch
   if (!silent) loading.value = true
   pageError.value = ''
   try {
@@ -81,14 +103,16 @@ async function loadData(silent = false) {
     ])
     if (disposed || epoch !== loadEpoch) return
     capabilities.value = nextCapabilities
-    candidates.value = nextCandidates
-    releases.value = nextReleases
-    if (detailRelease.value) detailRelease.value = nextReleases.find(item => item.release_id === detailRelease.value?.release_id) || detailRelease.value
-    const running = nextReleases.find(item => ['queued', 'uploading'].includes(internalStatus(item)))
-    if (running?.internal_upload && !uploadRunning.value && !submitting.value) {
-      void pollUpload(running.internal_upload.job_id, ++pollEpoch)
+    candidates.value = activeBatchItems(nextCandidates)
+    if (history === historyEpoch) {
+      releases.value = nextReleases
+      if (detailRelease.value) detailRelease.value = nextReleases.find(item => item.release_id === detailRelease.value?.release_id) || detailRelease.value
+      const running = nextReleases.find(item => ['queued', 'uploading'].includes(internalStatus(item)))
+      if (running?.internal_upload && !uploadRunning.value && !submitting.value) {
+        void pollUpload(running.internal_upload.job_id, ++pollEpoch)
+      }
     }
-    const available = new Set(nextCandidates.filter(item => item.ready).map(item => item.session_id))
+    const available = new Set(candidates.value.filter(item => item.ready).map(item => item.session_id))
     selectedSessionIds.value = selectedSessionIds.value.filter(id => available.has(id))
   } catch (error) {
     if (!disposed && epoch === loadEpoch) pageError.value = (error as Error).message
@@ -104,10 +128,12 @@ function selectAll() {
 async function createRelease() {
   const name = datasetName.value.trim()
   if (!name) { ElMessage.warning('请输入数据集名称'); return }
-  if (!selectedSessionIds.value.length) { ElMessage.warning('至少选择一个可发布会话'); return }
+  if (!selectedSessionIds.value.length) { ElMessage.warning('至少选择一个可发布批次'); return }
   creating.value = true
   try {
     const release = await api.createDatasetRelease(name, selectedSessionIds.value)
+    notifyBatchesPublished({ batch_ids: release.batch_ids, release_id: release.release_id, published_at: release.created_at })
+    if (disposed) return
     datasetName.value = ''
     selectedSessionIds.value = []
     await loadData(true)
@@ -118,6 +144,25 @@ async function createRelease() {
     ElMessage.error((error as Error).message)
   } finally {
     creating.value = false
+  }
+}
+
+async function externalReleased(release: DatasetRelease) {
+  const history = ++historyEpoch
+  const externalBatchIds = release.batch_ids.filter(id => id.startsWith('external_'))
+  if (externalBatchIds.length) notifyBatchesPublished({ batch_ids: externalBatchIds, release_id: release.release_id, published_at: release.created_at })
+  if (disposed) return
+  releases.value = [release, ...releases.value.filter(item => item.release_id !== release.release_id)]
+  ++detailEpoch
+  detailRelease.value = release
+  detailVisible.value = true
+  ElMessage.success('数据集 ' + release.release_id + ' 已发布')
+  try {
+    const next = await api.datasetReleases()
+    if (disposed || history !== historyEpoch) return
+    releases.value = next.some(item => item.release_id === release.release_id) ? next : [release, ...next]
+  } catch (cause) {
+    if (!disposed && history === historyEpoch) pageError.value = '数据集已发布，刷新历史失败：' + (cause as Error).message
   }
 }
 
@@ -201,6 +246,10 @@ async function copyS3(uri: string | null) {
 onMounted(async () => {
   await loadData()
   if (disposed) return
+  if (typeof route.query.release_id === 'string') {
+    try { const release = await api.datasetRelease(route.query.release_id); if (!disposed) { detailRelease.value = release; detailVisible.value = true } }
+    catch (cause) { if (!disposed) pageError.value = (cause as Error).message }
+  }
   const remembered = localStorage.getItem(ACTIVE_UPLOAD_KEY)
   if (remembered && !pollEpoch) void pollUpload(remembered, ++pollEpoch)
 })
@@ -210,9 +259,10 @@ onBeforeUnmount(() => { disposed = true; ++pollEpoch; clearPoll() })
 
 <template>
   <div class="page release-page">
+    <BatchPublishedNotice :notice="publishedNotice" />
     <header class="page-hero release-hero">
-      <div><span class="eyebrow">DATASET RELEASE</span><h1>数据发布</h1><p>登记专家纠偏后的完整数据集，将发布记录中的全部 Excel 上传到云道S3。</p></div>
-      <el-button :icon="Refresh" :loading="loading" @click="loadData()">刷新</el-button>
+      <div><span class="eyebrow">DATASET RELEASE</span><h1>数据发布</h1><p>发布专家纠偏数据或已有的轨迹表格，将发布记录中的全部 Excel 上传到云道S3。</p></div>
+      <div class="release-actions"><ExternalDatasetImport @released="externalReleased" /><el-button :icon="Refresh" :loading="loading" @click="loadData()">刷新</el-button></div>
     </header>
 
     <section class="metrics" aria-label="发布统计">
@@ -228,25 +278,25 @@ onBeforeUnmount(() => { disposed = true; ++pollEpoch; clearPoll() })
 
     <section class="panel create-panel" v-loading="loading">
       <div class="section-heading">
-        <div><h2>创建数据集</h2><p>每个会话使用最新一份“专家纠偏完整数据集”导出文件。</p></div>
+        <div><h2>创建数据集</h2><p>每个业务批次使用当前有效的“专家纠偏完整数据集”导出文件。</p></div>
         <div class="selection-actions"><el-button text @click="selectAll">全选可发布</el-button><el-button text @click="selectedSessionIds = []">取消选择</el-button></div>
       </div>
       <div class="create-form">
-        <el-input v-model="datasetName" maxlength="120" show-word-limit placeholder="输入数据集名称，例如：爱奇艺 GUI 轨迹数据集 v1" />
+        <el-input v-model="datasetName" data-testid="internal-release-name" maxlength="120" show-word-limit placeholder="输入数据集名称，例如：爱奇艺 GUI 轨迹数据集 v1" />
         <el-button type="primary" :icon="Plus" :loading="creating" :disabled="!selectedReadyCount" @click="createRelease">创建并发布</el-button>
       </div>
       <div v-if="candidates.length" class="candidate-list">
         <label v-for="candidate in candidates" :key="candidate.session_id" class="candidate" :class="{ disabled: !candidate.ready, selected: selectedSessionIds.includes(candidate.session_id) }">
           <el-checkbox v-model="selectedSessionIds" :value="candidate.session_id" :disabled="!candidate.ready" />
           <div class="candidate-main">
-            <div class="candidate-title"><b>{{ candidate.tree_run_id || '未命名纠偏批次' }}</b><el-tag v-if="candidate.ready" type="success" size="small">可发布</el-tag><el-tag v-else type="warning" size="small">缺少完整导出</el-tag></div>
+            <div class="candidate-title"><b>{{ candidate.batch_id || '未命名批次' }}</b><el-tag v-if="candidate.ready" type="success" size="small">可发布</el-tag><el-tag v-else type="warning" size="small">缺少完整导出</el-tag></div>
             <span v-if="candidate.ready">{{ candidate.latest_excel.filename }} · {{ candidate.step_count }} 行 · 更新于 {{ formatDate(candidate.updated_at) }}</span>
             <span v-else class="candidate-error">{{ candidate.reason }}</span>
           </div>
           <div class="candidate-stats"><b>{{ candidate.task_count }}</b> 任务 · <b>{{ candidate.trajectory_count }}</b> 轨迹</div>
         </label>
       </div>
-      <el-empty v-else-if="!loading" description="暂无未发布的纠偏会话" :image-size="72" />
+      <el-empty v-else-if="!loading" description="暂无可发布的业务批次" :image-size="72" />
     </section>
 
     <section v-if="activeUpload" class="panel upload-progress">
@@ -265,6 +315,7 @@ onBeforeUnmount(() => { disposed = true; ++pollEpoch; clearPoll() })
       </div>
       <el-table v-if="filteredReleases.length" :data="filteredReleases" row-key="release_id" class="release-table">
         <el-table-column label="数据集" min-width="250"><template #default="{ row }"><div class="release-name"><b>{{ row.name }}</b><code>{{ row.release_id }}</code></div></template></el-table-column>
+        <el-table-column label="来源" min-width="120"><template #default="{ row }"><el-tag :type="isExternalRelease(row) ? 'info' : 'success'">{{ isExternalRelease(row) ? '外部表格' : '专家纠偏' }}</el-tag><small v-if="isExternalRelease(row)" class="release-progress">{{ row.external_import?.data_source || '人工采集' }}</small></template></el-table-column>
         <el-table-column label="发布时间" min-width="170"><template #default="{ row }">{{ formatDate(row.created_at) }}</template></el-table-column>
         <el-table-column label="规模" min-width="180"><template #default="{ row }">{{ row.excel_paths.length }} Excel · {{ row.trajectory_count }} 轨迹 · {{ row.step_count }} 步</template></el-table-column>
         <el-table-column label="云道S3" min-width="130"><template #default="{ row }"><el-tag :type="statusType(internalStatus(row))" effect="light">{{ statusText(internalStatus(row)) }}</el-tag><small v-if="row.internal_upload" class="release-progress">{{ row.internal_upload.completed_files }}/{{ row.internal_upload.total_files }} 个 Excel</small></template></el-table-column>
@@ -278,10 +329,20 @@ onBeforeUnmount(() => { disposed = true; ++pollEpoch; clearPoll() })
         <div class="detail-title"><h3>{{ detailRelease.name }}</h3><code>{{ detailRelease.release_id }}</code></div>
         <el-descriptions :column="2" border>
           <el-descriptions-item label="发布时间">{{ formatDate(detailRelease.created_at) }}</el-descriptions-item><el-descriptions-item label="云道S3上传"><el-tag :type="statusType(internalStatus(detailRelease))">{{ statusText(internalStatus(detailRelease)) }}</el-tag></el-descriptions-item>
-          <el-descriptions-item label="会话来源数">{{ detailRelease.source_count }}</el-descriptions-item><el-descriptions-item label="数据规模">{{ detailRelease.task_count }} 任务 / {{ detailRelease.trajectory_count }} 轨迹 / {{ detailRelease.step_count }} 步</el-descriptions-item>
-          <el-descriptions-item label="轨迹根目录（仅登记）" :span="2"><code>{{ detailRelease.trajectory_paths.join('\n') }}</code></el-descriptions-item>
-          <el-descriptions-item label="历史模拟上传"><el-tag type="info">{{ statusText(detailRelease.upload_status) }}</el-tag><span v-if="detailRelease.upload_error">{{ detailRelease.upload_error }}</span></el-descriptions-item>
-          <el-descriptions-item label="模拟 S3 地址"><code>{{ detailRelease.s3_uri || '无' }}</code><el-button v-if="detailRelease.s3_uri" text :icon="CopyDocument" @click="copyS3(detailRelease.s3_uri)">复制</el-button></el-descriptions-item>
+          <el-descriptions-item label="数据来源">{{ isExternalRelease(detailRelease) ? '外部表格' : '专家纠偏' }}</el-descriptions-item>
+          <el-descriptions-item v-if="!isExternalRelease(detailRelease)" label="会话来源数">{{ detailRelease.source_count }}</el-descriptions-item>
+          <el-descriptions-item label="数据规模"><template v-if="!isExternalRelease(detailRelease)">{{ detailRelease.task_count }} 任务 / </template>{{ detailRelease.trajectory_count }} 轨迹 / {{ detailRelease.step_count }} 步</el-descriptions-item>
+          <template v-if="isExternalRelease(detailRelease) && detailRelease.external_import">
+            <el-descriptions-item label="来源名称">{{ detailRelease.external_import.data_source }}</el-descriptions-item>
+            <el-descriptions-item label="数据日期">{{ detailRelease.external_import.data_date }}</el-descriptions-item>
+            <el-descriptions-item label="工作表">{{ detailRelease.external_import.sheet_name }}</el-descriptions-item>
+            <el-descriptions-item v-if="detailRelease.external_import.filename" label="来源文件">{{ detailRelease.external_import.filename }}</el-descriptions-item>
+            <el-descriptions-item v-if="detailRelease.external_import.app" label="指定 App">{{ detailRelease.external_import.app }}</el-descriptions-item>
+            <el-descriptions-item v-if="detailRelease.external_import.level1 || detailRelease.external_import.level2" label="指定场景">{{ [detailRelease.external_import.level1, detailRelease.external_import.level2].filter(Boolean).join(' / ') }}</el-descriptions-item>
+          </template>
+          <el-descriptions-item v-if="!isExternalRelease(detailRelease)" label="轨迹根目录（仅登记）" :span="2"><code>{{ detailRelease.trajectory_paths.join('\n') }}</code></el-descriptions-item>
+          <el-descriptions-item v-if="!isExternalRelease(detailRelease)" label="历史模拟上传"><el-tag type="info">{{ statusText(detailRelease.upload_status) }}</el-tag><span v-if="detailRelease.upload_error">{{ detailRelease.upload_error }}</span></el-descriptions-item>
+          <el-descriptions-item v-if="!isExternalRelease(detailRelease)" label="模拟 S3 地址"><code>{{ detailRelease.s3_uri || '无' }}</code><el-button v-if="detailRelease.s3_uri" text :icon="CopyDocument" @click="copyS3(detailRelease.s3_uri)">复制</el-button></el-descriptions-item>
         </el-descriptions>
         <template v-if="detailRelease.internal_upload">
           <h4>云道S3上传结果 · {{ detailRelease.internal_upload.completed_files }}/{{ detailRelease.internal_upload.total_files }} 个 Excel</h4>
@@ -289,8 +350,9 @@ onBeforeUnmount(() => { disposed = true; ++pollEpoch; clearPoll() })
           <el-alert v-if="detailRelease.internal_upload.error" :title="datasetUploadMessage(detailRelease.internal_upload.error)" type="error" :closable="false" />
           <DatasetUploadReceipts :files="detailRelease.internal_upload.file_results" />
         </template>
-        <h4>纠偏 Excel</h4>
-        <div v-for="(excel, index) in detailRelease.excel_paths" :key="excel.path" class="excel-detail"><div><b>{{ excel.filename }}</b><span>{{ excel.rows }} 行 · {{ excel.available ? '本地可用' : '本地缺失' }}</span></div><code>{{ excel.path }}</code><small>SHA256 {{ excel.sha256 }}</small><el-button text :icon="Download" tag="a" :href="datasetReleaseExcelUrl(detailRelease.release_id, index)" target="_blank" :disabled="excel.available === false">下载</el-button></div>
+        <ReleaseOverviewStatus v-if="detailVisible" :key="detailRelease.release_id" :release-id="detailRelease.release_id" />
+        <h4>{{ isExternalRelease(detailRelease) ? '发布 Excel' : '纠偏 Excel' }}</h4>
+        <div v-for="(excel, index) in detailRelease.excel_paths" :key="excel.path" class="excel-detail"><div><b>{{ excel.filename }}</b><span>{{ excel.rows }} 行 · {{ excel.available ? '本地可用' : '本地缺失' }}</span></div><code v-if="!isExternalRelease(detailRelease)">{{ excel.path }}</code><small>SHA256 {{ excel.sha256 }}</small><el-button text :icon="Download" tag="a" :href="datasetReleaseExcelUrl(detailRelease.release_id, index)" target="_blank" :disabled="excel.available === false">下载</el-button></div>
       </template>
     </el-dialog>
   </div>
@@ -300,6 +362,7 @@ onBeforeUnmount(() => { disposed = true; ++pollEpoch; clearPoll() })
 .release-page { display: grid; grid-template-columns: minmax(0, 1fr); gap: 18px; }
 .release-hero { align-items: flex-start; }
 .release-hero .el-button { margin-top: 4px; }
+.release-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
 .metric { display: grid; gap: 4px; padding: 16px 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
 .metric b { color: var(--ink); font-size: 25px; font-weight: 650; }

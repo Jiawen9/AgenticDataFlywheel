@@ -43,12 +43,14 @@ class DataRegistryApiTests(unittest.TestCase):
         self.assertEqual(info["data_root"], str(self.root))
         self.assertEqual(info["database"], "system/app.sqlite")
         self.assertEqual(info["storage_mode"], "new_only")
+        self.assertEqual(info["stage_policy"], "single_current")
+        self.assertEqual(info["stage_files"], "batches/<batch_id>/<stage>")
         self.assertNotIn("legacy_root", info)
         self.assertEqual(self.client.get("/api/data-batches/missing/artifacts").status_code, 404)
         self.assertEqual(self.client.get("/api/data-batches/missing/artifacts/stage/version").status_code, 404)
         self.assertFalse(self.root.exists())
 
-    def test_lists_versions_and_downloads_exact_json_excel_without_writing(self):
+    def test_lists_one_current_artifact_per_stage_and_downloads_without_writing(self):
         payload = {"steps": [{"summary": "", "thought": "保留全文", "task": "=literal"}]}
         first = self.store.publish("batch-a", "01_conversion", payload, tables={"步骤": payload["steps"]})
         self.store.publish("batch-a", "02_annotation", {"marked": True})
@@ -58,10 +60,11 @@ class DataRegistryApiTests(unittest.TestCase):
         batches = self.client.get("/api/data-batches").json()["batches"]
         self.assertEqual(len(batches), 2)
         batch = next(item for item in batches if item["batch_id"] == "batch-a")
-        self.assertEqual(batch["version_count"], 3)
+        self.assertEqual(batch["stage_count"], 2)
+        self.assertEqual(batch["version_count"], 2)
         self.assertEqual(batch["stages"], ["01_conversion", "02_annotation"])
         listed = self.client.get("/api/data-batches/batch-a/artifacts").json()["artifacts"]
-        self.assertEqual(len(listed), 3)
+        self.assertEqual(len(listed), 2)
         url = self.artifact_url(first)
         self.assertEqual(self.client.get(url).json(), first)
         for file in first["files"]:
@@ -73,6 +76,20 @@ class DataRegistryApiTests(unittest.TestCase):
             if file["kind"] == "json":
                 self.assertEqual(response.json(), payload)
         self.assertEqual(self.snapshot(), before)
+
+    def test_current_url_follows_replacement_and_superseded_token_returns_gone(self):
+        original = self.store.publish("batch", "stage", {"task": "before"})
+        current_url = "/api/data-batches/batch/artifacts/stage"
+        self.assertEqual(self.client.get(current_url).json(), original)
+        updated = self.store.publish("batch", "stage", {"task": "after"})
+        self.assertEqual(self.client.get(current_url).json(), updated)
+        response = self.client.get(current_url + "/files/result.json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"task": "after"})
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertEqual(self.client.get(self.artifact_url(original)).status_code, 410)
+        self.assertEqual(self.client.get(self.artifact_url(original) + "/files/result.json").status_code, 410)
+        self.assertEqual(self.client.get(self.artifact_url(updated)).status_code, 200)
 
     def test_missing_file_and_checksum_mismatch_are_explicit(self):
         manifest = self.store.publish("batch", "stage", {"value": "original"})
@@ -95,7 +112,7 @@ class DataRegistryApiTests(unittest.TestCase):
         manifest["files"][0]["path"] = "../outside.json"
         manifest["files"][0]["sha256"] = hashlib.sha256(outside.read_bytes()).hexdigest()
         manifest["files"][0]["size"] = outside.stat().st_size
-        self.store.records.put("artifacts", f'batch/stage/{manifest["version"]}', manifest)
+        self.store.records.put("artifacts", "batch/stage", manifest)
         before = outside.read_bytes()
         self.assertEqual(self.client.get(url + "/files/result.json").status_code, 409)
         self.assertEqual(outside.read_bytes(), before)

@@ -20,6 +20,13 @@ function setup() {
 }
 
 describe('phone collection batch selection and dispatch', () => {
+  it('retirement invalidates an in-flight detail without defaulting another batch', async () => {
+    const { collection, batchApi } = setup(), pending = deferred<CollectionBatchDetail>()
+    batchApi.detail.mockReturnValueOnce(pending.promise)
+    const request = collection.selectBatch('batch-a')
+    collection.retireBatches(['batch-a']); pending.resolve(detail()); await request
+    expect(collection.selectedBatchId.value).toBe(''); expect(collection.selectedBatch.value).toBeNull()
+  })
   it('loads the query-selected batch without downloading, registering, or starting it', async () => {
     const { collection, batchApi, factoryApi } = setup()
     await collection.loadBatches('batch-a')

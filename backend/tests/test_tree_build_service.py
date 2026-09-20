@@ -142,6 +142,40 @@ class TreeBuildServiceTests(unittest.TestCase):
             self.assertEqual(first_tree["children"][0]["occurrences"][0]["summary"], "TASK-A summary")
             self.assertEqual(updates[-1]["stage"], "publishing")
 
+    def test_current_batch_builds_a_then_b_and_reuses_a_without_run_copies(self):
+        from backend.batch_results import current_tree_payload
+        from backend.data_store import ArtifactStore
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_root = Path(temp_dir)
+            old_raw, workbook = prepare_source(data_root)
+            raw = data_root / "raw"
+            old_raw.rename(raw)
+            store = ArtifactStore(data_root)
+            payload = workbook_payload(workbook)
+            conversion = store.publish("batch", "01_conversion", payload,
+                source_refs=[{"kind": "raw_trajectories", "path": str(raw)}])
+            annotation = store.publish("batch", "02_annotation", payload,
+                source_refs=[conversion], metadata={"raw_root": str(raw)})
+            options = dict(batch_id="batch", data_root=data_root,
+                annotation_version=annotation["version"], progress=lambda _: None,
+                env_path=data_root / ".env",
+                quality_builder=partial(build_quality_workbook, summarizer=FakeSummarizer()))
+            with patch("backend.tree_build_service.configure_reviewer_environment", return_value="fake-model") as setup, \
+                 patch("backend.tree_build_service.QwenIntermediateStateClassifier", FakeClassifier), \
+                 patch("backend.tree_build_service.QwenStateAlignmentReviewer", FakeAlignmentReviewer):
+                build_tree_run(["TASK-A"], job_id="a", **options)
+                run_id, manifest = build_tree_run(["TASK-B"], job_id="b", **options)
+                current = store.get("batch", "04_tree")
+                reused_id, reused = build_tree_run(["TASK-A"], job_id="a-again", **options)
+            self.assertEqual(run_id, "batch")
+            self.assertEqual(reused_id, "batch")
+            self.assertEqual(set(reused["task_ids"]), {"TASK-A", "TASK-B"})
+            self.assertEqual(set(current_tree_payload("batch", data_root)["trees"]), {"TASK-A", "TASK-B"})
+            self.assertEqual(store.get("batch", "04_tree"), current)
+            self.assertEqual(setup.call_count, 2)
+            self.assertFalse((data_root / "system" / "trajectory_tree_runs").exists())
+            self.assertEqual(list((data_root / "tmp" / "tree-builds").iterdir()), [])
+
     def test_failure_removes_temporary_batch_and_publishes_nothing(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -11,9 +11,12 @@ from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
+from .batch_operations import active_batch_lock, batch_operation
 from .trajectory_data import TREE_JOBS_DIR
-from .tree_build_service import build_tree_run
-from .data_store import RecordStore
+from .tree_build_service import build_tree_run, tree_build_config
+from .data_store import RecordStore, ArtifactStore
+from .batch_results import (annotation_task_fingerprints, tree_task_fingerprints,
+                            current_tree_payload, assert_task_inputs, StaleTaskInput)
 from .stage_artifacts import store_root
 from .trajectory_context import resolve_batch_context, row_task_id, validate_batch_sources
 
@@ -81,12 +84,48 @@ class TreeBuildJobManager:
 
     def submit(self, task_ids: list[str], *, batch_id: str | None = None,
                annotation_version: str | None = None) -> dict[str, Any]:
-        context = resolve_batch_context(batch_id, annotation_version, self.data_root) if batch_id is not None else None
-        if context is not None:
-            validate_batch_sources(context, self.data_root)
-            available = {row_task_id(row) for rows in context.payload["sheets"].values() for row in rows}
-            if not task_ids or any(task_id not in available for task_id in task_ids):
-                raise ValueError("所选任务不在该批次的标框版本中")
+        if batch_id is not None:
+            with active_batch_lock(batch_id, self.data_root), self._lock:
+                context = resolve_batch_context(batch_id, annotation_version, self.data_root)
+                return self._submit_batch(task_ids, context)
+        return self._submit_job(task_ids)
+
+    def _submit_batch(self, task_ids, context):
+        batch_id = context.batch_id
+        validate_batch_sources(context, self.data_root)
+        available = {row_task_id(row) for rows in context.payload["sheets"].values() for row in rows}
+        if not task_ids or any(task_id not in available for task_id in task_ids):
+            raise ValueError("所选任务不在该批次的标框版本中")
+        config = tree_build_config()
+        inputs = annotation_task_fingerprints(context.payload)
+        fingerprints = tree_task_fingerprints(context.payload, config)
+        expected = {task: fingerprints[task] for task in task_ids}
+        current = current_tree_payload(batch_id, self.data_root).get("task_fingerprints", {})
+        jobs = self.list_jobs(batch_id)
+        for job in jobs:
+            if job.get("status") in {"queued", "running"} and all(
+                    job.get("task_fingerprints", {}).get(task) == value for task, value in expected.items()):
+                return job
+            if job.get("status") == "succeeded" and all(current.get(task) == value and
+                    job.get("task_fingerprints", {}).get(task) == value for task, value in expected.items()):
+                return job
+        active = {task: value for job in jobs if job.get("status") in {"queued", "running"}
+                  for task, value in job.get("task_fingerprints", {}).items()}
+        pending = [task for task, value in expected.items() if current.get(task) != value and active.get(task) != value]
+        if not pending:
+            waiting = next((job for job in jobs if job.get("status") in {"queued", "running"} and any(
+                current.get(task) != value and job.get("task_fingerprints", {}).get(task) == value
+                for task, value in expected.items())), None)
+            if waiting is not None:
+                return waiting
+        extra = {"batch_id": batch_id, "annotation_version": context.annotation_version,
+                 "annotation_ref": context.annotation_ref, "raw_root": str(context.raw_root),
+                 "task_fingerprints": {task: expected[task] for task in pending} if pending else expected, "build_config": config,
+                 "source_task_fingerprints": {task: inputs[task] for task in pending},
+                 "requested_task_ids": task_ids, "reused_task_ids": [task for task in task_ids if task not in pending]}
+        return self._submit_job(pending, extra)
+
+    def _submit_job(self, task_ids, extra=None):
         job_id = uuid.uuid4().hex
         payload: dict[str, Any] = {
             "job_id": job_id,
@@ -107,12 +146,14 @@ class TreeBuildJobManager:
             "error": None,
             "run_id": None,
         }
-        if context is not None:
-            payload.update({"batch_id": batch_id, "annotation_version": context.annotation_version,
-                            "annotation_ref": context.annotation_ref, "raw_root": str(context.raw_root)})
+        payload.update(extra or {})
+        if not task_ids:
+            payload.update(status="succeeded", stage="succeeded", completed_at=_now(),
+                           percent=100, run_id=payload.get("batch_id"), reused=True)
         with self._lock:
             self._write(payload)
-        self._executor.submit(self._run, job_id, task_ids)
+        if task_ids:
+            self._executor.submit(self._run, job_id, task_ids)
         return payload
 
     def _progress(self, job_id: str, changes: dict[str, Any]) -> None:
@@ -144,23 +185,29 @@ class TreeBuildJobManager:
             payload.update({"status": "running", "stage": "classifying_and_observing", "started_at": _now()})
             self._write(payload)
         try:
-            context_options = {}
-            if payload.get("batch_id"):
-                context_options = {"batch_id": payload["batch_id"], "annotation_version": payload["annotation_version"],
-                                   "data_root": self.data_root}
-            run_id, _ = self.runner(
-                task_ids,
-                job_id=job_id,
-                progress=lambda changes: self._progress(job_id, changes),
-                **context_options,
-            )
+            with batch_operation(payload.get("batch_id"), "tree_build_worker", self.data_root):
+                context_options = {}
+                if payload.get("batch_id"):
+                    assert_task_inputs(payload["batch_id"], payload["source_task_fingerprints"], self.data_root)
+                    context = resolve_batch_context(payload["batch_id"], root=self.data_root)
+                    context_options = {"batch_id": payload["batch_id"], "annotation_version": context.annotation_version,
+                                       "data_root": self.data_root}
+                    if self.runner is build_tree_run:
+                        context_options.update(expected_task_inputs=payload["source_task_fingerprints"],
+                                               expected_build_config=payload["build_config"])
+                run_id, _ = self.runner(
+                    task_ids,
+                    job_id=job_id,
+                    progress=lambda changes: self._progress(job_id, changes),
+                    **context_options,
+                )
         except Exception as exc:
             with self._lock:
                 payload = self.get(job_id) or {"job_id": job_id}
                 payload.update(
                     {
-                        "status": "failed",
-                        "stage": "failed",
+                        "status": "stale" if isinstance(exc, StaleTaskInput) else "failed",
+                        "stage": "stale" if isinstance(exc, StaleTaskInput) else "failed",
                         "completed_at": _now(),
                         "error": str(exc),
                     }

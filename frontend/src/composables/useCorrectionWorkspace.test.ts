@@ -220,3 +220,61 @@ describe('correction task list and protected workbench', () => {
     expect(ws.activeRow.value!.actions).toBe('{"action":"wait"}')
   })
 })
+
+
+describe('current batch correction reviews', () => {
+  it('uses the new revision after changing export selection and exporting', async () => {
+    const { ws, api, saved } = fixture()
+    ws.setSession({ ...saved, batch_id: 'batch-a', storage_revision: 7 })
+    api.patchCorrectionExport.mockResolvedValueOnce({ ...saved.groups[0]!, export: true, storage_revision: 8 })
+    await ws.toggleExport(saved.groups[0]!)
+    expect(api.patchCorrectionExport).toHaveBeenCalledWith('old-session', 'group_0', true, 7)
+    expect(ws.session.value?.storage_revision).toBe(8)
+    const exported = { export_id: 'export', filename: 'review.xlsx', created_at: '', download_url: '', sheets: {}, storage_revision: 9 }
+    api.correctionExport.mockResolvedValueOnce(exported)
+    await ws.exportData()
+    expect(api.correctionExport).toHaveBeenCalledWith('old-session', 8)
+    expect(ws.session.value?.storage_revision).toBe(9)
+    await ws.toggleTrajectory('group_0')
+    await ws.saveAction('{"action":"wait"}')
+    expect(api.patchCorrectionRow).toHaveBeenCalledWith('old-session', 2, { actions: '{"action":"wait"}' }, 9)
+  })
+  it('uses the current revision for writes and keeps a draft after a stale-write rejection', async () => {
+    const { ws, api, saved, feedback } = fixture()
+    ws.setSession({ ...saved, batch_id: 'batch-a', storage_revision: 7 })
+    await ws.toggleTrajectory('group_0')
+    ws.actionDraft.value = '{"action":"wait"}'
+    api.patchCorrectionRow.mockRejectedValueOnce(new Error('当前批次已更新，请刷新后重试'))
+    expect(await ws.saveAction()).toBe(false)
+    expect(api.patchCorrectionRow).toHaveBeenCalledWith('old-session', 2, { actions: '{"action":"wait"}' }, 7)
+    expect(ws.actionDraft.value).toBe('{"action":"wait"}')
+    expect(feedback.error).toHaveBeenCalledWith('当前批次已更新，请刷新后重试')
+  })
+  it('blocks adding a pending group to export but leaves unaffected groups usable', async () => {
+    const { ws, api, saved } = fixture()
+    saved.groups[0]!.pending_review = true
+    saved.pending_review_count = 1
+    ws.setSession(saved)
+    await ws.toggleExport(saved.groups[0]!)
+    expect(api.patchCorrectionExport).not.toHaveBeenCalled()
+    await ws.toggleExport(saved.groups[3]!)
+    expect(api.patchCorrectionExport).toHaveBeenCalledWith('old-session', 'group_3', true)
+    expect(await ws.exportData()).not.toBeNull()
+  })
+  it('adopts retained changes into the same batch session and drops cached group data', async () => {
+    const { ws, api, saved, groups } = fixture()
+    saved.batch_id = 'batch-a'; saved.storage_revision = 4
+    saved.groups[0]!.pending_review = true
+    ws.setSession(saved)
+    const reviewed = { ...clone(saved), storage_revision: 5, pending_review_count: 0 }
+    reviewed.groups[0]!.pending_review = false
+    const review = vi.fn(async () => ({ session: reviewed, group: groups[0]! }))
+    Object.assign(api, { reviewCorrectionGroup: review })
+    await ws.toggleTrajectory('group_0')
+    expect(await ws.reviewGroup('group_0', 'adopt')).toBe(true)
+    expect(review).toHaveBeenCalledWith('old-session', 'group_0', 'adopt', 4)
+    expect(ws.session.value?.session_id).toBe('old-session')
+    expect(ws.session.value?.storage_revision).toBe(5)
+    expect(api.correctionGroup).toHaveBeenCalledTimes(2)
+  })
+})

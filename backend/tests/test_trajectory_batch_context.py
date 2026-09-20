@@ -108,17 +108,19 @@ class TrajectoryBatchContextTests(unittest.TestCase):
             self.assertTrue(path.is_relative_to(root_a))
         self.assertEqual(task_summaries(batch_id="batch-b", data_root=self.root)[0]["goal"], "Frozen goal batch-b")
 
-    def test_edit_creates_new_version_retaining_hidden_json_identity_and_excel_columns(self):
+    def test_edit_replaces_current_artifact_retaining_identity_and_excel_columns(self):
         payload, annotation, _ = self.make_batch()
         before = self.store.resolve_file(annotation, "result.json").read_bytes()
         result = self.edit("batch-a", annotation, payload)
         current = resolve_batch_context("batch-a", root=self.root)
         self.assertEqual(current.annotation_version, result["annotation_version"])
-        self.assertEqual(self.store.resolve_file(annotation, "result.json").read_bytes(), before)
+        with self.assertRaises(FileNotFoundError):
+            self.store.resolve_file(annotation, "result.json")
+        self.assertEqual(len(self.store.list("batch-a", "02_annotation")), 1)
         old_row, new_row = payload["sheets"]["VLA trajectories"][0], current.payload["sheets"]["VLA trajectories"][0]
         self.assertEqual({k: v for k, v in new_row.items() if k != "actions_box"},
                          {k: v for k, v in old_row.items() if k != "actions_box"})
-        self.assertEqual(current.annotation_ref["source_refs"][0]["version"], annotation["version"])
+        self.assertEqual(current.annotation_ref["source_refs"], annotation["source_refs"])
         excel = self.store.resolve_file(current.annotation_ref, "annotated_trajectories.xlsx")
         book = load_workbook(excel, read_only=True)
         try:
@@ -139,7 +141,7 @@ class TrajectoryBatchContextTests(unittest.TestCase):
             results = list(executor.map(lambda _: attempt(), range(2)))
         self.assertEqual(sum(isinstance(item, dict) for item in results), 1)
         self.assertEqual(results.count("conflict"), 1)
-        self.assertEqual(len(self.store.list("batch-a", "02_annotation")), 2)
+        self.assertEqual(len(self.store.list("batch-a", "02_annotation")), 1)
 
     def test_historical_registered_batch_keeps_original_ids_without_zero_stage(self):
         _, annotation, raw = self.make_batch("validation-batch", historical=True)
@@ -169,7 +171,7 @@ class TrajectoryBatchContextTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "跨越批次"):
             resolve_batch_context("other", root=self.root)
 
-    def test_job_freezes_annotation_when_queued_before_a_later_edit(self):
+    def test_job_is_stale_when_its_selected_input_changes_while_queued(self):
         payload, annotation, _ = self.make_batch()
         executor = DeferredExecutor()
         observed = {}
@@ -182,9 +184,8 @@ class TrajectoryBatchContextTests(unittest.TestCase):
         self.edit("batch-a", annotation, payload)
         executor.finish()
         self.assertEqual(job["annotation_version"], annotation["version"])
-        self.assertEqual(observed["version"], annotation["version"])
-        self.assertEqual(observed["row"]["actions_box"], payload["sheets"]["VLA trajectories"][0]["actions_box"])
-        self.assertEqual(manager.get(job["job_id"])["status"], "succeeded")
+        self.assertEqual(observed, {})
+        self.assertEqual(manager.get(job["job_id"])["status"], "stale")
 
     def test_job_listing_filters_batches_and_orders_newest_first(self):
         self.make_batch()
@@ -193,10 +194,11 @@ class TrajectoryBatchContextTests(unittest.TestCase):
         first = manager.submit(["TASK"], batch_id="batch-a")
         second = manager.submit(["TASK"], batch_id="batch-b")
         third = manager.submit(["TASK"], batch_id="batch-a")
+        self.assertEqual(third["job_id"], first["job_id"])
         self.assertEqual([item["job_id"] for item in manager.list_jobs()],
-                         [third["job_id"], second["job_id"], first["job_id"]])
+                         [second["job_id"], first["job_id"]])
         self.assertEqual([item["job_id"] for item in manager.list_jobs("batch-a")],
-                         [third["job_id"], first["job_id"]])
+                         [first["job_id"]])
         self.assertEqual(manager.list_jobs("missing"), [])
 
     def test_tree_observation_and_quality_json_preserve_all_identity_fields(self):
@@ -213,16 +215,21 @@ class TrajectoryBatchContextTests(unittest.TestCase):
         self.assertEqual(manifest["batch_id"], "batch-a")
         self.assertEqual(manifest["raw_root"], str(raw))
         self.assertEqual(manifest["source_refs"][0]["version"], annotation["version"])
-        frozen = json.loads((runs / run_id / "source_annotated.json").read_text(encoding="utf-8"))
+        from backend.batch_results import current_tree_payload, materialize_tree_inputs
+        current = current_tree_payload("batch-a", self.root)
+        self.assertEqual(run_id, "batch-a")
+        self.assertFalse((runs / run_id).exists())
+        frozen = current["source_annotation"]
         self.assertEqual(frozen["sheets"]["VLA trajectories"], payload["sheets"]["VLA trajectories"])
         observation = self.store.list("batch-a", "03_observation")[0]
         obs = json.loads(self.store.resolve_file(observation, "result.json").read_text(encoding="utf-8"))
         self.assertEqual(len(obs["trajectories"]), 2)
         self.assertEqual({item["steps"][0]["collection_run_id"] for item in obs["trajectories"]}, {"run-1", "run-2"})
-        tree = json.loads((runs / run_id / "TASK.json").read_text(encoding="utf-8"))
+        tree = current["trees"]["TASK"]
         self.assertEqual(len(tree["source_trajectories"]), 2)
-        quality = json.loads((runs / run_id / "rubric_trajectories.json").read_text(encoding="utf-8"))
-        book = load_workbook(runs / run_id / "rubric_trajectories.xlsx", read_only=True)
+        quality = current["quality_input"]
+        _, quality_path = materialize_tree_inputs("batch-a", self.root / "tmp" / "test-export", self.root)
+        book = load_workbook(quality_path, read_only=True)
         try:
             values = list(book["Tasks"].iter_rows(values_only=True))
             self.assertEqual([dict(zip(values[0], row)) for row in values[1:]], quality["sheets"]["Tasks"])

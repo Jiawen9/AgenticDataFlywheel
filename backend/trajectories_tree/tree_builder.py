@@ -1046,7 +1046,7 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_TRAJECTORY_ROOT,
         help="image/xml 相对路径的资源根目录",
     )
-    parser.add_argument("-o", "--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("-o", "--output", type=Path, help="Optional JSON export; batch builds otherwise retain only 03/04 artifacts")
     parser.add_argument("--batch-id")
     parser.add_argument("--data-root", type=Path, default=DATA_ROOT)
     parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV)
@@ -1079,8 +1079,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.data_root != DATA_ROOT:
         if args.xlsx == DEFAULT_XLSX:
             args.xlsx = args.data_root / "system" / "preprocessing" / DEFAULT_XLSX.name
-        if args.output == DEFAULT_OUTPUT:
-            args.output = args.data_root / "system" / "preprocessing" / DEFAULT_OUTPUT.name
         if args.trajectory_root == DEFAULT_TRAJECTORY_ROOT:
             args.trajectory_root = args.data_root / "raw" / "rollout_trajectories"
         if args.cache == DEFAULT_CLASSIFICATION_CACHE:
@@ -1092,10 +1090,57 @@ def main(argv: list[str] | None = None) -> int:
 
     xlsx_path = _resolved(args.xlsx)
     trajectory_root = _resolved(args.trajectory_root)
-    output_path = _resolved(args.output)
+    output_path = _resolved(args.output) if args.output else None
     env_path = _resolved(args.env_file)
     classification_cache = _resolved(args.cache)
     alignment_cache = _resolved(args.alignment_cache)
+    from backend.data_store import ArtifactStore
+    from backend.stage_artifacts import assert_unmanaged_output
+    if output_path:
+        assert_unmanaged_output(output_path, args.data_root)
+    source = read_workbook_payload(xlsx_path) if structured_input_exists(xlsx_path) else {}
+    source_ref = source.get("source_ref") or {}
+    batch_id = args.batch_id or source_ref.get("batch_id")
+    if batch_id:
+        from backend.batch_operations import batch_operation
+        with batch_operation(batch_id, "tree_cli", args.data_root):
+            if source_ref.get("batch_id") and source_ref["batch_id"] != batch_id:
+                parser.error("输入标框属于其他业务批次")
+            artifacts = ArtifactStore(args.data_root)
+            annotation = artifacts.get(batch_id, "02_annotation")
+            if annotation is None:
+                parser.error("该业务批次尚无当前标框结果，请先完成预处理")
+            payload = artifacts.read_payload(annotation)
+            active_sheet = next(iter(payload.get("sheets", {})), None)
+            if args.sheet and args.sheet != active_sheet:
+                parser.error("业务批次建树仅使用当前标框的业务工作表")
+            from backend.trajectory_context import row_task_id
+            from backend.tree_build_service import build_tree_run
+            from backend.batch_results import current_tree_payload
+            task_ids = sorted({row_task_id(row) for row in payload["sheets"].get(active_sheet, []) if row_task_id(row)})
+            if not task_ids:
+                parser.error("该业务批次没有可构建的轨迹任务")
+            build_tree_run(task_ids, job_id="cli-" + uuid.uuid4().hex, progress=lambda _: None,
+                batch_id=batch_id, annotation_version=annotation["version"], data_root=args.data_root,
+                env_path=env_path, classification_cache=classification_cache, alignment_cache=alignment_cache,
+                confidence_threshold=args.confidence_threshold, max_incidental_skip=args.max_incidental_skip)
+            result = current_tree_payload(batch_id, args.data_root)
+            # Retain the familiar single-task JSON export; multi-task batches expose
+            # their separate trees instead of merging unrelated tasks into one tree.
+            exported = next(iter(result["trees"].values())) if len(result["trees"]) == 1 else result
+            if output_path:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = output_path.with_name("." + output_path.name + "." + uuid.uuid4().hex + ".tmp")
+                try:
+                    temporary.write_text(json.dumps(exported, ensure_ascii=False, indent=2), encoding="utf-8")
+                    temporary.replace(output_path)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            destination = output_path or args.data_root / "batches" / batch_id / "04_tree"
+            print(f"Batch: {batch_id}; tasks: {len(result['trees'])}; JSON: {destination}")
+            return 0
+    if output_path is None:
+        parser.error("独立文件建树请用 --output 指定导出路径；批次建树使用 --batch-id")
     if not structured_input_exists(xlsx_path):
         parser.error(f"required JSON snapshot not found: {xlsx_path.with_suffix('.json')}")
     if not trajectory_root.is_dir():
@@ -1133,17 +1178,8 @@ def main(argv: list[str] | None = None) -> int:
         max_incidental_skip=args.max_incidental_skip,
         json_path=output_path,
     )
-    from backend.data_store import ArtifactStore
-    from backend.stage_artifacts import observation_payload
-    source = read_workbook_payload(xlsx_path)
-    source_ref = source.get("source_ref") or {"kind": "annotation_snapshot", "path": str(xlsx_path.with_suffix('.json'))}
-    batch_id = args.batch_id or source_ref.get("batch_id") or uuid.uuid4().hex
-    artifacts = ArtifactStore(args.data_root)
-    observed, rows = observation_payload({"cli": trajectories}, args.confidence_threshold)
-    observation_ref = artifacts.publish(batch_id, "03_observation", observed,
-        tables={"Observation与中间态": rows}, source_refs=[source_ref], metadata={"producer": "tree_builder_cli"})
-    artifacts.publish(batch_id, "04_tree", json.loads(output_path.read_text(encoding="utf-8")),
-        source_refs=[observation_ref], metadata={"producer": "tree_builder_cli", "tree_file": output_path.name})
+    # A standalone file export has no registered batch lineage. Only the
+    # business-batch branch above writes 03/04 through the shared service.
 
     ignored = sum(item["decision"] == "ignore_intermediate" for item in decisions)
     branches = sum(item["decision"] == "branch" for item in decisions)

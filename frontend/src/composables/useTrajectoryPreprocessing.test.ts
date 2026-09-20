@@ -39,6 +39,19 @@ function setup(protect = vi.fn(async () => true)) {
 afterEach(() => { disposers.splice(0).forEach(dispose => dispose()); vi.useRealTimers() })
 
 describe('batch preprocessing workspace', () => {
+  it('retires the selected batch without saving drafts and rejects its delayed trajectory', async () => {
+    const { flow, client, protect } = setup(), pending = deferred<TrajectoryRecord>()
+    await flow.loadBatches('a'); await flow.expandTasks(['same'])
+    client.trajectory.mockReturnValueOnce(pending.promise)
+    const request = flow.expandTrajectory('same', 'same-1')
+    await vi.waitFor(() => expect(client.trajectory).toHaveBeenCalled())
+    protect.mockClear(); flow.retireBatches(['a'])
+    pending.resolve(record('old')); await request
+    expect(flow.batchId.value).toBe(''); expect(flow.scope.value).toBeNull()
+    expect(flow.tasks.value).toEqual([]); expect(flow.trajectoryData).toEqual({})
+    expect(flow.batches.value.map(batch => batch.batch_id)).toEqual(['b', 'waiting'])
+    expect(protect).not.toHaveBeenCalled(); expect(client.updateBBox).not.toHaveBeenCalled()
+  })
   it('does not let an older batch refresh erase a newly started job or stop its polling', async () => {
     vi.useFakeTimers()
     const { flow, client } = setup(), pending = deferred<PreprocessingBatch[]>()
@@ -152,17 +165,16 @@ describe('batch preprocessing workspace', () => {
     expect(client.createBuild).toHaveBeenCalledWith(['same'], { batch_id: 'a', annotation_version: 'v2' })
     expect(flow.trajectoryData['other/old']).toBeUndefined()
   })
-  it('refresh preserves an inspected version until the user adopts the latest', async () => {
+  it('refresh follows the current artifact after protecting unsaved edits', async () => {
     const { flow, client, protect } = setup()
     await flow.loadBatches('a'); await flow.expandTasks(['same'])
     client.preprocessingBatches.mockResolvedValue([batch('a', 'v2')])
+    protect.mockResolvedValueOnce(false)
     await flow.loadBatches()
     expect(flow.annotationVersion.value).toBe('v1')
     expect(flow.newerVersion.value).toBe(true)
-    protect.mockResolvedValueOnce(false)
-    expect(await flow.adoptLatestVersion()).toBe(false)
     expect(flow.expandedTasks.value).toEqual(['same'])
-    expect(await flow.adoptLatestVersion()).toBe(true)
+    await flow.loadBatches()
     expect(flow.annotationVersion.value).toBe('v2')
     expect(flow.expandedTasks.value).toEqual([])
   })

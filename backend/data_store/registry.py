@@ -149,9 +149,9 @@ class RecordStore:
                 connection.rollback()
                 raise
 
-    def put_many(self, entries: list[dict]) -> list[dict]:
+    def put_many(self, entries: list[dict], *, deletes: list[dict] | None = None) -> list[dict]:
         """Atomically save records with independent optional expected revisions."""
-        if not entries:
+        if not entries and not deletes:
             return []
         keys = set()
         for entry in entries:
@@ -172,6 +172,15 @@ class RecordStore:
                     if expected is not None and expected != revision:
                         raise RevisionConflict(f"Record {namespace}/{key} changed: expected revision {expected}, found {revision}")
                     results.append(self._save(connection, namespace, key, entry["payload"], revision + 1))
+                for entry in deletes or []:
+                    namespace, key = entry['namespace'], entry['key']
+                    self._validate_key(namespace, key)
+                    if (namespace, key) in keys:
+                        raise ValueError('Cannot save and delete the same record')
+                    current = self._read(connection, namespace, key)
+                    if 'expected_revision' in entry and (current or {}).get('storage_revision', 0) != entry['expected_revision']:
+                        raise RevisionConflict(f'Record {namespace}/{key} changed')
+                    connection.execute('DELETE FROM records WHERE namespace = ? AND record_key = ?', (namespace, key))
                 connection.commit()
                 return results
             except BaseException:

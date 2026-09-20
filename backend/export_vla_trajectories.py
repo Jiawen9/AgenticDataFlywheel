@@ -8,6 +8,7 @@ import re
 import sys
 import uuid
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 from openpyxl import Workbook
@@ -163,7 +164,7 @@ def parse_args() -> argparse.Namespace:
         "-o",
         "--output",
         type=Path,
-        help="Output xlsx path (default: <data-root>/system/preprocessing/<batch-id>/trajectories_to_excel.xlsx)",
+        help="Optional Excel export path; without it only the current batch artifact is retained",
     )
     parser.add_argument("--batch-id")
     parser.add_argument("--data-root", type=Path)
@@ -186,27 +187,42 @@ def main() -> int:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", batch_id):
         raise ValueError("batch ID must contain only letters, digits, underscores, dots and hyphens")
     data_root = args.data_root or DATA_ROOT
-    output_path = (args.output or data_root / "system" / "preprocessing" / batch_id / "trajectories_to_excel.xlsx").expanduser().resolve()
-    rows, warnings = collect_rows(run_dir)
-    if not rows:
-        print(f"Error: no step*_vla_model_response.json files found under {run_dir}", file=sys.stderr)
-        return 1
+    from backend.batch_operations import batch_operation, active_batch_lock
+    with batch_operation(batch_id, "conversion_cli", data_root):
+        work_parent = data_root / "tmp" / "conversion-cli"
+        work_parent.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix="run-", dir=work_parent) as directory:
+            output_path = (args.output or Path(directory) / "trajectories_to_excel.xlsx").expanduser().resolve()
+            rows, warnings = collect_rows(run_dir)
+            if not rows:
+                print(f"Error: no step*_vla_model_response.json files found under {run_dir}", file=sys.stderr)
+                return 1
 
-    write_xlsx(rows, output_path)
-    if __package__:
-        from .stage_artifacts import publish_workbook
-    else:
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-        from backend.stage_artifacts import publish_workbook
-    publish_workbook(output_path, batch_id=batch_id, stage="01_conversion",
-                     data_root=data_root, source_refs=[{"kind": "raw_trajectories", "path": str(run_dir)}],
-                     metadata={"warnings": warnings})
-    print(f"Exported {len(rows)} steps to: {output_path}")
-    if warnings:
-        print(f"Warnings ({len(warnings)}):", file=sys.stderr)
-        for warning in warnings:
-            print(f"- {warning}", file=sys.stderr)
-    return 0
+            if __package__:
+                from .stage_artifacts import assert_unmanaged_output
+            else:
+                from backend.stage_artifacts import assert_unmanaged_output
+            assert_unmanaged_output(output_path, data_root)
+            if __package__:
+                from .stage_artifacts import publish_workbook
+                from .data_store import ArtifactStore
+            else:
+                sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+                from backend.stage_artifacts import publish_workbook
+                from backend.data_store import ArtifactStore
+            with active_batch_lock(batch_id, data_root):
+                write_xlsx(rows, output_path)
+                publish_workbook(output_path, batch_id=batch_id, stage="01_conversion",
+                                 data_root=data_root, source_refs=[{"kind": "raw_trajectories", "path": str(run_dir)}],
+                                 metadata={"warnings": warnings})
+            destination = output_path if args.output else data_root / "batches" / batch_id / "01_conversion"
+            print(f"Exported {len(rows)} steps to: {destination}")
+            if warnings:
+                print(f"Warnings ({len(warnings)}):", file=sys.stderr)
+                for warning in warnings:
+                    print(f"- {warning}", file=sys.stderr)
+
+        return 0
 
 
 if __name__ == "__main__":

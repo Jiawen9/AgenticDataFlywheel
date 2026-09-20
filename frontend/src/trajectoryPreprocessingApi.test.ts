@@ -5,10 +5,10 @@ import type { StageArtifact } from './types'
 
 afterEach(() => vi.unstubAllGlobals())
 describe('batch-scoped trajectory API', () => {
-  it('derives quality image scope from the selected run and preserves optional historical metadata', () => {
-    expect(imageUrl('runs/cr/original/1.png', treeRunScope({ batch_id: 'batch-b', annotation_version: 'v2' }))).toBe('/api/assets/runs/cr/original/1.png?batch_id=batch-b&annotation_version=v2')
+  it('loads quality images from the selected business batch', () => {
+    expect(imageUrl('runs/cr/original/1.png', treeRunScope({ batch_id: 'batch-b', annotation_version: 'v2' }))).toBe('/api/assets/runs/cr/original/1.png?batch_id=batch-b')
     expect(treeRunScope(undefined)).toBeUndefined()
-    expect(treeRunScope({ batch_id: 'incomplete' })).toBeUndefined()
+    expect(treeRunScope({ batch_id: 'incomplete' })).toEqual({ batch_id: 'incomplete' })
   })
   it('passes scope to tasks, trajectories, detail, images, bbox and tree builds', async () => {
     const fetcher = vi.fn(async () => new Response(JSON.stringify({ tasks: [], trajectories: [], trajectory: {}, annotation_version: 'v2', actions_box: '[]' })))
@@ -23,7 +23,7 @@ describe('batch-scoped trajectory API', () => {
     await api.updateBBox('task/a', 'traj/1', 1, 2, [1, 2, 3, 4], scope)
     expect(JSON.parse(String(fetcher.mock.calls.at(-1)?.[1]?.body))).toEqual({ excel_row: 2, bbox: [1, 2, 3, 4], ...scope })
     await api.createBuild(['task/a'], scope)
-    expect(JSON.parse(String(fetcher.mock.calls.at(-1)?.[1]?.body))).toEqual({ task_ids: ['task/a'], ...scope })
+    expect(JSON.parse(String(fetcher.mock.calls.at(-1)?.[1]?.body))).toEqual({ task_ids: ['task/a'], batch_id: scope.batch_id })
   })
   it('uses persisted-job endpoints and downloads exactly the frozen stage version', async () => {
     const fetcher = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(JSON.stringify({ batches: [], jobs: [] })))

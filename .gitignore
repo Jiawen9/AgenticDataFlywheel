@@ -42,3 +42,8 @@ outputs/storage-migration/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Offline single-artifact migration backups.
+.single-artifact-migration/
+
+.batch-publication-migration/

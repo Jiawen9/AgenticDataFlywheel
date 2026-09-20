@@ -34,7 +34,7 @@ AgenticDataFlywheel/
 ├─ backend_workspace/            统一数据根目录，不提交 Git
 │  ├─ system/app.sqlite          当前状态、编辑与产物索引
 │  ├─ raw/rollout_trajectories/   原始轨迹放置目录
-│  ├─ batches/                   按批次、阶段和版本保存 JSON/Excel
+│  ├─ batches/                   按批次、阶段保存唯一当前 JSON/Excel
 │  ├─ releases/                  发布时冻结的 Excel 副本
 │  └─ resources/                 场景树和先验知识库
 └─ README.md
@@ -195,7 +195,7 @@ backend_workspace/system/task_generation/
 └─ collection_batches/ # 已提交的采集 JSON 和 17 列 Excel
 ```
 
-阶段版本保存到 `backend_workspace/batches/<job_id>/`；日志保存到 `backend_workspace/logs/task_generation/`。生成／扩增仍调用原 `/jobs/{job_id}/export` 业务地址，后端保存到新数据目录；浏览器下载副本的位置由浏览器决定。
+阶段当前过程件保存到 `backend_workspace/batches/<job_id>/`；日志保存到 `backend_workspace/logs/task_generation/`。生成／扩增仍调用原 `/jobs/{job_id}/export` 业务地址，后端保存到新数据目录；浏览器下载副本的位置由浏览器决定。
 
 手机采集仅读取 SQLite 状态和 `backend_workspace/inputs/phone_factory/` 上传文件。没有状态时返回空列表和默认配置。需要一次性保留设备配置时，显式调用 `PhoneFactoryStore().initialize_settings(...)`，仅接受 `phones/apps/phoneApps/vla/config`，不导入任务或运行记录，也不覆盖已有状态；示例见[统一数据存储说明](DATA_STORAGE.md#手机设备和配置的一次性准备)。
 
@@ -214,7 +214,7 @@ backend_workspace/system/task_generation/
 
 1. 进入“轨迹采集 → 轨迹预处理与建树”，选择已登记的批次，查看其冻结 JSON 中的任务和轨迹；未登记的目录不会自动出现在页面。
 2. 展开任务并选择一条轨迹，按需查看每一步截图、action、summary 和 bbox。
-3. 点击截图右上角的“修改 bbox”，重新绘制并保存当前动作框；系统保存当前标注，更新 JSON/Excel 并登记新的 `02_annotation` 阶段版本。
+3. 点击截图右上角的“修改 bbox”，重新绘制并保存当前动作框；系统保存当前标注，更新同一份 JSON/Excel 及内部修订号，并只失效该任务的建树及后续结果。
 4. 勾选一个或多个已预处理任务并提交建树，等待后台作业完成。
 
 ### 轨迹质检
@@ -235,7 +235,7 @@ backend_workspace/system/trajectory_tree_runs/<完成时间串>/
 
 ### 轨迹修正
 
-进入“轨迹纠偏 → 专家动作纠偏”，选择已质检批次。当前每个任务仍按原规则选取质检 Top-1；同分时保留原工作簿顺序。已有批次自动恢复原草稿和入选轨迹，不用新推荐覆盖；源标注表版本不匹配时仍拒绝修正。
+进入“轨迹纠偏 → 专家动作纠偏”，选择已质检批次。当前每个任务仍按原规则选取质检 Top-1；同分时保留原工作簿顺序。已有批次自动恢复原草稿和入选轨迹，不用新推荐覆盖；来源变化的人工修改保留为待复核，采用或放弃后才能继续该任务导出。
 
 页面按“任务行（用例编号）→ 轨迹行 → 修正台”展开，首次进入和刷新默认全部收起。可同时展开多个任务，但整页只展开一个轨迹修正台，展开轨迹才加载步骤与截图。任务统计与轨迹统计分开；前端已预留一任务多轨迹的结构，本次没有开放 Top-3 筛选。
 
@@ -254,7 +254,7 @@ backend_workspace/system/trajectory_correction/
 └─ exports/      # 导出 Excel
 ```
 
-草稿、人工编辑和 COT 作业状态只保存在 `backend_workspace/system/app.sqlite`，不会从旧会话 JSON 恢复。修正 `/export` 和完整数据集 `/dataset-export` 业务地址不变，导出同时登记对应阶段版本。
+草稿、人工编辑和 COT 作业状态只保存在 `backend_workspace/system/app.sqlite`，不会从旧会话 JSON 恢复。修正 `/export` 和完整数据集 `/dataset-export` 业务地址不变，导出同时更新对应阶段的唯一过程件。
 
 ### 数据发布
 
@@ -267,7 +267,7 @@ backend_workspace/system/app.sqlite
 backend_workspace/releases/<release_id>/              # 冻结的发布文件
 ```
 
-记录包含冻结 Excel 的路径、SHA256、行数和上游会话/导出版本关系；发布时复制所选表格，不复制原始轨迹目录。发布成功的会话会从专家纠偏界面隐藏，但草稿和阶段快照仍保留。列表和下载只读取当前根目录登记的发布文件，不合并原旧 workspace 的发布记录。
+记录包含冻结 Excel 的路径、SHA256、行数和上游会话/导出版本关系；发布时复制所选表格，不复制原始轨迹目录。发布成功后批次永久结束处理，前端清理对应批次的选择、草稿、缓存和轮询，刷新及其他标签页也不会重新出现。后端仍保留原始文件、各阶段过程件和人工修改；已发布文件和来源 JSON 独立冻结，下载、统计和 S3 上传继续可用。后续生产使用新的 batch_id。列表和下载只读取当前根目录登记的发布文件，不合并原旧 workspace 的发布记录。
 
 页面下半部分展示新存储中已登记的数据集，支持按名称或发布 ID 搜索、按云道S3上传状态筛选、查看路径与哈希、下载发布 Excel。点击“云道S3上传”由后端按登记顺序读取全部已发布 Excel、核验 SHA256 并调用上传适配器；浏览器只提交发布编号和目标参数。每份回执立即保存，失败后停止，重试跳过已成功文件；刷新可恢复进度，服务重启后可手动重试中断任务。
 
@@ -280,6 +280,10 @@ s3://training-data/gui-agent-datasets/rel_a84f91c25d3e4b67/
 ```
 
 模拟目标地址可通过 `backend/.env` 中的 `DATASET_S3_BUCKET` 和 `DATASET_S3_PREFIX` 调整；当前 `DATASET_UPLOAD_MODE` 保持为 `mock`。上传作业状态只保存到 SQLite，不写 JSON 镜像或恢复旧上传任务。服务重启后未完成作业会标记为中断，可在页面重新上传。以上数据不提交到 GitHub。
+
+需要接入平台外的人工采集数据时，点击“上传外部表格”，上传完整步骤明细 Excel，补充来源和数据日期，校验预览后创建发布。每次有效上传建立一个已完成的新批次，自动累计进入汇总和看板；不会覆盖已有发布或清理平台批次草稿。格式、去重、接口和恢复说明见[外部完整表导入](backend/data_publishing/EXTERNAL_IMPORTS.md)。
+
+训练数据总览位于 `/data-publishing/overview`。发布成功后，后台会从冻结完整表自动生成 DataVue 格式的 `all_data.xlsx`，并更新场景／App 看板；无需手动上传汇总表。页面内容、布局、交互及统计口径与提供的 DataVue 原版保持一致，仅配色使用本项目主题。汇总与云道S3上传状态独立，转换状态、警告、重试和完整汇总下载位于发布详情。字段、统计口径、保存位置和接口见[训练数据总览对接说明](backend/training_data_overview/README.md)。
 
 ## 7. 生产模式运行
 
@@ -424,7 +428,7 @@ ADARUBRIC_PYTHON=D:\anaconda3\envs\guigent\python.exe
 backend_workspace/system/trajectory_quality_results/<建树任务集 ID>/
 ```
 
-质检当前状态只保存在 SQLite，不写作业 JSON 镜像；完整 JSON/Excel 阶段版本位于 `backend_workspace/batches/`。服务重启后，未完成作业会标记为
+质检当前状态只保存在 SQLite，不写作业 JSON 镜像；完整 JSON/Excel 当前过程件位于 `backend_workspace/batches/`。服务重启后，未完成作业会标记为
 `interrupted`；重新提交相同任务即可从缓存和 checkpoint 续跑。批量作业只有在本次所选任务全部成功后才发布，
 失败不会覆盖已有成功结果；重新质检部分任务时也只更新这些任务。
 

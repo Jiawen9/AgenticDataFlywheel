@@ -64,6 +64,7 @@ async function main() {
       const url = new URL(req.url()).pathname
       if (!url.startsWith('/api/')) return route.continue()
       requests.push({ url, method: req.method(), body: req.postData() })
+      if (url === '/api/training-data-overview') return route.fulfill({ json: { conversions: [], workbook_url: null } })
       // An older backend response must render the new name without mutation.
       if (url === '/api/dataset-upload-capabilities') return route.fulfill({ json: { internal: { configured, reason: configured ? null : '内部网站上传尚未配置' } } })
       if (url === '/api/dataset-releases/candidates') return route.fulfill({ json: { candidates: [] } })

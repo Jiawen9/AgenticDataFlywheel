@@ -1,31 +1,49 @@
 <script setup lang="ts">
+import BatchPublishedNotice from '@/components/BatchPublishedNotice.vue'
+import { useBatchLifecycle } from '@/composables/useBatchLifecycle'
+import { activeBatchItems, eventMatchesRoute, withoutBatchQuery, type PublishedBatchEvent } from '@/utils/batchLifecycle'
+
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { DataLine } from '@element-plus/icons-vue'
 import { api, imageUrl, treeRunScope } from '@/api'
+import { useBatchQualityWorkspace } from '@/composables/useBatchQualityWorkspace'
 import ActionImage from '@/components/ActionImage.vue'
 import ReferenceTrajectoryTree from '@/components/ReferenceTrajectoryTree.vue'
-import type { AuditStep, CorrectionRecommendation, DimensionEvaluation, QualityJob, QualityTaskSummary, TaskQualityResult, TrajectoryQualityEvaluation, TrajectoryTreeNode, TreeOccurrence, TreeRun, TreeRunTask } from '@/types'
+import type { AuditStep, DimensionEvaluation, QualityJob, TrajectoryQualityEvaluation, TrajectoryTreeNode, TreeOccurrence, TreeRunTask } from '@/types'
 
 const route = useRoute(), router = useRouter()
-const runs = ref<TreeRun[]>([]), selectedRunId = ref(''), checkedTasks = ref<string[]>([])
-const summaries = ref<Record<string, QualityTaskSummary>>({}), qualityJobs = ref<QualityJob[]>([])
-const selectedTaskId = ref(''), tree = ref<TrajectoryTreeNode | null>(null), quality = ref<TaskQualityResult | null>(null)
+const flow = useBatchQualityWorkspace(api)
+const { batches, batchId: selectedBatchId, currentTree: selectedRun, summaries, recommendation: correctionRecommendation, selectedTaskId, tree, quality, loadingBatches: loadingRuns, loadingTree, counts, readyTasks, error: batchError } = flow
+const checkedTasks = ref<string[]>([]), qualityJobs = ref<QualityJob[]>([])
 const selectedNode = ref<TrajectoryTreeNode | null>(null), occurrenceIndex = ref(0), qualityTrajectory = ref('')
-const loadingRuns = ref(true), loadingTree = ref(false), submitting = ref(false), auditVisible = ref(false)
+const submitting = ref(false), auditVisible = ref(false)
 const auditSelected = ref<(AuditStep & { trajectory: string }) | null>(null)
-const correctionRecommendation = ref<CorrectionRecommendation | null>(null), polling = ref(false)
+const polling = ref(false)
 let pollTimer: number | undefined
+let jobEpoch = 0, disposed = false
+const lifecycle = useBatchLifecycle({ currentBatch: () => selectedBatchId.value || String(route.query.batch_id ?? ''), onPublished, refreshChoices: () => flow.refreshChoices() })
+const { notice: publishedNotice } = lifecycle
+function onPublished(event: PublishedBatchEvent) {
+  const current = eventMatchesRoute(event, selectedBatchId.value, route.query)
+  flow.retireBatches(event.batch_ids, current)
+  qualityJobs.value = qualityJobs.value.filter(job => !event.batch_ids.includes(job.batch_id || ''))
+  if (!current) return
+  ++jobEpoch; stopPolling(); polling.value = false
+  checkedTasks.value = []; selectedNode.value = null; auditSelected.value = null; auditVisible.value = false; qualityTrajectory.value = ''; occurrenceIndex.value = 0
+  publishedNotice.value = event
+  void router.replace({ query: withoutBatchQuery(route.query) })
+}
 
-const selectedRun = computed(() => runs.value.find((run) => run.run_id === selectedRunId.value))
 const selectedTask = computed<TreeRunTask | undefined>(() => selectedRun.value?.tasks.find((task) => task.task_id === selectedTaskId.value))
 const occurrence = computed(() => selectedNode.value?.occurrences?.[occurrenceIndex.value] ?? null)
 const terminalIds = computed(() => selectedNode.value?.terminal_trajectories.filter((id) => quality.value?.evaluations[id]) ?? [])
 const evaluation = computed<TrajectoryQualityEvaluation | null>(() => quality.value?.evaluations[qualityTrajectory.value] ?? null)
 const ignoredSteps = computed(() => (tree.value?.source_trajectories ?? []).flatMap((item) => item.steps.filter((step) => !step.counted_in_tree).map((step) => ({ ...step, trajectory: item.trajectory }))))
-const activeJobs = computed(() => qualityJobs.value.filter((job) => ['queued', 'running'].includes(job.status)).sort((a, b) => a.created_at.localeCompare(b.created_at)))
-const visibleJobs = computed(() => [...activeJobs.value, ...qualityJobs.value.filter((job) => !['queued', 'running'].includes(job.status)).slice(0, 3)])
+const batchJobs = computed(() => qualityJobs.value.filter(job => job.batch_id === selectedBatchId.value || (!job.batch_id && job.run_id === selectedRun.value?.run_id)))
+const activeJobs = computed(() => batchJobs.value.filter((job) => ['queued', 'running'].includes(job.status)).sort((a, b) => a.created_at.localeCompare(b.created_at)))
+const visibleJobs = computed(() => [...activeJobs.value, ...batchJobs.value.filter((job) => !['queued', 'running'].includes(job.status)).slice(0, 3)])
 const jobRunning = computed(() => activeJobs.value.length > 0)
 const desktopTree = computed<TrajectoryTreeNode | null>(() => {
   if (!tree.value) return null
@@ -40,43 +58,36 @@ const desktopTree = computed<TrajectoryTreeNode | null>(() => {
 
 function taskQuality(taskId: string) { return summaries.value[taskId] }
 function top1Task(taskId: string) {
-  if (correctionRecommendation.value?.status !== 'ready' || (correctionRecommendation.value.tree_run_id ?? correctionRecommendation.value.run_id) !== selectedRunId.value) return null
+  if (correctionRecommendation.value?.status !== 'ready' || (correctionRecommendation.value.batch_id && correctionRecommendation.value.batch_id !== selectedBatchId.value)) return null
   return correctionRecommendation.value.tasks.find((task) => task.task_id === taskId) ?? null
 }
 function dimensions(value: TrajectoryQualityEvaluation | null): DimensionEvaluation[] {
   if (!value) return []
   return Array.isArray(value.dimension_global_scores) ? value.dimension_global_scores : Object.entries(value.dimension_global_scores ?? {}).map(([dimension_name, score]) => ({ dimension_name, score }))
 }
-async function loadRuns() {
-  loadingRuns.value = true
-  try { runs.value = await api.runs(); const requested = typeof route.query.run === 'string' ? route.query.run : ''; selectedRunId.value = runs.value.some((r) => r.run_id === requested) ? requested : runs.value[0]?.run_id || '' }
-  catch (error) { ElMessage.error((error as Error).message) } finally { loadingRuns.value = false }
+async function changeBatch(id: string) {
+  if (!await lifecycle.checkBatch(id)) return
+  publishedNotice.value = null
+  checkedTasks.value = []; selectedNode.value = null; auditSelected.value = null
+  await flow.selectBatch(id)
+  if (selectedBatchId.value === id) await router.replace({ query: { batch_id: id } })
 }
-async function loadSummary() {
-  if (!selectedRunId.value) return
-  try { const result = await api.runQuality(selectedRunId.value); summaries.value = Object.fromEntries(result.tasks.map((item) => [item.task_id, item])) }
-  catch (error) { ElMessage.error((error as Error).message) }
-}
-async function loadQualityJobs() {
-  qualityJobs.value = await api.qualityJobs()
-}
-async function loadCorrectionRecommendation(runId = selectedRunId.value) {
-  if (!runId) { correctionRecommendation.value = null; return }
-  try { correctionRecommendation.value = await api.correctionRecommendation(runId) }
-  catch { correctionRecommendation.value = null }
-}
+async function loadQualityJobs() { const token = jobEpoch; const jobs = await api.qualityJobs(); if (!disposed && token === jobEpoch) qualityJobs.value = activeBatchItems(jobs) }
 async function viewTree(taskId: string) {
-  selectedTaskId.value = taskId; loadingTree.value = true
-  try {
-    tree.value = await api.tree(selectedRunId.value, taskId)
-    quality.value = taskQuality(taskId)?.status === 'succeeded' ? await api.taskQuality(selectedRunId.value, taskId) : null
-    selectedNode.value = desktopTree.value; occurrenceIndex.value = 0
-  } catch (error) { ElMessage.error((error as Error).message) } finally { loadingTree.value = false }
+  selectedNode.value = null
+  await flow.viewTree(taskId)
+  if (selectedTaskId.value === taskId) { selectedNode.value = desktopTree.value; occurrenceIndex.value = 0 }
+}
+function treeReady(task: TreeRunTask) { return readyTasks.value.some(item => item.task_id === task.task_id) }
+function qualityStatus(taskId: string) {
+  const state = taskQuality(taskId)?.status
+  return state === 'succeeded' ? '已质检' : ['stale', 'invalidated'].includes(state ?? '') ? '已失效，待重处理' : '待质检'
 }
 async function submitQuality() {
   if (!checkedTasks.value.length) return ElMessage.warning('请至少选择一个任务')
   submitting.value = true
-  try { await api.createQuality(selectedRunId.value, checkedTasks.value); await loadQualityJobs(); startPolling() }
+  const token = jobEpoch, batchId = selectedBatchId.value
+  try { await api.createQuality(batchId, checkedTasks.value); if (disposed || token !== jobEpoch || selectedBatchId.value !== batchId) return; await loadQualityJobs(); if (token === jobEpoch) startPolling() }
   catch (error) { ElMessage.error((error as Error).message) } finally { submitting.value = false }
 }
 function stopPolling() { if (pollTimer) clearInterval(pollTimer); pollTimer = undefined }
@@ -91,23 +102,24 @@ function jobLabel(job: QualityJob) {
 async function pollJobs() {
   if (polling.value) return
   polling.value = true
+  const token = jobEpoch
   const previous = new Map(qualityJobs.value.map((job) => [job.job_id, job.status]))
   try {
     await loadQualityJobs()
+    if (disposed || token !== jobEpoch) return
     const completed = qualityJobs.value.filter((job) => {
       const oldStatus = previous.get(job.job_id)
       return oldStatus && ['queued', 'running'].includes(oldStatus) && !['queued', 'running'].includes(job.status)
     })
     for (const job of completed) {
-      if (job.status === 'succeeded') ElMessage.success(`轨迹质检完成：${job.run_id}`)
+      if (job.status === 'succeeded') ElMessage.success(`轨迹质检完成：${job.batch_id || selectedBatchId.value}`)
       else ElMessage.error(job.error || `${jobLabel(job)}：${job.job_id}`)
     }
-    if (completed.some((job) => job.status === 'succeeded')) {
-      await loadCorrectionRecommendation(selectedRunId.value)
-      await loadSummary()
-      if (selectedTaskId.value) await viewTree(selectedTaskId.value)
+    if (!disposed && token === jobEpoch && selectedBatchId.value && completed.some((job) => job.status === 'succeeded')) {
+      await flow.refresh()
+      selectedNode.value = desktopTree.value
     }
-    if (!activeJobs.value.length) stopPolling()
+    if (!qualityJobs.value.some(job => ['queued', 'running'].includes(job.status))) stopPolling()
   } catch (error) {
     ElMessage.error((error as Error).message)
   } finally {
@@ -116,28 +128,48 @@ async function pollJobs() {
 }
 function selectNode(node: TrajectoryTreeNode) { selectedNode.value = node; occurrenceIndex.value = 0; qualityTrajectory.value = node.terminal_trajectories.find((id) => quality.value?.evaluations[id]) ?? '' }
 function selectAuditStep(row: AuditStep & { trajectory: string }) { auditSelected.value = row }
-function toggleAll() { checkedTasks.value = checkedTasks.value.length === (selectedRun.value?.tasks.length ?? 0) ? [] : (selectedRun.value?.tasks.map((t) => t.task_id) ?? []) }
-watch(selectedRunId, async (id) => { checkedTasks.value = []; selectedTaskId.value = ''; tree.value = quality.value = selectedNode.value = null; correctionRecommendation.value = null; await router.replace({ query: id ? { run: id } : {} }); if (id) await Promise.all([loadSummary(), loadCorrectionRecommendation(id)]) })
+function toggleAll() { checkedTasks.value = checkedTasks.value.length === readyTasks.value.length ? [] : readyTasks.value.map(task => task.task_id) }
+watch(() => [route.query.batch_id, route.query.run], async ([batch, run]) => {
+  if ((batch === selectedBatchId.value && run === undefined) || (publishedNotice.value && batch === undefined && run === undefined)) return
+  if (typeof batch === 'string' && !await lifecycle.checkBatch(batch)) return
+  publishedNotice.value = null
+  checkedTasks.value = []; selectedNode.value = null
+  await flow.loadBatches(typeof batch === 'string' ? batch : undefined, typeof run === 'string' ? run : undefined)
+  if (selectedBatchId.value) await router.replace({ query: { batch_id: selectedBatchId.value } })
+})
+watch(readyTasks, tasks => { const ready = new Set(tasks.map(task => task.task_id)); checkedTasks.value = checkedTasks.value.filter(id => ready.has(id)) })
+watch(flow.error, value => { if (value) ElMessage.error(value) })
 watch(terminalIds, (ids) => { qualityTrajectory.value = ids[0] ?? '' })
-onMounted(async () => { await Promise.all([loadRuns(), loadQualityJobs()]); await loadCorrectionRecommendation(selectedRunId.value); if (activeJobs.value.length) startPolling() })
-onBeforeUnmount(stopPolling)
+onMounted(async () => {
+  try {
+    const requested = typeof route.query.batch_id === 'string' ? route.query.batch_id : undefined
+    if (requested !== undefined && !await lifecycle.checkBatch(requested)) { await flow.refreshChoices(); return }
+    await Promise.all([flow.loadBatches(requested, typeof route.query.run === 'string' ? route.query.run : undefined), loadQualityJobs()])
+    if (disposed || publishedNotice.value) return
+    if (selectedBatchId.value) await router.replace({ query: { batch_id: selectedBatchId.value } })
+    if (qualityJobs.value.some(job => ['queued', 'running'].includes(job.status))) startPolling()
+  } catch (cause) { if (!disposed) batchError.value = (cause as Error).message }
+})
+onBeforeUnmount(() => { disposed = true; ++jobEpoch; stopPolling(); flow.dispose() })
 </script>
 
 <template>
   <div class="page quality-page">
-    <header class="page-hero"><div><span class="eyebrow">TRAJECTORY QUALITY</span><h1>轨迹质检</h1><p>选择已完成的建树任务集，批量评价轨迹；评分会显示在对应终点叶子上。</p></div><div class="run-selector"><label>已完成任务集</label><el-select v-model="selectedRunId" :loading="loadingRuns" placeholder="选择完成时间串" style="width:260px"><el-option v-for="run in runs" :key="run.run_id" :label="`${run.run_id} · ${run.task_count} 个任务`" :value="run.run_id" /></el-select></div></header>
-    <el-empty v-if="!loadingRuns && !runs.length" description="还没有成功发布的建树任务集"><router-link to="/collection"><el-button type="primary">前往轨迹采集</el-button></router-link></el-empty>
+    <BatchPublishedNotice :notice="publishedNotice" />
+    <header class="page-hero"><div><span class="eyebrow">TRAJECTORY QUALITY</span><h1>轨迹质检</h1><p>选择业务批次，对当前有效轨迹树进行质检；分次处理的任务汇总在同一批次。</p></div><div class="run-selector"><label>业务批次</label><el-select :model-value="selectedBatchId" :loading="loadingRuns" placeholder="选择批次" style="width:300px" @change="changeBatch"><el-option v-for="batch in batches" :key="batch.batch_id" :label="`${batch.label || batch.batch_id} · ${batch.task_count} 个任务`" :value="batch.batch_id" /></el-select></div></header>
+    <el-alert v-if="batchError" :title="batchError" type="error" :closable="false" show-icon />
+    <el-empty v-if="!loadingRuns && !batches.length" description="还没有可处理的业务批次"><router-link to="/collection"><el-button type="primary">前往轨迹采集</el-button></router-link></el-empty>
     <template v-else-if="selectedRun">
-      <section class="task-toolbar"><div><b>{{ selectedRun.task_count }} 个任务</b><span>{{ selectedRun.completed_at }} · {{ selectedRun.model_name }}</span></div><div><el-button @click="toggleAll">{{ checkedTasks.length === selectedRun.tasks.length ? '取消全选' : '全选' }}</el-button><el-button type="primary" :loading="submitting" :disabled="jobRunning" @click="submitQuality">提交轨迹质检（{{ checkedTasks.length }}）</el-button></div></section>
-      <section v-if="visibleJobs.length" class="job-queue"><div class="job-queue__head"><div><b>质检任务队列</b><span>{{ activeJobs.length }} 个执行中 / 等待，页面切换后会从后端恢复</span></div><el-button text :loading="polling" @click="loadQualityJobs">刷新队列</el-button></div><article v-for="job in visibleJobs" :key="job.job_id" class="job-queue__item" :class="`job-queue__item--${job.status}`"><div class="job-queue__main"><b>{{ jobLabel(job) }}</b><span>{{ job.run_id }} · {{ job.current_task || '等待任务' }}<template v-if="job.current_trajectory"> · {{ job.current_trajectory }}</template></span><small>{{ job.job_id }}</small></div><el-progress :percentage="job.percent" :status="job.status === 'failed' ? 'exception' : job.status === 'succeeded' ? 'success' : undefined" /><small class="job-queue__count">{{ job.completed_trajectories }} / {{ job.total_trajectories || '—' }} 条轨迹</small><small v-if="job.error" class="job-queue__error">{{ job.error }}</small></article></section>
-      <section class="task-list"><article v-for="task in selectedRun.tasks" :key="task.task_id" class="task-row"><el-checkbox v-model="checkedTasks" :value="task.task_id" /><div class="task-main"><b>{{ task.task_id }}</b><p>{{ task.goal }}</p></div><div class="metric"><span>轨迹 / 步骤</span><b>{{ task.trajectory_count }} / {{ task.original_step_count }}</b></div><div class="status"><el-tag :type="taskQuality(task.task_id)?.rubric_ready ? 'success' : 'info'">Rubric {{ taskQuality(task.task_id)?.rubric_ready ? '就绪' : '待生成' }}</el-tag><el-tag :type="taskQuality(task.task_id)?.status === 'succeeded' ? 'success' : 'info'">{{ taskQuality(task.task_id)?.status === 'succeeded' ? '已质检' : '未质检' }}</el-tag></div><div class="metric"><span>平均分 / 通过</span><b>{{ taskQuality(task.task_id)?.average_score?.toFixed(2) ?? '—' }} / {{ taskQuality(task.task_id)?.passed_count ?? '—' }}</b></div><div v-if="top1Task(task.task_id)" class="metric top1-metric"><span>Top-1 修正</span><b>{{ top1Task(task.task_id)?.trajectory_id }}</b><small>{{ top1Task(task.task_id)?.global_score.toFixed(4) }} 分 · {{ top1Task(task.task_id)?.step_count }} 步</small></div><el-button v-if="top1Task(task.task_id)" type="success" plain @click="router.push({ path: '/correction', query: { tree_run_id: selectedRunId } })">进入轨迹修正</el-button><el-button type="primary" plain @click="viewTree(task.task_id)">查看轨迹树</el-button></article></section>
+      <section class="task-toolbar"><div><b>{{ selectedRun.task_count }} 个任务</b><span>已完成 {{ counts.completed }} · 待处理 {{ counts.pending }} · 已失效 {{ counts.stale }}</span></div><div><el-button @click="toggleAll">{{ checkedTasks.length === readyTasks.length ? '取消全选' : '全选' }}</el-button><el-button type="primary" :loading="submitting" :disabled="jobRunning || !checkedTasks.length" @click="submitQuality">提交轨迹质检（{{ checkedTasks.length }}）</el-button></div></section>
+      <section v-if="visibleJobs.length" class="job-queue"><div class="job-queue__head"><div><b>质检任务队列</b><span>{{ activeJobs.length }} 个执行中 / 等待，页面切换后会从后端恢复</span></div><el-button text :loading="polling" @click="loadQualityJobs">刷新队列</el-button></div><article v-for="job in visibleJobs" :key="job.job_id" class="job-queue__item" :class="`job-queue__item--${job.status}`"><div class="job-queue__main"><b>{{ jobLabel(job) }}</b><span>{{ job.batch_id || selectedBatchId }} · {{ job.current_task || '等待任务' }}<template v-if="job.current_trajectory"> · {{ job.current_trajectory }}</template></span><small>{{ job.job_id }}</small></div><el-progress :percentage="job.percent" :status="job.status === 'failed' ? 'exception' : job.status === 'succeeded' ? 'success' : undefined" /><small class="job-queue__count">{{ job.completed_trajectories }} / {{ job.total_trajectories || '—' }} 条轨迹</small><small v-if="job.error" class="job-queue__error">{{ job.error }}</small></article></section>
+      <section class="task-list"><article v-for="task in selectedRun.tasks" :key="task.task_id" class="task-row"><el-checkbox v-model="checkedTasks" :value="task.task_id" :disabled="!treeReady(task)" /><div class="task-main"><b>{{ task.task_id }}</b><p>{{ task.goal }}</p></div><div class="metric"><span>轨迹 / 步骤</span><b>{{ task.trajectory_count }} / {{ task.original_step_count }}</b></div><div class="status"><el-tag :type="taskQuality(task.task_id)?.rubric_ready ? 'success' : 'info'">Rubric {{ taskQuality(task.task_id)?.rubric_ready ? '就绪' : '待生成' }}</el-tag><el-tag :type="taskQuality(task.task_id)?.status === 'succeeded' ? 'success' : 'info'">{{ qualityStatus(task.task_id) }}</el-tag></div><div class="metric"><span>平均分 / 通过</span><b>{{ taskQuality(task.task_id)?.average_score?.toFixed(2) ?? '—' }} / {{ taskQuality(task.task_id)?.passed_count ?? '—' }}</b></div><div v-if="top1Task(task.task_id)" class="metric top1-metric"><span>Top-1 修正</span><b>{{ top1Task(task.task_id)?.trajectory_id }}</b><small>{{ top1Task(task.task_id)?.global_score.toFixed(4) }} 分 · {{ top1Task(task.task_id)?.step_count }} 步</small></div><el-button v-if="top1Task(task.task_id)" type="success" plain @click="router.push({ path: '/correction', query: { batch_id: selectedBatchId } })">进入轨迹修正</el-button><el-button type="primary" plain :disabled="!treeReady(task)" @click="viewTree(task.task_id)">查看轨迹树</el-button></article></section>
       <template v-if="selectedTask"><section class="run-banner"><div><span>当前任务</span><b>{{ selectedTask.goal }}</b></div><el-button :icon="DataLine" @click="auditVisible = true">中间态审计（{{ ignoredSteps.length }}）</el-button></section><section class="stat-grid"><div><span>原始步骤</span><b>{{ tree?.original_step_count ?? selectedTask.original_step_count }}</b></div><div><span>入树步骤</span><b>{{ tree?.tree_step_count ?? selectedTask.tree_step_count }}</b></div><div><span>忽略步骤</span><b>{{ tree?.ignored_incidental_step_count ?? selectedTask.ignored_step_count }}</b></div><div><span>Action 节点</span><b>{{ selectedTask.action_node_count }}</b></div></section>
-        <section v-loading="loadingTree" class="tree-workspace"><div class="tree-canvas"><ReferenceTrajectoryTree v-if="desktopTree" :root="desktopTree" :selected-id="selectedNode?.id" :quality="quality?.evaluations" @select="selectNode" /></div><aside class="node-panel"><el-empty v-if="!selectedNode" description="点击一个节点查看详情" :image-size="70" /><template v-else><div class="panel-head"><div><span>NODE {{ selectedNode.id }} · DEPTH {{ selectedNode.depth }}</span><h2>{{ selectedNode.label }}</h2></div><el-tag type="success">{{ selectedNode.occurrence_count }} occurrences</el-tag></div><p class="summary">{{ occurrence?.summary || selectedNode.summary }}</p><el-select v-if="selectedNode.occurrences.length" v-model="occurrenceIndex" style="width:100%"><el-option v-for="(item,index) in selectedNode.occurrences" :key="`${item.trajectory}-${item.step}`" :label="`${item.trajectory} · step ${item.step}`" :value="index" /></el-select><ActionImage v-if="occurrence" class="node-image" :image-url="imageUrl(occurrence.image, treeRunScope(selectedRun))" :action="occurrence.action || selectedNode.action" :actions-box="occurrence.actions_box || selectedNode.actions_box" :show-overlay="selectedNode.id !== 0" color-tone="bright" />
+        <section v-loading="loadingTree" class="tree-workspace"><div class="tree-canvas"><ReferenceTrajectoryTree v-if="desktopTree" :root="desktopTree" :selected-id="selectedNode?.id" :quality="quality?.evaluations" @select="selectNode" /></div><aside class="node-panel"><el-empty v-if="!selectedNode" description="点击一个节点查看详情" :image-size="70" /><template v-else><div class="panel-head"><div><span>NODE {{ selectedNode.id }} · DEPTH {{ selectedNode.depth }}</span><h2>{{ selectedNode.label }}</h2></div><el-tag type="success">{{ selectedNode.occurrence_count }} occurrences</el-tag></div><p class="summary">{{ occurrence?.summary || selectedNode.summary }}</p><el-select v-if="selectedNode.occurrences.length" v-model="occurrenceIndex" style="width:100%"><el-option v-for="(item,index) in selectedNode.occurrences" :key="`${item.trajectory}-${item.step}`" :label="`${item.trajectory} · step ${item.step}`" :value="index" /></el-select><ActionImage v-if="occurrence" class="node-image" :image-url="imageUrl(occurrence.image, treeRunScope(selectedRun ?? undefined))" :action="occurrence.action || selectedNode.action" :actions-box="occurrence.actions_box || selectedNode.actions_box" :show-overlay="selectedNode.id !== 0" color-tone="bright" />
           <div v-if="terminalIds.length" class="quality-card"><div class="quality-title"><b>终点质检结果</b><el-select v-if="terminalIds.length > 1" v-model="qualityTrajectory" size="small"><el-option v-for="id in terminalIds" :key="id" :label="id" :value="id" /></el-select></div><template v-if="evaluation"><div class="score"><strong>{{ evaluation.global_score.toFixed(2) }}</strong><span>/ 5</span><el-tag :type="evaluation.passed_threshold ? 'success' : 'danger'">{{ evaluation.passed_threshold ? '通过' : '未通过' }}</el-tag></div><div v-for="item in dimensions(evaluation)" :key="item.dimension_name" class="dimension"><b>{{ item.dimension_name }}</b><em>{{ item.score.toFixed(2) }}</em></div><el-collapse><el-collapse-item title="逐步评价"><div v-for="step in evaluation.step_evaluations" :key="step.step_id" class="step"><b>Step {{ step.step_id }}</b><small>{{ step.step_quality_summary }}</small><p v-for="item in step.dimension_scores" :key="item.dimension_name"><span>{{ item.dimension_name }} · {{ item.score }}</span>{{ item.rationale }}</p></div></el-collapse-item></el-collapse></template></div>
-          <div class="node-data"><template v-if="selectedNode.id !== 0"><label>ACTION SUMMARY / THOUGHT</label><p>{{ occurrence?.summary || selectedNode.summary || '—' }}</p><label>OBSERVATION</label><p class="observation">{{ occurrence?.observation || selectedNode.observation || '该旧任务集未生成 observation' }}</p><label>ACTION</label><pre>{{ JSON.stringify(occurrence?.action || selectedNode.action, null, 2) }}</pre><template v-if="occurrence?.classification"><label>INTERMEDIATE STATE</label><p>{{ occurrence.classification.category }} · {{ occurrence.classification.confidence.toFixed(2) }}<br>{{ occurrence.classification.reason }}</p></template></template><template v-else><label>STATE</label><p>设备桌面 · 所有轨迹从这里开始</p></template><label>BBOX</label><code>{{ occurrence?.actions_box || selectedNode.actions_box || '—' }}</code></div></template></aside></section>
+          <div class="node-data"><template v-if="selectedNode.id !== 0"><label>ACTION SUMMARY / THOUGHT</label><p>{{ occurrence?.summary || selectedNode.summary || '—' }}</p><label>OBSERVATION</label><p class="observation">{{ occurrence?.observation || selectedNode.observation || '该任务尚未生成 observation' }}</p><label>ACTION</label><pre>{{ JSON.stringify(occurrence?.action || selectedNode.action, null, 2) }}</pre><template v-if="occurrence?.classification"><label>INTERMEDIATE STATE</label><p>{{ occurrence.classification.category }} · {{ occurrence.classification.confidence.toFixed(2) }}<br>{{ occurrence.classification.reason }}</p></template></template><template v-else><label>STATE</label><p>设备桌面 · 所有轨迹从这里开始</p></template><label>BBOX</label><code>{{ occurrence?.actions_box || selectedNode.actions_box || '—' }}</code></div></template></aside></section>
       </template>
     </template>
-    <el-drawer v-model="auditVisible" title="中间态审计" size="72%"><div class="audit"><el-table :data="ignoredSteps" highlight-current-row @row-click="selectAuditStep"><el-table-column prop="trajectory" label="轨迹" /><el-table-column prop="step" label="Step" width="70" /><el-table-column prop="classification.category" label="类别" /><el-table-column prop="classification.confidence" label="置信度" /><el-table-column prop="summary" label="Action Summary" /></el-table><div v-if="auditSelected"><h3>{{ auditSelected.trajectory }} · step {{ auditSelected.step }}</h3><ActionImage :image-url="imageUrl(auditSelected.image, treeRunScope(selectedRun))" :action="auditSelected.action" :actions-box="auditSelected.actions_box" /><p>{{ auditSelected.classification?.reason }}</p></div><el-empty v-else description="选择一个忽略步骤查看证据" /></div></el-drawer>
+    <el-drawer v-model="auditVisible" title="中间态审计" size="72%"><div class="audit"><el-table :data="ignoredSteps" highlight-current-row @row-click="selectAuditStep"><el-table-column prop="trajectory" label="轨迹" /><el-table-column prop="step" label="Step" width="70" /><el-table-column prop="classification.category" label="类别" /><el-table-column prop="classification.confidence" label="置信度" /><el-table-column prop="summary" label="Action Summary" /></el-table><div v-if="auditSelected"><h3>{{ auditSelected.trajectory }} · step {{ auditSelected.step }}</h3><ActionImage :image-url="imageUrl(auditSelected.image, treeRunScope(selectedRun ?? undefined))" :action="auditSelected.action" :actions-box="auditSelected.actions_box" /><p>{{ auditSelected.classification?.reason }}</p></div><el-empty v-else description="选择一个忽略步骤查看证据" /></div></el-drawer>
   </div>
 </template>
 

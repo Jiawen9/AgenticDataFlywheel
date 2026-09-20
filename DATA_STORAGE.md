@@ -1,183 +1,164 @@
-# 统一数据存储与阶段产物
+# 批次与当前过程件
 
-本方案覆盖任务生成、扩增、手机采集登记、轨迹转换、标框、Observation/中间态判断、建树、质检、修正、COT 和数据发布。当前运行数据统一读写项目根目录的 `backend_workspace/`，可通过 `ADF_DATA_ROOT` 指定其他根目录。该目录沿用此前 `data/` 的完整内部结构；原旧 workspace 的模块目录和历史记录不合并、不导入。后端也不扫描 `backend/_workspace/` 或 `frontend/data/`。
+业务批次统一使用 `batch_id`。一个批次可以分次处理不同任务，但每个阶段只有一份当前过程件；先处理 A 再处理 B，结果合并为 A+B。前端不提供标框版本或建树运行选择器。
 
-## 三种格式的职责
+默认数据根为项目根的 backend_workspace/，启动前可用 ADF_DATA_ROOT 指定其他目录。后端不扫描 backend/_workspace/、frontend/data/ 或迁移备份补数据。
 
-| 形式 | 用途 | 更新方式 |
-| --- | --- | --- |
-| SQLite：`backend_workspace/system/app.sqlite` | 当前作业状态、人工编辑、结果、批次索引和发布登记 | 后端事务更新；需要整记录保存时校验版本 |
-| JSON | 模块之间读取的结构化数据，以及各阶段的完整版本 | 每次完成阶段保存新版本；下游读取 JSON |
-| Excel | 人工查看、核对、下载和对外交付 | 与阶段 JSON 一起保存为快照；不反向导入手改内容 |
+## 存储职责
 
-SQLite 只需一个本地数据库文件，无需单独安装数据库服务器。多个用户通过同一个后端访问它。当前后台作业仍按单个后端进程管理，启动时使用一个 worker；本次没有引入分布式作业调度。
+| 形式 | 内容 |
+| --- | --- |
+| SQLite：system/app.sqlite | 当前索引、作业进度、人工草稿、稳定步骤身份、任务失效状态和发布登记 |
+| JSON | 当前阶段的完整有效结果，供下游读取 |
+| Excel | 与 JSON 同次保存的完整核对表，供查看和下载；修改下载文件不会回写业务数据 |
+| 发布目录 | 独立冻结的交付表、来源 JSON 和校验清单 |
+| 迁移备份 | 批次目录之外的迁移前完整数据，只用于审计和回滚 |
 
-流程间必需的 JSON 缺失、损坏或校验失败时明确报错，不回退 Excel、旧目录或其他批次，也不靠重新调用模型补齐来掩盖输入缺失。Excel 被修改不会覆盖当前存值。手动修改请通过页面保存；知识库、扩增失败用例和采集任务仍接受各自入口明确上传的 Excel，这些是输入操作，不是对阶段核对表的修改回导。
+缺失或损坏的必需 JSON 明确报错，不回退 Excel，也不自动调用模型补齐。仍通过业务上传入口接受的知识库、失败用例和采集 Excel 不受影响。
 
-JSON 可避免下游反复解析 Excel，SQLite 可减少并发读改写丢失；模型推理和图片处理的耗时不因此消失。本次没有声称固定比例的性能提升。
-
-## 目录
-
-```text
+~~~text
 backend_workspace/
 ├─ system/
-│  ├─ app.sqlite                  当前状态、人工编辑和索引
-│  ├─ preprocessing/             当前预处理 JSON、Excel 和输入登记
-│  ├─ task_generation/           作业输入、知识库快照、导出和冻结采集批次
-│  ├─ trajectory_tree_runs/      按 run_id 保存的建树运行文件
-│  ├─ trajectory_quality_results/  质检运行文件
-│  └─ trajectory_correction/     冻结会话 JSON/Excel 输入和导出
-├─ raw/
-│  ├─ rollout_trajectories/     显式导入的原始轨迹、截图和 XML
-│  └─ collection_batches/      按业务批次与 collection_run_id 保存的采集原件
-├─ inputs/phone_factory/        手机采集上传表
-├─ resources/task_generation/KnowledgeBase/  场景树与先验资源
-├─ batches/<batch_id>/<stage>/<version>/
-│  ├─ result.json               这一版完整结构化结果
-│  ├─ result.xlsx               这一版人工核对表，具体名称见 manifest
-│  └─ manifest.json             上游关系、文件名、SHA256、时间和版本
+│  ├─ app.sqlite
+│  ├─ batch_locks/                  批次跨进程锁
+│  ├─ preprocessing/                冻结输入清单；完成后清理计算文件
+│  ├─ task_generation/              作业输入及采集表
+│  └─ trajectory_correction/        当前活动会话输入及当前导出
+├─ raw/                             原始轨迹、截图、XML和采集原件
+├─ inputs/phone_factory/
+├─ resources/task_generation/KnowledgeBase/
+├─ batches/<batch_id>/<stage>/
+│  ├─ result.json                   当前完整结果
+│  ├─ result.xlsx                   名称以manifest为准，建树主要保存JSON
+│  └─ manifest.json                 内部修订号、摘要、来源和文件SHA256
 ├─ releases/<release_id>/
 │  ├─ manifest.json
-│  ├─ 001/<原文件名>.xlsx       发布时冻结的第一份表
-│  └─ 002/<原文件名>.xlsx       多会话发布时保留多份表
-├─ cache/                       可复用的模型/标框缓存
-├─ logs/                        日志
-└─ tmp/                         尚未完成发布的临时文件
-```
+│  ├─ 001/<导出文件>.xlsx
+│  └─ provenance/                   冻结来源JSON、最终表和索引
+├─ cache/
+├─ logs/
+└─ tmp/artifact_transactions/       文件提交恢复日志，完成后清理
+~~~
 
-作业状态、人工编辑和当前结果只保存到 SQLite，不再双写草稿、结果和作业状态 JSON，也不会用磁盘旧 JSON 恢复数据库记录。`system/` 中的文件用于当前流程的冻结输入、诊断和导出；查看已完成阶段应使用 `batches/` 中的版本。文件清单以对应 `manifest.json` 为准：已有导出器的阶段可能保留原 Excel 文件名，建树阶段主要保存 JSON。
+batches/ 下不再有时间戳版本子目录。manifest 中的 version/revision 是内部并发校验令牌，不能作为用户选择历史结果的入口。作业编号仍用于查询进度和日志。
 
-一个阶段完整写好 JSON、Excel 和清单后才登记到索引。失败不会登记一份只有部分文件的阶段版本。每次重新保存阶段都会生成新版本，已有版本不覆盖。
+## 阶段
 
-## 逐阶段保存什么
-
-| 阶段目录 | 产物 | 保存时机 |
-| --- | --- | --- |
-| `00_task_generation` | 普通生成当前结果 JSON/Excel | 本次生成结束 |
-| `00_scene_matching` | 扩增源失败用例、分类和错误 JSON/Excel | 分类阶段结束 |
-| `00_augmentation` | 扩增结果 JSON/Excel | 扩增结束 |
-| `00_collection` | 冻结采集输入 JSON 和原 17 列采集表 | 首次提交采集 |
-| `00_task_export` | 本次导出的未删除任务 JSON/原格式 Excel | 点击生成侧导出 |
-| `01_conversion` | 转换后的步骤 JSON/轨迹 Excel | 原始轨迹转换结束 |
-| `02_annotation` | 步骤、动作框 JSON/标框 Excel | 标框结束或页面保存标框 |
-| `03_observation` | 全部步骤的 Observation、中间态类别、判断原因及是否计入树 | 建树任务发布时，保存同次视觉判断的全部步骤 |
-| `04_tree` | JSON 内含轨迹树和同版本的完整质检输入 | 建树完成 |
-| `05_quality` | 评分 JSON，轨迹汇总、步骤评分、评分标准 Excel | 质检成功 |
-| `06_correction` | 完整步骤 JSON/Excel，含人工编辑、删除和导出选择 | 修正导出、完整导出或提交 COT 前 |
-| `07_cot` | 完整过程 JSON/Excel，另附原完整数据集 Excel | COT 完成或完整数据集导出 |
-| `releases/<release_id>` | 发布清单和所选完整数据集 Excel 的冻结副本 | 创建数据发布记录 |
-
-普通编辑立即保存当前状态，不会为每次按键或字段保存生成一套 Excel。生成侧额外提供 `POST /api/task-generation/jobs/{job_id}/snapshot`，可从已保存结果补存中间表，不调用模型。COT 结果已保存但过程表失败时可重新导出，不必重新生成。
-
-`06/07` 的完整过程表保留已删除步骤，便于追溯；对外 SFT/RL 和完整数据集导出继续遵循现有各自规则，不能把过程表当成训练投影。Observation 阶段同样保留未计入树的广告、加载等步骤。
-
-单一上游批次继续沿用其 `batch_id`；修正与 COT 沿用冻结的建树批次关系。采集批次号等于来源生成作业 ID；每次采集使用独立 `collection_run_id`，按 [采集完成协议](backend/COLLECTION_RUNS.md) 登记原文件，并在同批次发布01／02。前端按批次和标框版本提交建树，避免全局结果覆盖。完整入口见 [批次预处理](backend/PREPROCESSING.md)。
-
-`run_jiawen.py export` 辅助命令保存工作簿和 JSON 侧车，不登记为完整的广告分类阶段。网页建树保存的 `03_observation` 包含同步视觉分类结果。
-
-## 使用方法
-
-先将需要重新处理的原始任务目录显式复制到 `backend_workspace/raw/rollout_trajectories/`，保留任务／轨迹层级、截图、XML 和响应文件。确认同名任务不会覆盖已有输入后再复制。复制原始输入不包含旧转换表、标框结果、作业记录、评分或缓存；后端不会从旧根目录自动寻找缺少的文件。
-
-从项目根目录运行。默认不需要配置路径：
-
-```powershell
-# 新原始轨迹放到 backend_workspace/raw/rollout_trajectories 后，转换并运行标框
-python backend/trajectories_preprocessing.py --batch-id processing-demo-001
-
-# 明确指定本次已复制的新目录
-python backend/trajectories_preprocessing.py --source "backend_workspace/raw/rollout_trajectories" --batch-id processing-demo-001
-
-# 只做格式转换，不调用标框模型
-python backend/export_vla_trajectories.py "backend_workspace/raw/rollout_trajectories" --batch-id processing-demo-001
-```
-
-前两个命令会调用现有标框模型，仍需原模型配置。随后在页面提交建树、质检、修正、COT 和发布，阶段产物自动保存。重复使用同一个 `--batch-id` 会增加该批次的阶段版本，不覆盖之前的表格。
-
-需要把所有新数据放在另一块磁盘时，在**启动后端或脚本前**设置进程环境变量：
-
-```powershell
-$env:ADF_DATA_ROOT = "E:/AgenticData"
-python -m uvicorn backend.api:app --host 0.0.0.0 --port 8765 --workers 1
-```
-
-`ADF_DATA_ROOT` 在 Python 导入存储模块时读取，不通过模型配置文件 `backend/.env` 延迟加载。预处理/转换 CLI 也支持 `--data-root`；网页服务必须指向同一根目录，才能看到同一份数据。指定其他根目录时，原始输入也应复制到该根目录的 `raw/rollout_trajectories/`。
-
-知识库等必要资源由操作者明确放入 `backend_workspace/resources/`，或通过对应页面上传，不自动复制旧知识库。需要保留既有场景树节点身份时，显式复制完整知识库版本目录及其 `current.json`；不要把旧作业、结果或采集任务一起复制进运行目录。旧发布记录不会自动出现在新页面，也不会覆盖旧发布文件。
-
-## 手机设备和配置的一次性准备
-
-手机采集的 `/api/phone-factory/*` 统一由 FastAPI 提供，开发模式通过 Vite 的 `/api` 代理访问。没有 SQLite 状态时，页面返回空设备／任务列表和默认参数，不从 `frontend/data/` 导入。上传幂等规则、运行按钮和 Python 手机协议保持不变。
-
-需要沿用已确认的设备配置时，可在后端 Python 中显式调用：
-
-```python
-from backend.phone_factory import PhoneFactoryStore
-
-PhoneFactoryStore().initialize_settings({
-    "phones": ["phone-id"],
-    "apps": ["App"],
-    "phoneApps": [{"phone_id": "phone-id", "app": "App"}],
-    "vla": [],
-    "config": {"sampling_enabled": False, "temperature": 0.7,
-               "top_p": 0.85, "use_experience_lib": False},
-})
-```
-
-示例值需替换为已确认的本地配置。方法只接受 `phones/apps/phoneApps/vla/config`，拒绝 `tasks` 和运行记录；关联状态设为“空闲”。已有 SQLite 状态时拒绝覆盖。该方法不读取旧文件、不复制上传表、不下发手机任务，且不是启动时自动执行的步骤。
-
-## 统一查看接口
-
-| 接口 | 返回 |
+| 目录 | 当前产物 |
 | --- | --- |
-| `GET /api/data-storage` | 实际数据根目录、数据库位置和快照规则 |
-| `GET /api/data-batches` | 已登记批次、阶段、版本数和更新时间 |
-| `GET /api/data-batches/{batch_id}/artifacts` | 该批次全部已保存版本 |
-| `GET /api/data-batches/{batch_id}/artifacts/{stage}/{version}` | 单一版本清单 |
-| `GET /api/data-batches/{batch_id}/artifacts/{stage}/{version}/files/{filename}` | 下载登记文件，验证 SHA256 |
+| 00_task_generation | 生成结果 JSON/Excel |
+| 00_scene_matching | 扩增来源、分类和错误 JSON/Excel |
+| 00_augmentation | 扩增结果 JSON/Excel |
+| 00_collection | 采集输入 JSON 和原 17 列采集表 |
+| 00_task_export | 当前未删除任务 JSON/Excel |
+| 01_conversion | 转换后的步骤 JSON/Excel |
+| 02_annotation | 步骤、动作框 JSON/Excel |
+| 03_observation | 全部有效任务步骤的 Observation、中间态判断及未入树原因 |
+| 04_tree | 有效任务的轨迹树、来源标注和完整质检输入 JSON |
+| 05_quality | 有效任务评分 JSON、轨迹汇总/步骤评分/评分标准 Excel |
+| 06_correction | 有效任务完整修正过程 JSON/Excel及当前筛选导出 |
+| 07_cot | 有效任务完整 COT 过程 JSON/Excel及当前完整数据集导出 |
 
-缺少文件/版本返回 404；文件被篡改等完整性错误返回 409。读接口不生成模型结果、不临时补 Excel、不迁移数据。现有业务 API 地址保留，内部数据源已经切换；去掉的是旧文件读取链路，不是页面仍在调用的业务路由。
+过程表保留有效任务中已删除或未入树的步骤及对应标记；训练导出遵循删除和导出选择规则。待复核或失效任务不混入有效导出。
 
-生成导出仍调用 `POST /api/task-generation/jobs/{job_id}/export`，修正导出仍调用 `POST /api/correction/sessions/{session_id}/export`，完整数据集导出仍调用同会话下的 `/dataset-export`；下载也沿用响应中的业务地址。后端将文件保存到新 `backend_workspace/system/` 导出目录，并保存对应阶段快照。统一产物接口用于查看、核对和下载阶段文件，不能将修正过程表误当成 SFT/RL 导出。发布 Excel 从 `backend_workspace/releases/` 的冻结副本下载。
+## 更新、依赖与恢复
 
-浏览器点击下载后的本机副本仍使用浏览器的下载目录；这里的 `backend_workspace/` 指后端已保存的产物位置。
+- 相同任务、输入和配置的重复提交复用正在执行或已成功结果。失败允许重试，已有有效结果不会因计算失败被替换。
+- 建树和质检按任务合并。新增 B 不改变 A 的输入指纹，也不会使 A 的计算或编辑无故失效。
+- 修改 A 的标框只让 A 的建树及后续结果失效。页面显示待重新处理；B 保持有效，不自动调用模型。
+- 每批次维护一个活动修正会话。编辑、导出选择和 COT 按稳定的任务／轨迹／步骤身份关联；Excel 行号只用于展示。
+- 来源未变的编辑保留；来源变化的编辑保留为待复核，采用或放弃后才允许该任务参与导出、COT和发布。
+- 编辑请求携带内部修订号。冲突返回409，页面保留草稿并要求刷新。
+- 后台回写前校验所选任务输入指纹，拒绝旧结果覆盖新输入。
+- 文件先写暂存目录，持有批次锁后替换并以数据库事务登记；03/04成对提交。恢复日志处理文件替换或数据库提交中断；任务失效通知通过事务记录恢复。
+- 后端仍按一个 worker 部署。跨进程文件锁和 CAS 防止存储冲突，不代表引入分布式模型作业调度。
 
-## 本次重跑验收
+首次预处理可以先发布01，保留标框失败时的转换结果；已有01/02成功链时，新计算完成后一起更新，失败保留原链。原始采集文件和作业冻结输入清单继续保留。
 
-本次使用批次 `validation-20260915-155706`，输入任务为 `AT-YYSP-AQY-001`，基线为 10 条轨迹、142 个 response。该批次已完成转换、标框、Observation、建树和质检；实际阶段版本以已登记的 manifest 为准，未自动进入修正、COT、发布或上传。
+## 当前结果接口
 
-1. 在首次重跑时显式复制原始任务并核对文件清单与哈希；此次目录更名保留这份已核对的原始数据，原旧 workspace 随迁移验收完成后删除。
-2. 重新执行转换和标框，核对 `01_conversion`、`02_annotation` 的步骤身份、数量、动作和框。
-3. 在页面建树，检查 `03_observation` 保留全部步骤及广告／中间态原因，`04_tree` 保存树和同版本质检输入；未入树步骤不能从过程表消失。
-4. 执行质检并检查 `05_quality` 的 JSON 和评分表可追溯到同批次轨迹。到此暂停，由用户核对，不自动继续修正、COT、发布或上传。
-5. 隔离测试验证：旧目录哨兵记录不可查询；Excel 改动不改变内部读取结果；必需 JSON 缺失或损坏时明确失败；阶段文件哈希与清单一致。
+| 接口 | 行为 |
+| --- | --- |
+| GET /api/data-storage | 实际数据根、数据库及当前阶段保存规则 |
+| GET /api/data-batches | 业务批次及阶段数量 |
+| GET /api/data-batches/{batch_id}/artifacts | 各阶段当前清单 |
+| GET /api/data-batches/{batch_id}/artifacts/{stage} | 当前阶段详情 |
+| GET /api/data-batches/{batch_id}/artifacts/{stage}/files/{filename} | 校验并下载当前文件 |
+| GET /api/data-batches/{batch_id}/tree | 当前树和全部任务状态 |
+| GET /api/data-batches/{batch_id}/quality | 当前质检和全部任务状态 |
+| GET /api/data-batches/{batch_id}/tasks/{task_id}/tree | 单任务有效树 |
+| GET /api/data-batches/{batch_id}/tasks/{task_id}/quality | 单任务有效质检 |
 
-## 备份与范围
+建树、质检提交使用 {batch_id, task_ids}；修正会话用 {batch_id} 幂等获取或创建。所有页面路由定位使用 batch_id。
 
-停掉后端、预处理和其他写入脚本后，备份整个 `backend_workspace/`。只备份 SQLite 会缺少图片和 Excel，只备份 Excel 会缺少当前编辑和索引。更换数据根目录应复制完整目录并核对上游资源可访问，不要在多个进程运行时手工覆盖数据库。迁移中的旧目录仅作临时回退，验收成功后由迁移命令删除；不作为新系统的数据来源。
+兼容旧链接时，只有仍对应当前有效结果的运行标识才映射到业务批次；已淘汰的版本返回明确失效响应（410），不静默替换成另一份结果。内部资源访问仍允许携带当前修订令牌用于一致性校验。
 
-本次仅清理用户指定的原旧 workspace；当前统一目录内的历史阶段和冻结文件全部保留。不调整训练配比/模型发布等页面中的演示存储，也不新增 Excel 修改回导或依赖调度。采集端需按完成登记协议将结果写到共享数据目录；未接通时页面明确等待采集结果。
+修正 /export、/dataset-export 和发布下载沿用业务接口，不能把过程核对表当作训练导出。当前会话仅保留每种导出的当前文件，已发布文件独立保存。
 
-## 从 data 更名到 backend_workspace
+## 发布
 
-一次性迁移命令先只读检查，再停止写入并正式切换。旧目标目录临时保存在项目内 `.data-root-migration/`，不合并到新数据。迁移记录、校验清单和原 SQLite 备份保存在同目录，供故障恢复与审计。
+发布时冻结所选完整数据集 Excel、来源 JSON、上游关系和校验清单。训练总览统计读取发布内的冻结来源，不再依赖随批次更新的当前文件。发布成功在同一数据库事务中登记发布、更新修正会话并将所有所选批次置为 published。结束后不提供恢复编辑入口；原始文件、过程件和已保存人工修改只读保留，下载、SHA256、统计和 S3 上传继续可用。后续生产使用新的 batch_id。
 
-```powershell
+## 迁移为每阶段一份
+
+先停止后端、模型作业和所有写入脚本。从项目根执行：
+
+~~~powershell
+python -m backend.data_store.migrate_single_artifact check
+python -m backend.data_store.migrate_single_artifact apply
+python -m backend.data_store.migrate_single_artifact verify
+# 验证不通过且没有迁移后业务写入时，可恢复迁移前数据
+python -m backend.data_store.migrate_single_artifact rollback
+~~~
+
+命令接受 --data-root <目录>。备份和校验清单位于数据根同级 .single-artifact-migration/<数据根目录名>/，不放在 batches/ 内。apply先完整备份数据库及文件并验证SHA256，再冻结已有发布来源、沿上游关系选择完整有效链、重建索引和稳定身份，最后删除运行目录中的旧版本和重复计算文件。
+
+迁移不会分别挑选每个阶段最新文件拼接。现有 validation 批次保留9月16日建树和匹配的质检、修正、COT链；旧空修正会话只留在备份。人工编辑、COT和原始采集原件保留。若发现无法自动合并的多个人工草稿、缺失来源或校验失败，迁移明确报错。
+
+verify检查阶段结构、文件摘要、上游引用、人工编辑和发布统计。回滚先验证备份；迁移后有新业务写入时拒绝直接覆盖。失败迁移应执行verify调查或rollback，不手动混合新旧数据。备份长期保留，由操作者另行归档。
+
+## 原数据根更名
+
+已有 data/ 到 backend_workspace/ 的根目录迁移工具仍独立可用：
+
+~~~powershell
 python -m backend.data_store.migrate_root check --project-root .
-# 确认无运行中作业，停止后端及其他写入脚本后执行
 python -m backend.data_store.migrate_root apply --project-root .
-# 检查迁移后文件字节、登记路径与阶段文件完整性
 python -m backend.data_store.migrate_root verify --project-root .
-# 完成文件校验、页面及接口验收后删除暂存的原旧 workspace
 python -m backend.data_store.migrate_root finalize --project-root .
-# 如尚未 finalize 且验收失败，停止写入后恢复
-python -m backend.data_store.migrate_root rollback --project-root .
-```
+# finalize之前且无新增业务写入时可rollback
+~~~
 
-冻结 JSON、Excel、原始轨迹与缓存原字节保持不变，不批量替换其中记录的旧绝对路径。SQLite 保存明确的原根目录登记，路径解析器只将已登记旧根的相对后缀定位到当前数据根，并校验路径边界；不会访问旧目录、创建目录联接或通过扫描补数据。因此历史 JSON 内可能仍显示当时的原路径，这是来源记录，不是当前读取位置。
+这一步不能代替阶段迁移。历史JSON中的旧绝对路径由已登记根目录映射解析，原始文件字节不改写。
 
-迁移事务会重建以工作簿绝对路径为键的标框索引，保留人工存值和阶段版本。当前 API 地址、`ADF_DATA_ROOT` 变量和 `@data/` 标记不改名。后端重启必须使用新根；不能沿用指向原 `data` 的启动环境。
+## 验证
 
-迁移命令使用操作系统文件锁，进程退出后锁自动释放，可按迁移记录继续执行。正式删除旧目录前可回退，但若切换后已经新增或修改业务记录，回退会拒绝覆盖数据库；应先保留新写入并人工制定恢复方案。迁移审计目录和原 SQLite 备份不参与业务读取，建议随运维备份保留。
+~~~powershell
+python -m unittest discover -s backend/tests -q
+npm test --prefix frontend
+npm run build --prefix frontend
+~~~
 
-业务全流程与存储关系图见 [Word 设计文档](outputs/数据流转与存储设计.docx)。
+测试使用临时数据、模拟模型和模拟采集；覆盖任务合并、局部失效、并发提交、迟到回写、跨进程CAS、进程中断恢复、编辑稳定身份、发布冻结和迁移回滚。真实模型或手机采集需用户在业务页面主动发起。
+
+更多采集流程见 [批次预处理](backend/PREPROCESSING.md) 和 [采集完成协议](backend/COLLECTION_RUNS.md)。
+
+
+## 发布后结束批次
+
+生命周期保存在 SQLite 的 batch_lifecycle 记录中：缺省 active，成功发布后为 published，携带 published_at 和 release_id。发布响应包含 release.batch_ids；GET /api/data-batches/{batch_id}/lifecycle 返回持久状态。批次锁覆盖完整性检查、冻结文件和数据库提交，多批次同时成功或全部回滚。
+
+整批的全部任务须有当前有效的预处理、建树和完整质检结果，且没有执行中作业、失效任务和待复核修改。保留原有轨迹筛选规则，不要求所有步骤生成 COT。失败不改变批次状态。已结束批次的处理入口及写入返回结构化 409（batch_published、批次和发布编号）；各阶段只读详情、下载以及作业日志仍保留。
+
+前端的采集、预处理、质检、修正、COT 和发布候选只列 active 批次。发布后通过同窗口通知和 BroadcastChannel 移除对应批次，失效请求和轮询；重新聚焦/恢复可见时核对服务端。当前选择清空并显示已发布，不自动切到下一批。不调用 localStorage.clear，发布历史和 S3 上传恢复信息保留。
+
+### 为既有发布登记状态
+
+在停止写入后执行（不调用采集或模型）：
+
+    .venv/Scripts/python.exe -m backend.data_store.migrate_batch_lifecycle check
+    .venv/Scripts/python.exe -m backend.data_store.migrate_batch_lifecycle apply
+
+只有来源会话仍与最后一次发布内容指纹相同、整批完整的批次才会登记结束。旧发布后有修改、未完成任务或待复核内容会保留 active，并在 skipped 中列出原因。apply 先用 SQLite 在线备份保存数据库，执行 integrity_check 和 SHA256 校验，再在单个事务中补登记生命周期。备份位于数据根同级 .batch-publication-migration/<根目录名>/<迁移编号>/app.sqlite；report.json 保存判断原因、全部 batches/releases/raw 文件校验清单和验证结果。过程文件、发布文件和原始文件不改动。重复执行不会再次登记。
+
+若需撤销这次补登记，停止后端和所有写入后，用此次 app.sqlite 备份恢复 system/app.sqlite，再重启；这会恢复备份时点的全部数据库状态，因此恢复前也应保存当前数据库。

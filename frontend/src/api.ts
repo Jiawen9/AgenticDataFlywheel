@@ -1,3 +1,4 @@
+import { activeBatchItems, notifyBatchesPublished } from '@/utils/batchLifecycle'
 import type { BuildJob, CorrectionBatch, CorrectionCotJob, CorrectionCotResponse, CorrectionExport, CorrectionGroup, CorrectionGroupSummary, CorrectionRecommendation, CorrectionSession, DatasetRelease, DatasetReleaseCandidate, DatasetUploadJob, KnowledgeBaseSummary, QualityJob, RunQualitySummary, TaskGenerationExport, TaskGenerationJob, TaskGenerationResult, TaskGenerationTree, TaskGenerationSelection, TaskGenerationTreeNode, TaskQualityResult, TaskSummary, TrajectoryRecord, TrajectorySummary, TrajectoryTreeNode, TreeRun } from './types'
 
 import type { AugmentationPreview, CollectionSourceRun, CollectionSourceTask, DatasetUploadCapabilities, PreprocessingBatch, PreprocessingJob, StageArtifact, TrajectoryScope } from './types'
@@ -5,11 +6,11 @@ import type { AugmentationPreview, CollectionSourceRun, CollectionSourceTask, Da
 const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
 
 export class ApiError extends Error {
-  constructor(message: string, readonly status: number) { super(message); this.name = 'ApiError' }
+  constructor(message: string, readonly status: number, readonly detail?: { code?: string; batch_id?: string; release_id?: string | null; published_at?: string | null }) { super(message); this.name = 'ApiError' }
 }
 
 function scopeQuery(scope?: TrajectoryScope): string {
-  return scope ? '?' + new URLSearchParams({ ...scope }).toString() : ''
+  return scope ? '?' + new URLSearchParams(Object.entries(scope).filter((entry): entry is [string, string] => typeof entry[1] === 'string')).toString() : ''
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -20,19 +21,26 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     headers,
   })
   if (!response.ok) {
-    let detail = `${response.status} ${response.statusText}`
+    let message = response.status + ' ' + response.statusText
+    let detail: { code?: string; message?: string; batch_id?: string; release_id?: string | null; published_at?: string | null } | undefined
     try {
-      const payload = (await response.json()) as { detail?: string | Array<{ msg: string }> }
-      detail = Array.isArray(payload.detail) ? payload.detail.map(item => item.msg).join('；') : payload.detail || detail
-    } catch {
-      // Keep the HTTP fallback message.
-    }
-    throw new ApiError(detail, response.status)
+      const payload = await response.json()
+      if (typeof payload.detail === 'string') message = payload.detail
+      else if (Array.isArray(payload.detail)) message = payload.detail.map((item: { msg: string }) => item.msg).join('；')
+      else if (payload.detail && typeof payload.detail === 'object') { detail = payload.detail; message = detail?.message || message }
+    } catch { /* Keep the HTTP fallback message. */ }
+    if (detail?.code === 'batch_published' && detail.batch_id) notifyBatchesPublished({ batch_ids: [detail.batch_id], release_id: detail.release_id ?? null, published_at: detail.published_at, source_path: path.split('?')[0] })
+    throw new ApiError(message, response.status, detail)
   }
-  return response.json() as Promise<T>
+  const result = await response.json()
+  if (result?.error_code === 'batch_published' && result.detail?.batch_id) notifyBatchesPublished({ batch_ids: [result.detail.batch_id], release_id: result.detail.release_id ?? null, published_at: result.detail.published_at, source_path: path.split('?')[0] })
+  return result as T
 }
 
 export const api = {
+  batchLifecycle(batchId: string): Promise<{ batch_id: string; status: 'active' | 'published'; published_at: string | null; release_id: string | null }> {
+    return request('/api/data-batches/' + encodeURIComponent(batchId) + '/lifecycle', { cache: 'no-store' })
+  },
   async taskGenerationKnowledgeBases(): Promise<KnowledgeBaseSummary[]> {
     return (await request<{ knowledge_bases: KnowledgeBaseSummary[] }>('/api/task-generation/knowledge-bases')).knowledge_bases
   },
@@ -80,7 +88,7 @@ export const api = {
     return request(`/api/task-generation/jobs/${encodeURIComponent(jobId)}/export`, { method: 'POST' })
   },
   async preprocessingBatches(): Promise<PreprocessingBatch[]> {
-    return (await request<{ batches: PreprocessingBatch[] }>('/api/trajectory-preprocessing/batches')).batches
+    return activeBatchItems((await request<{ batches: PreprocessingBatch[] }>('/api/trajectory-preprocessing/batches', { cache: 'no-store' })).batches)
   },
   async collectionSourceRuns(batchId: string): Promise<CollectionSourceRun[]> {
     return (await request<{ runs: CollectionSourceRun[] }>('/api/phone-factory/collection-runs?batch_id=' + encodeURIComponent(batchId))).runs
@@ -127,7 +135,7 @@ export const api = {
   async createBuild(taskIds: string[], scope?: TrajectoryScope): Promise<BuildJob> {
     return request('/api/tree-builds', {
       method: 'POST',
-      body: JSON.stringify({ task_ids: taskIds, ...scope }),
+      body: JSON.stringify({ task_ids: taskIds, batch_id: scope?.batch_id }),
     })
   },
   build(jobId: string): Promise<BuildJob> {
@@ -136,15 +144,21 @@ export const api = {
   async runs(): Promise<TreeRun[]> {
     return (await request<{ runs: TreeRun[] }>('/api/tree-runs')).runs
   },
-  tree(runId: string, taskId: string): Promise<TrajectoryTreeNode> {
+  treeRun(runId: string): Promise<TreeRun> {
+    return request(`/api/tree-runs/${encodeURIComponent(runId)}`)
+  },
+  batchTree(batchId: string): Promise<TreeRun> {
+    return request(`/api/data-batches/${encodeURIComponent(batchId)}/tree`)
+  },
+  tree(batchId: string, taskId: string): Promise<TrajectoryTreeNode> {
     return request(
-      `/api/tree-runs/${encodeURIComponent(runId)}/tasks/${encodeURIComponent(taskId)}/tree`,
+      `/api/data-batches/${encodeURIComponent(batchId)}/tasks/${encodeURIComponent(taskId)}/tree`,
     )
   },
-  createQuality(runId: string, taskIds: string[]): Promise<QualityJob> {
+  createQuality(batchId: string, taskIds: string[]): Promise<QualityJob> {
     return request('/api/quality-jobs', {
       method: 'POST',
-      body: JSON.stringify({ run_id: runId, task_ids: taskIds }),
+      body: JSON.stringify({ batch_id: batchId, task_ids: taskIds }),
     })
   },
   qualityJob(jobId: string): Promise<QualityJob> {
@@ -153,26 +167,27 @@ export const api = {
   async qualityJobs(): Promise<QualityJob[]> {
     return (await request<{ jobs: QualityJob[] }>('/api/quality-jobs')).jobs
   },
-  runQuality(runId: string): Promise<RunQualitySummary> {
-    return request(`/api/tree-runs/${encodeURIComponent(runId)}/quality`)
+  runQuality(batchId: string): Promise<RunQualitySummary> {
+    return request(`/api/data-batches/${encodeURIComponent(batchId)}/quality`)
   },
-  taskQuality(runId: string, taskId: string): Promise<TaskQualityResult> {
-    return request(`/api/tree-runs/${encodeURIComponent(runId)}/tasks/${encodeURIComponent(taskId)}/quality`)
+  taskQuality(batchId: string, taskId: string): Promise<TaskQualityResult> {
+    return request(`/api/data-batches/${encodeURIComponent(batchId)}/tasks/${encodeURIComponent(taskId)}/quality`)
   },
-  correctionBatches(): Promise<{ default_tree_run_id: string | null; batches: CorrectionBatch[] }> {
-    return request('/api/correction/batches')
+  async correctionBatches(): Promise<{ default_batch_id: string | null; default_tree_run_id?: string | null; batches: CorrectionBatch[] }> {
+    const result = await request<{ default_batch_id: string | null; batches: CorrectionBatch[] }>('/api/correction/batches', { cache: 'no-store' })
+    return { ...result, batches: activeBatchItems(result.batches) }
   },
-  correctionRecommendation(treeRunId?: string): Promise<CorrectionRecommendation> {
-    const query = treeRunId ? `?tree_run_id=${encodeURIComponent(treeRunId)}` : ''
+  correctionRecommendation(batchId?: string): Promise<CorrectionRecommendation> {
+    const query = batchId ? `?batch_id=${encodeURIComponent(batchId)}` : ''
     return request(`/api/correction/recommendation${query}`)
   },
   async correctionSessions(): Promise<CorrectionSession[]> {
-    return (await request<{ sessions: CorrectionSession[] }>('/api/correction/sessions')).sessions
+    return activeBatchItems((await request<{ sessions: CorrectionSession[] }>('/api/correction/sessions', { cache: 'no-store' })).sessions)
   },
-  async createCorrectionSession(treeRunId: string): Promise<CorrectionSession> {
+  async createCorrectionSession(batchId: string): Promise<CorrectionSession> {
     return (await request<{ session: CorrectionSession }>('/api/correction/sessions', {
       method: 'POST',
-      body: JSON.stringify({ tree_run_id: treeRunId }),
+      body: JSON.stringify({ batch_id: batchId }),
     })).session
   },
   correctionSession(sessionId: string): Promise<CorrectionSession> {
@@ -181,10 +196,10 @@ export const api = {
   correctionSessionCot(sessionId: string): Promise<CorrectionCotResponse> {
     return request(`/api/correction/sessions/${encodeURIComponent(sessionId)}/cot`)
   },
-  async createCorrectionCotJob(sessionId: string, groupIds?: string[], rowIds?: number[], options?: { generateBBox?: boolean; forceOverwrite?: boolean }): Promise<CorrectionCotJob> {
+  async createCorrectionCotJob(sessionId: string, groupIds?: string[], rowIds?: number[], options?: { generateBBox?: boolean; forceOverwrite?: boolean; expectedRevision?: number }): Promise<CorrectionCotJob> {
     return request('/api/correction/cot-jobs', {
       method: 'POST',
-      body: JSON.stringify({ session_id: sessionId, group_ids: groupIds && groupIds.length ? groupIds : undefined, row_ids: rowIds && rowIds.length ? rowIds : undefined, generate_bbox: options?.generateBBox ?? false, force_overwrite: options?.forceOverwrite ?? false }),
+      body: JSON.stringify({ session_id: sessionId, group_ids: groupIds && groupIds.length ? groupIds : undefined, row_ids: rowIds && rowIds.length ? rowIds : undefined, generate_bbox: options?.generateBBox ?? false, force_overwrite: options?.forceOverwrite ?? false, expected_revision: options?.expectedRevision }),
     })
   },
   updateActionBBox(taskId: string, trajectoryId: string, step: number, excelRow: number, bbox: [number, number, number, number], action?: Record<string, unknown>): Promise<{ actions_box: string }> {
@@ -205,26 +220,30 @@ export const api = {
   correctionGroup(sessionId: string, groupId: string): Promise<CorrectionGroup> {
     return request<{ group: CorrectionGroup }>(`/api/correction/sessions/${encodeURIComponent(sessionId)}/tasks/${encodeURIComponent(groupId)}`).then((result) => result.group)
   },
-  async patchCorrectionRow(sessionId: string, excelRow: number, patch: { sop?: string; actions?: string; actions_box?: string; summary?: string; thought?: string; deleted?: boolean }): Promise<{ group: CorrectionGroupSummary; row: CorrectionGroup['rows'][number] }> {
+  async patchCorrectionRow(sessionId: string, excelRow: number, patch: { sop?: string; actions?: string; actions_box?: string; summary?: string; thought?: string; deleted?: boolean }, expectedRevision?: number): Promise<{ group: CorrectionGroupSummary; row: CorrectionGroup['rows'][number]; storage_revision?: number }> {
     return request(`/api/correction/sessions/${encodeURIComponent(sessionId)}/rows/${excelRow}`, {
       method: 'PATCH',
-      body: JSON.stringify(patch),
+      body: JSON.stringify({ ...patch, expected_revision: expectedRevision }),
     })
   },
-  async patchCorrectionExport(sessionId: string, groupId: string, exportState: boolean): Promise<CorrectionGroupSummary> {
-    return (await request<{ group: CorrectionGroupSummary }>(`/api/correction/sessions/${encodeURIComponent(sessionId)}/tasks/${encodeURIComponent(groupId)}/export`, {
+  async patchCorrectionExport(sessionId: string, groupId: string, exportState: boolean, expectedRevision?: number): Promise<CorrectionGroupSummary> {
+    const result = await request<{ group: CorrectionGroupSummary; storage_revision?: number }>(`/api/correction/sessions/${encodeURIComponent(sessionId)}/tasks/${encodeURIComponent(groupId)}/export`, {
       method: 'PATCH',
-      body: JSON.stringify({ export: exportState }),
-    })).group
+      body: JSON.stringify({ export: exportState, expected_revision: expectedRevision }),
+    })
+    return { ...result.group, storage_revision: result.storage_revision ?? result.group.storage_revision }
   },
-  correctionExport(sessionId: string): Promise<CorrectionExport> {
-    return request(`/api/correction/sessions/${encodeURIComponent(sessionId)}/export`, { method: 'POST' })
+  reviewCorrectionGroup(sessionId: string, groupId: string, decision: 'adopt' | 'discard', expectedRevision?: number): Promise<{ session: CorrectionSession; group: CorrectionGroup }> {
+    return request(`/api/correction/sessions/${encodeURIComponent(sessionId)}/tasks/${encodeURIComponent(groupId)}/review`, { method: 'PATCH', body: JSON.stringify({ decision, expected_revision: expectedRevision }) })
   },
-  correctionDatasetExport(sessionId: string): Promise<CorrectionExport> {
-    return request(`/api/correction/sessions/${encodeURIComponent(sessionId)}/dataset-export`, { method: 'POST' })
+  correctionExport(sessionId: string, expectedRevision?: number): Promise<CorrectionExport> {
+    return request(`/api/correction/sessions/${encodeURIComponent(sessionId)}/export`, { method: 'POST', body: JSON.stringify({ expected_revision: expectedRevision }) })
+  },
+  correctionDatasetExport(sessionId: string, expectedRevision?: number): Promise<CorrectionExport> {
+    return request(`/api/correction/sessions/${encodeURIComponent(sessionId)}/dataset-export`, { method: 'POST', body: JSON.stringify({ expected_revision: expectedRevision }) })
   },
   async datasetReleaseCandidates(): Promise<DatasetReleaseCandidate[]> {
-    return (await request<{ candidates: DatasetReleaseCandidate[] }>('/api/dataset-releases/candidates')).candidates
+    return activeBatchItems((await request<{ candidates: DatasetReleaseCandidate[] }>('/api/dataset-releases/candidates', { cache: 'no-store' })).candidates)
   },
   async datasetReleases(): Promise<DatasetRelease[]> {
     return (await request<{ releases: DatasetRelease[] }>('/api/dataset-releases')).releases
@@ -256,7 +275,7 @@ export const api = {
 }
 
 export function treeRunScope(run: Pick<TreeRun, 'batch_id' | 'annotation_version'> | undefined): TrajectoryScope | undefined {
-  return run?.batch_id && run.annotation_version ? { batch_id: run.batch_id, annotation_version: run.annotation_version } : undefined
+  return run?.batch_id ? { batch_id: run.batch_id } : undefined
 }
 
 export function imageUrl(relativePath: string, scope?: TrajectoryScope): string {

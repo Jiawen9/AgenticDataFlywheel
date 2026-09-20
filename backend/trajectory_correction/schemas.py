@@ -8,10 +8,19 @@ from pydantic import BaseModel, Field
 
 
 class CreateSessionRequest(BaseModel):
-    tree_run_id: str = Field(min_length=1)
+    batch_id: Optional[str] = Field(default=None, min_length=1)
+    tree_run_id: Optional[str] = Field(default=None, min_length=1)
 
 
-class RowPatchRequest(BaseModel):
+class RevisionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+
+
+class ReviewRequest(RevisionRequest):
+    decision: str
+
+
+class RowPatchRequest(RevisionRequest):
     sop: Optional[str] = None
     actions: Optional[str] = None
     actions_box: Optional[str] = None
@@ -20,11 +29,11 @@ class RowPatchRequest(BaseModel):
     deleted: Optional[bool] = None
 
 
-class ExportStateRequest(BaseModel):
+class ExportStateRequest(RevisionRequest):
     export: bool
 
 
-class CreateCotJobRequest(BaseModel):
+class CreateCotJobRequest(RevisionRequest):
     session_id: str = Field(min_length=1)
     group_ids: Optional[list[str]] = None
     row_ids: Optional[list[int]] = None

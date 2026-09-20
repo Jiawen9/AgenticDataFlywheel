@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import threading
-import time
+from contextlib import ExitStack
 import unittest
 from pathlib import Path
 
@@ -144,7 +144,7 @@ class ServiceTests(unittest.TestCase):
 
 class JobManagerTests(unittest.TestCase):
     def test_job_persists_results_supports_group_delete_and_export(self):
-        with tempfile.TemporaryDirectory() as temp:
+        with tempfile.TemporaryDirectory() as temp, ExitStack() as workers:
             base = Path(temp)
             kb = base / "kb"
             _write_knowledge_base(kb)
@@ -156,34 +156,31 @@ class JobManagerTests(unittest.TestCase):
                     {"result_id": "main", "task_uuid": "main", "pre_task_uuid": "pre", "dependency_group_id": "main", "pre_dependency": "weak", "app": "AppA", "scene": "场景A", "capability": "能力A", "sub_capability": "子能力A", "task": "主任务", "deleted": False},
                 ], "errors": [], "warnings": [], "total_items": 1}
 
-            manager = TaskGenerationJobManager(base / "jobs", base / "runs", base / "exports", kb, initial_runner=runner)
+            manager = TaskGenerationJobManager(base / "jobs", base / "runs", base / "exports", kb, base / "logs", initial_runner=runner)
+            workers.callback(manager.shutdown, wait=True)
             job = _submit_initial(manager, kb)
-            for _ in range(100):
-                current = manager.get(job["job_id"])
-                if current and current["status"] == "succeeded":
-                    break
-                time.sleep(0.01)
+            manager.shutdown(wait=True)
+            current = manager.get(job["job_id"])
             self.assertEqual(current["status"], "succeeded")
             manager.patch_result(job["job_id"], "main", {"deleted": True})
             self.assertTrue(all(item["deleted"] for item in manager.results(job["job_id"])))
             manager.patch_result(job["job_id"], "main", {"deleted": False})
             exported = manager.export(job["job_id"])
             self.assertTrue(Path(exported["path"]).is_file())
-            manager.shutdown()
 
     def test_startup_marks_running_job_interrupted(self):
-        with tempfile.TemporaryDirectory() as temp:
+        with tempfile.TemporaryDirectory() as temp, ExitStack() as workers:
             base = Path(temp)
             jobs = base / "jobs"
             jobs.mkdir()
             from backend.data_store import RecordStore
             RecordStore(base / ".data_store").put("task_generation.jobs", "old", {"job_id": "old", "status": "running"})
-            manager = TaskGenerationJobManager(jobs, base / "runs", base / "exports", base / "kb")
+            manager = TaskGenerationJobManager(jobs, base / "runs", base / "exports", base / "kb", base / "logs")
+            workers.callback(manager.shutdown, wait=True)
             self.assertEqual(manager.get("old")["status"], "interrupted")
-            manager.shutdown()
 
     def test_partial_result_is_reported_as_partial(self):
-        with tempfile.TemporaryDirectory() as temp:
+        with tempfile.TemporaryDirectory() as temp, ExitStack() as workers:
             base = Path(temp)
             kb = base / "kb"
             _write_knowledge_base(kb)
@@ -191,16 +188,13 @@ class JobManagerTests(unittest.TestCase):
             def runner(_nodes, _count, *, kb_root, progress):
                 return {"results": [{"result_id": "one", "task": "任务", "deleted": False}], "errors": [{"item_id": "second", "error": "模型失败"}], "warnings": [], "total_items": 2}
 
-            manager = TaskGenerationJobManager(base / "jobs", base / "runs", base / "exports", kb, initial_runner=runner)
+            manager = TaskGenerationJobManager(base / "jobs", base / "runs", base / "exports", kb, base / "logs", initial_runner=runner)
+            workers.callback(manager.shutdown, wait=True)
             job = _submit_initial(manager, kb)
-            for _ in range(100):
-                current = manager.get(job["job_id"])
-                if current and current["status"] == "partial":
-                    break
-                time.sleep(0.01)
+            manager.shutdown(wait=True)
+            current = manager.get(job["job_id"])
             self.assertEqual(current["status"], "partial")
             self.assertEqual(current["result_count"], 1)
-            manager.shutdown()
 
 
 if __name__ == "__main__":

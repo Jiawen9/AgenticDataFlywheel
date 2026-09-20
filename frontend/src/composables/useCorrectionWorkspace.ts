@@ -3,7 +3,7 @@ import type { api as appApi } from '@/api'
 import type { CorrectionExport, CorrectionGroup, CorrectionGroupSummary, CorrectionRow, CorrectionSession } from '@/types'
 import { correctionTasks } from '@/utils/correctionTasks'
 
-type WorkspaceApi = Pick<typeof appApi, 'correctionGroup' | 'patchCorrectionRow' | 'patchCorrectionExport' | 'correctionExport'>
+type WorkspaceApi = Pick<typeof appApi, 'correctionGroup' | 'patchCorrectionRow' | 'patchCorrectionExport' | 'correctionExport'> & Partial<Pick<typeof appApi, 'reviewCorrectionGroup'>>
 export type ActionDecision = 'save' | 'discard' | 'cancel'
 interface Feedback {
   error: (message: string) => void
@@ -51,6 +51,7 @@ export function useCorrectionWorkspace(api: WorkspaceApi, feedback: Feedback) {
     session.value = value
     expandedTasks.value = []
     cache.clear()
+    rememberedRows.clear()
   }
 
   function selectRow(row: CorrectionRow | null) {
@@ -62,6 +63,7 @@ export function useCorrectionWorkspace(api: WorkspaceApi, feedback: Feedback) {
 
   function applySummary(summary: CorrectionGroupSummary) {
     if (!session.value) return
+    if (summary.storage_revision !== undefined) session.value.storage_revision = summary.storage_revision
     session.value.groups = session.value.groups.map((group) => group.group_id === summary.group_id ? summary : group)
     const cacheKey = key(session.value.session_id, summary.group_id)
     const previous = cache.get(cacheKey)
@@ -85,11 +87,12 @@ export function useCorrectionWorkspace(api: WorkspaceApi, feedback: Feedback) {
 
   async function patchRow(row: CorrectionRow, patch: { actions?: string; sop?: string; deleted?: boolean }): Promise<boolean> {
     if (!session.value || !activeGroup.value) return false
-    const sessionId = session.value.session_id, groupId = activeGroup.value.group_id, version = epoch
+    const sessionId = session.value.session_id, groupId = activeGroup.value.group_id, version = epoch, revision = session.value.storage_revision
     return trackWrite(async () => {
-      const result = await api.patchCorrectionRow(sessionId, row.excel_row, patch)
+      const result = revision === undefined ? await api.patchCorrectionRow(sessionId, row.excel_row, patch) : await api.patchCorrectionRow(sessionId, row.excel_row, patch, revision)
       if (epoch !== version || session.value?.session_id !== sessionId) return false
       if (result.group.group_id !== groupId || result.row.excel_row !== row.excel_row) throw new Error('保存响应与当前轨迹不一致，请重新加载')
+      if (result.storage_revision !== undefined && session.value) session.value.storage_revision = result.storage_revision
       const cacheKey = key(sessionId, groupId)
       const previous = cache.get(cacheKey)
       if (previous) cache.set(cacheKey, { ...previous, rows: previous.rows.map((item) => item.excel_row === row.excel_row ? result.row : item) })
@@ -165,9 +168,11 @@ export function useCorrectionWorkspace(api: WorkspaceApi, feedback: Feedback) {
 
   async function toggleExport(group: CorrectionGroupSummary) {
     if (!session.value || busy.value) return
+    if (group.pending_review) { feedback.error('请先复核保留的人工修改'); return }
     const sessionId = session.value.session_id, version = epoch
     await trackWrite(async () => {
-      const summary = await api.patchCorrectionExport(sessionId, group.group_id, !group.export)
+      const revision = session.value?.storage_revision
+      const summary = revision === undefined ? await api.patchCorrectionExport(sessionId, group.group_id, !group.export) : await api.patchCorrectionExport(sessionId, group.group_id, !group.export, revision)
       if (epoch !== version || session.value?.session_id !== sessionId) return false
       applySummary(summary)
       return true
@@ -187,12 +192,27 @@ export function useCorrectionWorkspace(api: WorkspaceApi, feedback: Feedback) {
     const current = session.value
     let output: Awaited<ReturnType<WorkspaceApi['correctionExport']>> | null = null
     await trackWrite(async () => {
-      output = await api.correctionExport(current.session_id)
+      output = current.storage_revision === undefined ? await api.correctionExport(current.session_id) : await api.correctionExport(current.session_id, current.storage_revision)
+      if (output.storage_revision !== undefined) current.storage_revision = output.storage_revision
       current.exports.unshift(output)
       return true
     })
     return output
   }
 
-  return { session, tasks, expandedTasks, openGroupId, activeGroup, activeRow, actionDraft, actionRevision, loadingGroup, groupError, savingCount, guarding, busy, hasUnsaved, setSession, loadGroup, toggleTask, toggleTrajectory, chooseRow, saveAction, toggleExport, toggleDeleted, prepareTransition, exportData }
+  async function reviewGroup(groupId: string, decision: 'adopt' | 'discard') {
+    if (!session.value || !api.reviewCorrectionGroup || !await prepareTransition()) return false
+    const current = session.value, token = epoch
+    return trackWrite(async () => {
+      const result = await api.reviewCorrectionGroup!(current.session_id, groupId, decision, current.storage_revision)
+      if (epoch !== token || session.value?.session_id !== current.session_id) return false
+      setSession(result.session)
+      const task = tasks.value.find(item => item.trajectories.some(trajectory => trajectory.group.group_id === groupId))
+      if (task) expandedTasks.value = [task.task_id]
+      await loadGroup(groupId)
+      return true
+    })
+  }
+
+  return { session, tasks, expandedTasks, openGroupId, activeGroup, activeRow, actionDraft, actionRevision, loadingGroup, groupError, savingCount, guarding, busy, hasUnsaved, setSession, loadGroup, reviewGroup, toggleTask, toggleTrajectory, chooseRow, saveAction, toggleExport, toggleDeleted, prepareTransition, exportData }
 }

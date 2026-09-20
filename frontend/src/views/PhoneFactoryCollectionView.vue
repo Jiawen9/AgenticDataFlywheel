@@ -1,5 +1,6 @@
 <template>
   <div class="phone-factory-page">
+    <BatchPublishedNotice :notice="publishedNotice" />
     <header class="page-hero">
       <div>
         <span class="eyebrow">PHONE FACTORY COLLECTION</span>
@@ -201,8 +202,12 @@
 </template>
 
 <script setup lang="ts">
+import BatchPublishedNotice from '@/components/BatchPublishedNotice.vue'
+import { useBatchLifecycle } from '@/composables/useBatchLifecycle'
+import { eventMatchesRoute, publishedBatch, withoutBatchQuery, type PublishedBatchEvent } from '@/utils/batchLifecycle'
+
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { phoneFactoryApi, type FactoryConfig, type PhoneAppRow, type TaskRow } from '@/phoneFactoryApi'
 import { collectionBatchesApi, type CollectionBatchSummary } from '@/collectionBatchesApi'
@@ -244,14 +249,25 @@ const runDialogVisible = ref(false)
 const runDialogPhoneId = ref('')
 const runDialogApp = ref('')
 const runTargetTask = ref<TaskRow | null>(null)
-const route = useRoute()
+const route = useRoute(), router = useRouter()
 const manualTaskBusy = computed(() => savingTask.value || Boolean(deletingTask.value) || Boolean(startingTask.value) || confirmingRun.value)
 const collection = usePhoneCollectionBatches(collectionBatchesApi, phoneFactoryApi, {
-  setTasks: rows => { tasks.value = rows },
+  setTasks: rows => { tasks.value = activeFactoryTasks(rows) },
   isBlocked: () => manualTaskBusy.value || runDialogVisible.value,
 })
 const { batches: collectionBatches, selectedBatchId, selectedBatch, loadingBatches, loadingBatch, downloading: downloadingBatch, error: batchError } = collection
 let disposed = false
+const activeFactoryTasks = (rows: TaskRow[]) => rows.filter(item => !publishedBatch(item.source_batch_id))
+const lifecycle = useBatchLifecycle({ currentBatch: () => selectedBatchId.value || runTargetTask.value?.source_batch_id || String(route.query.collection_batch_id ?? ''), onPublished, refreshChoices: () => collection.loadBatches() })
+const { notice: publishedNotice } = lifecycle
+function onPublished(event: PublishedBatchEvent) {
+  const current = eventMatchesRoute(event, selectedBatchId.value, route.query) || Boolean(runTargetTask.value?.source_batch_id && event.batch_ids.includes(runTargetTask.value.source_batch_id))
+  collection.retireBatches(event.batch_ids, current); tasks.value = activeFactoryTasks(tasks.value)
+  if (runTargetTask.value?.source_batch_id && event.batch_ids.includes(runTargetTask.value.source_batch_id)) { runTargetTask.value = null; runDialogVisible.value = false }
+  if (!current) return
+  publishedNotice.value = event
+  void router.replace({ query: withoutBatchQuery(route.query) })
+}
 const taskBusy = computed(() => loadingFactory.value || manualTaskBusy.value || collection.busy.value)
 const collectionBatchKindLabel = (kind: CollectionBatchSummary['kind']) => kind === 'augmentation' ? '泛化扩增' : '任务生成'
 const collectionBatchTimeLabel = (createdAt: string) => createdAt.slice(0, 19).replace('T', ' ')
@@ -264,13 +280,13 @@ const selectedBatchRow = computed<TaskRow | null>(() => {
     description: `采集批次 ${batch.batch_id}`, filename: batch.filename, source_batch_id: batch.batch_id, status: '未运行',
   }
 })
-function selectCollectionBatch(value: unknown) { void collection.selectBatch(typeof value === 'string' ? value : '') }
+async function selectCollectionBatch(value: unknown) { const id = typeof value === 'string' ? value : ''; if (!await lifecycle.checkBatch(id)) return; publishedNotice.value = null; await collection.selectBatch(id) }
 async function downloadCollectionBatch() {
   if (taskBusy.value) return
   try { await collection.downloadBatch() }
   catch (error) { if (!disposed) ElMessage.error((error as Error).message) }
 }
-watch(() => route.query.collection_batch_id, value => { if (typeof value === 'string') void collection.selectBatch(value) })
+watch(() => route.query.collection_batch_id, value => { if (typeof value === 'string') void selectCollectionBatch(value) })
 
 const rowKey = (row: PhoneAppRow) => `${row.phone_id}||${row.app}`
 
@@ -294,7 +310,7 @@ async function loadState() {
   apps.value = state.apps
   phoneApps.value = state.phoneApps
   vla.value = state.vla
-  tasks.value = state.tasks
+  tasks.value = activeFactoryTasks(state.tasks)
   Object.assign(config, savedConfig)
 }
 
@@ -385,7 +401,7 @@ async function handleAddTask() {
   try {
     const contentBase64 = await fileToBase64(selectedFile.value)
     const state = await phoneFactoryApi.addTask(description, selectedFile.value.name, contentBase64)
-    tasks.value = state.tasks
+    tasks.value = activeFactoryTasks(state.tasks)
     ElMessage.success(`任务「${description}」已新增，文件已上传`)
     newTaskDesc.value = ''
     selectedFile.value = null
@@ -403,7 +419,7 @@ async function handleRemoveTask(row: TaskRow) {
   deletingTask.value = row.filename
   try {
     const state = await phoneFactoryApi.removeTask(row.filename)
-    tasks.value = state.tasks
+    tasks.value = activeFactoryTasks(state.tasks)
     ElMessage.success(`已删除任务「${row.description}」`)
   } catch (error) {
     ElMessage.error((error as Error).message)
@@ -435,7 +451,7 @@ async function handleStartTask(row: TaskRow) {
     // 不带 phone_id/app：server 端对关联文件中所有手机下发
     const remote = await phoneFactoryApi.remoteStartRun(row.filename, '', '')
     const state = await phoneFactoryApi.startTask(row.filename)
-    tasks.value = state.tasks
+    tasks.value = activeFactoryTasks(state.tasks)
     ElMessage.success(remote.message || `任务「${row.description}」已下发全部手机`)
   } catch (error) {
     if (!disposed) ElMessage.error((error as Error).message)
@@ -467,7 +483,7 @@ async function confirmRun() {
     const remote = await phoneFactoryApi.remoteStartRun(task.filename, phoneId, app)
     // 再更新本地任务状态：未运行 -> 运行中
     const state = await phoneFactoryApi.startTask(task.filename)
-    tasks.value = state.tasks
+    tasks.value = activeFactoryTasks(state.tasks)
     runDialogVisible.value = false
     ElMessage.success(remote.message || `已发送 任务「${task.description}」到手机 ${phoneId}（${app}）`)
   } catch (error) {
@@ -493,7 +509,8 @@ async function handleConfigChange() {
 
 onMounted(() => {
   loadState().catch((error) => ElMessage.error(`加载数据失败：${(error as Error).message}`)).finally(() => { loadingFactory.value = false })
-  void collection.loadBatches(typeof route.query.collection_batch_id === 'string' ? route.query.collection_batch_id : undefined)
+  const requested = typeof route.query.collection_batch_id === 'string' ? route.query.collection_batch_id : undefined
+  void lifecycle.checkBatch(requested || '').then(active => collection.loadBatches(active ? requested : undefined)).catch(cause => { batchError.value = (cause as Error).message })
 })
 onBeforeUnmount(() => { disposed = true; collection.dispose() })
 </script>

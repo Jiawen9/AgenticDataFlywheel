@@ -1,3 +1,4 @@
+import { notifyBatchesPublished } from '@/utils/batchLifecycle'
 /**
  * 手机工厂采集页 API 客户端。
  * 由 FastAPI 的 /api/phone-factory/* 提供服务，
@@ -48,7 +49,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${BASE}${path}`, init)
   const payload = (await response.json().catch(() => null)) as (T & { error?: string }) | null
   if (!response.ok || payload === null || (payload as { error?: string }).error) {
-    const message = (payload as { error?: string } | null)?.error || `${response.status} ${response.statusText}`
+    const detail = (payload as { detail?: { code?: string; message?: string; batch_id?: string; release_id?: string; published_at?: string } } | null)?.detail
+    if (detail?.code === 'batch_published' && detail.batch_id) notifyBatchesPublished({ batch_ids: [detail.batch_id], release_id: detail.release_id ?? null, published_at: detail.published_at })
+    const message = detail?.message || (payload as { error?: string } | null)?.error || `${response.status} ${response.statusText}`
     throw new Error(message)
   }
   return payload as T

@@ -15,12 +15,14 @@ from zoneinfo import ZoneInfo
 
 from .constants import CORRECTION_BBOX_CACHE_DIR, CORRECTION_COT_JOBS_DIR, PROJECT_ROOT
 from ..data_store import RecordStore, DATA_ROOT, rebase_data_path
-from .cot_generator import QwenCotGenerator, read_env
+from .cot_generator import QwenCotGenerator, read_env, SYSTEM_PROMPT
 from ..bounding_box.build_annotations import resolve_action_box
 from ..bounding_box.qwen_reviewer import QwenBoxReviewer
 from ..trajectory_data import _format_manual_actions_box
-from .draft_store import load_session, update_session, storage_root
-from .service import _snapshot, session_asset, publish_stage_snapshot, publish_cot_snapshot
+from .draft_store import load_session, update_session, storage_root, session_batch_id
+from .service import _snapshot, session_asset, publish_stage_snapshot, publish_cot_snapshot, _check_revision, active_session_lock
+from .session_state import identified, row_index, fingerprint
+from ..batch_lifecycle import BatchPublishedError, is_batch_active
 
 
 Progress = Callable[[dict[str, Any]], None]
@@ -99,9 +101,13 @@ class CotJobManager:
         with self._lock:
             return self._records.get("correction_cot_jobs", job_id)
 
-    def list_jobs(self) -> list[dict[str, Any]]:
+    def list_jobs(self, *, active_only: bool = False) -> list[dict[str, Any]]:
         with self._lock:
-            return sorted(self._records.list("correction_cot_jobs"), key=lambda item: str(item.get("created_at", "")), reverse=True)
+            jobs = sorted(self._records.list("correction_cot_jobs"), key=lambda item: str(item.get("created_at", "")), reverse=True)
+        if active_only:
+            jobs = [job for job in jobs if is_batch_active(str(job.get("batch_id") or
+                session_batch_id(load_session(str(job["session_id"])) or {"session_id": job["session_id"]})), storage_root())]
+        return jobs
 
     def mark_interrupted_jobs(self) -> None:
         for payload in self.list_jobs():
@@ -114,13 +120,16 @@ class CotJobManager:
         session = load_session(session_id)
         if session is None:
             raise FileNotFoundError("纠偏会话不存在")
-        snapshot = _snapshot(session)
+        snapshot = identified(_snapshot(session))
         allowed = set(group_ids or [str(group["group_id"]) for group in snapshot["groups"]])
         requested_rows = {int(value) for value in (row_ids or [])}
         targets: list[dict[str, Any]] = []
+        invalid_tasks = set(session.get("stale_tasks", [])) | {item["task_id"] for item in session.get("pending_review", {}).values()}
         for group in snapshot["groups"]:
-            if str(group["group_id"]) not in allowed:
+            if str(group["group_id"]) not in allowed and str(group.get("legacy_group_id")) not in allowed:
                 continue
+            if group.get("task_id") in invalid_tasks:
+                raise ValueError("待复核任务不能生成 COT")
             rows = sorted(group["rows"], key=lambda row: int(row["step"]))
             for index, row in enumerate(rows):
                 edit = session.get("row_edits", {}).get(str(row["excel_row"]), {})
@@ -148,6 +157,10 @@ class CotJobManager:
                 )
                 targets.append({
                     "base_action": row.get("action") or {},
+                    "step_key": row["step_key"],
+                    "source_fingerprint": row["source_fingerprint"],
+                    "task_id": group["task_id"],
+                    "task_fingerprint": session.get("task_fingerprints", {}).get(group["task_id"]),
                     "edit_baseline": dict(edit),
                     "group_id": group["group_id"],
                     "task": group["task"],
@@ -157,6 +170,7 @@ class CotJobManager:
                     "image": row["image"],
                     "action": action,
                     "history": history,
+                    "history_hash": fingerprint(history),
                     "reference_answer": current_bbox,
                     "bbox_hash": _bbox_hash(current_bbox),
                     "summary": str(row.get("original_summary") or row.get("summary") or ""),
@@ -169,7 +183,21 @@ class CotJobManager:
             raise ValueError("当前没有动作已修改且未删除的步骤可生成 COT")
         return targets
 
-    def submit(self, session_id: str, group_ids: list[str] | None = None, row_ids: list[int] | None = None, *, generate_bbox: bool = False, force_overwrite: bool = False) -> dict[str, Any]:
+    def _configuration_fingerprint(self, generate_bbox: bool) -> str:
+        if self.generator_factory is QwenCotGenerator:
+            values = read_env(PROJECT_ROOT / "backend" / ".env")
+            return fingerprint({"model": values.get("COT_MODEL_NAME") or "qwen3-vl-32b-instruct",
+                "endpoint": values.get("MODEL_URL"), "prompt": SYSTEM_PROMPT,
+                "bbox_model": values.get("MODEL_NAME") if generate_bbox else None})
+        return fingerprint({"factory": f"{self.generator_factory.__module__}.{self.generator_factory.__qualname__}"})
+
+    def submit(self, session_id: str, group_ids: list[str] | None = None, row_ids: list[int] | None = None, *, generate_bbox: bool = False, force_overwrite: bool = False, expected_revision: int | None = None) -> dict[str, Any]:
+        with active_session_lock(session_id):
+            return self._submit(session_id, group_ids, row_ids, generate_bbox=generate_bbox,
+                                force_overwrite=force_overwrite, expected_revision=expected_revision)
+
+    def _submit(self, session_id: str, group_ids: list[str] | None = None, row_ids: list[int] | None = None, *, generate_bbox: bool = False, force_overwrite: bool = False, expected_revision: int | None = None) -> dict[str, Any]:
+        _check_revision(load_session(session_id) or {}, expected_revision)
         targets = self._targets(session_id, group_ids, row_ids)
         if generate_bbox and not force_overwrite:
             conflicts = [
@@ -180,10 +208,19 @@ class CotJobManager:
             if conflicts:
                 raise ValueError("批量生成将覆盖人工修改，请确认后重试：" + "、".join(conflicts))
         session = load_session(session_id)
+        configuration_fingerprint = self._configuration_fingerprint(generate_bbox)
+        request_fingerprint = fingerprint({"configuration": configuration_fingerprint, "session_id": session_id, "targets": targets,
+            "generate_bbox": generate_bbox, "force_overwrite": force_overwrite})
+        for previous in self.list_jobs():
+            if previous.get("request_fingerprint") == request_fingerprint and previous.get("status") in {"queued", "running", "succeeded"}:
+                return previous
         publish_stage_snapshot(session, _snapshot(session), "06_correction")
         payload = {
             "job_id": uuid.uuid4().hex,
+            "request_fingerprint": request_fingerprint,
+            "configuration_fingerprint": configuration_fingerprint,
             "session_id": session_id,
+            "batch_id": session_batch_id(session),
             "group_ids": group_ids or [],
             "row_ids": row_ids or [],
             "generate_bbox": bool(generate_bbox),
@@ -226,12 +263,18 @@ class CotJobManager:
             session = load_session(str(payload["session_id"]))
             if session is None:
                 raise FileNotFoundError("纠偏会话不存在")
+            with active_session_lock(str(payload["session_id"])):
+                pass
+            if payload.get("configuration_fingerprint") != self._configuration_fingerprint(bool(payload.get("generate_bbox"))):
+                raise RuntimeError("模型配置已更新，请重新提交 COT 任务")
             generator = self.generator_factory()
             reviewer = _bbox_reviewer() if payload.get("generate_bbox") else None
             completed = int(payload.get("completed_steps") or 0)
             completed_bbox = int(payload.get("completed_bbox") or 0)
             completed_cot = int(payload.get("completed_cot") or 0)
             for target in payload["targets"]:
+                with active_session_lock(str(payload["session_id"])):
+                    pass
                 self._progress(job_id, {"current_task": target["task"], "current_trajectory": target["trajectory_id"], "current_step": target["step"]})
                 image = session_asset(str(payload["session_id"]), str(target["image"]))
                 action = dict(target["action"])
@@ -259,6 +302,8 @@ class CotJobManager:
                     target["bbox_hash"] = _bbox_hash(box)
                     completed_bbox += 1
                     self._progress(job_id, {"stage": "generating_bbox", "completed_bbox": completed_bbox})
+                with active_session_lock(str(payload["session_id"])):
+                    pass
                 result = generator.generate(task=target["task"], trajectory_id=target["trajectory_id"], step=int(target["step"]), history=target["history"], action=target["action"], image=image, reference_answer=str(target.get("reference_answer") or ""))
                 def save_cot(current):
                     self._validate_target(current, target)
@@ -267,6 +312,8 @@ class CotJobManager:
                     current.setdefault("cot", {})[str(target["excel_row"])] = {
                         "thought": str(result["thought"]), "summary": str(result["summary"]),
                         "model": generator.model, "content_tag": "thought_summary",
+                        "step_key": target.get("step_key"), "source_fingerprint": target.get("source_fingerprint"),
+                        "task_fingerprint": target.get("task_fingerprint"),
                         "action_hash": _action_hash(target["action"]), "bbox_hash": _bbox_hash(current_bbox),
                         "actions_box": current_bbox, "generated_at": _now(),
                     }
@@ -280,12 +327,20 @@ class CotJobManager:
                 completed += 1
                 completed_cot += 1
                 self._progress(job_id, {"stage": "generating_cot", "completed_steps": completed, "completed_cot": completed_cot, "percent": round(completed / len(payload["targets"]) * 100), "error": None})
+        except BatchPublishedError as exc:
+            self._progress(job_id, {"status": "failed", "stage": "batch_published", "completed_at": _now(),
+                                   "error": str(exc), "error_code": "batch_published", "detail": exc.detail})
+            return
         except Exception as exc:
             self._progress(job_id, {"status": "failed", "stage": "failed", "completed_at": _now(), "error": str(exc)})
             return
         try:
             artifact = publish_cot_snapshot(str(payload["session_id"]))
             self._progress(job_id, {"artifact": artifact})
+        except BatchPublishedError as exc:
+            self._progress(job_id, {"status": "failed", "stage": "batch_published", "completed_at": _now(),
+                                   "error": str(exc), "error_code": "batch_published", "detail": exc.detail})
+            return
         except Exception as exc:
             self._progress(job_id, {"status": "failed", "stage": "export_failed", "completed_at": _now(), "error": f"COT 已保存，过程表导出失败；可重新导出，无需重新生成：{exc}"})
             return
@@ -293,7 +348,29 @@ class CotJobManager:
 
     @staticmethod
     def _validate_target(session, target):
+        if target.get("task_id") in session.get("stale_tasks", []):
+            raise RuntimeError("生成期间任务来源已更新，请重新提交")
+        if target.get("step_key"):
+            snapshot = identified(_snapshot(session))
+            current = row_index(snapshot).get(target["step_key"])
+            current_group = next((group for group in snapshot["groups"] if any(row["step_key"] == target["step_key"] for row in group["rows"])), None)
+            if current_group is not None:
+                rows = sorted(current_group["rows"], key=lambda row: int(row["step"]))
+                index = next(index for index, row in enumerate(rows) if row["step_key"] == target["step_key"])
+                history = "\n".join(f"Step {int(previous['step'])}: {str(previous.get('original_summary') or previous.get('summary') or '').strip()}"
+                    for previous in rows[:index] if str(previous.get("summary") or "").strip()
+                    and not session.get("row_edits", {}).get(str(previous["excel_row"]), {}).get("deleted"))
+                if target.get("history_hash") and fingerprint(history) != target["history_hash"]:
+                    raise RuntimeError("生成期间步骤上下文已更新，请重新提交")
+            if current is None or current["source_fingerprint"] != target.get("source_fingerprint"):
+                raise RuntimeError("生成期间步骤来源已更新，请重新提交")
+            if session.get("task_fingerprints", {}).get(target["task_id"]) != target.get("task_fingerprint"):
+                raise RuntimeError("生成期间任务来源已更新，请重新提交")
+            # Another task may have changed the Excel position without changing this step.
+            target["excel_row"] = int(current["excel_row"])
         edit = session.get("row_edits", {}).get(str(target["excel_row"]), {})
+        if "actions_box" in edit and _bbox_hash(str(edit["actions_box"])) != target.get("bbox_hash"):
+            raise RuntimeError("生成期间标框已修改，请重新提交")
         if edit.get("deleted"):
             raise RuntimeError(f"第 {target['step']} 步在生成期间被删除，请重新提交")
         current_action = json.loads(edit["actions"]) if "actions" in edit else target.get("base_action", target["action"])

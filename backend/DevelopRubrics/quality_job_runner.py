@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -20,8 +21,11 @@ HERE = Path(__file__).resolve().parent
 REPOSITORY_ROOT = HERE.parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
+from backend.batch_operations import batch_operation
 from backend.data_store import DATA_ROOT, ArtifactStore, RecordStore
-from backend.stage_artifacts import load_quality_objects, quality_tables
+from backend.stage_artifacts import load_quality_objects, quality_tables, write_payload_workbook, write_sidecar
+from backend.batch_results import (current_tree_payload, current_tree_batch, merge_quality_results,
+                                   quality_task_fingerprints, StaleTaskInput)
 from backend.trajectory_data import resolve_tree_run_dir
 from backend.quality_data import quality_manifest
 
@@ -135,16 +139,56 @@ def _ensure_workbook(run_id: str, manifest: dict[str, Any], task_ids: list[str])
 
 
 async def run(run_id: str, task_ids: list[str], job_id: str) -> dict[str, Any]:
+    alias = RecordStore(DATA_ROOT).get("batch_run_aliases", run_id)
+    operation_batch = alias["batch_id"] if alias else run_id
+    with batch_operation(operation_batch, "quality", DATA_ROOT):
+        current = current_tree_payload(run_id, DATA_ROOT)
+        if current.get("trees"):
+            job = RecordStore(DATA_ROOT).get("quality_jobs", job_id) or {}
+            expected = job.get("source_tree_hashes") or {task: current["tree_hashes"].get(task) for task in task_ids}
+            if any(current["tree_hashes"].get(task) != value for task, value in expected.items()):
+                raise StaleTaskInput("所选任务的轨迹树已变化，请重新质检")
+            parent = DATA_ROOT / "tmp" / "quality-jobs"
+            parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix=f"{job_id}-", dir=parent) as directory:
+                work = Path(directory)
+                quality_path = work / "rubric_trajectories.xlsx"
+                write_payload_workbook(quality_path, current["quality_input"])
+                write_sidecar(quality_path, current["quality_input"])
+                return await _run_frozen(run_id, task_ids, job_id, current, work)
+        if (RecordStore(DATA_ROOT).get("quality_jobs", job_id) or {}).get("batch_id"):
+            raise StaleTaskInput("当前批次轨迹树已失效，请重新建树")
+        manifest = _tree_manifest(run_id)
+        with batch_operation(str(manifest.get("batch_id") or operation_batch), "quality_legacy", DATA_ROOT):
+            return await _run_frozen(run_id, task_ids, job_id)
+
+
+async def _run_frozen(run_id: str, task_ids: list[str], job_id: str,
+                      current: dict | None = None, work: Path | None = None) -> dict[str, Any]:
     configure_model_environment(DEFAULT_ENV_FILE)
-    manifest = _tree_manifest(run_id)
+    manifest = current or _tree_manifest(run_id)
     manifest_tasks = {str(item["task_id"]): item for item in manifest.get("tasks", [])}
     unknown = [task_id for task_id in task_ids if task_id not in manifest_tasks]
     if unknown:
         raise ValueError(f"tasks not in tree run: {unknown}")
     total = sum(int(manifest_tasks[item].get("trajectory_count", 0)) for item in task_ids)
     progress(stage="preparing", total_trajectories=total, completed_trajectories=0, percent=2)
-    workbook, tasks, all_trajectories = _ensure_workbook(run_id, manifest, task_ids)
+    if current is not None:
+        workbook = work / "rubric_trajectories.xlsx"
+        tasks, all_trajectories = load_quality_objects(workbook.with_suffix(".json"))
+        selected = [item for item in all_trajectories if item.task_id in task_ids]
+        if not selected or any(not str(item.final_answer or "").strip() for item in selected):
+            raise ValueError("quality JSON snapshot is missing final answers")
+        if any(not str(step.observation or "").strip() for item in selected for step in item.steps):
+            raise ValueError("quality JSON snapshot is missing observations")
+    else:
+        workbook, tasks, all_trajectories = _ensure_workbook(run_id, manifest, task_ids)
     config = GEN.load_config(CONFIG_PATH)
+    input_fingerprints = quality_task_fingerprints(current) if current is not None else {}
+    queued = RecordStore(DATA_ROOT).get("quality_jobs", job_id) or {}
+    if current is not None and queued.get("task_fingerprints") and any(
+            queued["task_fingerprints"].get(task) != input_fingerprints.get(task) for task in task_ids):
+        raise StaleTaskInput("质检配置已变化，请重新提交")
     completed = 0
     summaries: list[dict[str, Any]] = []
     task_results: list[dict[str, Any]] = []
@@ -154,8 +198,12 @@ async def run(run_id: str, task_ids: list[str], job_id: str) -> dict[str, Any]:
         if task is None:
             raise ValueError(f"task missing from rubric workbook: {task_id}")
         trajectories = [item for item in all_trajectories if item.task_id == task_id]
-        tree_path = resolve_tree_run_dir(run_id, TREE_RUNS) / str(manifest_tasks[task_id]["tree_file"])
-        terminals = _terminal_ids(json.loads(tree_path.read_text(encoding="utf-8")))
+        if current is not None:
+            tree = current["trees"][task_id]
+        else:
+            tree_path = resolve_tree_run_dir(run_id, TREE_RUNS) / str(manifest_tasks[task_id]["tree_file"])
+            tree = json.loads(tree_path.read_text(encoding="utf-8"))
+        terminals = _terminal_ids(tree)
         by_id = {item.trajectory_id: item for item in trajectories}
         if terminals != set(by_id):
             raise ValueError(f"tree/workbook trajectory mismatch for {task_id}: tree={sorted(terminals)}, workbook={sorted(by_id)}")
@@ -165,7 +213,9 @@ async def run(run_id: str, task_ids: list[str], job_id: str) -> dict[str, Any]:
             rubric_path = await _generate_rubric(task, trajectories, config, workbook)
         rubric = EVAL._load_rubric(rubric_path, task)
         pipeline = EVAL._build_pipeline(config)
-        checkpoint = CHECKPOINT_ROOT / run_id / f"{task_id}.jsonl"
+        checkpoint_key = quality_task_fingerprints(current).get(task_id) if current is not None else None
+        checkpoint = (CHECKPOINT_ROOT / run_id / checkpoint_key / f"{task_id}.jsonl" if checkpoint_key
+                      else CHECKPOINT_ROOT / run_id / f"{task_id}.jsonl")
         EVAL.initialize_evaluations_jsonl(checkpoint, resume=True)
         existing = EVAL.load_existing_evaluations_jsonl(checkpoint)
         settings = EVAL._evaluation_settings(config)
@@ -232,6 +282,13 @@ async def run(run_id: str, task_ids: list[str], job_id: str) -> dict[str, Any]:
         summaries.append({key: task_result[key] for key in ("task_id", "completed_at", "trajectory_count", "average_score", "passed_count")})
 
     progress(stage="publishing", completed_trajectories=completed, total_trajectories=total, percent=97)
+    if current is not None:
+        fingerprints = quality_task_fingerprints(current)
+        if any(fingerprints.get(task) != input_fingerprints.get(task) for task in task_ids):
+            raise StaleTaskInput("质检期间模型配置已变化，请重新提交")
+        return merge_quality_results(run_id, task_results,
+            {task: current["tree_hashes"][task] for task in task_ids},
+            {task: fingerprints[task] for task in task_ids}, job_id=job_id, completed_at=_now(), root=DATA_ROOT)
     artifact = ArtifactStore(DATA_ROOT).publish(str(manifest.get("batch_id") or run_id), "05_quality",
         {"schema_version": 1, "run_id": run_id, "job_id": job_id, "tasks": task_results},
         tables=quality_tables(task_results),
@@ -261,7 +318,11 @@ def main() -> int:
     parser.add_argument("--task-id", action="append", required=True)
     parser.add_argument("--job-id", required=True)
     args = parser.parse_args()
-    result = asyncio.run(run(args.run_id, args.task_id, args.job_id))
+    try:
+        result = asyncio.run(run(args.run_id, args.task_id, args.job_id))
+    except StaleTaskInput as exc:
+        print("ERROR " + json.dumps({"kind": "stale", "message": str(exc)}, ensure_ascii=False), flush=True)
+        return 2
     print("RESULT " + json.dumps(result, ensure_ascii=False), flush=True)
     return 0
 

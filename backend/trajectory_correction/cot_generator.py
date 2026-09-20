@@ -101,18 +101,19 @@ class QwenCotGenerator:
         from openai import OpenAI
 
         values = read_env(env_file)
+        self.endpoint = values["MODEL_URL"]
         self.model = values.get("COT_MODEL_NAME") or "qwen3-vl-32b-instruct"
         self.client = OpenAI(api_key=values["YUNAI_API_KEY"], base_url=values["MODEL_URL"], max_retries=2)
         self.cache_dir = cache_dir
 
     @staticmethod
-    def _key(*, task: str, trajectory_id: str, step: int, history: str, action: dict[str, Any], reference_answer: str, image: Path, model: str) -> str:
+    def _key(*, task: str, trajectory_id: str, step: int, history: str, action: dict[str, Any], reference_answer: str, image: Path, model: str, endpoint: str = "") -> str:
         digest = hashlib.sha256(image.read_bytes()).hexdigest()
-        payload = {"version": "cot-v8-expert-action-only", "model": model, "task": task, "trajectory_id": trajectory_id, "step": step, "history": history, "action": action, "image": digest}
+        payload = {"version": "cot-v9-current-batch", "model": model, "endpoint": endpoint, "prompt": SYSTEM_PROMPT, "task": task, "trajectory_id": trajectory_id, "step": step, "history": history, "action": action, "image": digest}
         return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
     def generate(self, *, task: str, trajectory_id: str, step: int, history: str, action: dict[str, Any], image: Path, reference_answer: str = "") -> dict[str, str | bool]:
-        key = self._key(task=task, trajectory_id=trajectory_id, step=step, history=history, action=action, reference_answer=reference_answer, image=image, model=self.model)
+        key = self._key(task=task, trajectory_id=trajectory_id, step=step, history=history, action=action, reference_answer=reference_answer, image=image, model=self.model, endpoint=getattr(self, "endpoint", ""))
         path = self.cache_dir / f"{key}.json"
         if path.is_file():
             cached = json.loads(path.read_text(encoding="utf-8"))

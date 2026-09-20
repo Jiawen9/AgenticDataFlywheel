@@ -1,3 +1,4 @@
+import { activeBatchItems, publishedBatch } from '@/utils/batchLifecycle'
 import { computed, reactive, ref } from 'vue'
 import type { api } from '@/api'
 import type { BuildJob, CollectionSourceRun, CollectionSourceTask, PreprocessingBatch, PreprocessingJob, TaskSummary, TrajectoryRecord, TrajectoryScope, TrajectoryStep, TrajectorySummary } from '@/types'
@@ -7,6 +8,7 @@ const active = (job: { status: string } | null) => Boolean(job && ['queued', 'ru
 const clear = (value: Record<string, unknown>) => Object.keys(value).forEach(key => delete value[key])
 
 export function useTrajectoryPreprocessing(client: Client, protect: () => Promise<boolean> = async () => true) {
+  const retiredIds = new Set<string>()
   const batches = ref<PreprocessingBatch[]>([])
   const batchId = ref(''), annotationVersion = ref(''), error = ref('')
   const loadingBatches = ref(false), loading = ref(false), submitting = ref(false), protecting = ref(false), saving = ref(false)
@@ -78,6 +80,7 @@ export function useTrajectoryPreprocessing(client: Client, protect: () => Promis
   }
   async function selectBatch(id: string) {
     const attempt = ++selectionRequest
+    if (publishedBatch(id) || retiredIds.has(id)) { retireBatches([id]); return false }
     if (id === batchId.value) return true
     if (!(await guard()) || attempt !== selectionRequest) return false
     const batch = batches.value.find(item => item.batch_id === id)
@@ -98,7 +101,7 @@ export function useTrajectoryPreprocessing(client: Client, protect: () => Promis
     try {
       const result = await client.preprocessingBatches()
       if (!current(token) || request !== listRequest) return
-      batches.value = result
+      batches.value = activeBatchItems(result).filter(batch => !retiredIds.has(batch.batch_id))
       if (preferredId !== undefined) await selectBatch(preferredId)
       else if (batchId.value && selectedBatch.value) {
         preprocessingJob.value = selectedBatch.value.latest_job
@@ -106,6 +109,8 @@ export function useTrajectoryPreprocessing(client: Client, protect: () => Promis
         if (!annotationVersion.value && selectedBatch.value.annotation_version) {
           annotationVersion.value = selectedBatch.value.annotation_version
           await loadTasks()
+        } else if (newerVersion.value && !busy.value) {
+          await adoptLatestVersion()
         }
       }
       schedulePoll()
@@ -123,7 +128,7 @@ export function useTrajectoryPreprocessing(client: Client, protect: () => Promis
           if (!active(value)) await loadBatches()
         }) : Promise.resolve(),
         active(build) && build ? client.build(build.job_id).then(value => {
-          if (current(token) && value.batch_id === batchId.value) buildJob.value = value
+          if (current(token) && value.batch_id === batchId.value) { buildJob.value = value; if (!active(value)) void loadTasks() }
         }) : Promise.resolve(),
       ])
     } catch (cause) { if (current(token)) error.value = `状态刷新失败：${(cause as Error).message}；将继续重试` }
@@ -184,12 +189,12 @@ export function useTrajectoryPreprocessing(client: Client, protect: () => Promis
   }
   async function saveBBox(taskId: string, trajectoryId: string, step: TrajectoryStep, bbox: [number, number, number, number]) {
     const selected = scope.value, token = epoch
-    if (!selected || saving.value) throw new Error('未选择标框版本，或正在保存')
+    if (!selected || saving.value) throw new Error('当前批次尚未就绪，或正在保存')
     saving.value = true
     try {
       const result = await client.updateBBox(taskId, trajectoryId, step.step, step.excel_row, bbox, { ...selected })
       if (!current(token)) throw new Error('已切换批次，请重新加载当前结果')
-      if (!result.annotation_version) throw new Error('保存结果缺少标框版本，请刷新后重试')
+      if (!result.annotation_version) throw new Error('保存结果缺少更新标识，请刷新后重试')
       const cached = trajectoryData[key(taskId, trajectoryId)]
       step.actions_box = result.actions_box; epoch++
       const currentTask = taskData[taskId]
@@ -214,10 +219,20 @@ export function useTrajectoryPreprocessing(client: Client, protect: () => Promis
     } catch (cause) { if (current(token)) error.value = (cause as Error).message; return false }
     finally { if (!disposed) submitting.value = false }
   }
+  function retireBatches(ids: string[], forceReset = false) {
+    ids.forEach(id => retiredIds.add(id))
+    batches.value = batches.value.filter(batch => !ids.includes(batch.batch_id))
+    if (!forceReset && !ids.includes(batchId.value)) return
+    ++listRequest; loadingBatches.value = false
+    stopPoll(); ++epoch; ++selectionRequest; ++sourceRequest; resetData()
+    batchId.value = ''; annotationVersion.value = ''; error.value = ''
+    preprocessingJob.value = null; buildJob.value = null
+    sourceTasks.value = []; sourceRuns.value = []; loadingSources.value = false; sourceError.value = ''
+  }
   function dispose() { disposed = true; epoch++; listRequest++; stopPoll() }
   return { batches, batchId, selectedBatch, annotationVersion, scope, error, busy, processing, building, newerVersion,
     sourceTasks, sourceRuns, loadingSources, sourceError,
     loadingBatches, loading, submitting, tasks, selectedTasks, expandedTasks, expandedTrajectories,
     taskData, trajectoryData, loadingTasks, loadingTrajectories, preprocessingJob, buildJob,
-    loadBatches, selectBatch, start, adoptLatestVersion, expandTasks, expandTrajectory, saveBBox, submitBuild, poll, dispose, key, guard }
+    loadBatches, selectBatch, start, adoptLatestVersion, expandTasks, expandTrajectory, saveBBox, submitBuild, poll, retireBatches, dispose, key, guard }
 }

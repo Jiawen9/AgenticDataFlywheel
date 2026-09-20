@@ -2,15 +2,12 @@
 from __future__ import annotations
 
 import json
-import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .data_store import ArtifactStore, DATA_ROOT, rebase_data_path
 
-_LOCKS_GUARD = threading.Lock()
-_LOCKS: dict[tuple[str, str], Any] = {}
 IDENTITY_FIELDS = ("task_id", "trajectory_id", "source_trajectory_id", "collection_run_id", "collected_at")
 
 
@@ -19,9 +16,7 @@ class AnnotationVersionConflict(ValueError):
 
 
 def annotation_batch_lock(batch_id: str, root: Path | None = None):
-    key = (str(Path(root or DATA_ROOT).resolve()), batch_id)
-    with _LOCKS_GUARD:
-        return _LOCKS.setdefault(key, threading.RLock())
+    return ArtifactStore(Path(root or DATA_ROOT).resolve()).batch_lock(batch_id)
 
 
 def row_task_id(row: dict[str, Any]) -> str:
@@ -65,6 +60,12 @@ class TrajectoryBatchContext:
 
 def resolve_batch_context(batch_id: str, annotation_version: str | None = None,
                           root: Path | None = None) -> TrajectoryBatchContext:
+    with annotation_batch_lock(batch_id, root):
+        return _resolve_batch_context_locked(batch_id, annotation_version, root)
+
+
+def _resolve_batch_context_locked(batch_id: str, annotation_version: str | None = None,
+                                  root: Path | None = None) -> TrajectoryBatchContext:
     """Read registered JSON only; never import Excel or select another batch.
 
     Missing batch/version/JSON raises FileNotFoundError. Invalid JSON, source
@@ -83,7 +84,7 @@ def resolve_batch_context(batch_id: str, annotation_version: str | None = None,
         if manifest is None:
             raise FileNotFoundError("该批次的标框版本不存在")
     path = store.resolve_file(manifest, "result.json")
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = store.read_payload(manifest)
     if not isinstance(payload, dict) or not isinstance(payload.get("sheets"), dict):
         raise ValueError("标框 JSON 快照格式无效")
     roots: set[Path] = set()
@@ -117,7 +118,7 @@ def resolve_batch_context(batch_id: str, annotation_version: str | None = None,
         if artifact.get("metadata", {}).get("raw_root"):
             add_root(artifact["metadata"]["raw_root"])
         if artifact["stage"] == "00_collection":
-            value = json.loads(store.resolve_file(artifact, "result.json").read_text(encoding="utf-8"))
+            value = store.read_payload(artifact)
             for task in value.get("snapshot", {}).get("tasks", []):
                 for identifier in (task.get("task_id"), task.get("collection_case_id")):
                     if identifier:

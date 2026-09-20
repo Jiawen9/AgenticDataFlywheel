@@ -143,7 +143,8 @@ class TrajectoryStageStorageTests(unittest.TestCase):
             sentinel = legacy / "trajectory_tree_runs" / "old" / "manifest.json"
             before = sentinel.read_bytes()
             with patch.object(trajectory_data, "TREE_RUNS_DIR", new_runs), patch.object(trajectory_data, "LEGACY_ROOT", legacy, create=True):
-                self.assertEqual({row["run_id"] for row in trajectory_data.list_tree_runs(new_runs)}, {"new"})
+                # Current batch views do not rediscover retired run-directory snapshots.
+                self.assertEqual(trajectory_data.list_tree_runs(new_runs), [])
                 self.assertEqual(trajectory_data.resolve_tree_run_dir("old", new_runs), (new_runs / "old").resolve())
             new_workbook = root / "current" / "annotated.xlsx"
             payload = {"columns": {"Steps": ["文件夹名", "image", "xml", "action", "summary", "actions_box"]},
@@ -259,6 +260,56 @@ class TrajectoryStageStorageTests(unittest.TestCase):
             self.assertEqual(RecordStore(data_root).get("quality_manifests", run_id), previous_manifest)
 
             self.assertFalse((root / "results" / run_id).exists())
+
+    def test_quality_worker_merges_current_batch_a_then_b(self):
+        from backend.batch_results import current_quality_payload
+        from backend.stage_artifacts import workbook_payload
+        rubric_module = Path(__file__).resolve().parents[1] / "DevelopRubrics"
+        with patch.object(sys, "path", [str(rubric_module), *sys.path]):
+            worker = importlib.import_module("backend.DevelopRubrics.quality_job_runner")
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            root = Path(directory)
+            trajectory_root, workbook = prepare_source(root)
+            raw = root / "raw"
+            trajectory_root.rename(raw)
+            store = ArtifactStore(root)
+            payload = workbook_payload(workbook)
+            conversion = store.publish("batch", "01_conversion", payload,
+                source_refs=[{"kind": "raw_trajectories", "path": str(raw)}])
+            annotation = store.publish("batch", "02_annotation", payload,
+                source_refs=[conversion], metadata={"raw_root": str(raw)})
+            with patch("backend.tree_build_service.configure_reviewer_environment", return_value="fake-model"), \
+                 patch("backend.tree_build_service.QwenIntermediateStateClassifier", FakeClassifier), \
+                 patch("backend.tree_build_service.QwenStateAlignmentReviewer", FakeAlignmentReviewer):
+                build_tree_run(["TASK-A", "TASK-B"], job_id="tree", progress=lambda _: None,
+                    batch_id="batch", annotation_version=annotation["version"], data_root=root,
+                    env_path=root / ".env", quality_builder=partial(build_quality_workbook, summarizer=FakeSummarizer()))
+            stack.enter_context(patch.object(worker, "DATA_ROOT", root))
+            stack.enter_context(patch.object(worker, "CHECKPOINT_ROOT", root / "checkpoints"))
+            stack.enter_context(patch.object(worker, "configure_model_environment"))
+            stack.enter_context(patch.object(worker, "_matching_rubric", return_value=root / "rubric.json"))
+            stack.enter_context(patch.object(worker.GEN, "load_config", return_value={}))
+            rubric = SimpleNamespace(model_dump_json=lambda: json.dumps({"dimensions": [{"name": "correct"}]}))
+            stack.enter_context(patch.object(worker.EVAL, "_load_rubric", return_value=rubric))
+            stack.enter_context(patch.object(worker.EVAL, "_build_pipeline", return_value=object()))
+            stack.enter_context(patch.object(worker.EVAL, "_evaluation_settings", return_value={}))
+            stack.enter_context(patch.object(worker.EVAL, "_settings_signature", return_value="test"))
+            stack.enter_context(patch.object(worker.EVAL, "initialize_evaluations_jsonl"))
+            stack.enter_context(patch.object(worker.EVAL, "load_existing_evaluations_jsonl", return_value={}))
+            async def evaluate(**kwargs):
+                trajectory = kwargs["trajectories"][0]
+                data = {"trajectory_id": trajectory.trajectory_id, "global_score": 4.5,
+                        "passed_threshold": True, "step_evaluations": []}
+                result = SimpleNamespace(trajectory_id=trajectory.trajectory_id, global_score=4.5,
+                    passed_threshold=True, model_dump_json=lambda **_: json.dumps(data))
+                return SimpleNamespace(all_evaluations=[result])
+            stack.enter_context(patch.object(worker.EVAL, "evaluate_run_incrementally", side_effect=evaluate))
+            asyncio.run(worker.run("batch", ["TASK-A"], "quality-a"))
+            asyncio.run(worker.run("batch", ["TASK-B"], "quality-b"))
+            self.assertEqual({item["task_id"] for item in current_quality_payload("batch", root)["tasks"]}, {"TASK-A", "TASK-B"})
+            self.assertEqual(len(store.list("batch", "05_quality")), 1)
+            self.assertTrue((root / "batches/batch/05_quality/result.xlsx").is_file())
+            self.assertEqual(list((root / "tmp/quality-jobs").iterdir()), [])
 
 
 

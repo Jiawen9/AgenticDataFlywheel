@@ -107,7 +107,7 @@ class CorrectionStorageTests(unittest.TestCase):
         self.assertEqual(manager.list_jobs(), [])
         self.assertEqual(path.read_bytes(), before)
 
-    def test_process_snapshot_includes_deleted_and_unselected_rows_and_versions(self):
+    def test_process_snapshot_keeps_one_current_result_and_all_audit_rows(self):
         service.patch_row(self.sid, 2, {"summary": "=literal", "thought": "final thought", "deleted": True})
         session = draft_store.load_session(self.sid)
         first = service.publish_stage_snapshot(session, self.snapshot, "06_correction")
@@ -124,8 +124,10 @@ class CorrectionStorageTests(unittest.TestCase):
         service.patch_row(self.sid, 2, {"summary": "new"})
         second = service.publish_stage_snapshot(draft_store.load_session(self.sid), self.snapshot, "06_correction")
         self.assertNotEqual(first["version"], second["version"])
-        self.assertEqual(store.resolve_file(first, "result.json").read_bytes(), before)
-        self.assertEqual(len(store.list(batch_id="batch-one", stage="06_correction")), 2)
+        with self.assertRaises(FileNotFoundError):
+            store.resolve_file(first, "result.json")
+        self.assertEqual(len(store.list(batch_id="batch-one", stage="06_correction")), 1)
+        self.assertNotEqual(store.resolve_file(second, "result.json").read_bytes(), before)
 
     def run_cot(self, edit_during_generate):
         service.patch_row(self.sid, 2, {"actions": '{"action":"answer","text":"done"}', "summary": "before submit"})
@@ -192,14 +194,12 @@ class CorrectionStorageTests(unittest.TestCase):
             book = load_workbook(output)
             self.assertEqual(book.active.cell(2, 4).value, "original 1")
             book.close()
-            # Required JSON absence is an error, even if an Excel exists.
+            # SQLite owns the current draft; export files may be regenerated.
             frozen.write_bytes(b"must not import this workbook")
             frozen.with_suffix(".json").unlink()
-            with self.assertRaises(FileNotFoundError):
-                service.export_dataset_session(saved["session_id"])
+            service.export_dataset_session(saved["session_id"])
             (self.root / "inputs" / saved["session_id"] / saved["source_snapshot"]["json"]).unlink()
-            with self.assertRaises(FileNotFoundError):
-                service.get_group(saved["session_id"], before["groups"][0]["group_id"])
+            self.assertEqual(len(service.get_group(saved["session_id"], before["groups"][0]["group_id"])["rows"]), 2)
 
     def test_upstream_json_ignores_excel_changes_and_json_alone_validates_quality(self):
         from backend.trajectory_correction.quality_selection import _verify_source_version
@@ -234,11 +234,38 @@ class CorrectionStorageTests(unittest.TestCase):
         book.close()
 
     def test_release_and_published_session_commit_together(self):
-        export_dir = self.root / "exports" / self.sid
-        export_dir.mkdir(parents=True)
-        (export_dir / "full.xlsx").write_bytes(self.source.read_bytes())
-        draft_store.update_session(self.sid, lambda current: current.update(exports=[{
-            "kind": "full_dataset", "filename": "full.xlsx", "sha256": hashlib.sha256(self.source.read_bytes()).hexdigest(), "sheets": {"Steps": 2}}]))
+        from backend.batch_lifecycle import BatchPublishedError, lifecycle
+        from backend.batch_results import annotation_task_fingerprints, tree_task_fingerprints, tree_result_hashes
+        from backend.trajectory_correction.session_state import identified
+        payload = workbook_payload(self.source)
+        write_sidecar(self.source, payload)
+        snapshot = identified(self.snapshot)
+        tasks = {group["task_id"]: group for group in snapshot["groups"]}
+        store = ArtifactStore(self.root)
+        conversion = store.publish("batch-one", "01_conversion", payload)
+        annotation = store.publish("batch-one", "02_annotation", payload, source_refs=[conversion])
+        observation = store.publish("batch-one", "03_observation", {"trajectories": [
+            {"task_id": task, "trajectory_id": group["meta_task"], "steps": group["rows"]}
+            for task, group in tasks.items()]}, source_refs=[annotation])
+        quality_input = {"sheets": {"Tasks": [{"task_id": task} for task in tasks],
+            "Trajectories": [{"task_id": task, "trajectory_id": group["meta_task"]} for task, group in tasks.items()],
+            "Steps": [{"trajectory_id": group["meta_task"], "step_id": row["step"]}
+                      for group in tasks.values() for row in group["rows"]]}}
+        trees = {task: {"task_id": task, "source_trajectories": [group["meta_task"]]} for task, group in tasks.items()}
+        task_fingerprints = tree_task_fingerprints(payload, {"model": "offline"})
+        tree_hashes = tree_result_hashes(trees, quality_input, task_fingerprints)
+        tree = store.publish("batch-one", "04_tree", {
+            "batch_id": "batch-one", "run_id": "batch-one", "raw_root": str(self.root),
+            "trees": trees, "source_annotation": payload, "quality_input": quality_input,
+            "tasks": [{"task_id": task, "trajectory_count": 1} for task in tasks],
+            "source_task_fingerprints": annotation_task_fingerprints(payload),
+            "task_fingerprints": task_fingerprints, "tree_hashes": tree_hashes}, source_refs=[observation])
+        store.publish("batch-one", "05_quality", {"run_id": "batch-one", "source_tree_hashes": tree_hashes,
+            "tasks": [{"task_id": task, "trajectory_count": 1, "evaluations": {
+                group["meta_task"]: {"global_score": 5, "passed_threshold": True}}} for task, group in tasks.items()]},
+            source_refs=[tree])
+        draft_store.update_session(self.sid, lambda current: current.update(task_fingerprints=task_fingerprints))
+        service.export_dataset_session(self.sid)
         registry = DatasetReleaseRegistry(releases_file=self.root / "release-index.json", project_root=self.root,
                                           data_root=self.root, trajectory_root=self.root,
                                           correction_exports_dir=self.root / "exports")
@@ -246,9 +273,15 @@ class CorrectionStorageTests(unittest.TestCase):
             with self.assertRaises(RevisionConflict):
                 registry.create("try", [self.sid])
         self.assertFalse(draft_store.load_session(self.sid).get("published"))
+        self.assertEqual(lifecycle("batch-one", self.root)["status"], "active")
         self.assertEqual(registry.list_releases(), [])
         release = registry.create("success", [self.sid])
         self.assertEqual(draft_store.load_session(self.sid)["published_release_id"], release["release_id"])
         self.assertEqual(RecordStore(self.root).get("dataset_releases", release["release_id"])["source_refs"][0]["id"], self.sid)
-        with self.assertRaisesRegex(ValueError, "已发布"):
+        before = draft_store.load_session(self.sid)
+        with self.assertRaises(BatchPublishedError):
             draft_store.update_session(self.sid, lambda current: current.update(row_edits={}))
+        self.assertEqual(draft_store.load_session(self.sid), before)
+        self.assertTrue(before["published"])
+        with self.assertRaises(BatchPublishedError):
+            registry.create("duplicate", [self.sid])

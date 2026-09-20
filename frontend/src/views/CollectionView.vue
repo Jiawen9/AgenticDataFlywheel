@@ -1,7 +1,11 @@
 <script setup lang="ts">
+import BatchPublishedNotice from '@/components/BatchPublishedNotice.vue'
+import { useBatchLifecycle } from '@/composables/useBatchLifecycle'
+import { eventMatchesRoute, withoutBatchQuery, type PublishedBatchEvent } from '@/utils/batchLifecycle'
+
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowDown, Check, Clock, Download, Refresh, Select } from '@element-plus/icons-vue'
 import { api, stageArtifactDownloadUrl } from '@/api'
 import type { StageArtifact, TrajectoryStep } from '@/types'
@@ -15,12 +19,26 @@ async function protectEditors() {
   return true
 }
 const flow = useTrajectoryPreprocessing(api, protectEditors)
-const { batches, batchId, selectedBatch, annotationVersion, scope, error, busy, processing, building, newerVersion,
+const { batches, batchId, selectedBatch, scope, error, busy, processing, building,
   sourceTasks, sourceRuns, loadingSources, sourceError,
   loadingBatches, loading, submitting, tasks, selectedTasks, expandedTasks, expandedTrajectories,
   taskData, trajectoryData, loadingTasks, loadingTrajectories, preprocessingJob, buildJob } = flow
+const lifecycle = useBatchLifecycle({ currentBatch: () => batchId.value || String(route.query.batch_id ?? route.query.collection_batch_id ?? ''), onPublished, refreshChoices: () => flow.loadBatches() })
+const { notice: publishedNotice } = lifecycle
+function onPublished(event: PublishedBatchEvent) {
+  const current = eventMatchesRoute(event, batchId.value, route.query)
+  flow.retireBatches(event.batch_ids, current)
+  if (!current) return
+  publishedNotice.value = event; editors.clear(); ElMessageBox.close()
+  void router.replace({ query: withoutBatchQuery(route.query) })
+}
 const mounted = ref(false)
 let disposed = false
+const treeCounts = computed(() => {
+  const completed = tasks.value.filter(task => task.tree_status === 'succeeded').length
+  const stale = tasks.value.filter(task => ['stale', 'invalidated'].includes(task.tree_status || '')).length
+  return { completed, stale, pending: tasks.value.length - completed - stale }
+})
 const eligibleTasks = computed(() => tasks.value.filter(task => task.annotated))
 const allSelected = computed(() => eligibleTasks.value.length > 0 && eligibleTasks.value.every(task => selectedTasks.value.includes(task.task_id)))
 const labels: Record<string, string> = {
@@ -56,7 +74,9 @@ function registerEditor(key: string, value: unknown) {
   else editors.delete(key)
 }
 async function chooseBatch(id: string) {
-  if (await flow.selectBatch(id)) await router.replace({ query: { ...route.query, collection_batch_id: id || undefined } })
+  if (!await lifecycle.checkBatch(id)) return
+  publishedNotice.value = null
+  if (await flow.selectBatch(id)) await router.replace({ query: { ...route.query, batch_id: id || undefined, collection_batch_id: undefined } })
 }
 function toggleSelectAll() { selectedTasks.value = allSelected.value ? [] : eligibleTasks.value.map(task => task.task_id) }
 async function toggleTask(name: string | number) {
@@ -73,16 +93,22 @@ async function submitBuild() { if (await flow.submitBuild()) ElMessage.success('
 function beforeUnload(event: BeforeUnloadEvent) {
   if ([...editors.values()].some(editor => editor.isEditing)) { event.preventDefault(); event.returnValue = '' }
 }
-watch(() => route.query.collection_batch_id, async value => {
-  if (!mounted.value) return
+watch(() => route.query.batch_id ?? route.query.collection_batch_id, async value => {
+  if (!mounted.value || (publishedNotice.value && value === undefined)) return
   const requested = typeof value === 'string' ? value : ''
   if (requested === batchId.value) return
-  if (!(await flow.selectBatch(requested))) await router.replace({ query: { ...route.query, collection_batch_id: batchId.value || undefined } })
+  if (!await lifecycle.checkBatch(requested)) return
+  publishedNotice.value = null
+  if (!(await flow.selectBatch(requested))) await router.replace({ query: { ...route.query, batch_id: batchId.value || undefined, collection_batch_id: undefined } })
 })
 onBeforeRouteLeave(() => flow.guard())
 onMounted(async () => {
   document.body.classList.add('preprocessing-responsive')
-  await flow.loadBatches(typeof route.query.collection_batch_id === 'string' ? route.query.collection_batch_id : undefined)
+  const requested = route.query.batch_id ?? route.query.collection_batch_id
+  try {
+    const active = typeof requested !== 'string' || await lifecycle.checkBatch(requested)
+    await flow.loadBatches(active && typeof requested === 'string' ? requested : undefined)
+  } catch (cause) { error.value = (cause as Error).message }
   if (disposed) return
   mounted.value = true
   window.addEventListener('beforeunload', beforeUnload)
@@ -92,6 +118,7 @@ onBeforeUnmount(() => { disposed = true; flow.dispose(); window.removeEventListe
 
 <template>
   <div class="page collection-page">
+    <BatchPublishedNotice :notice="publishedNotice" />
     <header class="page-hero">
       <div>
         <span class="eyebrow">TRAJECTORY PREPROCESSING</span>
@@ -170,7 +197,7 @@ onBeforeUnmount(() => { disposed = true; flow.dispose(); window.removeEventListe
     </section>
 
     <template v-if="selectedBatch">
-      <div class="workspace-heading"><div><h2>任务与轨迹</h2><p>当前批次 {{ batchId }}<span v-if="annotationVersion"> · 标框版本 <code :title="annotationVersion">{{ annotationVersion }}</code></span></p></div><el-button v-if="newerVersion" :disabled="busy" @click="flow.adoptLatestVersion()">载入最新标框版本</el-button></div>
+      <div class="workspace-heading"><div><h2>任务与轨迹</h2><p>当前批次 {{ batchId }} · 建树已完成 {{ treeCounts.completed }} / 待处理 {{ treeCounts.pending }} / 已失效 {{ treeCounts.stale }}</p></div><el-button :disabled="busy" @click="flow.loadBatches()">刷新当前结果</el-button></div>
       <el-empty v-if="!scope && !processing" description="完成预处理后，可查看步骤、编辑动作框并建树" :image-size="80" />
       <template v-if="scope">
         <section class="toolbar-card">
@@ -184,7 +211,7 @@ onBeforeUnmount(() => { disposed = true; flow.dispose(); window.removeEventListe
             <p>分类与 Observation {{ buildJob.classified_steps }} / {{ buildJob.total_steps }}<span v-if="buildJob.current_task"> · {{ buildJob.current_task }}</span></p>
             <p v-if="buildJob.stage === 'summarizing_trajectories'">轨迹摘要 {{ buildJob.summarized_trajectories || 0 }} / {{ buildJob.total_trajectories || 0 }}</p>
             <p v-if="buildJob.error" class="job-error">{{ buildJob.error }}</p>
-            <router-link v-if="buildJob.run_id" :to="{ path: '/quality', query: { run: buildJob.run_id } }">进入任务集 {{ buildJob.run_id }} →</router-link>
+            <router-link v-if="buildJob.status === 'succeeded'" :to="{ path: '/quality', query: { batch_id: batchId } }">进入本批次质检 →</router-link>
           </div>
         </section>
         <section v-loading="loading" class="task-list">
@@ -193,7 +220,7 @@ onBeforeUnmount(() => { disposed = true; flow.dispose(); window.removeEventListe
             <el-collapse-item v-for="task in tasks" :key="task.task_id" :name="task.task_id">
               <template #title><div class="task-title">
                 <el-checkbox v-model="selectedTasks" :value="task.task_id" :disabled="!task.annotated || busy || processing || building" @click.stop />
-                <b>{{ task.task_id }}</b><span class="task-goal" :title="task.goal">{{ task.goal }}</span><el-tag :type="task.annotated ? 'success' : 'warning'">{{ task.annotated ? '已预处理' : '待预处理' }}</el-tag><small>{{ task.trajectory_count }} 轨迹 · {{ task.step_count }} 步</small>
+                <b>{{ task.task_id }}</b><span class="task-goal" :title="task.goal">{{ task.goal }}</span><el-tag :type="task.annotated ? 'success' : 'warning'">{{ task.annotated ? '已预处理' : '待预处理' }}</el-tag><el-tag v-if="task.tree_status" :type="task.tree_status === 'succeeded' ? 'success' : 'warning'">{{ task.tree_status === 'succeeded' ? '已建树' : ['stale', 'invalidated'].includes(task.tree_status) ? '建树已失效' : '待建树' }}</el-tag><small>{{ task.trajectory_count }} 轨迹 · {{ task.step_count }} 步</small>
               </div></template>
               <el-alert v-if="task.warning" :title="task.warning" type="warning" :closable="false" show-icon />
               <div v-loading="loadingTasks[task.task_id]" class="trajectory-list">

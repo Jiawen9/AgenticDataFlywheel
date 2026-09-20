@@ -7,7 +7,10 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 
-from .schemas import CreateCotJobRequest, CreateSessionRequest, ExportStateRequest, RowPatchRequest
+from ..data_store import RevisionConflict
+from ..batch_lifecycle import BatchPublishedError
+
+from .schemas import CreateCotJobRequest, CreateSessionRequest, ExportStateRequest, RowPatchRequest, ReviewRequest, RevisionRequest
 from .quality_selection import (
     QualitySelectionError,
     correction_batches,
@@ -27,6 +30,7 @@ from .service import (
     session_asset,
     sessions,
     get_cot,
+    review_group,
 )
 from .cot_jobs import CotJobManager
 
@@ -43,11 +47,10 @@ def configure_cot_job_manager(manager: CotJobManager) -> None:
 @router.get("/recommendation")
 def correction_recommendation(
     tree_run_id: Optional[str] = Query(default=None),
+    batch_id: Optional[str] = Query(default=None),
 ) -> dict[str, object]:
-    if tree_run_id and tree_run_id in published_tree_run_ids():
-        raise HTTPException(status_code=409, detail="该质检批次的纠偏会话已经发布")
     try:
-        return top1_recommendation(tree_run_id)
+        return top1_recommendation(batch_id or tree_run_id)
     except QualitySelectionError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -60,7 +63,7 @@ def correction_quality_batches() -> dict[str, object]:
     default_run_id = str(batches[0].get("tree_run_id", "")) if batches else ""
     for item in batches:
         item["is_default"] = item.get("tree_run_id") == default_run_id
-    return {"default_tree_run_id": default_run_id or None, "batches": batches}
+    return {"default_batch_id": default_run_id or None, "default_tree_run_id": default_run_id or None, "batches": batches}
 
 
 @router.get("/sessions")
@@ -72,7 +75,7 @@ def correction_sessions() -> dict[str, object]:
 def correction_cot_jobs() -> dict[str, object]:
     if _cot_job_manager is None:
         return {"jobs": []}
-    return {"jobs": _cot_job_manager.list_jobs()}
+    return {"jobs": _cot_job_manager.list_jobs(active_only=True)}
 
 
 @router.post("/cot-jobs", status_code=202)
@@ -86,10 +89,15 @@ def create_correction_cot_job(request: CreateCotJobRequest) -> dict[str, object]
             request.row_ids,
             generate_bbox=request.generate_bbox,
             force_overwrite=request.force_overwrite,
+            expected_revision=request.expected_revision,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except (OSError, TypeError, ValueError) as exc:
+    except RevisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except BatchPublishedError:
+        raise
+    except (OSError, TypeError, ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
@@ -106,10 +114,12 @@ def get_correction_cot_job(job_id: str) -> dict[str, object]:
 @router.post("/sessions", status_code=201)
 def create_correction_session(request: CreateSessionRequest) -> dict[str, object]:
     try:
-        return {"session": create_session(request.tree_run_id)}
+        return {"session": create_session(request.tree_run_id, batch_id=request.batch_id)}
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except QualitySelectionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RevisionConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (OSError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -121,6 +131,8 @@ def correction_session(session_id: str) -> dict[str, object]:
         return {"session": get_session(session_id)}
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RevisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (OSError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -131,6 +143,8 @@ def correction_session_cot(session_id: str) -> dict[str, object]:
         return get_cot(session_id)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RevisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (OSError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -141,6 +155,8 @@ def correction_tasks(session_id: str) -> dict[str, object]:
         return {"groups": get_groups(session_id)}
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RevisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (OSError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -153,6 +169,8 @@ def correction_task(session_id: str, group_id: str) -> dict[str, object]:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="修正任务不存在") from exc
+    except RevisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (OSError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -164,11 +182,13 @@ def correction_task_export(
     request: ExportStateRequest,
 ) -> dict[str, object]:
     try:
-        return {"group": patch_group_export(session_id, group_id, request.export)}
+        return {"group": patch_group_export(session_id, group_id, request.export, request.expected_revision)}
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="修正任务不存在") from exc
+    except RevisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (OSError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -185,6 +205,8 @@ def correction_row_patch(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Excel 行不存在") from exc
+    except RevisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (OSError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -201,21 +223,25 @@ def correction_asset(session_id: str, image_path: str) -> FileResponse:
 
 
 @router.post("/sessions/{session_id}/export")
-def correction_export(session_id: str) -> dict[str, object]:
+def correction_export(session_id: str, request: RevisionRequest) -> dict[str, object]:
     try:
-        return export_session(session_id)
+        return export_session(session_id, request.expected_revision)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RevisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (OSError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.post("/sessions/{session_id}/dataset-export")
-def correction_dataset_export(session_id: str) -> dict[str, object]:
+def correction_dataset_export(session_id: str, request: RevisionRequest) -> dict[str, object]:
     try:
-        return export_dataset_session(session_id)
+        return export_dataset_session(session_id, request.expected_revision)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RevisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (OSError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -233,3 +259,13 @@ def correction_export_download(session_id: str, filename: str) -> FileResponse:
         filename=path.name,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+
+@router.patch("/sessions/{session_id}/tasks/{group_id}/review")
+def correction_review(session_id: str, group_id: str, request: ReviewRequest) -> dict[str, object]:
+    try:
+        return review_group(session_id, group_id, request.decision, request.expected_revision)
+    except (FileNotFoundError, KeyError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc

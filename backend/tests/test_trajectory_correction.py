@@ -652,7 +652,7 @@ class CorrectionWorkbookTests(unittest.TestCase):
 
     def test_recommendation_blocks_when_no_completed_quality_run_exists(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            with patch.object(quality_selection, "QUALITY_RESULTS_DIR", Path(temp_dir) / "missing"):
+            with patch("backend.trajectory_correction.draft_store.storage_root", return_value=Path(temp_dir) / "empty-data"):
                 recommendation = quality_selection.top1_recommendation()
             self.assertEqual(recommendation["status"], "blocked")
             self.assertEqual(recommendation["tasks"], [])

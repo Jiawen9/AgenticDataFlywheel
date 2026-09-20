@@ -61,14 +61,19 @@ class TaskGenerationStorageTests(unittest.TestCase):
         self.assertEqual([row["task"] for row in self.manager.results("generation-1")],
                          [f"人工任务 {i}" for i in range(12)])
 
-    def test_snapshot_versions_preserve_old_values_and_excel_literal_text(self):
+    def test_current_snapshot_replaces_fixed_files_and_preserves_excel_literal_text(self):
         first = self.manager.snapshot("generation-1")
         first_json = self.manager.artifacts.resolve_file(first, "result.json")
         original_bytes = first_json.read_bytes()
         self.manager.patch_result("generation-1", "result-0", {"task": "=原文不能变公式"})
         second = self.manager.snapshot("generation-1")
         self.assertNotEqual(first["version"], second["version"])
-        self.assertEqual(first_json.read_bytes(), original_bytes)
+        self.assertEqual(self.manager.artifacts.resolve_file(second, "result.json"), first_json)
+        self.assertNotEqual(first_json.read_bytes(), original_bytes)
+        self.assertEqual(len(self.manager.artifacts.list(first["batch_id"], first["stage"])), 1)
+        self.assertIsNone(self.manager.artifacts.get(first["batch_id"], first["stage"], first["version"]))
+        with self.assertRaises(FileNotFoundError):
+            self.manager.artifacts.resolve_file(first, "result.json")
         payload = json.loads(self.manager.artifacts.resolve_file(second, "result.json").read_text(encoding="utf-8"))
         self.assertEqual(payload["results"][0]["task"], "=原文不能变公式")
         workbook = load_workbook(self.manager.artifacts.resolve_file(second, "result.xlsx"), data_only=False)

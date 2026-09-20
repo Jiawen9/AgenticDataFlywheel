@@ -7,6 +7,8 @@ import json
 import math
 from datetime import datetime
 from copy import deepcopy
+from contextlib import contextmanager
+from tempfile import TemporaryDirectory
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +17,27 @@ from .constants import FIXED_SOURCE_ID, FIXED_TRAJECTORY_ROOT
 from .workbook import load_snapshot, has_workbook_json
 from ..stage_artifacts import sidecar_path, structured_input_exists
 from ..quality_data import quality_manifest as read_quality_manifest, quality_task as read_quality_task
+from ..batch_lifecycle import ensure_batch_active, is_batch_active
+from ..data_store import ArtifactStore, RecordStore
+from .draft_store import storage_root
+
+def correction_batch_id(identifier: str, *, tree_root: Path | None = None) -> str:
+    """Resolve old run labels without requiring an open workbench result."""
+    records = RecordStore(storage_root())
+    alias = records.get("batch_run_aliases", identifier)
+    if alias and alias.get("batch_id"):
+        return str(alias["batch_id"])
+    for session in records.list("correction_sessions"):
+        if session.get("tree_run_id") == identifier:
+            return str(session.get("storage_batch_id") or session.get("batch_id") or identifier)
+    manifest = _read_json(_tree_dir(identifier, tree_root) / "manifest.json") or {}
+    return str(manifest.get("batch_id") or identifier)
+
+
+def _open_runs(runs: list[dict]) -> list[dict]:
+    return [run for run in runs if is_batch_active(
+        str(run.get("tree_manifest", {}).get("batch_id") or correction_batch_id(run["tree_run_id"])), storage_root())]
+
 
 def _tree_dir(run_id: str, tree_root: Path | None = None) -> Path:
     if run_id and (Path(run_id).name != run_id or run_id in {".", ".."}):
@@ -162,6 +185,45 @@ def _valid_quality_task(
     )
 
 
+@contextmanager
+def current_selection_input(batch_id: str):
+    """Materialize only a temporary processing view of the current batch."""
+    from ..batch_results import materialize_tree_inputs, current_tree_payload
+    from .draft_store import storage_root
+    from .assets import registered_asset_root
+    with ArtifactStore(storage_root()).batch_lock(batch_id):
+        ensure_batch_active(batch_id, storage_root())
+        with TemporaryDirectory(prefix="correction-input-") as directory:
+            materialize_tree_inputs(batch_id, Path(directory), storage_root())
+            value = current_tree_payload(batch_id, storage_root())
+            raw_root = value.get("raw_root")
+            assets = registered_asset_root(str(raw_root), storage_root()) if raw_root else FIXED_TRAJECTORY_ROOT
+            yield Path(directory) / "source_annotated.xlsx", assets, value
+
+
+def _current_quality_runs() -> list[dict[str, Any]]:
+    from ..batch_results import list_current_tree_batches, current_quality_payload
+    from .draft_store import storage_root
+    runs = []
+    for tree in list_current_tree_batches(storage_root()):
+        batch_id = tree["batch_id"]
+        if not is_batch_active(batch_id, storage_root()):
+            continue
+        quality = current_quality_payload(batch_id, storage_root())
+        tree_tasks = {item["task_id"]: item for item in tree.get("tasks", [])}
+        tasks = [item for item in quality.get("tasks", []) if item.get("task_id") in tree_tasks
+                 and _valid_quality_task(item, item, tree_tasks[item["task_id"]])]
+        if tasks:
+            runs.append({"current": True, "run_id": batch_id, "tree_run_id": batch_id,
+                "tree_manifest": tree, "quality_manifest": quality,
+                "tree_completed_at": tree.get("completed_at", ""),
+                "quality_completed_at": quality.get("updated_at", ""),
+                "completed_at": quality.get("updated_at", ""),
+                "tree_tasks": list(tree_tasks.values()), "tasks": tasks,
+                "results": {item["task_id"]: item for item in tasks}})
+    return sorted(runs, key=lambda run: str(run["quality_completed_at"]), reverse=True)
+
+
 def _completed_quality_runs(
     root: Path | None = None,
     tree_root: Path | None = None,
@@ -173,6 +235,8 @@ def _completed_quality_runs(
     expected trajectory counts.  A batch may contain only a subset of its
     tasks because the quality runner merges task results across submissions.
     """
+    if root is None and tree_root is None:
+        return _current_quality_runs()
     root_was_default = root is None
     root = QUALITY_RESULTS_DIR if root is None else root
     if tree_root is None:
@@ -266,6 +330,7 @@ def _batch_summary(run: dict[str, Any], *, default_run_id: str = "") -> dict[str
     tree_tasks = run.get("tree_tasks") or []
     return {
         "tree_run_id": run["tree_run_id"],
+        "batch_id": str(run.get("tree_manifest", {}).get("batch_id") or run["tree_run_id"]),
         "storage_batch_id": str(run.get("tree_manifest", {}).get("batch_id") or run["tree_run_id"]),
         "tree_completed_at": run.get("tree_completed_at", ""),
         "quality_completed_at": run.get("quality_completed_at", ""),
@@ -281,9 +346,10 @@ def correction_batches(
     tree_root: Path | None = None,
 ) -> dict[str, Any]:
     """Return every tree-run batch with at least one valid reviewed task."""
-    runs = _completed_quality_runs(root, tree_root)
+    runs = _open_runs(_completed_quality_runs(root, tree_root))
     default_run_id = runs[0]["tree_run_id"] if runs else ""
     return {
+        "default_batch_id": default_run_id or None,
         "default_tree_run_id": default_run_id or None,
         "batches": [_batch_summary(run, default_run_id=default_run_id) for run in runs],
     }
@@ -424,9 +490,9 @@ def _selection_for_run(
         "reviewed_task_count": len(selected),
         "source_id": FIXED_SOURCE_ID,
         "source_path": source_path.as_posix(),
-        "source_sha256": _verify_source_version(
-            run["run_id"], source_path, tree_root=tree_root
-        ),
+        "source_sha256": (_source_sha256(sidecar_path(source_path)) if run.get("current") else
+            _verify_source_version(run["run_id"], source_path, tree_root=tree_root)),
+        "task_fingerprints": run.get("tree_manifest", {}).get("task_fingerprints", {}),
         "source_json_sha256": _source_sha256(sidecar_path(source_path)) if has_workbook_json(source_path) else None,
         "tasks": selected,
         "selected_trajectories": selected_trajectories,
@@ -442,8 +508,10 @@ def top1_recommendation(
     source_path: Path | None = None,
     asset_root: Path | None = None,
 ) -> dict[str, Any]:
-    """Return Top-1s for a selected batch, or the latest usable batch by default."""
-    runs = _completed_quality_runs(root, tree_root)
+    """Return Top-1s for a selected open batch, or the latest usable open batch."""
+    if tree_run_id:
+        ensure_batch_active(correction_batch_id(tree_run_id, tree_root=tree_root), storage_root())
+    runs = _open_runs(_completed_quality_runs(root, tree_root))
     if not runs:
         return {
             "status": "blocked",
@@ -458,6 +526,10 @@ def top1_recommendation(
         )
         if selected_run is None:
             raise QualitySelectionUnavailable(f"批次 {tree_run_id} 没有可用的质检结果")
+    if selected_run.get("current") and source_path is None:
+        with current_selection_input(selected_run["tree_run_id"]) as (path, assets, _):
+            snapshot = load_snapshot(path, asset_root=assets, source_kind="annotated_workbook")
+            return _selection_for_run(selected_run, snapshot, source_path=path)
     if source_path is None:
         source_path, default_assets = source_for_tree_run(selected_run["tree_run_id"], tree_root)
     else:
@@ -484,13 +556,18 @@ def top1_selection_for_run(
     source_path: Path | None = None,
     asset_root: Path | None = None,
 ) -> dict[str, Any]:
-    runs = _completed_quality_runs(root, tree_root)
+    ensure_batch_active(correction_batch_id(tree_run_id, tree_root=tree_root), storage_root())
+    runs = _open_runs(_completed_quality_runs(root, tree_root))
     selected = next(
         (run for run in runs if str(run["tree_run_id"]) == str(tree_run_id)),
         None,
     )
     if selected is None:
         raise QualitySelectionUnavailable("请先完成轨迹质检，再进入轨迹修正")
+    if selected.get("current") and source_path is None:
+        with current_selection_input(tree_run_id) as (path, assets, _):
+            snapshot = load_snapshot(path, asset_root=assets, source_kind="annotated_workbook")
+            return _selection_for_run(selected, snapshot, source_path=path)
     if source_path is None:
         source_path, default_assets = source_for_tree_run(tree_run_id, tree_root)
     else:

@@ -2,8 +2,11 @@ export type ActionPayload = Record<string, unknown>
 
 export interface TrajectoryScope {
   batch_id: string
-  annotation_version: string
+  annotation_version?: string
 }
+
+export type TaskStageStatus = 'pending' | 'succeeded' | 'stale' | 'invalidated' | 'pending_review' | 'failed' | 'running'
+export interface StageCounts { completed: number; pending: number; stale: number; pending_review?: number }
 
 export interface StageArtifact {
   batch_id: string
@@ -64,6 +67,8 @@ export interface TaskSummary {
   trajectory_count: number
   step_count: number
   annotated: boolean
+  tree_status?: TaskStageStatus
+  quality_status?: TaskStageStatus
 }
 
 export interface TrajectoryStep {
@@ -115,6 +120,7 @@ export interface BuildJob {
 
 export interface QualityJob {
   job_id: string
+  batch_id?: string
   run_id: string
   task_ids: string[]
   status: 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted'
@@ -132,7 +138,7 @@ export interface QualityJob {
 
 export interface QualityTaskSummary {
   task_id: string
-  status: 'unreviewed' | 'succeeded'
+  status: 'unreviewed' | TaskStageStatus
   rubric_ready: boolean
   trajectory_count?: number
   average_score?: number
@@ -142,6 +148,7 @@ export interface QualityTaskSummary {
 
 export interface RunQualitySummary {
   run_id: string
+  batch_id?: string
   updated_at?: string
   tasks: QualityTaskSummary[]
 }
@@ -188,6 +195,9 @@ export interface TreeRunTask {
   tree_step_count: number
   ignored_step_count: number
   action_node_count: number
+  status?: TaskStageStatus
+  tree_status?: TaskStageStatus
+  quality_status?: TaskStageStatus
 }
 
 export interface TreeRun {
@@ -201,6 +211,8 @@ export interface TreeRun {
   total_original_steps: number
   total_tree_steps: number
   tasks: TreeRunTask[]
+  revision?: number | string
+  counts?: StageCounts
 }
 
 export interface ClassificationResult {
@@ -296,6 +308,7 @@ export interface CorrectionTop1Task {
 }
 
 export interface CorrectionRecommendation {
+  batch_id?: string
   status: 'ready' | 'blocked'
   message?: string
   tree_run_id?: string
@@ -313,6 +326,7 @@ export interface CorrectionRecommendation {
 }
 
 export interface CorrectionBatch {
+  batch_id: string
   tree_run_id: string
   tree_completed_at: string
   quality_completed_at: string
@@ -323,6 +337,7 @@ export interface CorrectionBatch {
 }
 
 export interface CorrectionRow {
+  step_key?: string
   excel_row: number
   step: number
   task: string
@@ -363,7 +378,12 @@ export interface CorrectionRow {
 }
 
 export interface CorrectionGroupSummary {
+  storage_revision?: number
   group_id: string
+  task_id?: string
+  pending_review?: boolean
+  pending_review_count?: number
+  can_adopt_review?: boolean
   task: string
   meta_task: string
   quality: string
@@ -377,6 +397,7 @@ export interface CorrectionGroupSummary {
 
 export interface CorrectionGroup extends CorrectionGroupSummary {
   rows: CorrectionRow[]
+  pending_reviews?: Array<{ step_key: string; step?: number; image?: string; baseline?: Record<string, unknown>; changes: Record<string, unknown>; reason: string; can_adopt: boolean }>
 }
 
 export interface CorrectionCotRow {
@@ -407,6 +428,8 @@ export interface CorrectionCotRow {
 }
 
 export interface CorrectionCotGroup {
+  pending_review?: boolean
+  pending_review_count?: number
   group_id: string
   trajectory_id: string
   task: string
@@ -415,6 +438,8 @@ export interface CorrectionCotGroup {
 
 export interface CorrectionCotResponse {
   session_id: string
+  storage_revision?: number
+  pending_review_count?: number
   groups: CorrectionCotGroup[]
 }
 
@@ -459,6 +484,7 @@ export interface CorrectionTaskItem {
 }
 
 export interface CorrectionExport {
+  storage_revision?: number
   export_id: string
   kind?: 'routed' | 'full_dataset'
   filename: string
@@ -470,6 +496,9 @@ export interface CorrectionExport {
 
 export interface CorrectionSession {
   session_id: string
+  batch_id?: string
+  storage_revision?: number
+  pending_review_count?: number
   source_id: string
   source: CorrectionSource | null
   tree_run_id: string
@@ -635,6 +664,7 @@ export interface AugmentationPreview {
 
 export interface DatasetReleaseCandidate {
   session_id: string
+  batch_id?: string
   tree_run_id: string
   created_at: string | null
   updated_at: string | null
@@ -689,7 +719,25 @@ export interface DatasetInternalUpload {
   file_results: DatasetUploadFileResult[]
 }
 
+export interface DatasetExternalImport {
+  filename?: string
+  data_source: string
+  data_date: string
+  sheet_name: string
+  app: string
+  level1: string
+  level2: string
+  source_sha256: string
+  content_hash: string
+  parser_version: string
+  canonical?: unknown
+  manifest?: unknown
+}
+
 export interface DatasetRelease {
+  source_kind?: string
+  external_import?: DatasetExternalImport
+  batch_ids: string[]
   release_id: string
   name: string
   created_at: string

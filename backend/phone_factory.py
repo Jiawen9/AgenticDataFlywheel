@@ -22,6 +22,8 @@ from typing import Callable
 from fastapi import APIRouter, Body, Request
 from fastapi.responses import JSONResponse
 
+from .batch_operations import active_batch_lock
+from .batch_lifecycle import is_batch_active
 from .data_store import DATA_ROOT, RecordStore, RevisionConflict
 from .data_store.paths import contained_path
 from .collection_runs import CollectionRunError, CollectionRunStore
@@ -150,9 +152,11 @@ class PhoneFactoryStore:
         current = self.records.get("phone_factory", "state")
         return current if current is not None else self._empty_state()
 
-    @staticmethod
-    def _public(state: dict) -> dict:
-        return {key: state.get(key, []) for key in ("phones", "apps", "phoneApps", "vla", "tasks")}
+    def _public(self, state: dict) -> dict:
+        result = {key: state.get(key, []) for key in ("phones", "apps", "phoneApps", "vla", "tasks")}
+        result["tasks"] = [item for item in result["tasks"] if not item.get("source_batch_id")
+                           or is_batch_active(item["source_batch_id"], self.root)]
+        return result
 
     def state(self) -> dict:
         return self._public(self._current())
@@ -217,7 +221,8 @@ class PhoneFactoryStore:
                 row.update(source_batch_id=batch, content_sha256=digest)
             tasks.append(row)
 
-        return self._public(self._update(mutate))
+        with active_batch_lock(batch, self.root):
+            return self._public(self._update(mutate))
 
     def start_task(self, filename) -> dict:
         filename = _filename(filename)
@@ -228,11 +233,15 @@ class PhoneFactoryStore:
                 raise PhoneFactoryError(f"任务 {filename} 不存在", 404)
             task["status"] = "运行中"
 
-        return self._public(self._update(mutate))
+        task = next((row for row in self._current()["tasks"] if row.get("filename") == filename), {})
+        with active_batch_lock(task.get("source_batch_id"), self.root):
+            return self._public(self._update(mutate))
 
     def remove_task(self, filename) -> dict:
         filename = _filename(filename)
-        return self._public(self._update(lambda state: state.update(tasks=[row for row in state["tasks"] if row.get("filename") != filename])))
+        task = next((row for row in self._current()["tasks"] if row.get("filename") == filename), {})
+        with active_batch_lock(task.get("source_batch_id"), self.root):
+            return self._public(self._update(lambda state: state.update(tasks=[row for row in state["tasks"] if row.get("filename") != filename])))
 
     def _remote_result(self, args: list[str]):
         result = self.run_client(args)
@@ -290,6 +299,9 @@ class PhoneFactoryStore:
                 if run is not None:
                     args.extend(["--batch-id", batch_id, "--collection-run-id", run["collection_run_id"],
                                  "--output-dir", run["output_dir"]])
+                with active_batch_lock(batch_id, self.root):
+                    # The persisted collection run reserves execution after this check.
+                    pass
                 response = self._remote_result(args)
                 if run is None:
                     return response

@@ -41,6 +41,8 @@ class CollectionCorrectionFlowTests(unittest.TestCase):
             patch.object(draft_store, "CORRECTION_SESSIONS_DIR", self.root / "sessions"),
             patch.object(quality_selection, "TREE_RUNS_DIR", self.tree_root),
             patch.object(quality_selection, "QUALITY_RESULTS_DIR", self.quality_root),
+            # These fixtures explicitly exercise the legacy source adapter.
+            patch.object(quality_selection, "_current_quality_runs", side_effect=lambda: quality_selection._completed_quality_runs(self.quality_root, self.tree_root)),
             patch.object(stage_artifacts, "DATA_ROOT", self.root),
             patch.object(service, "CORRECTION_INPUTS_DIR", self.inputs),
             patch.object(service, "CORRECTION_EXPORTS_DIR", self.exports),
