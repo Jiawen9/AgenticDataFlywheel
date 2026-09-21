@@ -12,14 +12,41 @@ const state = (id = 'batch-a', status = '未运行'): FactoryState => ({ phones:
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(yes => { resolve = yes }); return { promise, resolve } }
 function setup() {
   const batchApi = { list: vi.fn(async () => [detail()]), detail: vi.fn(async (id: string) => detail(id)), workbook: vi.fn(async () => new Blob(['workbook bytes'])) }
-  const factoryApi = { addTask: vi.fn(async (_description: string, _filename: string, _content: string, id?: string) => state(id)), remoteStartRun: vi.fn(async () => ({ ok: true, message: '已接受' })), startTask: vi.fn(async () => state('batch-a', '运行中')) }
+  const factoryApi = { addTask: vi.fn(async (_description: string, _filename: string, _content: string, id?: string) => state(id)), remoteStartRun: vi.fn(async () => ({ ok: true, message: '已接受' })), state: vi.fn(async () => state('batch-a', '运行中')) }
   const setTasks = vi.fn()
   const downloadFile = vi.fn()
-  const collection = usePhoneCollectionBatches(batchApi, factoryApi, { setTasks, downloadFile })
+  const collection = usePhoneCollectionBatches(batchApi, factoryApi, { setTasks, downloadFile, runOptions: () => ({ vla: 'http://vla.test/v1', run_mode: 'generate' }) })
   return { collection, batchApi, factoryApi, setTasks, downloadFile }
 }
 
 describe('phone collection batch selection and dispatch', () => {
+  it('retiring one batch blocks its retry while keeping another batch request identity', async () => {
+    const { collection, factoryApi } = setup()
+    factoryApi.remoteStartRun.mockRejectedValueOnce(new Error('lost a')).mockRejectedValueOnce(new Error('lost b'))
+    await expect(collection.runBatch('batch-a')).rejects.toThrow('lost a')
+    await expect(collection.runBatch('batch-b')).rejects.toThrow('lost b')
+    collection.retireBatches(['batch-a'])
+    await expect(collection.runBatch('batch-a')).rejects.toThrow('已发布')
+    await collection.runBatch('batch-b')
+    expect(factoryApi.remoteStartRun.mock.calls[1]).toEqual(factoryApi.remoteStartRun.mock.calls[2])
+  })
+
+  it('reuses request identity after a lost response and passes per-run configuration', async () => {
+    const { collection, factoryApi } = setup()
+    const config = { sampling_enabled: true, temperature: 0.5, top_p: 0.9, use_experience_lib: true }
+    factoryApi.remoteStartRun.mockRejectedValueOnce(new Error('network lost'))
+    await expect(collection.runBatch('batch-a', 'phone-1', 'AppA', { vla: 'vla:8000', config })).rejects.toThrow('network lost')
+    await collection.runBatch('batch-a', 'phone-1', 'AppA', { vla: 'vla:8000', config })
+    expect(factoryApi.remoteStartRun.mock.calls[0]).toEqual(factoryApi.remoteStartRun.mock.calls[1])
+    expect(factoryApi.remoteStartRun).toHaveBeenLastCalledWith(expect.objectContaining({ config, vla: 'vla:8000' }))
+  })
+  it('keeps an accepted dispatch successful when the following state refresh fails', async () => {
+    const { collection, factoryApi } = setup()
+    factoryApi.state.mockRejectedValueOnce(new Error('state unavailable'))
+    await expect(collection.runBatch('batch-a')).resolves.toEqual({ ok: true, message: '已接受' })
+    expect(factoryApi.remoteStartRun).toHaveBeenCalledTimes(1)
+  })
+
   it('retirement invalidates an in-flight detail without defaulting another batch', async () => {
     const { collection, batchApi } = setup(), pending = deferred<CollectionBatchDetail>()
     batchApi.detail.mockReturnValueOnce(pending.promise)
@@ -49,10 +76,10 @@ describe('phone collection batch selection and dispatch', () => {
     await collection.selectBatch('batch-a')
     await collection.runBatch('batch-a', 'phone-1', 'AppA')
     expect(factoryApi.addTask).toHaveBeenCalledWith('采集批次 batch-a · 1 条任务', 'collection-batch-batch-a.xlsx', btoa('workbook bytes'), 'batch-a')
-    expect(factoryApi.remoteStartRun).toHaveBeenCalledWith('collection-batch-batch-a.xlsx', 'phone-1', 'AppA')
+    expect(factoryApi.remoteStartRun).toHaveBeenCalledWith(expect.objectContaining({ filename: 'collection-batch-batch-a.xlsx', phone_id: 'phone-1', app: 'AppA', vla: 'http://vla.test/v1', request_id: expect.any(String), run_mode: 'generate' }))
     expect(batchApi.workbook.mock.invocationCallOrder[0]!).toBeLessThan(factoryApi.addTask.mock.invocationCallOrder[0]!)
     expect(factoryApi.addTask.mock.invocationCallOrder[0]!).toBeLessThan(factoryApi.remoteStartRun.mock.invocationCallOrder[0]!)
-    expect(factoryApi.startTask).toHaveBeenCalledWith('collection-batch-batch-a.xlsx')
+    expect(factoryApi.state).toHaveBeenCalledTimes(1)
     expect(setTasks).toHaveBeenLastCalledWith(state('batch-a', '运行中').tasks)
   })
   it('never dispatches after a failed import and allows a deliberate retry', async () => {
@@ -90,7 +117,7 @@ describe('phone collection batch selection and dispatch', () => {
     await expect(second.collection.runBatch('batch-a')).rejects.toThrow('已经在运行中')
     expect(second.factoryApi.remoteStartRun).not.toHaveBeenCalled()
   })
-  it('persists an accepted remote run after unmount without updating destroyed UI', async () => {
+  it('does not make a late status write after an accepted run unmounts', async () => {
     const { collection, factoryApi, setTasks } = setup(), response = deferred<{ ok: boolean; message: string }>()
     factoryApi.remoteStartRun.mockReturnValueOnce(response.promise)
     const run = collection.runBatch('batch-a')
@@ -99,7 +126,7 @@ describe('phone collection batch selection and dispatch', () => {
     const callsBefore = setTasks.mock.calls.length
     response.resolve({ ok: true, message: 'accepted' })
     await run
-    expect(factoryApi.startTask).toHaveBeenCalledWith('collection-batch-batch-a.xlsx')
+    expect(factoryApi.state).not.toHaveBeenCalled()
     expect(setTasks).toHaveBeenCalledTimes(callsBefore)
   })
   it('downloads the selected workbook without importing or running and rejects late downloads', async () => {

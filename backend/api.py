@@ -43,7 +43,7 @@ from .batch_api import router as batch_results_router, task_status_summaries
 from .data_store import ArtifactStore, DATA_ROOT, RecordStore
 from .batch_results import current_tree_payload, current_tree_batch, recover_pending_batch_results
 from .batch_lifecycle import install_lifecycle_handlers, ensure_batch_active, is_batch_active
-from .phone_factory import router as phone_factory_router
+from .phone_factory import router as phone_factory_router, model_iter_router, start_phone_factory, close_phone_factory
 from .stage_artifacts import read_workbook_payload
 from .preprocessing_jobs import PreprocessingJobManager
 from .preprocessing_router import router as preprocessing_router, configure_preprocessing_manager
@@ -121,6 +121,7 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(recover_dataset_imports)
     manager = get_overview_manager()
     manager.start()
+    start_phone_factory()
 
     async def clean_expired_imports():
         while True:
@@ -137,6 +138,7 @@ async def lifespan(app: FastAPI):
         cleanup.cancel()
         with suppress(asyncio.CancelledError):
             await cleanup
+        close_phone_factory()
         manager.close()
 
 
@@ -155,6 +157,7 @@ app.include_router(data_publishing_router)
 app.include_router(data_registry_router)
 app.include_router(batch_results_router)
 app.include_router(phone_factory_router)
+app.include_router(model_iter_router)
 app.include_router(preprocessing_router)
 app.include_router(training_overview_router)
 model_job_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="model-job")

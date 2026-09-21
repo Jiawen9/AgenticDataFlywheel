@@ -205,7 +205,16 @@ class CollectionRunTests(unittest.TestCase):
 
     def test_router_real_batch_dispatch_idempotency_completion_and_client_fields(self):
         calls = []
-        factory = PhoneFactoryStore(self.root, run_client_fn=lambda args: (calls.append(args) or {"ok": True, "output": '{"ok":true}'}))
+        def remote(args):
+            if args[0] == "run":
+                return {"ok": False, "output": "unknown remote run"}
+            if args[0] == "capabilities":
+                return {"ok": True, "output": '{"protocol_version":1,"batch_results":true}'}
+            calls.append(args)
+            return {"ok": True, "output": '{"ok":true}'}
+        factory = PhoneFactoryStore(self.root, run_client_fn=remote)
+        factory.dispatch("phone-apps", "POST", {"phone_id": "phone", "app": "Demo"})
+        factory.dispatch("vla", "POST", {"value": "http://model.invalid"})
         factory.add_task({"filename": self.batch["filename"], "description": "batch", "source_batch_id": "batch-one", "content_base64": base64.b64encode(self.workbook.read_bytes()).decode()})
         app = FastAPI()
         app.include_router(create_router(factory))
@@ -219,7 +228,7 @@ class CollectionRunTests(unittest.TestCase):
             self.assertEqual(len(calls), 1)
             self.assertIn("--batch-id", calls[0])
             self.assertEqual(calls[0][calls[0].index("--collection-run-id") + 1], run_id)
-            conflict = client.post("/api/phone-factory/remote/start-run", json={**request, "phone_id": "different"})
+            conflict = client.post("/api/phone-factory/remote/start-run", json={**request, "vla": "http://different.invalid"})
             self.assertEqual(conflict.status_code, 409)
             run = factory.collection_runs.get(run_id)
             entry = raw_trajectory(run)
@@ -233,6 +242,10 @@ class CollectionRunTests(unittest.TestCase):
     def test_dispatch_failure_retry_uses_same_run_and_completed_callback_is_not_lost(self):
         calls = []
         def remote(args):
+            if args[0] == "run":
+                return {"ok": False, "output": "unknown remote run"}
+            if args[0] == "capabilities":
+                return {"ok": True, "output": '{"protocol_version":1,"batch_results":true}'}
             calls.append(args)
             if len(calls) == 1:
                 return {"ok": False, "output": "mock timeout"}
@@ -241,6 +254,8 @@ class CollectionRunTests(unittest.TestCase):
             self.complete(run)
             return {"ok": True, "output": '{"ok":true}'}
         factory = PhoneFactoryStore(self.root, run_client_fn=remote)
+        factory.dispatch("phone-apps", "POST", {"phone_id": "phone", "app": "Demo"})
+        factory.dispatch("vla", "POST", {"value": "http://model.invalid"})
         factory.add_task({"filename": self.batch["filename"], "description": "batch", "source_batch_id": "batch-one", "content_base64": base64.b64encode(self.workbook.read_bytes()).decode()})
         request = {"filename": self.batch["filename"], "request_id": "retry-one"}
         with self.assertRaises(PhoneFactoryError):
@@ -266,24 +281,32 @@ class CollectionRunTests(unittest.TestCase):
         entered, release = threading.Event(), threading.Event()
         calls = []
         def remote(args):
+            if args[0] == "run":
+                return {"ok": False, "output": "unknown remote run"}
+            if args[0] == "capabilities":
+                return {"ok": True, "output": '{"protocol_version":1,"batch_results":true}'}
             calls.append(args)
             entered.set()
             release.wait(5)
             return {"ok": True, "output": '{"ok":true}'}
         factory = PhoneFactoryStore(self.root, run_client_fn=remote)
+        factory.dispatch("phone-apps", "POST", {"phone_id": "phone", "app": "Demo"})
+        factory.dispatch("vla", "POST", {"value": "http://model.invalid"})
         factory.add_task({"filename": self.batch["filename"], "description": "batch", "source_batch_id": "batch-one", "content_base64": base64.b64encode(self.workbook.read_bytes()).decode()})
         request = {"filename": self.batch["filename"], "request_id": "parallel"}
         with ThreadPoolExecutor(max_workers=2) as pool:
             first = pool.submit(factory.remote_start, request)
             self.assertTrue(entered.wait(5))
             try:
-                second = pool.submit(factory.remote_start, request).result(timeout=5)
-                self.assertTrue(second["dispatch_pending"])
+                second = pool.submit(factory.remote_start, request)
                 self.assertEqual(len(calls), 1)
             finally:
                 release.set()
-            self.assertEqual(first.result(timeout=5)["collection_run_id"], second["collection_run_id"])
-        with patch("backend.phone_factory.tempfile.TemporaryDirectory", side_effect=OSError("disk error")):
+            second_result = second.result(timeout=5)
+            self.assertTrue(second_result["reused"])
+            self.assertEqual(first.result(timeout=5)["collection_run_id"], second_result["collection_run_id"])
+            self.assertEqual(len(calls), 1)
+        with patch("backend.phone_factory_runtime.tempfile.TemporaryDirectory", side_effect=OSError("disk error")):
             with self.assertRaises(OSError):
                 factory.remote_start({**request, "request_id": "disk-failure"})
         failed = next(run for run in self.store.list_runs() if run["dispatch_key"] == "disk-failure")

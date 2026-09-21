@@ -47,3 +47,6 @@ Thumbs.db
 .single-artifact-migration/
 
 .batch-publication-migration/
+
+# Independent collector runtime (devices, archives and SQLite).
+phone_factory_workspace/

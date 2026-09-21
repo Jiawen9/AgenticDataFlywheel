@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from backend.phone_factory import DEFAULT_CONFIG, PhoneFactoryError, PhoneFactoryStore, create_router, run_client
+from backend.tests.test_manual_collection import workbook_bytes
 
 
 def batch(identifier="batch-a", content=b"workbook bytes"):
@@ -41,6 +42,8 @@ class PhoneFactoryTests(unittest.TestCase):
         return PhoneFactoryStore(self.root, run_client_fn=self.mock_client)
 
     def mock_client(self, args):
+        if args[0] == "capabilities":
+            return {"ok": True, "output": '{"protocol_version":1,"batch_results":true}'}
         call = {"args": args}
         if args[0] == "start-run":
             call["task"] = Path(args[1]).read_bytes()
@@ -128,28 +131,31 @@ class PhoneFactoryTests(unittest.TestCase):
         self.assertEqual(next(row for row in state["tasks"] if row["source_batch_id"] == "a")["status"], "运行中")
 
     def test_remote_protocol_uses_frozen_upload_and_current_app_config_without_real_phone(self):
-        request = {**batch(), "filename": "manual.xlsx"}
+        original = workbook_bytes()
+        request = {**batch(content=original), "filename": "manual.xlsx"}
         request.pop("source_batch_id")
-        self.store.add_task(request)
+        registered = self.store.add_task(request)
+        request["filename"] = registered["tasks"][0]["filename"]
+        self.store.dispatch("vla", "POST", {"value": "http://model.invalid"})
         self.store.dispatch("phone-apps", "POST", {"phone_id": "phone", "app": "App"})
         self.store.dispatch("config", "POST", {"sampling_enabled": True, "temperature": 0.5, "top_p": 0.9, "use_experience_lib": True})
         result = self.store.remote_start({"filename": request["filename"], "phone_id": "phone", "app": "App"})
         self.assertTrue(result["ok"])
         call = self.calls[-1]
-        self.assertEqual(call["task"], b"workbook bytes")
+        self.assertEqual(call["task"], original)
         self.assertEqual(call["phoneApps"], [{"phone_id": "phone", "app": "App", "status": "空闲"}])
         self.assertEqual(call["args"][3:5], ["phone", "App"])
         self.assertIn("--sampling", call["args"])
         self.assertIn("--exp", call["args"])
         self.assertFalse(Path(call["args"][2]).exists())
-        self.assertEqual(self.store.state()["tasks"][0]["status"], "未运行")
+        self.assertEqual(self.store.state()["tasks"][0]["status"], "运行中")
         self.store.dispatch("remote/add-phone", "POST", {"phone_id": "phone"})
         self.assertEqual(self.calls[-1]["args"], ["add-phone", "phone"])
         self.store.run_client = lambda args: {"ok": False, "output": "mock timeout"}
         with self.assertRaises(PhoneFactoryError) as context:
             self.store.remote_start({"filename": request["filename"]})
         self.assertEqual(context.exception.status, 502)
-        self.assertEqual(self.store.state()["tasks"][0]["status"], "未运行")
+        self.assertEqual(self.store.state()["tasks"][0]["status"], "失败")
 
     def test_old_tasks_and_uploads_cannot_be_used_by_new_flow(self):
         self.legacy.mkdir(parents=True)
@@ -171,10 +177,10 @@ class PhoneFactoryTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
         self.assertEqual((self.uploads / "old.xlsx").read_bytes(), b"legacy")
         self.store.remove_task("old.xlsx")
-        self.store.add_task({"filename": "old.xlsx", "description": "new", "content_base64": base64.b64encode(b"new").decode()})
+        self.store.add_task({"filename": "old.xlsx", "description": "new", "content_base64": base64.b64encode(b"new").decode()}, mode="modeliter")
         self.store.start_task("old.xlsx")
         with self.assertRaises(PhoneFactoryError) as context:
-            self.store.add_task({"filename": "old.xlsx", "description": "replacement", "content_base64": base64.b64encode(b"changed").decode()})
+            self.store.add_task({"filename": "old.xlsx", "description": "replacement", "content_base64": base64.b64encode(b"changed").decode()}, mode="modeliter")
         self.assertEqual(context.exception.status, 409)
         self.assertEqual((self.uploads / "old.xlsx").read_bytes(), b"legacy")
         self.assertEqual((self.store.upload_dir / "old.xlsx").read_bytes(), b"new")
@@ -204,7 +210,7 @@ class PhoneFactoryTests(unittest.TestCase):
             runner.return_value = subprocess.CompletedProcess([], 0, '{"ok":true}', "")
             self.assertTrue(run_client(["add-phone", "mock"])["ok"])
             self.assertEqual(runner.call_args.args[0][0], sys.executable)
-            self.assertEqual(runner.call_args.kwargs["timeout"], 12)
+            self.assertEqual(runner.call_args.kwargs["timeout"], 35)
             runner.side_effect = subprocess.TimeoutExpired("mock", 12)
             self.assertFalse(run_client(["add-phone", "mock"])["ok"])
 

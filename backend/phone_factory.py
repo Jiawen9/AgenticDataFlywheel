@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Callable
 
 from fastapi import APIRouter, Body, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from .batch_operations import active_batch_lock
 from .batch_lifecycle import is_batch_active
@@ -47,7 +47,7 @@ def run_client(args: list[str]) -> dict:
         result = subprocess.run(
             [sys.executable, str(CLIENT_SCRIPT), *args],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=12, check=False,
+            timeout=float(os.environ.get("PHONE_FACTORY_TRANSFER_TIMEOUT", "300") if args and args[0] in {"run-archive", "report-download"} else os.environ.get("PHONE_FACTORY_TIMEOUT", "30")) + 5, check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (subprocess.TimeoutExpired, OSError) as exc:
@@ -152,14 +152,21 @@ class PhoneFactoryStore:
         current = self.records.get("phone_factory", "state")
         return current if current is not None else self._empty_state()
 
+    @property
+    def runtime(self):
+        if not hasattr(self, "_runtime"):
+            from .phone_factory_runtime import FactoryRuntime
+            self._runtime = FactoryRuntime(self)
+        return self._runtime
+
     def _public(self, state: dict) -> dict:
         result = {key: state.get(key, []) for key in ("phones", "apps", "phoneApps", "vla", "tasks")}
         result["tasks"] = [item for item in result["tasks"] if not item.get("source_batch_id")
                            or is_batch_active(item["source_batch_id"], self.root)]
         return result
 
-    def state(self) -> dict:
-        return self._public(self._current())
+    def state(self, mode="generate") -> dict:
+        return self.runtime.public_state(self._public(self._current()), mode)
 
     def config(self) -> dict:
         return self._current()["config"]
@@ -170,7 +177,7 @@ class PhoneFactoryStore:
     def task_path(self, filename: str) -> Path:
         return contained_path(self.upload_dir, filename)
 
-    def add_task(self, data: dict) -> dict:
+    def add_task(self, data: dict, *, mode="generate") -> dict:
         filename = _filename(data.get("filename"))
         description = _text(data.get("description"))
         if not description:
@@ -181,6 +188,9 @@ class PhoneFactoryStore:
             raise PhoneFactoryError("文件内容不是有效的Base64") from exc
         if not content:
             raise PhoneFactoryError("文件内容为空")
+        if not data.get("source_batch_id") and mode == "generate":
+            data = self.runtime.register_manual(data, filename, content)
+            filename = data["filename"]
         batch = data.get("source_batch_id")
         if "source_batch_id" in data and (not isinstance(batch, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", batch)):
             raise PhoneFactoryError("采集批次编号无效")
@@ -216,13 +226,19 @@ class PhoneFactoryStore:
             if batch and path.is_file() and path.read_bytes() != content:
                 raise PhoneFactoryError("批次文件已存在且内容不同", 409)
             _atomic_write(destination, content)
-            row = {"description": description, "filename": filename, "status": "未运行"}
+            row = {"description": description, "filename": filename, "status": "未运行",
+                   "content_sha256": digest}
+            for key in ("original_filename", "warnings"):
+                if key in data:
+                    row[key] = data[key]
             if batch:
                 row.update(source_batch_id=batch, content_sha256=digest)
             tasks.append(row)
 
         with active_batch_lock(batch, self.root):
-            return self._public(self._update(mutate))
+            state = self.runtime.public_state(self._public(self._update(mutate)), mode)
+            imported = next(row for row in state["tasks"] if row["filename"] == filename)
+            return {**state, "imported_task": dict(imported)}
 
     def start_task(self, filename) -> dict:
         filename = _filename(filename)
@@ -252,72 +268,13 @@ class PhoneFactoryStore:
         except (TypeError, ValueError):
             return {"ok": True, "message": result.get("output", "")}
 
-    def remote_start(self, data: dict):
-        filename = _filename(data.get("filename"))
-        state = self._current()
-        task = next((row for row in state["tasks"] if row.get("filename") == filename), None)
-        if task is None:
-            raise PhoneFactoryError(f"任务 {filename} 不存在", 404)
-        task_path = self.task_path(filename)
-        if not task_path.is_file():
-            raise PhoneFactoryError("已登记任务文件缺失", 409)
-        if task.get("content_sha256") and hashlib.sha256(task_path.read_bytes()).hexdigest() != task["content_sha256"]:
-            raise PhoneFactoryError("采集批次文件内容与登记校验值不一致", 409)
-        config = state["config"]
-        batch_id = task.get("source_batch_id")
-        if data.get("batch_id") is not None and data["batch_id"] != batch_id:
-            raise PhoneFactoryError("采集批次与已登记任务不匹配", 409)
-        run = None
-        if batch_id:
-            request_id = data.get("request_id", data.get("dispatch_key"))
-            run, created = self.collection_runs.create(
-                batch_id, dispatch_key=request_id,
-                workbook_sha256=hashlib.sha256(task_path.read_bytes()).hexdigest(),
-                metadata={"filename": filename, "phone_id": _text(data.get("phone_id")),
-                          "app": _text(data.get("app")), "config": config,
-                          "phone_apps": state["phoneApps"]},
-            )
-            if not created:
-                run, created = self.collection_runs.retry_dispatch(run["collection_run_id"])
-                if not created:
-                    return {**run.get("dispatch_response", {"ok": True}),
-                            "batch_id": batch_id, "collection_run_id": run["collection_run_id"],
-                            "output_dir": run["output_dir"], "collection_status": run["status"],
-                            "dispatch_pending": run["status"] == "dispatching"}
-        try:
-            temp_dir = contained_path(self.root, "tmp", "phone_factory")
-            temp_dir.mkdir(parents=True, exist_ok=True)
-            with tempfile.TemporaryDirectory(dir=temp_dir) as directory:
-                apps_path = Path(directory) / "phone_apps.json"
-                apps_path.write_text(json.dumps(state["phoneApps"], ensure_ascii=False), encoding="utf-8")
-                args = ["start-run", str(task_path), str(apps_path), _text(data.get("phone_id")), _text(data.get("app"))]
-                if config["sampling_enabled"]:
-                    args.append("--sampling")
-                args.extend(["--temperature", str(config["temperature"]), "--top-p", str(config["top_p"])])
-                if config["use_experience_lib"]:
-                    args.append("--exp")
-                if run is not None:
-                    args.extend(["--batch-id", batch_id, "--collection-run-id", run["collection_run_id"],
-                                 "--output-dir", run["output_dir"]])
-                with active_batch_lock(batch_id, self.root):
-                    # The persisted collection run reserves execution after this check.
-                    pass
-                response = self._remote_result(args)
-                if run is None:
-                    return response
-                if not isinstance(response, dict):
-                    raise PhoneFactoryError("手机采集服务返回了无效响应", 502)
-                if response.get("ok") is False:
-                    raise PhoneFactoryError(str(response.get("error") or response.get("message") or "手机采集服务拒绝运行"), 502)
-                saved = self.collection_runs.dispatched(run["collection_run_id"], response)
-                return {**response, "batch_id": batch_id, "collection_run_id": run["collection_run_id"],
-                        "output_dir": run["output_dir"], "collection_status": saved["status"]}
-        except Exception as exc:
-            if run is not None:
-                self.collection_runs.dispatch_failed(run["collection_run_id"], str(exc))
-            raise
+    def remote_start(self, data: dict, *, mode="generate"):
+        return self.runtime.remote_start(data, mode)
 
-    def dispatch(self, action: str, method: str, data: dict):
+    def dispatch(self, action: str, method: str, data: dict, *, mode="generate"):
+        handled, result = self.runtime.dispatch(action, method, data, mode)
+        if handled:
+            return result
         if method == "GET" and action == "collection-runs":
             return {"runs": self.collection_runs.list_runs(data.get("batch_id"))}
         if action.startswith("collection-runs/"):
@@ -331,17 +288,17 @@ class PhoneFactoryStore:
                 run, _ = self.collection_runs.complete(parts[1], data)
                 return run
         if method == "GET" and action == "state":
-            return self.state()
+            return self.state(mode)
         if method == "GET" and action == "config":
             return self.config()
         if method == "POST" and action == "tasks":
-            return self.add_task(data)
+            return self.add_task(data, mode=mode)
         if method == "POST" and action == "tasks/start":
             return self.start_task(data.get("filename"))
         if method == "DELETE" and action == "tasks":
             return self.remove_task(data.get("filename"))
         if method == "POST" and action == "remote/start-run":
-            return self.remote_start(data)
+            return self.remote_start(data, mode=mode)
         if method == "POST" and action == "remote/add-phone":
             phone_id = _text(data.get("phone_id"))
             if not phone_id:
@@ -394,15 +351,16 @@ class PhoneFactoryStore:
         raise PhoneFactoryError(f"Unsupported {method} /{action}", 404)
 
 
-def create_router(store: PhoneFactoryStore | None = None) -> APIRouter:
+def create_router(store: PhoneFactoryStore | None = None, *, prefix="/api/phone-factory", mode="generate") -> APIRouter:
     service = store if store is not None else PhoneFactoryStore()
-    result = APIRouter(prefix="/api/phone-factory", tags=["phone-factory"])
+    result = APIRouter(prefix=prefix, tags=["phone-factory"])
 
     @result.api_route("/{action:path}", methods=["GET", "POST", "DELETE"])
     def dispatch(action: str, request: Request, data: dict | None = Body(default=None)):
         try:
             body = dict(request.query_params) if request.method == "GET" else data or {}
-            return JSONResponse(service.dispatch(action, request.method, body), headers={"Cache-Control": "no-store"})
+            value = service.dispatch(action, request.method, body, mode=mode)
+            return value if isinstance(value, Response) else JSONResponse(value, headers={"Cache-Control": "no-store"})
         except (PhoneFactoryError, CollectionRunError) as exc:
             return JSONResponse({"error": str(exc)}, status_code=exc.status, headers={"Cache-Control": "no-store"})
         except (ValueError, OSError) as exc:
@@ -411,4 +369,14 @@ def create_router(store: PhoneFactoryStore | None = None) -> APIRouter:
     return result
 
 
-router = create_router()
+store = PhoneFactoryStore()
+router = create_router(store)
+model_iter_router = create_router(store, prefix="/api/model-iter", mode="modeliter")
+
+
+def start_phone_factory():
+    store.runtime.start()
+
+
+def close_phone_factory():
+    store.runtime.close()

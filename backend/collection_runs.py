@@ -84,6 +84,10 @@ class CollectionRunStore:
             if payload is None:
                 raise CollectionRunError("采集批次不存在", 404)
             return payload
+        from .manual_collection import ManualCollectionStore
+        manual = ManualCollectionStore(self.root).get(batch_id, require_workbook=require_workbook)
+        if manual is not None:
+            return manual
         directory = contained_path(self.root, "system", "task_generation", "collection_batches", batch_id)
         path = directory / "batch.json"
         if not path.is_file():
@@ -161,7 +165,10 @@ class CollectionRunStore:
                 if case_id.casefold() in seen_paths:
                     raise CollectionRunError("采集用例编号重复或在文件系统中冲突")
                 seen_paths.add(case_id.casefold())
-                if not isinstance(task.get("task_id"), str) or not task["task_id"].strip() or not task.get("source_result_id"):
+                manual = batch.get("kind") == "manual_collection"
+                if (not isinstance(task.get("task_id"), str) or not task["task_id"].strip()
+                        or (manual and (task.get("source_result_id") is not None or not task.get("source_row_id")))
+                        or (not manual and not task.get("source_result_id"))):
                     raise CollectionRunError("采集批次缺少生成任务编号或来源结果编号")
                 by_case[case_id] = task
             if not by_case:
@@ -210,16 +217,20 @@ class CollectionRunStore:
         with active_batch_lock(current["batch_id"], self.root):
             def mutate(run):
                 # A fast collector may finish before its dispatch response arrives.
-                if run["status"] != "completed":
+                if run["status"] not in {"completed", "interrupted"}:
                     run["status"] = "running"
                 run.update(dispatch_response=response, dispatched_at=_now(), dispatch_error=None)
             return self.records.update("collection_runs", run_id, mutate)
 
     def dispatch_failed(self, run_id: str, error: str) -> dict:
-        def mutate(run):
-            if run["status"] != "completed":
-                run.update(status="failed", dispatch_error=str(error))
-        return self.records.update("collection_runs", run_id, mutate)
+        current = self.get(run_id)
+        if current is None:
+            raise CollectionRunError("采集运行不存在", 404)
+        with active_batch_lock(current["batch_id"], self.root):
+            def mutate(run):
+                if run["status"] not in {"completed", "interrupted"}:
+                    run.update(status="failed", dispatch_error=str(error))
+            return self.records.update("collection_runs", run_id, mutate)
 
     def _normalize(self, run: dict, manifest: dict, completed_at: str) -> dict:
         if not isinstance(manifest, dict) or manifest.get("batch_id") != run["batch_id"]:
@@ -239,8 +250,10 @@ class CollectionRunStore:
                 raise CollectionRunError(f"用例不属于本采集批次：{case_id}")
             relative_dir = _relative(entry.get("relative_dir"), "轨迹目录")
             parts = relative_dir.split("/")
-            if len(parts) != 2 or parts[0] != case_id:
-                raise CollectionRunError("轨迹目录必须为 collection_case_id/原轨迹目录")
+            if len(parts) not in {2, 3} or parts[0] != case_id:
+                raise CollectionRunError("轨迹目录必须为 collection_case_id/设备限定轨迹目录")
+            if len(parts) == 3 and parts[1] != entry.get("phone_id"):
+                raise CollectionRunError("轨迹目录的手机编号与清单不匹配")
             if relative_dir.casefold() in directories:
                 raise CollectionRunError("完成清单包含重复轨迹目录")
             directories.add(relative_dir.casefold())
@@ -272,6 +285,9 @@ class CollectionRunStore:
                 "source_trajectory_id": source_id, "relative_dir": relative_dir,
                 "collected_at": _timestamp(entry.get("collected_at"), completed_at),
                 "files": sorted(files, key=lambda item: item["path"]),
+                **({"phone_id": entry["phone_id"]} if entry.get("phone_id") is not None else {}),
+                **({"source_row_id": source_task["source_row_id"], "source_kind": "manual_collection"}
+                   if source_task.get("source_kind") == "manual_collection" else {}),
             })
         normalized_errors = []
         for item in errors:
@@ -293,8 +309,8 @@ class CollectionRunStore:
         except (OSError, ValueError) as exc:
             raise CollectionRunError(f"采集源文件无法校验：{exc}") from exc
 
-    def _validate_source_files(self, run: dict, manifest: dict) -> None:
-        root = self.run_root(run["batch_id"], run["collection_run_id"])
+    def _validate_source_files(self, run: dict, manifest: dict, *, root_override: Path | None = None) -> None:
+        root = root_override if root_override is not None else self.run_root(run["batch_id"], run["collection_run_id"])
         for trajectory in manifest["trajectories"]:
             self._no_links(root / trajectory["relative_dir"])
             directory = contained_path(root, trajectory["relative_dir"])
@@ -340,6 +356,8 @@ class CollectionRunStore:
                 run = self.get(run_id)
                 if run is None:
                     raise CollectionRunError("采集运行不存在", 404)
+                if run["status"] == "interrupted":
+                    raise CollectionRunError("采集运行已中断，不能回写迟到结果")
                 completed_at = run.get("completed_at") or _now()
                 normalized = self._normalize(run, manifest, completed_at)
                 self._validate_sources(run, normalized)

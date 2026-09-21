@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { api, imageUrl, stageArtifactDownloadUrl, treeRunScope } from './api'
-import { phoneFactoryApi } from './phoneFactoryApi'
+import { phoneFactoryApi, newRunRequestId } from './phoneFactoryApi'
 import type { StageArtifact } from './types'
 
 afterEach(() => vi.unstubAllGlobals())
@@ -38,12 +38,12 @@ describe('batch-scoped trajectory API', () => {
   it('assigns a fresh idempotency ID per run and permits reusing it for a network retry', async () => {
     const fetcher = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response('{"ok":true}'))
     vi.stubGlobal('fetch', fetcher)
-    await phoneFactoryApi.remoteStartRun('tasks.xlsx', 'phone', 'App')
+    await phoneFactoryApi.remoteStartRun({ filename: 'tasks.xlsx', phone_id: 'phone', app: 'App', vla: 'vla:8000', request_id: newRunRequestId() })
     const first = JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))
     expect(first.request_id).toMatch(/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/)
-    await phoneFactoryApi.remoteStartRun('tasks.xlsx', 'phone', 'App', first.request_id)
+    await phoneFactoryApi.remoteStartRun(first)
     expect(JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body))).toEqual(first)
-    await phoneFactoryApi.remoteStartRun('tasks.xlsx', 'phone', 'App')
+    await phoneFactoryApi.remoteStartRun({ filename: 'tasks.xlsx', phone_id: 'phone', app: 'App', vla: 'vla:8000', request_id: newRunRequestId() })
     expect(JSON.parse(String(fetcher.mock.calls[2]?.[1]?.body)).request_id).not.toBe(first.request_id)
   })
 })

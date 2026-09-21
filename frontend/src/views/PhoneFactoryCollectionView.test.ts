@@ -2,13 +2,13 @@ import { describe, expect, it, vi } from 'vitest'
 import { createSSRApp, defineComponent, h, ref } from 'vue'
 import { renderToString } from '@vue/server-renderer'
 import { createMemoryHistory, createRouter } from 'vue-router'
-import type { CollectionBatchSummary } from '@/collectionBatchesApi'
+import type { FactoryBatchSummary } from '@/phoneFactoryApi'
 import PhoneFactoryCollectionView from './PhoneFactoryCollectionView.vue'
 
 const mock = vi.hoisted(() => ({ state: {} as Record<string, unknown> }))
 vi.mock('@/composables/usePhoneCollectionBatches', () => ({ usePhoneCollectionBatches: () => mock.state }))
 
-const batch = (batchId: string, kind: CollectionBatchSummary['kind'], createdAt: string, taskCount: number): CollectionBatchSummary => ({
+const batch = (batchId: string, kind: FactoryBatchSummary['kind'], createdAt: string, taskCount: number): FactoryBatchSummary => ({
   schema_version: 1,
   batch_id: batchId,
   source_job_id: batchId,
@@ -22,11 +22,12 @@ const batch = (batchId: string, kind: CollectionBatchSummary['kind'], createdAt:
   download_url: `/api/task-generation/collection-batches/${batchId}/workbook`,
 })
 
-async function render() {
+async function render(mode: 'generate' | 'modeliter' = 'generate') {
   mock.state = {
     batches: ref([
       batch('generation-batch', 'task_generation', '2026-09-09T10:20:30+08:00', 12),
       batch('augmentation-batch', 'augmentation', '2026-09-08T09:08:07+08:00', 6),
+      { ...batch('manual-batch', 'manual_collection', '2026-09-21T09:08:07+08:00', 2), source_job_id: null },
     ]),
     selectedBatchId: ref(''),
     selectedBatch: ref(null),
@@ -41,11 +42,12 @@ async function render() {
     downloadBatch: vi.fn(),
     dispose: vi.fn(),
   }
-  const app = createSSRApp(PhoneFactoryCollectionView)
+  const app = createSSRApp(PhoneFactoryCollectionView, { mode })
   app.use(createRouter({ history: createMemoryHistory(), routes: [{ path: '/', component: { render: () => null } }] }))
   const empty = defineComponent({ setup: () => () => h('div') })
   const passthrough = defineComponent({ setup: (_props, { slots }) => () => h('div', null, slots.default?.()) })
   app.component('el-input', empty)
+  app.component('el-switch', empty)
   app.component('el-button', passthrough)
   app.component('el-table', empty)
   app.component('el-table-column', empty)
@@ -65,12 +67,20 @@ async function render() {
 }
 
 describe('phone collection batch picker', () => {
+  it('keeps evaluation runs outside production batch and preprocessing controls', async () => {
+    const html = await render('modeliter')
+    expect(html).toContain('模型迭代评估')
+    expect(html).toContain('评估运行与报告')
+    expect(html).not.toContain('采集任务批次')
+    expect(html).not.toContain('前往预处理')
+  })
   it('uses neutral copy and identifies generation and augmentation batches in the same dropdown', async () => {
     const html = await render()
     expect(html).toContain('采集任务批次')
     expect(html).toContain('data-placeholder="选择已提交的采集批次"')
     expect(html).toContain('generation-batch · 任务生成 · 2026-09-09 10:20:30 · 12 条任务')
     expect(html).toContain('augmentation-batch · 泛化扩增 · 2026-09-08 09:08:07 · 6 条任务')
+    expect(html).toContain('manual-batch · 手动上传 · 2026-09-21 09:08:07 · 2 条任务')
     expect(html).not.toContain('生成采集批次')
     expect(html).not.toContain('选择已提交的生成批次')
   })

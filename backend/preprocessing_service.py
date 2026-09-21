@@ -118,7 +118,9 @@ def convert_input(snapshot: dict, progress: Callable[[dict], None], *, data_root
                          "source_trajectory_id": source_id, "collection_run_id": run_id,
                          "collected_at": trajectory.get("collected_at"),
                          "collection_case_id": trajectory["collection_case_id"],
-                         "source_result_id": trajectory.get("source_result_id"), "step": step})
+                         "source_result_id": trajectory.get("source_result_id"), "step": step,
+                         **({"source_row_id": trajectory["source_row_id"], "source_kind": "manual_collection"}
+                            if trajectory.get("source_kind") == "manual_collection" else {})})
         progress({**event, "completed_steps": index + 1})
     if not rows:
         raise PreprocessingError("所选采集结果没有可转换步骤")

@@ -43,6 +43,7 @@ async function main() {
         const method=route.request().method(),body=route.request().postDataJSON()
         calls.push({path:url.pathname,query:Object.fromEntries(url.searchParams),method,body})
         const send=json=>route.fulfill({json})
+        if (/^\/api\/data-batches\/[^/]+\/lifecycle$/.test(url.pathname)) return send({ batch_id:url.pathname.split('/')[3],status:'active',published_at:null,release_id:null })
         if (url.pathname==='/api/trajectory-preprocessing/batches') return send({batches:rows})
         if (url.pathname==='/api/trajectory-preprocessing/jobs'&&method==='POST') {
           activeJobs[body.batch_id]=job(body.batch_id)
@@ -60,7 +61,7 @@ async function main() {
         }
         if (url.pathname==='/api/tree-builds'&&method==='GET') return send({jobs:build?[build]:[]})
         if (url.pathname==='/api/tree-builds'&&method==='POST') {
-          build={job_id:'tree-a',batch_id:body.batch_id,annotation_version:body.annotation_version,status:'running',stage:'classifying',task_ids:body.task_ids,created_at:'2026-09-15T20:00:00',classified_steps:1,total_steps:2,percent:50,error:null,run_id:null}
+          build={job_id:'tree-a',batch_id:body.batch_id,annotation_version:rows.find(row=>row.batch_id===body.batch_id)?.annotation_version,status:'running',stage:'classifying',task_ids:body.task_ids,created_at:'2026-09-15T20:00:00',classified_steps:1,total_steps:2,percent:50,error:null,run_id:null}
           return send(build)
         }
         if (url.pathname==='/api/tree-builds/tree-a') return send(build)
@@ -84,9 +85,11 @@ async function main() {
         }
         if (url.pathname.includes('/api/data-batches/')) return route.fulfill({contentType:'application/octet-stream',headers:{'Content-Disposition':'attachment; filename="result.xlsx"'},body:'mock frozen bytes'})
         if (url.pathname==='/api/phone-factory/state') return send({phones:['phone'],apps:['App'],phoneApps:[],vla:[],tasks:[]})
+        if (url.pathname==='/api/phone-factory/remote/status') return send({ok:true,statuses:[]})
+        if (url.pathname==='/api/phone-factory/remote/adb-devices') return send({ok:true,devices:[]})
         if (url.pathname==='/api/phone-factory/config') return send({sampling_enabled:false,temperature:0.5,top_p:0.9,use_experience_lib:false})
-        if (url.pathname==='/api/task-generation/collection-batches') return send({batches:[{schema_version:1,batch_id:'b',source_job_id:'b',kind:'task_generation',job_status:'succeeded',knowledge_base_version:null,created_at:'2026-09-15T20:00:00',task_count:1,apps:['App'],filename:'collection-batch-b.xlsx'}]})
-        if (url.pathname.startsWith('/api/task-generation/collection-batches/')) {
+        if (url.pathname==='/api/task-generation/collection-batches'||url.pathname==='/api/phone-factory/batches') return send({batches:[{schema_version:1,batch_id:'b',source_job_id:'b',kind:'task_generation',job_status:'succeeded',knowledge_base_version:null,created_at:'2026-09-15T20:00:00',task_count:1,apps:['App'],filename:'collection-batch-b.xlsx'}]})
+        if (url.pathname.startsWith('/api/task-generation/collection-batches/')||url.pathname.startsWith('/api/phone-factory/batches/')) {
           const id=url.pathname.split('/').at(-1)
           return send({schema_version:1,batch_id:id,source_job_id:id,kind:'task_generation',job_status:'succeeded',knowledge_base_version:null,created_at:'2026-09-15T20:00:00',task_count:1,apps:['App'],filename:'collection-batch-'+id+'.xlsx',snapshot:{tasks:[{task_id:'same',collection_case_id:'CASE-1',task:'采集源任务 '+id,app:'App'}]}})
         }
@@ -131,7 +134,7 @@ async function main() {
       await page.getByRole('button',{name:'保存并继续',exact:true}).click()
       await page.getByLabel('建树进度').waitFor()
       const buildCall=calls.find(call=>call.path==='/api/tree-builds'&&call.method==='POST')
-      assert.deepEqual(buildCall.body,{task_ids:['same'],batch_id:'a',annotation_version:'v2'})
+      assert.deepEqual(buildCall.body,{task_ids:['same'],batch_id:'a'})
       assert.ok(calls.some(call=>call.path.startsWith('/api/assets/')&&call.query.annotation_version==='v2'))
       const artifactLink=page.getByLabel('阶段文件').locator('a').filter({hasText:'Excel'}).last()
       assert.ok((await artifactLink.getAttribute('href')).includes('/02_annotation/v2/'))
@@ -162,7 +165,7 @@ async function main() {
       await page.goto(base+'/collection/phone-factory?collection_batch_id=b')
       await page.getByRole('link',{name:'前往预处理',exact:true}).waitFor()
       await page.getByRole('link',{name:'前往预处理',exact:true}).click()
-      await page.waitForURL('**/collection/tree-building?collection_batch_id=b')
+      await page.waitForURL('**/collection/tree-building?batch_id=b')
       await page.getByRole('button',{name:'选择批次 b',exact:true}).waitFor()
       assert.equal(calls.filter(call=>call.path.includes('/remote/start-run')).length,0)
       await select('a');await openTask()

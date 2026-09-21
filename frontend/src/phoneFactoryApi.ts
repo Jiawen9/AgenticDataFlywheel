@@ -1,41 +1,21 @@
-import { notifyBatchesPublished } from '@/utils/batchLifecycle'
-/**
- * 手机工厂采集页 API 客户端。
- * 由 FastAPI 的 /api/phone-factory/* 提供服务，
- * 开发环境经 Vite 代理访问同一后端。
- */
+import { notifyBatchesPublished, activeBatchItems } from '@/utils/batchLifecycle'
+import type { CollectionBatchDetail, CollectionBatchSummary } from '@/collectionBatchesApi'
 
-export interface PhoneAppRow {
-  phone_id: string
-  app: string
-  status: string
-}
+export interface PhoneAppRow { phone_id: string; app: string; status: string }
+export interface CollectionWarning { sheet: string; row: number; field: string; message: string }
+export interface TaskRow { warnings?: CollectionWarning[]; original_filename?: string; description: string; filename: string; status: string; source_batch_id?: string }
+export interface FactoryState { imported_task?: Pick<TaskRow, 'filename' | 'source_batch_id' | 'warnings'>; phones: string[]; apps: string[]; phoneApps: PhoneAppRow[]; vla: string[]; tasks: TaskRow[] }
+export interface FactoryConfig { sampling_enabled: boolean; temperature: number; top_p: number; use_experience_lib: boolean }
+export interface RunOptions { filename: string; phone_id?: string; app?: string; request_id: string; vla: string; run_mode?: 'generate' | 'modeliter'; config?: FactoryConfig }
+export interface RemoteResult { ok: boolean; message?: string; error?: string; run_id?: string; collection_run_id?: string; batch_id?: string }
+export interface AdbDevice { serial: string; model: string; battery: number | null }
+export interface PhoneMonitor { ok: boolean; screenshot: string | null; log: string; running: boolean; device_size?: { width: number; height: number } | null }
+export interface FactoryRun { run_id?: string; collection_run_id?: string; batch_id?: string; status: string; created_at?: string; filename?: string; vla?: string; error?: string; dispatch_error?: string; transfer_error?: string; transfer_status?: string; errors?: Array<{ error?: string; message?: string }>; trajectory_count?: number }
+export interface ReportFile { name: string; size: number; modified?: number; file_id?: string }
+export interface ReportFolder { index: number; dir_name: string; modified?: number; run_id?: string; files: ReportFile[] }
+export type FactoryBatchSummary = Omit<CollectionBatchSummary, 'kind' | 'source_job_id'> & { warnings?: CollectionWarning[]; kind: CollectionBatchSummary['kind'] | 'manual_collection'; source_job_id: string | null }
+export type FactoryBatchDetail = Omit<CollectionBatchDetail, 'kind' | 'source_job_id' | 'snapshot'> & FactoryBatchSummary & { snapshot: { tasks: Array<Record<string, unknown>> } }
 
-export interface TaskRow {
-  description: string
-  filename: string
-  status: string
-  source_batch_id?: string
-}
-
-export interface FactoryState {
-  phones: string[]
-  apps: string[]
-  phoneApps: PhoneAppRow[]
-  vla: string[]
-  tasks: TaskRow[]
-}
-
-export interface FactoryConfig {
-  sampling_enabled: boolean
-  temperature: number
-  top_p: number
-  use_experience_lib: boolean
-}
-
-const BASE = '/api/phone-factory'
-
-// One ID per intentional run; callers that retry a request can reuse the same ID.
 export function newRunRequestId(): string {
   if (globalThis.crypto.randomUUID) return globalThis.crypto.randomUUID()
   const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16))
@@ -44,87 +24,59 @@ export function newRunRequestId(): string {
   const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
 }
-
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${BASE}${path}`, init)
-  const payload = (await response.json().catch(() => null)) as (T & { error?: string }) | null
-  if (!response.ok || payload === null || (payload as { error?: string }).error) {
-    const detail = (payload as { detail?: { code?: string; message?: string; batch_id?: string; release_id?: string; published_at?: string } } | null)?.detail
+const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
+function jsonInit(method: string, body: unknown, signal?: AbortSignal): RequestInit {
+  return { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal }
+}
+async function checked(path: string, init?: RequestInit) {
+  const response = await fetch(`${API_BASE}${path}`, { ...init, cache: 'no-store' })
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null)
+    const detail = payload?.detail
     if (detail?.code === 'batch_published' && detail.batch_id) notifyBatchesPublished({ batch_ids: [detail.batch_id], release_id: detail.release_id ?? null, published_at: detail.published_at })
-    const message = detail?.message || (payload as { error?: string } | null)?.error || `${response.status} ${response.statusText}`
-    throw new Error(message)
+    throw new Error(detail?.message || (typeof detail === 'string' ? detail : '') || payload?.error || `${response.status} ${response.statusText}`)
   }
+  return response
+}
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await checked(path, init)
+  const payload = await response.json()
+  if (!payload || payload.error || payload.ok === false) throw new Error(payload?.error || payload?.message || '服务返回了无效响应')
   return payload as T
 }
-
-function jsonInit(method: string, body: unknown): RequestInit {
+export function createFactoryApi(base: '/api/phone-factory' | '/api/model-iter') {
+  const req = <T>(path: string, init?: RequestInit) => request<T>(base + path, init)
   return {
-    method,
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    state: (signal?: AbortSignal) => req<FactoryState>('/state', { signal }),
+    addPhone: (phoneId: string) => req<FactoryState>('/phones', jsonInit('POST', { phone_id: phoneId })),
+    addApp: (app: string) => req<FactoryState>('/apps', jsonInit('POST', { app })),
+    addPhoneApp: (phoneId: string, app: string) => req<FactoryState>('/phone-apps', jsonInit('POST', { phone_id: phoneId, app })),
+    removePhoneApp: (phoneId: string, app: string) => req<FactoryState>('/phone-apps', jsonInit('DELETE', { phone_id: phoneId, app })),
+    saveVla: (value: string) => req<FactoryState>('/vla', jsonInit('POST', { value })),
+    addTask: (description: string, filename: string, contentBase64: string, sourceBatchId?: string, requestId?: string) => req<FactoryState>('/tasks', jsonInit('POST', { description, filename, content_base64: contentBase64, ...(sourceBatchId ? { source_batch_id: sourceBatchId } : {}), ...(requestId ? { request_id: requestId } : {}) })),
+    startTask: (filename: string) => req<FactoryState>('/tasks/start', jsonInit('POST', { filename })),
+    removeTask: (filename: string) => req<FactoryState>('/tasks', jsonInit('DELETE', { filename })),
+    config: () => req<FactoryConfig>('/config'),
+    saveConfig: (config: FactoryConfig) => req<FactoryConfig>('/config', jsonInit('POST', config)),
+    remoteAddPhone: (phoneId: string) => req<RemoteResult>('/remote/add-phone', jsonInit('POST', { phone_id: phoneId })),
+    remoteDeletePhone: (phoneId: string) => req<RemoteResult & { state?: FactoryState }>('/remote/del-phone', jsonInit('POST', { phone_id: phoneId })),
+    remoteStartRun: (options: RunOptions) => req<RemoteResult>('/remote/start-run', jsonInit('POST', options)),
+    remoteStatus: (phones: string[], signal?: AbortSignal) => req<{ ok: boolean; statuses: Array<{ phone_id: string; status: string }> }>('/remote/status', jsonInit('POST', { phones }, signal)),
+    adbDevices: (signal?: AbortSignal) => req<{ ok: boolean; devices: AdbDevice[] }>('/remote/adb-devices', jsonInit('POST', {}, signal)),
+    monitor: (phoneId: string, signal?: AbortSignal) => req<PhoneMonitor>('/remote/monitor', jsonInit('POST', { phone_id: phoneId }, signal)),
+    runs: (signal?: AbortSignal) => req<{ runs: FactoryRun[] }>(base === '/api/model-iter' ? '/runs' : '/collection-runs', { signal }),
+    syncRun: (id: string) => req<FactoryRun>(`/collection-runs/${encodeURIComponent(id)}/sync`, jsonInit('POST', {})),
+    reports: (signal?: AbortSignal) => req<{ ok: boolean; folders: ReportFolder[] }>('/reports', { signal }),
+    async reportDownload(folder: ReportFolder, file: ReportFile) {
+      const params = new URLSearchParams(folder.run_id && file.file_id ? { run_id: folder.run_id, file_id: file.file_id } : { folder: folder.dir_name, name: file.name })
+      return (await checked(`${base}/report-download?${params}`)).blob()
+    },
   }
 }
-
-export const phoneFactoryApi = {
-  /** 一次性拉取全部状态 */
-  state(): Promise<FactoryState> {
-    return request<FactoryState>('/state')
-  },
-  /** 新增手机ID（SQLite 登记，不能重复） */
-  addPhone(phoneId: string): Promise<FactoryState> {
-    return request<FactoryState>('/phones', jsonInit('POST', { phone_id: phoneId }))
-  },
-  /** 新增运行APP（SQLite 登记，不能重复） */
-  addApp(app: string): Promise<FactoryState> {
-    return request<FactoryState>('/apps', jsonInit('POST', { app }))
-  },
-  /** 建立手机ID与运行APP的关联（SQLite；同一手机可多APP，同一对不重复） */
-  addPhoneApp(phoneId: string, app: string): Promise<FactoryState> {
-    return request<FactoryState>('/phone-apps', jsonInit('POST', { phone_id: phoneId, app }))
-  },
-  /** 删除手机与某APP的关联（只删这一对，不影响该手机其他APP） */
-  removePhoneApp(phoneId: string, app: string): Promise<FactoryState> {
-    return request<FactoryState>('/phone-apps', jsonInit('DELETE', { phone_id: phoneId, app }))
-  },
-  /** 保存VLA接口（SQLite 登记，不能重复） */
-  saveVla(value: string): Promise<FactoryState> {
-    return request<FactoryState>('/vla', jsonInit('POST', { value }))
-  },
-  /** 新增任务：后端保存到数据根目录 inputs/phone_factory，并在 SQLite 登记。 */
-  addTask(description: string, filename: string, contentBase64: string, sourceBatchId?: string): Promise<FactoryState> {
-    return request<FactoryState>(
-      '/tasks',
-      jsonInit('POST', { description, filename, content_base64: contentBase64, ...(sourceBatchId ? { source_batch_id: sourceBatchId } : {}) }),
-    )
-  },
-  /** 开始运行任务：状态 未运行 -> 运行中 */
-  startTask(filename: string): Promise<FactoryState> {
-    return request<FactoryState>('/tasks/start', jsonInit('POST', { filename }))
-  },
-  /** 读取采样/经验库配置 */
-  config(): Promise<FactoryConfig> {
-    return request<FactoryConfig>('/config')
-  },
-  /** 保存采样/经验库配置 */
-  saveConfig(config: FactoryConfig): Promise<FactoryConfig> {
-    return request<FactoryConfig>('/config', jsonInit('POST', config))
-  },
-  /** 删除任务登记 */
-  removeTask(filename: string): Promise<FactoryState> {
-    return request<FactoryState>('/tasks', jsonInit('DELETE', { filename }))
-  },
-  /** 新增手机 -> 通知 server 端（client add-phone） */
-  remoteAddPhone(phoneId: string): Promise<{ ok: boolean; message?: string; error?: string }> {
-    return request<{ ok: boolean; message?: string; error?: string }>(
-      '/remote/add-phone',
-      jsonInit('POST', { phone_id: phoneId }),
-    )
-  },
-  /** 开始运行 -> 把任务文件与 手机ID/运行APP 关联文件 发送到 server 端 */
-  remoteStartRun(filename: string, phoneId: string, app: string, requestId = newRunRequestId()): Promise<{ ok: boolean; message?: string; error?: string }> {
-    return request<{ ok: boolean; message?: string; error?: string }>(
-      '/remote/start-run',
-      jsonInit('POST', { filename, phone_id: phoneId, app, request_id: requestId }),
-    )
-  },
+export const phoneFactoryApi = createFactoryApi('/api/phone-factory')
+export const modelIterationApi = createFactoryApi('/api/model-iter')
+export const factoryBatchesApi = {
+  async list(): Promise<FactoryBatchSummary[]> { return activeBatchItems((await request<{ batches: FactoryBatchSummary[] }>('/api/phone-factory/batches')).batches) },
+  detail: (id: string) => request<FactoryBatchDetail>(`/api/phone-factory/batches/${encodeURIComponent(id)}`),
+  async workbook(id: string) { return (await checked(`/api/phone-factory/batches/${encodeURIComponent(id)}/workbook`)).blob() },
 }

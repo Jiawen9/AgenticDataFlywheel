@@ -1,6 +1,8 @@
 """Validated external workbooks become immutable releases without workflow sessions."""
 from __future__ import annotations
 
+from copy import deepcopy
+
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
