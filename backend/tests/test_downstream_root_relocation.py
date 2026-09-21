@@ -73,9 +73,14 @@ class DownstreamRootRelocationTests(unittest.TestCase):
         batch, workbook = seed_batch(self.root)
         calls = []
         def remote(args):
+            if args[0] == "run":
+                return {"ok": False, "output": "unknown remote run"}
+            if args[0] == "capabilities":
+                return {"ok": True, "output": '{"protocol_version":1,"batch_results":true}'}
             calls.append(args)
             return {"ok": len(calls) > 1, "output": '{"ok":true}' if len(calls) > 1 else "mock timeout"}
         phone = PhoneFactoryStore(self.root, run_client_fn=remote)
+        phone.initialize_settings({"vla": ["http://mock.invalid/vla"], "phoneApps": [{"phone_id": "phone", "app": "App"}]})
         phone.add_task({"filename": batch["filename"], "description": "test batch", "source_batch_id": batch["batch_id"],
                         "content_base64": base64.b64encode(workbook.read_bytes()).decode()})
         request = {"filename": batch["filename"], "request_id": "once"}

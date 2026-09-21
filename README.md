@@ -5,6 +5,8 @@
 
 运行数据统一读写项目根目录的 `backend_workspace/`：SQLite 保存当前状态，JSON 在流程间流转，各阶段保留 Excel 核对表。后端不扫描旧目录、不从旧 JSON 恢复状态；必需 JSON 缺失时明确失败，不回退 Excel。目录、命令、显式资源准备和产物读取接口见[统一数据存储说明](DATA_STORAGE.md)。
 
+手机工厂新增采集、设备监控与模型迭代评估，运行结果通过 HTTP 回传平台。配置与接入见[手机工厂集成说明](PHONE_FACTORY.md)，采集服务器部署见[独立 9011 服务说明](backend/collector_service/README.md)。
+
 ## 主要能力
 
 - 递归读取 rollout 轨迹并导出 Excel。

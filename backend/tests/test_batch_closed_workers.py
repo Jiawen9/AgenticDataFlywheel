@@ -116,7 +116,9 @@ class ClosedBatchWorkerTests(unittest.TestCase):
                 call()
         self.assertEqual(store.get(run["collection_run_id"]), before)
         self.assertEqual({str(path): path.read_bytes() for path in Path(run["output_dir"]).rglob("*") if path.is_file()}, raw_files)
-        self.assertEqual(store.dispatch_failed(run["collection_run_id"], "late failure")["status"], "failed")
+        with self.assertRaises(BatchPublishedError):
+            store.dispatch_failed(run["collection_run_id"], "late failure")
+        self.assertEqual(store.get(run["collection_run_id"]), before)
 
     def test_preprocessing_submit_retry_and_queued_work_reject_closed(self):
         from backend.collection_runs import CollectionRunStore
