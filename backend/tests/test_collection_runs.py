@@ -132,6 +132,18 @@ class CollectionRunTests(unittest.TestCase):
         self.assertNotEqual(after["input_digest"], before["input_digest"])
         self.assertEqual(len({item["collection_run_id"] for item in after["trajectories"]}), 2)
 
+    def test_two_phone_runs_completed_in_reverse_order_share_ready_input(self):
+        first, _ = self.store.create("batch-one", dispatch_key="phone-a", metadata={"phone_id": "phone-a"})
+        second, _ = self.store.create("batch-one", dispatch_key="phone-b", metadata={"phone_id": "phone-b"})
+        self.complete(second, raw_trajectory(second, "task-two"))
+        self.assertEqual({item["task_id"] for item in self.store.ready_input("batch-one")["trajectories"]}, {"task-two"})
+        self.complete(first, raw_trajectory(first, "task-one"))
+        ready = CollectionRunStore(self.root).ready_input("batch-one")
+        self.assertEqual({item["task_id"] for item in ready["trajectories"]}, {"task-one", "task-two"})
+        self.assertEqual({item["collection_run_id"] for item in ready["trajectories"]},
+                         {first["collection_run_id"], second["collection_run_id"]})
+        self.assertEqual(ready, self.store.freeze_ready_input("batch-one"))
+
     def test_zero_success_is_completed_but_cannot_start_preprocessing(self):
         run = self.create()
         saved, _ = self.store.complete(run["collection_run_id"], {"batch_id": "batch-one", "trajectories": [], "errors": [{"collection_case_id": "task-one", "error": "failed"}]})

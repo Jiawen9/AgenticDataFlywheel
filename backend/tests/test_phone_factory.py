@@ -155,7 +155,14 @@ class PhoneFactoryTests(unittest.TestCase):
         with self.assertRaises(PhoneFactoryError) as context:
             self.store.remote_start({"filename": request["filename"]})
         self.assertEqual(context.exception.status, 502)
-        self.assertEqual(self.store.state()["tasks"][0]["status"], "失败")
+        # This failed dispatch must not hide the earlier accepted phone run.
+        runs = self.store.collection_runs.list_runs()
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(self.store.collection_runs.get(result["collection_run_id"])["status"], "running")
+        failed = next(run for run in runs if run["collection_run_id"] != result["collection_run_id"])
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["dispatch_error"], str(context.exception))
+        self.assertEqual(self.store.state()["tasks"][0]["status"], "运行中")
 
     def test_old_tasks_and_uploads_cannot_be_used_by_new_flow(self):
         self.legacy.mkdir(parents=True)
