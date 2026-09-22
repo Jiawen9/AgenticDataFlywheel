@@ -43,7 +43,7 @@
 
         <h3 class="sub-title">手机列表</h3>
         <el-alert v-if="deviceError" :title="deviceError" type="warning" :closable="false" show-icon />
-        <el-table :data="sortedPhoneApps" border stripe>
+        <el-table :data="sortedPhoneApps" border stripe data-testid="phone-apps">
           <el-table-column prop="phone_id" label="手机ID" min-width="110" show-overflow-tooltip />
           <el-table-column label="连接 / 型号" min-width="110"><template #default="{ row }">{{ deviceFor(row.phone_id)?.model || (deviceFor(row.phone_id) ? '已连接' : '离线 / 未知') }}<span v-if="deviceFor(row.phone_id)?.battery != null"> · {{ deviceFor(row.phone_id)?.battery }}%</span></template></el-table-column>
           <el-table-column prop="app" label="运行APP" min-width="85" show-overflow-tooltip />
@@ -54,8 +54,9 @@
               </el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="100" align="center">
+          <el-table-column label="操作" width="170" align="center">
             <template #default="{ row }">
+              <el-button link type="primary" :disabled="taskBusy || saving || phoneIsBusy(row.phone_id)" @click="openCustomRun(row)">定制运行</el-button>
               <el-button link type="danger" :loading="deletingKey === rowKey(row)" :disabled="taskBusy || saving" @click="handleRemovePhoneApp(row)">
                 删除手机
               </el-button>
@@ -127,8 +128,7 @@
           <p><strong>{{ selectedBatch.task_count }} 条任务</strong> · {{ selectedBatch.apps.join('、') }} · {{ selectedBatch.created_at.slice(0, 19).replace('T', ' ') }}</p>
           <el-alert v-if="selectedBatch.warnings?.length" :title="warningSummary(selectedBatch.warnings)" type="warning" :closable="false" show-icon class="batch-alert" data-testid="collection-classification-warning" />
           <p>{{ selectedBatch.source_job_id ? `来源作业：${selectedBatch.source_job_id}` : '来源：手动上传' }} · {{ selectedBatchRow.status }}</p>
-          <el-button type="primary" :loading="startingTask === selectedBatchRow.filename" :disabled="taskBusy || selectedBatchRow.status === '运行中'" @click="handleStartTask(selectedBatchRow)">开始运行所选批次</el-button>
-          <el-button :disabled="taskBusy || selectedBatchRow.status === '运行中'" @click="openRunDialog(selectedBatchRow)">定制运行</el-button>
+          <el-button type="primary" :loading="startingTask === selectedBatchRow.filename" :disabled="taskBusy" @click="handleStartTask(selectedBatchRow)">开始运行所选批次</el-button>
           <el-button :loading="downloadingBatch" :disabled="taskBusy" @click="downloadCollectionBatch">下载采集表</el-button>
           <router-link :to="{ path: '/collection/tree-building', query: { batch_id: selectedBatch.batch_id } }" class="preprocessing-link">前往预处理</router-link>
         </div>
@@ -164,19 +164,10 @@
                 link
                 type="primary"
                 :loading="startingTask === row.filename"
-                :disabled="taskBusy || row.status === '运行中'"
+                :disabled="taskBusy"
                 @click="handleStartTask(row)"
               >
-                {{ row.status === '运行中' ? '运行中' : '开始运行' }}
-              </el-button>
-              <el-button
-                link
-                type="warning"
-                :loading="customStarting === row.filename"
-                :disabled="taskBusy || row.status === '运行中'"
-                @click="openRunDialog(row)"
-              >
-                定制运行
+                开始运行
               </el-button>
             </template>
           </el-table-column>
@@ -191,32 +182,38 @@
           <el-table-column label="结果" min-width="170"><template #default="{ row }">{{ runMessage(row) }}</template></el-table-column>
           <el-table-column v-if="!isEvaluation" label="操作" min-width="100"><template #default="{ row }"><el-button link :loading="syncingRun === (row.collection_run_id || row.run_id)" @click="syncRun(row)">重试回传</el-button></template></el-table-column>
         </el-table>
-        <template v-if="isEvaluation">
-          <p v-if="!reportFolders.length" class="empty-hint">暂无评估报告，完成运行后将在这里显示。</p>
+        <section v-if="isEvaluation" data-testid="evaluation-reports">
+          <div class="report-heading"><h3 class="sub-title">模型迭代评估报告</h3><el-button :loading="loadingReports" @click="reportPoller.start()">刷新报告</el-button></div>
+          <el-alert v-if="reportError" :title="reportError" type="warning" :closable="false" />
+          <p v-if="!reportFolders.length" class="empty-hint">{{ loadingReports ? '正在读取评估报告…' : '暂无评估报告，完成运行后将在这里显示。' }}</p>
           <section v-for="folder in reportFolders" :key="folder.run_id || folder.dir_name" class="report-folder">
-            <strong>第 {{ folder.index }} 轮 · {{ folder.run_id || folder.dir_name }}</strong>
-            <div v-for="file in folder.files" :key="file.file_id || file.name" class="report-file"><span>{{ file.name }} · {{ Math.ceil(file.size / 1024) }} KiB</span><el-button link type="primary" :loading="downloadingReport === `${folder.run_id || folder.dir_name}/${file.file_id || file.name}`" @click="downloadReport(folder, file)">下载报告</el-button></div>
+            <strong>第 {{ folder.index }} 轮 · {{ folder.dir_name }}</strong>
+            <p v-if="folder.run_id">运行标识：{{ folder.run_id }}</p>
+            <p>轮次时间：{{ reportTime(folder.modified) }}</p>
+            <el-table v-if="folder.files.length" :data="folder.files" border>
+              <el-table-column prop="name" label="文件名" min-width="160" />
+              <el-table-column label="生成时间" min-width="160"><template #default="{ row }">{{ reportTime(row.modified) }}</template></el-table-column>
+              <el-table-column label="操作" width="100"><template #default="{ row }"><el-button link type="primary" :loading="downloadingReport === `${folder.run_id || folder.dir_name}/${row.file_id || row.name}`" @click="downloadReport(folder, row)">下载报告</el-button></template></el-table-column>
+            </el-table>
+            <p v-else class="empty-hint">第 {{ folder.index }} 轮暂无 xlsx 报告文件</p>
           </section>
-        </template>
+        </section>
         <!-- 定制运行只覆盖此次运行的配置 -->
-        <el-dialog v-model="runDialogVisible" title="选择手机运行" width="420px" :close-on-click-modal="false" :close-on-press-escape="!confirmingRun" :show-close="!confirmingRun">
+        <el-dialog v-model="runDialogVisible" title="定制运行" width="480px" :close-on-click-modal="false" :close-on-press-escape="!confirmingRun" :show-close="!confirmingRun">
           <div class="row-form">
             <span class="field-label">手机ID</span>
-            <el-select v-model="runDialogPhoneId" :disabled="confirmingRun" filterable placeholder="选择手机ID" style="width: 240px">
-              <el-option v-for="phoneId in phoneIdOptions" :key="phoneId" :label="phoneId" :value="phoneId" />
-            </el-select>
+            <span data-testid="custom-run-phone">{{ runDialogPhoneId }}</span>
           </div>
           <div class="row-form" style="margin-top: 14px">
             <span class="field-label">运行APP</span>
-            <el-select v-model="runDialogApp" :disabled="confirmingRun" filterable placeholder="选择运行APP" style="width: 240px">
-              <el-option v-for="app in runDialogAppOptions" :key="app" :label="app" :value="app" />
-            </el-select>
+            <span data-testid="custom-run-app">{{ runDialogApp }}</span>
           </div>
           <div class="custom-config">
-            <label>VLA 接口<el-select v-model="runDialogVla" filterable allow-create :disabled="confirmingRun" placeholder="选择 VLA 接口"><el-option v-for="item in vla" :key="item" :value="item" :label="item" /></el-select></label>
+            <label>VLA 接口<el-select v-model="runDialogVla" data-testid="custom-run-vla" filterable allow-create :disabled="confirmingRun" placeholder="选择 VLA 接口"><el-option v-for="item in vla" :key="item" :value="item" :label="item" /></el-select></label>
             <label>打开采样<el-switch v-model="runDialogConfig.sampling_enabled" :disabled="confirmingRun" /></label>
             <template v-if="runDialogConfig.sampling_enabled"><label>temperature<el-input-number v-model="runDialogConfig.temperature" :min="0" :max="2" :step="0.05" :disabled="confirmingRun" /></label><label>top_p<el-input-number v-model="runDialogConfig.top_p" :min="0" :max="1" :step="0.05" :disabled="confirmingRun" /></label></template>
             <label>使用经验库<el-switch v-model="runDialogConfig.use_experience_lib" :disabled="confirmingRun" /></label>
+            <label>任务列表<el-select v-model="runDialogTaskKey" data-testid="custom-run-task-select" filterable :disabled="confirmingRun" placeholder="选择要运行的任务"><el-option v-for="option in runTaskOptions" :key="option.key" :value="option.key" :label="option.label" /></el-select></label>
           </div>
           <template #footer>
             <el-button :disabled="confirmingRun" @click="runDialogVisible = false">取消</el-button>
@@ -273,14 +270,13 @@ const savingConfig = ref(false)
 const deletingKey = ref('')
 const deletingTask = ref('')
 const startingTask = ref('')
-const customStarting = ref('')
 const confirmingRun = ref(false)
 
 // 开始运行 / 定制运行 弹窗状态
 const runDialogVisible = ref(false)
 const runDialogPhoneId = ref('')
 const runDialogApp = ref('')
-const runTargetTask = ref<TaskRow | null>(null)
+const runDialogTaskKey = ref('')
 const runDialogVla = ref('')
 const runDialogConfig = reactive<FactoryConfig>({ ...config })
 const devices = ref<AdbDevice[]>([])
@@ -288,6 +284,7 @@ const deviceError = ref('')
 const runError = ref('')
 const runs = ref<FactoryRun[]>([])
 const reportFolders = ref<ReportFolder[]>([])
+const loadingReports = ref(false), reportError = ref('')
 const syncingRun = ref('')
 const downloadingReport = ref('')
 let stateEpoch = 0
@@ -305,20 +302,48 @@ const collection = usePhoneCollectionBatches(factoryBatchesApi, factoryApi, {
   runOptions: () => ({ vla: newVla.value.trim(), run_mode: props.mode, config: { ...config } }),
 })
 const { batches: collectionBatches, selectedBatchId, selectedBatch, loadingBatches, loadingBatch, downloading: downloadingBatch, error: batchError } = collection
+// A production task keeps its batch identity even before its workbook is registered.
+const runTaskOptions = computed(() => {
+  const options = new Map<string, { key: string; label: string; task: TaskRow }>()
+  for (const task of activeFactoryTasks(tasks.value)) {
+    const key = !isEvaluation && task.source_batch_id ? `batch:${task.source_batch_id}` : `task:${task.filename}`
+    options.set(key, { key, label: `${task.description} · ${task.source_batch_id || task.filename}`, task })
+  }
+  if (!isEvaluation) for (const batch of collectionBatches.value) {
+    if (publishedBatch(batch.batch_id)) continue
+    const key = `batch:${batch.batch_id}`
+    const task = options.get(key)?.task || { description: `采集批次 ${batch.batch_id}`, filename: batch.filename, source_batch_id: batch.batch_id, status: '未运行' }
+    options.set(key, { key, label: collectionBatchOptionLabel(batch), task })
+  }
+  return [...options.values()]
+})
+const runTargetTask = computed(() => runTaskOptions.value.find(option => option.key === runDialogTaskKey.value)?.task || null)
 let disposed = false
 const activeFactoryTasks = (rows: TaskRow[]) => isEvaluation ? rows : rows.filter(item => !publishedBatch(item.source_batch_id))
-const lifecycle = useBatchLifecycle({ currentBatch: () => isEvaluation ? '' : selectedBatchId.value || runTargetTask.value?.source_batch_id || String(route.query.collection_batch_id ?? route.query.batch_id ?? ''), onPublished, refreshChoices: () => isEvaluation ? Promise.resolve() : collection.loadBatches() })
+const lifecycle = useBatchLifecycle({
+  currentBatch: () => isEvaluation ? '' : selectedBatchId.value || String(route.query.collection_batch_id ?? route.query.batch_id ?? ''),
+  onPublished,
+  async refreshChoices() {
+    if (isEvaluation) return
+    // The batch area and the phone's draft can refer to two independent batches.
+    const target = runDialogVisible.value && runDialogTaskKey.value.startsWith('batch:') ? runDialogTaskKey.value.slice(6) : ''
+    if (target && target !== selectedBatchId.value) await lifecycle.checkBatch(target)
+    await collection.loadBatches()
+  },
+})
 const { notice: publishedNotice } = lifecycle
 function onPublished(event: PublishedBatchEvent) {
   if (isEvaluation) return
-  const current = eventMatchesRoute(event, selectedBatchId.value, route.query) || Boolean(runTargetTask.value?.source_batch_id && event.batch_ids.includes(runTargetTask.value.source_batch_id))
+  const targetPublished = event.batch_ids.some(id => runDialogTaskKey.value === `batch:${id}`)
+  const selectedPublished = eventMatchesRoute(event, selectedBatchId.value, route.query)
+  const current = selectedPublished || targetPublished
   stateEpoch++
-  collection.retireBatches(event.batch_ids, current); tasks.value = activeFactoryTasks(tasks.value)
+  collection.retireBatches(event.batch_ids, selectedPublished); tasks.value = activeFactoryTasks(tasks.value)
   runs.value = runs.value.filter(item => !item.batch_id || !event.batch_ids.includes(item.batch_id))
-  if (runTargetTask.value?.source_batch_id && event.batch_ids.includes(runTargetTask.value.source_batch_id)) { runTargetTask.value = null; runDialogVisible.value = false }
+  if (targetPublished) { runDialogTaskKey.value = ''; runDialogVisible.value = false }
   if (!current) return
   publishedNotice.value = event
-  void router.replace({ query: withoutBatchQuery(route.query) })
+  if (selectedPublished) void router.replace({ query: withoutBatchQuery(route.query) })
 }
 const taskBusy = computed(() => loadingFactory.value || manualTaskBusy.value || collection.busy.value || Boolean(deletingKey.value))
 const collectionBatchKindLabel = (kind: FactoryBatchSummary['kind']) => kind === 'manual_collection' ? '手动上传' : kind === 'augmentation' ? '泛化扩增' : '任务生成'
@@ -342,16 +367,8 @@ watch(() => route.query.batch_id ?? route.query.collection_batch_id, value => { 
 
 const rowKey = (row: PhoneAppRow) => `${row.phone_id}||${row.app}`
 
-// 手机ID下拉选项（去重）
-const phoneIdOptions = computed(() => [...new Set(phoneApps.value.map((row) => row.phone_id))])
-// 运行APP下拉选项（选中手机后，列出该手机已关联的APP）
-const runDialogAppOptions = computed(() =>
-  runDialogPhoneId.value
-    ? phoneApps.value.filter((row) => row.phone_id === runDialogPhoneId.value).map((row) => row.app)
-    : [],
-)
-
-watch(runDialogAppOptions, options => { if (!options.includes(runDialogApp.value)) runDialogApp.value = '' })
+// Occupancy belongs to a physical phone, including its other App associations.
+const phoneIsBusy = (phoneId: string) => phoneApps.value.some(row => row.phone_id === phoneId && ['运行中', '排队中', '下发中'].includes(row.status))
 
 // 手机ID列排好序，逐个显示；同一手机多 APP 时手机ID列可重复
 const sortedPhoneApps = computed(() =>
@@ -492,13 +509,13 @@ async function handleRemoveTask(row: TaskRow) {
   }
 }
 
-// ---------- 3.3 开始运行/定制运行：打开弹窗选择手机ID与运行APP ----------
-function openRunDialog(row: TaskRow) {
-  if (taskBusy.value || row.status === '运行中') return
-  runTargetTask.value = row
-  runDialogPhoneId.value = phoneIdOptions.value[0] || ''
-  runDialogApp.value = ''
-  runDialogVla.value = newVla.value
+// 定制运行从手机行进入，任务和参数只属于本次下发。
+function openCustomRun(row: PhoneAppRow) {
+  if (taskBusy.value || phoneIsBusy(row.phone_id)) return
+  runDialogTaskKey.value = ''
+  runDialogPhoneId.value = row.phone_id
+  runDialogApp.value = row.app
+  runDialogVla.value = newVla.value.trim() || vla.value[0] || ''
   Object.assign(runDialogConfig, config)
   runDialogVisible.value = true
 }
@@ -506,13 +523,13 @@ function openRunDialog(row: TaskRow) {
 // ---------- 3.3 开始运行：不弹窗，把任务文件与 手机ID/运行APP 关联文件 发送到 server 端，
 // 关联文件中的所有手机都执行 ----------
 async function handleStartTask(row: TaskRow) {
-  if (taskBusy.value || row.status === '运行中') return
+  if (taskBusy.value) return
   if (!newVla.value.trim()) return ElMessage.warning('请选择 VLA 接口')
   startingTask.value = row.filename; stateEpoch++
   try {
     if (!isEvaluation && row.source_batch_id) {
       const remote = await collection.runBatch(row.source_batch_id)
-      if (!disposed) ElMessage.success(remote.message || '采集批次已下发')
+      if (!disposed && !publishedBatch(row.source_batch_id)) ElMessage.success(remote.message || '采集批次已下发')
     } else { await dispatchTask(row, '', '', newVla.value.trim(), { ...config }) }
   } catch (error) { if (!disposed) ElMessage.error((error as Error).message) }
   finally { stateEpoch++; startingTask.value = '' }
@@ -521,7 +538,8 @@ async function handleStartTask(row: TaskRow) {
 // ---------- 3.3 定制运行确认：把任务文件、关联文件 + 手机ID/运行APP 发送到 server 端，
 // 仅指定的 手机ID 执行 ----------
 async function confirmRun() {
-  if (!runTargetTask.value || taskBusy.value) return
+  if (taskBusy.value) return
+  if (!runTargetTask.value) return ElMessage.warning('请选择要运行的任务')
   if (!runDialogPhoneId.value) return ElMessage.warning('请选择手机ID')
   if (!runDialogApp.value) return ElMessage.warning('请选择运行APP')
   if (!runDialogVla.value.trim()) return ElMessage.warning('请选择 VLA 接口')
@@ -530,9 +548,9 @@ async function confirmRun() {
   try {
     if (!isEvaluation && task.source_batch_id) {
       const remote = await collection.runBatch(task.source_batch_id, runDialogPhoneId.value, runDialogApp.value, { vla: runDialogVla.value.trim(), run_mode: 'generate', config: { ...runDialogConfig } })
-      if (!disposed) ElMessage.success(remote.message || '定制采集任务已下发')
+      if (!disposed && !publishedBatch(task.source_batch_id)) ElMessage.success(remote.message || '定制采集任务已下发')
     } else { await dispatchTask(task, runDialogPhoneId.value, runDialogApp.value, runDialogVla.value.trim(), { ...runDialogConfig }) }
-    if (!disposed) runDialogVisible.value = false
+    if (!disposed && (isEvaluation || !publishedBatch(task.source_batch_id))) runDialogVisible.value = false
   } catch (error) { if (!disposed) ElMessage.error((error as Error).message) }
   finally { stateEpoch++; confirmingRun.value = false }
 }
@@ -583,10 +601,18 @@ useFactoryPolling(async (signal, current) => {
   if (!current()) return
   try {
     const result = await factoryApi.runs(signal)
-    const reports = isEvaluation ? await factoryApi.reports(signal) : null
-    if (current()) { runs.value = result.runs.filter(item => isEvaluation || !publishedBatch(item.batch_id)); if (reports) reportFolders.value = reports.folders; runError.value = '' }
+    if (current()) { runs.value = result.runs.filter(item => isEvaluation || !publishedBatch(item.batch_id)); runError.value = '' }
   } catch (error) { if (current()) runError.value = `运行状态暂不可用：${(error as Error).message}` }
 })
+const reportPoller = isEvaluation ? useFactoryPolling(async (signal, current) => {
+  loadingReports.value = true
+  try {
+    const result = await factoryApi.reports(signal)
+    if (current()) { reportFolders.value = result.folders; reportError.value = '' }
+  } catch (error) { if (current()) reportError.value = `报告读取失败：${(error as Error).message}` }
+  finally { if (current()) loadingReports.value = false }
+}) : { start() {} }
+const reportTime = (value?: number) => value != null && Number.isFinite(value) ? new Date(value * 1000).toLocaleString('zh-CN', { hour12: false }) : '—'
 const runStatus = (status: string) => ({ dispatching: '正在下发', queued: '排队中', running: '运行中', completed: '已完成', succeeded: '已完成', failed: '失败', cancelled: '已取消', interrupted: '已中断', partial: '部分完成', ready: '结果已就绪', waiting: '等待回传', syncing: '正在回传', pending: '等待中' } as Record<string, string>)[status] || status
 const runMessage = (run: FactoryRun) => run.transfer_error || run.dispatch_error || run.error || run.errors?.map(item => item.error || item.message).filter(Boolean).join('；') || (run.trajectory_count != null ? `${run.trajectory_count} 条轨迹` : runStatus(run.transfer_status || ''))
 async function syncRun(run: FactoryRun) {
@@ -605,6 +631,7 @@ async function downloadReport(folder: ReportFolder, file: ReportFile) {
     if (disposed) return
     const url = URL.createObjectURL(blob), link = document.createElement('a')
     link.href = url; link.download = file.name; link.click(); setTimeout(() => URL.revokeObjectURL(url), 0)
+    ElMessage.success(`已开始下载 ${file.name}`)
   } catch (error) { if (!disposed) ElMessage.error((error as Error).message) }
   finally { downloadingReport.value = '' }
 }
@@ -621,7 +648,7 @@ onBeforeUnmount(() => { document.body.classList.remove('factory-responsive'); di
 
 <style scoped>
 :global(body.factory-responsive) { min-width: 0; }
-.custom-config { display: grid; gap: 14px; margin-top: 20px; }.custom-config label { display: flex; align-items: center; justify-content: space-between; gap: 14px; }.custom-config .el-select { width: 240px; }.report-folder { margin-top: 14px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; }.report-file { display:flex; justify-content:space-between; gap:12px; margin-top:8px; overflow-wrap:anywhere; }
+.report-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }.report-folder p { overflow-wrap: anywhere; color: var(--muted); font-size: 13px; }.custom-config { display: grid; gap: 14px; margin-top: 20px; }.custom-config label { display: flex; align-items: center; justify-content: space-between; gap: 14px; }.custom-config .el-select { width: 240px; }.report-folder { margin-top: 14px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; }.report-file { display:flex; justify-content:space-between; gap:12px; margin-top:8px; overflow-wrap:anywhere; }
 .batch-select { width: min(480px, 100%); }.batch-summary { padding: 12px; border: 1px solid #dbe3ed; border-radius: 8px; background: #f8fffd; }.batch-summary p { margin: 0 0 9px; color: #64748b; font-size: 12px; overflow-wrap: anywhere; }.batch-alert { margin: 10px 0; }
 .phone-factory-page { width: min(1680px, 100%); min-height: 100vh; margin: 0 auto; padding: 34px 42px 50px; }
 .page-hero { margin-bottom: 26px; }

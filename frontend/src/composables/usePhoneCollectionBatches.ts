@@ -97,8 +97,10 @@ export function usePhoneCollectionBatches(batchApi: BatchApi, factoryApi: Factor
     const supplied = overrides || options.runOptions?.() || { vla: '' }
     const runOptions = { ...supplied, ...(supplied.config ? { config: { ...supplied.config } } : {}) }
     const revision = selectionRevision
+    const followsSelection = selectedBatchId.value === batchId
+    const isCurrent = () => !disposed && (!followsSelection || revision === selectionRevision) && !retiredIds.has(batchId) && !publishedBatch(batchId)
     const ensureCurrent = () => {
-      if (disposed || revision !== selectionRevision || retiredIds.has(batchId) || publishedBatch(batchId)) throw new Error('批次选择已变化或已发布，本次未继续下发')
+      if (!isCurrent()) throw new Error('批次选择已变化或已发布，本次未继续下发')
     }
     try {
       const batch = selectedBatch.value?.batch_id === batchId ? selectedBatch.value : await batchApi.detail(batchId)
@@ -114,15 +116,15 @@ export function usePhoneCollectionBatches(batchApi: BatchApi, factoryApi: Factor
       if (!task) throw new Error('批次文件未成功登记，不能开始运行')
       const parameters = { filename: task.filename, phone_id: phoneId, app, ...runOptions }
       const key = JSON.stringify(parameters)
-      if (task.status === '运行中' && !pendingRequests.has(key)) throw new Error('该采集批次已经在运行中，请勿重复下发')
       const requestId = pendingRequests.get(key) || newRunRequestId()
       pendingRequests.set(key, requestId)
       const remote = await factoryApi.remoteStartRun({ ...parameters, request_id: requestId })
       if (!remote.ok) throw new Error(remote.error || '手机工厂未接受本次运行请求')
+      ensureCurrent()
       pendingRequests.delete(key)
       // The server owns run status; a late client write must not revive a run.
-      if (!disposed && revision === selectionRevision) {
-        try { const state = await factoryApi.state(); if (!disposed && revision === selectionRevision) options.setTasks(state.tasks) }
+      if (isCurrent()) {
+        try { const state = await factoryApi.state(); if (isCurrent()) options.setTasks(state.tasks) }
         catch { /* The next refresh recovers state without resubmitting accepted work. */ }
       }
       return remote

@@ -88,10 +88,10 @@ class Execution:
         self.cancels.append(run["run_id"])
 
 
-def workbook():
+def workbook(app="App"):
     wb = Workbook()
     wb.active.append(["用例编号", "涉及APP", "任务", "一级场景", "二级场景"])
-    wb.active.append(["case-1", "App", "打开App", "一级", "二级"])
+    wb.active.append(["case-1", app, "打开" + app, "一级", "二级"])
     out = io.BytesIO()
     wb.save(out)
     return out.getvalue()
@@ -147,6 +147,57 @@ class CollectorServiceTests(unittest.TestCase):
                 self.submit(**{field: value})
             self.assertEqual(caught.exception.status, 409)
         self.assertEqual(self.execution.calls, 1)
+
+    def test_same_batch_different_phones_run_concurrently_and_retry_reuses_run(self):
+        self.executor = QueuedExecutor()
+        self.collector.close()
+        self.collector = self.new_collector()
+        requests = [("cr_phone_a", "phone-a"), ("cr_phone_b", "127.0.0.1:5555")]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            runs = list(pool.map(lambda item: self.submit(collection_run_id=item[0], phone_id=item[1]), requests))
+        self.assertEqual({run["status"] for run in runs}, {"queued"})
+        self.assertEqual({run["batch_id"] for run in runs}, {"batch-1"})
+        self.assertEqual(len(self.executor.jobs), 2)
+        for run, (run_id, phone) in zip(runs, requests):
+            self.assertEqual(run["phones"], [{"phone_id": phone}])
+            self.assertEqual(self.submit(collection_run_id=run_id, phone_id=phone), run)
+        self.assertEqual(len(self.executor.jobs), 2)
+        self.executor.finish()
+        self.assertEqual(self.execution.calls, 2)
+        self.assertEqual({run["status"] for run in self.collector.list_runs()}, {"succeeded"})
+
+    def test_physical_phone_is_exclusive_across_apps_and_run_modes(self):
+        self.executor = QueuedExecutor()
+        self.collector.close()
+        self.collector = self.new_collector()
+        self.submit(collection_run_id="cr_active", phone_id="phone-a", app="App")
+        for mode, app in (("generate", "Other"), ("modeliter", "App"), ("modeliter", "Other")):
+            with self.subTest(mode=mode, app=app):
+                tasks = [{"collection_case_id": "case-1", "task_id": "task-1", "task": "打开" + app, "app": app}]
+                with self.assertRaisesRegex(CollectorError, "手机已有运行中的任务") as caught:
+                    self.collector.submit(task_bytes=workbook(app),
+                        apps_bytes=json.dumps([{"phone_id": "phone-a", "app": app}]).encode(),
+                        form={**self.form, "collection_run_id": "cr_" + mode + app, "phone_id": "phone-a",
+                              "app": app, "runmode": mode, "task_manifest": json.dumps({"tasks": tasks})})
+                self.assertEqual(caught.exception.status, 409)
+        self.assertEqual([run["run_id"] for run in self.collector.list_runs()], ["cr_active"])
+        self.assertEqual(len(self.executor.jobs), 1)
+
+    def test_whole_batch_busy_phone_rejects_atomically_without_reserving_free_phone(self):
+        self.executor = QueuedExecutor()
+        self.collector.close()
+        self.collector = self.new_collector()
+        self.submit(collection_run_id="cr_active", phone_id="phone-a")
+        with self.assertRaisesRegex(CollectorError, "phone-a") as caught:
+            self.submit(collection_run_id="cr_whole_batch")
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual([run["run_id"] for run in self.collector.list_runs()], ["cr_active"])
+        self.assertFalse(self.collector.run_dir("cr_whole_batch").exists())
+        self.assertFalse(self.collector.phone_dir("127.0.0.1:5555").exists())
+        self.assertEqual(len(self.executor.jobs), 1)
+        other = self.submit(collection_run_id="cr_free_phone", phone_id="127.0.0.1:5555")
+        self.assertEqual(other["status"], "queued")
+        self.assertEqual(len(self.executor.jobs), 2)
 
     def test_device_busy_and_delete_cancels_keeps_archives(self):
         self.submit()

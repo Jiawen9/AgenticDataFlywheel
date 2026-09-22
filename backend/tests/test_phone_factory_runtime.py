@@ -184,5 +184,38 @@ class FactoryRuntimeTests(unittest.TestCase):
         self.assertEqual(self.store.runtime.batches(), [])
         self.assertEqual(self.calls, [])
 
+    def test_newer_completion_does_not_hide_older_active_run_in_either_mode(self):
+        self.store.dispatch('phone-apps', 'POST', {'phone_id': 'phone-2', 'app': 'App'})
+        task = self.store.add_task(self.upload)['imported_task']
+        for mode, namespace, final, label in (
+            ('generate', 'collection_runs', 'completed', '已回传'),
+            ('modeliter', 'model_iter_runs', 'succeeded', '已完成'),
+        ):
+            with self.subTest(mode=mode):
+                first = self.store.remote_start(self.request(filename=task['filename'], request_id=mode + '-first', phone_id='phone-1'), mode=mode)
+                second = self.store.remote_start(self.request(filename=task['filename'], request_id=mode + '-second', phone_id='phone-2'), mode=mode)
+                first_id, second_id = first['collection_run_id'], second['collection_run_id']
+                self.store.records.update(namespace, first_id, lambda item: item.update(created_at='2026-09-22T00:00:01Z'))
+                self.store.records.update(namespace, second_id, lambda item: item.update(created_at='2026-09-22T00:00:02Z', status=final))
+                for status, active_label in (('dispatching', '下发中'), ('queued', '排队中'), ('running', '运行中')):
+                    with self.subTest(status=status):
+                        self.store.records.update(namespace, first_id, lambda item: item.update(status=status))
+                        rebuilt = PhoneFactoryStore(self.root, run_client_fn=self.client)
+                        self.assertEqual(rebuilt.state(mode)['tasks'][0]['status'], active_label)
+                self.store.records.update(namespace, first_id, lambda item: item.update(status=final))
+                self.assertEqual(self.store.state(mode)['tasks'][0]['status'], label)
+
+    def test_failed_transfer_does_not_hide_other_live_run_and_remains_actionable(self):
+        self.store.add_task(self.upload)
+        first = self.store.remote_start(self.request(request_id='first'))
+        second = self.store.remote_start(self.request(request_id='second'))
+        first_id, second_id = first['collection_run_id'], second['collection_run_id']
+        self.store.records.update('collection_runs', first_id, lambda item: item.update(created_at='2026-09-22T00:00:01Z'))
+        self.store.records.update('collection_runs', second_id, lambda item: item.update(created_at='2026-09-22T00:00:02Z'))
+        self.store.records.put('collection_transfers', second_id, {'transfer_error': 'mock download failure'})
+        self.assertEqual(self.store.state()['tasks'][0]['status'], '运行中')
+        self.store.records.update('collection_runs', first_id, lambda item: item.update(status='completed'))
+        self.assertEqual(self.store.state()['tasks'][0]['status'], '回传失败')
+
 if __name__ == '__main__':
     unittest.main()

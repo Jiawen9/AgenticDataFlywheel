@@ -268,7 +268,11 @@ class FactoryRuntime:
         for task in state["tasks"]:
             matching = [run for run in runs if run.get("filename") == task["filename"]]
             if matching:
-                latest = matching[-1]
+                # A task can run on several phones; one phone finishing must not
+                # hide another phone's active run, regardless of dispatch order.
+                active = [run for run in matching if run["status"] in {"dispatching", "queued", "running"}]
+                live = [run for run in active if not run.get("transfer_error")]
+                latest = (live or active or matching)[-1]
                 task["status"] = "回传失败" if latest.get("transfer_error") else statuses.get(latest["status"], latest["status"])
         return state
 
