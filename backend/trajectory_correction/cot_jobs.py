@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ..pipeline_access import submit_with_context, execution_pipeline_id
+
 import hashlib
 import json
 import re
@@ -92,6 +94,8 @@ class CotJobManager:
         return self.jobs_dir / f"{job_id}.json"
 
     def _write(self, payload: dict[str, Any]) -> None:
+        if execution_pipeline_id():
+            payload.setdefault("pipeline_id", execution_pipeline_id())
         saved = self._records.put("correction_cot_jobs", str(payload["job_id"]), payload)
         payload["storage_revision"] = saved["storage_revision"]
 
@@ -192,7 +196,10 @@ class CotJobManager:
         return fingerprint({"factory": f"{self.generator_factory.__module__}.{self.generator_factory.__qualname__}"})
 
     def submit(self, session_id: str, group_ids: list[str] | None = None, row_ids: list[int] | None = None, *, generate_bbox: bool = False, force_overwrite: bool = False, expected_revision: int | None = None) -> dict[str, Any]:
-        with active_session_lock(session_id):
+        with active_session_lock(session_id) as session:
+            from ..pipeline_access import ensure_pipeline_write
+            from .draft_store import storage_root
+            ensure_pipeline_write(session_batch_id(session), storage_root())
             return self._submit(session_id, group_ids, row_ids, generate_bbox=generate_bbox,
                                 force_overwrite=force_overwrite, expected_revision=expected_revision)
 
@@ -243,7 +250,7 @@ class CotJobManager:
         }
         with self._lock:
             self._write(payload)
-        self._executor.submit(self._run, payload["job_id"])
+        submit_with_context(self._executor, self._run, payload["job_id"])
         return payload
 
     def _progress(self, job_id: str, changes: dict[str, Any]) -> None:
@@ -317,12 +324,14 @@ class CotJobManager:
                         "action_hash": _action_hash(target["action"]), "bbox_hash": _bbox_hash(current_bbox),
                         "actions_box": current_bbox, "generated_at": _now(),
                     }
-                    # Explicit regeneration replaces the values present when
-                    # submitted, but must preserve edits made while it ran.
+                    # Automated generation fills generated content without
+                    # removing handwritten text. Only explicit force-overwrite
+                    # may replace the baseline, never a later human edit.
                     baseline = target.get("edit_baseline", {})
-                    for field in ("summary", "thought"):
-                        if field in baseline and edit.get(field) == baseline[field]:
-                            edit.pop(field, None)
+                    if payload.get("force_overwrite"):
+                        for field in ("summary", "thought"):
+                            if field in baseline and edit.get(field) == baseline[field]:
+                                edit.pop(field, None)
                 update_session(str(payload["session_id"]), save_cot)
                 completed += 1
                 completed_cot += 1

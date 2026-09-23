@@ -494,6 +494,8 @@ def _update_batch_bbox(batch_id, task_id, trajectory_id, step, excel_row, bbox,
         raise AnnotationVersionConflict("修改标框必须提供当前 annotation_version")
     root = Path(data_root or DATA_ROOT).resolve()
     with active_batch_lock(batch_id, root):
+        from .pipeline_access import ensure_pipeline_write
+        ensure_pipeline_write(batch_id, root)
         context = resolve_batch_context(batch_id, root=root)
         if context.annotation_version != expected_version:
             raise AnnotationVersionConflict("标框版本已更新，请刷新后重试")

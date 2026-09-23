@@ -8,6 +8,8 @@ export type ActionDecision = 'save' | 'discard' | 'cancel'
 interface Feedback {
   error: (message: string) => void
   actionDecision: () => Promise<ActionDecision>
+  readOnly?: () => boolean
+  managed?: () => boolean
 }
 
 /** All asynchronous operations retain their session/group identity. */
@@ -86,7 +88,7 @@ export function useCorrectionWorkspace(api: WorkspaceApi, feedback: Feedback) {
   }
 
   async function patchRow(row: CorrectionRow, patch: { actions?: string; sop?: string; deleted?: boolean }): Promise<boolean> {
-    if (!session.value || !activeGroup.value) return false
+    if (feedback.readOnly?.() || !session.value || !activeGroup.value) return false
     const sessionId = session.value.session_id, groupId = activeGroup.value.group_id, version = epoch, revision = session.value.storage_revision
     return trackWrite(async () => {
       const result = revision === undefined ? await api.patchCorrectionRow(sessionId, row.excel_row, patch) : await api.patchCorrectionRow(sessionId, row.excel_row, patch, revision)
@@ -167,7 +169,7 @@ export function useCorrectionWorkspace(api: WorkspaceApi, feedback: Feedback) {
   }
 
   async function toggleExport(group: CorrectionGroupSummary) {
-    if (!session.value || busy.value) return
+    if (feedback.readOnly?.() || !session.value || busy.value) return
     if (group.pending_review) { feedback.error('请先复核保留的人工修改'); return }
     const sessionId = session.value.session_id, version = epoch
     await trackWrite(async () => {
@@ -188,7 +190,7 @@ export function useCorrectionWorkspace(api: WorkspaceApi, feedback: Feedback) {
   }
 
   async function exportData(): Promise<CorrectionExport | null> {
-    if (!session.value || !await prepareTransition()) return null
+    if (feedback.managed?.() || feedback.readOnly?.() || !session.value || !await prepareTransition()) return null
     const current = session.value
     let output: Awaited<ReturnType<WorkspaceApi['correctionExport']>> | null = null
     await trackWrite(async () => {
@@ -201,7 +203,7 @@ export function useCorrectionWorkspace(api: WorkspaceApi, feedback: Feedback) {
   }
 
   async function reviewGroup(groupId: string, decision: 'adopt' | 'discard') {
-    if (!session.value || !api.reviewCorrectionGroup || !await prepareTransition()) return false
+    if (feedback.readOnly?.() || !session.value || !api.reviewCorrectionGroup || !await prepareTransition()) return false
     const current = session.value, token = epoch
     return trackWrite(async () => {
       const result = await api.reviewCorrectionGroup!(current.session_id, groupId, decision, current.storage_revision)

@@ -99,7 +99,10 @@ class _Sources:
             raise ConversionError(f"{label}：发布表与冻结完整导出版本校验值不一致")
         # Verify the registered full export as well as the independently frozen release copy.
         self.store.resolve_file(manifest, "full_dataset.xlsx")
-        if source.get("id") and payload.get("session_id") != source["id"]:
+        if source.get("kind") == "pipeline_selection":
+            if payload.get("pipeline_id") != source.get("id") or payload.get("source_kind") != "pipeline_selection":
+                raise ConversionError(f"{label}：发布来源 Pipeline 不一致")
+        elif source.get("id") and payload.get("session_id") != source["id"]:
             raise ConversionError(f"{label}：发布来源修正会话不一致")
         if payload.get("batch_id") != self.batch_id:
             raise ConversionError(f"{label}：修正快照批次不一致")

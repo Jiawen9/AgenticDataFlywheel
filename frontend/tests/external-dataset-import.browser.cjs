@@ -77,6 +77,7 @@ async function main() {
       if(!name.startsWith('/api/'))return route.continue()
       requests.push({name,method:req.method(),query:url.search})
       const json=body=>route.fulfill({json:clone(body)})
+      if (name === '/api/pipelines') return json({ pipelines: [] })
       if(name==='/api/dataset-release-imports/preview'){
         const form=await new Response(req.postDataBuffer(),{headers:{'content-type':req.headers()['content-type']}}).formData()
         const fields=Object.fromEntries([...form.entries()].filter(([name])=>name!=='file'))

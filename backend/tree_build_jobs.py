@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .pipeline_access import submit_with_context, execution_pipeline_id
+
 import json
 import threading
 import uuid
@@ -47,6 +49,8 @@ class TreeBuildJobManager:
         self.mark_interrupted_jobs()
 
     def _write(self, payload: dict[str, Any]) -> None:
+        if execution_pipeline_id():
+            payload.setdefault("pipeline_id", execution_pipeline_id())
         payload.update(self.records.put("tree_jobs", payload["job_id"], payload))
 
     def get(self, job_id: str) -> dict[str, Any] | None:
@@ -86,6 +90,8 @@ class TreeBuildJobManager:
                annotation_version: str | None = None) -> dict[str, Any]:
         if batch_id is not None:
             with active_batch_lock(batch_id, self.data_root), self._lock:
+                from .pipeline_access import ensure_pipeline_write
+                ensure_pipeline_write(batch_id, self.data_root)
                 context = resolve_batch_context(batch_id, annotation_version, self.data_root)
                 return self._submit_batch(task_ids, context)
         return self._submit_job(task_ids)
@@ -153,7 +159,7 @@ class TreeBuildJobManager:
         with self._lock:
             self._write(payload)
         if task_ids:
-            self._executor.submit(self._run, job_id, task_ids)
+            submit_with_context(self._executor, self._run, job_id, task_ids)
         return payload
 
     def _progress(self, job_id: str, changes: dict[str, Any]) -> None:

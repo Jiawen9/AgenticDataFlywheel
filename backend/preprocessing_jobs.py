@@ -1,6 +1,8 @@
 """SQLite-backed preprocessing jobs with immutable collection-input snapshots."""
 from __future__ import annotations
 
+from .pipeline_access import submit_with_context, execution_pipeline_id
+
 import copy
 import json
 import threading
@@ -114,9 +116,11 @@ class PreprocessingJobManager:
                "fingerprint": digest({"input": snapshot["input_digest"], "config": config}),
                "resumed_from": resumed_from}
         job["base_annotation_version"] = base_annotation_version
+        if execution_pipeline_id():
+            job["pipeline_id"] = execution_pipeline_id()
         self.records.put("preprocessing_jobs", job_id, job, expected_revision=0)
         try:
-            self._executor.submit(self._run, job_id)
+            submit_with_context(self._executor, self._run, job_id)
         except Exception as exc:
             self._update(job_id, status="failed", stage="failed", error=str(exc), completed_at=utc_now())
             raise
@@ -124,6 +128,8 @@ class PreprocessingJobManager:
 
     def submit(self, batch_id):
         with active_batch_lock(batch_id, self.root), self._lock:
+            from .pipeline_access import ensure_pipeline_write
+            ensure_pipeline_write(batch_id, self.root)
             # Validate the identifier before any filesystem use.
             self.artifacts.list(batch_id=batch_id)
             active = self._active(batch_id)
@@ -156,6 +162,8 @@ class PreprocessingJobManager:
         if previous is None:
             raise PreprocessingError("预处理作业不存在", 404)
         with active_batch_lock(previous["batch_id"], self.root), self._lock:
+            from .pipeline_access import ensure_pipeline_write
+            ensure_pipeline_write(previous["batch_id"], self.root)
             previous = self._get(job_id)
             if previous is None:
                 raise PreprocessingError("预处理作业不存在", 404)
@@ -338,7 +346,7 @@ class PreprocessingJobManager:
                              [latest_job["created_at"] if latest_job else ""])
             result.append({"batch_id": batch_id, "kind": kind,
                 "label": {"task_generation": "任务生成", "augmentation": "任务泛化扩增",
-                          "manual_collection": "手工采集任务",
+                          "manual_collection": "手工采集任务", "rollout_import": "导入 Rollout",
                           "existing_trajectories": "已有轨迹批次"}.get(kind, kind),
                 "task_count": task_count, "ready_trajectory_count": len(source_trajectories) or old_count,
                 "ready_step_count": source_steps or old_steps, "collection_status": collection_status,

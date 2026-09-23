@@ -43,6 +43,7 @@ async function main() {
         const method=route.request().method(),body=route.request().postDataJSON()
         calls.push({path:url.pathname,query:Object.fromEntries(url.searchParams),method,body})
         const send=json=>route.fulfill({json})
+        if (url.pathname === '/api/pipelines') return send({ pipelines: [] })
         if (/^\/api\/data-batches\/[^/]+\/lifecycle$/.test(url.pathname)) return send({ batch_id:url.pathname.split('/')[3],status:'active',published_at:null,release_id:null })
         if (url.pathname==='/api/trajectory-preprocessing/batches') return send({batches:rows})
         if (url.pathname==='/api/trajectory-preprocessing/jobs'&&method==='POST') {

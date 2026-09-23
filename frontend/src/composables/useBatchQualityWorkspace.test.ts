@@ -5,7 +5,7 @@ import type { CorrectionRecommendation, PreprocessingBatch, RunQualitySummary, T
 const task = (id: string, state = 'succeeded') => ({ task_id: id, goal: id, tree_file: '', trajectory_count: 1, original_step_count: 2, tree_step_count: 2, ignored_step_count: 0, action_node_count: 2, tree_status: state })
 const built = (batch: string, ids = ['A']): TreeRun => ({ run_id: 'current', batch_id: batch, completed_at: '', model_name: '', task_ids: ids, task_count: ids.length, total_original_steps: ids.length * 2, total_tree_steps: ids.length * 2, tasks: ids.map(id => task(id)) } as TreeRun)
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(yes => { resolve = yes }); return { promise, resolve } }
-function setup() {
+function setup(options: Parameters<typeof useBatchQualityWorkspace>[1] = {}) {
   const client = {
     preprocessingBatches: vi.fn(async () => [{ batch_id: 'one', task_count: 2 }, { batch_id: 'two', task_count: 1 }] as PreprocessingBatch[]),
     batchTree: vi.fn(async (id: string) => built(id)),
@@ -15,7 +15,7 @@ function setup() {
     taskQuality: vi.fn(async (id: string, taskId: string) => ({ run_id: id, task_id: taskId }) as TaskQualityResult),
     treeRun: vi.fn(async (id: string) => ({ ...built('two'), run_id: id })),
   }
-  const flow = useBatchQualityWorkspace(client)
+  const flow = useBatchQualityWorkspace(client, options)
   return { client, flow }
 }
 describe('business batch quality workspace', () => {
@@ -138,4 +138,37 @@ describe('business batch quality workspace', () => {
     expect(flow.currentTree.value).toBeNull()
     expect(flow.error.value).toBe('service unavailable')
   })
+})
+
+
+describe('Pipeline quality waiting', () => {
+  it('does not request missing upstream artifacts, and loads each result only after readiness', async () => {
+    let treePending = true, qualityPending = true
+    const { client, flow } = setup({ waitingForTree: () => treePending, waitingForQuality: () => qualityPending })
+    await flow.loadBatches('one')
+    expect(flow.batchId.value).toBe('one')
+    expect(flow.error.value).toBe('')
+    expect(client.batchTree).not.toHaveBeenCalled()
+    expect(client.runQuality).not.toHaveBeenCalled()
+    treePending = false; await flow.refresh()
+    expect(client.batchTree).toHaveBeenCalledWith('one')
+    expect(client.runQuality).not.toHaveBeenCalled()
+    expect(flow.currentTree.value?.batch_id).toBe('one')
+    qualityPending = false; await flow.refresh()
+    expect(client.runQuality).toHaveBeenCalledWith('one')
+    expect(client.correctionRecommendation).toHaveBeenCalledWith('one')
+    flow.dispose()
+  })
+})
+
+
+it('keeps historical Pipeline results separate from a now-modified active batch', async () => {
+  const { client, flow } = setup({ historyOnly: () => true })
+  await flow.loadBatches('one'); await flow.refreshChoices()
+  expect(client.preprocessingBatches).not.toHaveBeenCalled()
+  expect(client.batchTree).not.toHaveBeenCalled()
+  expect(client.runQuality).not.toHaveBeenCalled()
+  expect(flow.currentTree.value).toBeNull()
+  expect(flow.error.value).toBe('')
+  flow.dispose()
 })

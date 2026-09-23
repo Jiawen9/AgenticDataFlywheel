@@ -1,5 +1,7 @@
 <template>
   <div class="phone-factory-page">
+    <PipelineStatusBar :context="pipelineContext" />
+    <template v-if="!pipelineContext.historyOnly.value">
     <BatchPublishedNotice :notice="publishedNotice" />
     <header class="page-hero">
       <div>
@@ -20,6 +22,7 @@
           <span class="field-label">手机ID</span>
           <el-input
             v-model="newPhoneId"
+            :disabled="pipelineContext.isPipelineRoute.value"
             placeholder="示例：3B65AB01LBl00000"
             clearable
             class="field-input phone-id-input"
@@ -28,6 +31,7 @@
           <span class="field-label app-gap">运行APP</span>
           <el-select
             v-model="newApp"
+            :disabled="pipelineContext.isPipelineRoute.value"
             filterable
             allow-create
             default-first-option
@@ -38,7 +42,7 @@
           >
             <el-option v-for="app in apps" :key="app" :label="app" :value="app" />
           </el-select>
-          <el-button type="primary" :loading="saving" :disabled="Boolean(deletingKey)" @click="handleAddPhoneApp">新增</el-button>
+          <el-button type="primary" :loading="saving" :disabled="taskBusy || Boolean(deletingKey)" @click="handleAddPhoneApp">新增</el-button>
         </div>
 
         <h3 class="sub-title">手机列表</h3>
@@ -128,9 +132,9 @@
           <p><strong>{{ selectedBatch.task_count }} 条任务</strong> · {{ selectedBatch.apps.join('、') }} · {{ selectedBatch.created_at.slice(0, 19).replace('T', ' ') }}</p>
           <el-alert v-if="selectedBatch.warnings?.length" :title="warningSummary(selectedBatch.warnings)" type="warning" :closable="false" show-icon class="batch-alert" data-testid="collection-classification-warning" />
           <p>{{ selectedBatch.source_job_id ? `来源作业：${selectedBatch.source_job_id}` : '来源：手动上传' }} · {{ selectedBatchRow.status }}</p>
-          <el-button type="primary" :loading="startingTask === selectedBatchRow.filename" :disabled="taskBusy" @click="handleStartTask(selectedBatchRow)">开始运行所选批次</el-button>
+          <el-button type="primary" :loading="startingTask === selectedBatchRow.filename" :disabled="taskBusy || isManagedTask(selectedBatchRow)" @click="handleStartTask(selectedBatchRow)">开始运行所选批次</el-button>
           <el-button :loading="downloadingBatch" :disabled="taskBusy" @click="downloadCollectionBatch">下载采集表</el-button>
-          <router-link :to="{ path: '/collection/tree-building', query: { batch_id: selectedBatch.batch_id } }" class="preprocessing-link">前往预处理</router-link>
+          <router-link :to="{ path: '/collection/tree-building', query: { ...route.query, batch_id: selectedBatch.batch_id, collection_batch_id: undefined, ...(pipelineContext.isPipelineRoute.value ? { step_id: 'preprocessing' } : {}) } }" class="preprocessing-link">前往预处理</router-link>
         </div>
         <p class="empty-hint">选择批次仅查看信息；手动上传任务也会登记业务批次，采集结果回传完成后可进入预处理。</p>
         </template>
@@ -180,7 +184,7 @@
           <el-table-column label="运行编号" min-width="160" show-overflow-tooltip><template #default="{ row }">{{ row.collection_run_id || row.run_id }}</template></el-table-column>
           <el-table-column label="状态" width="110"><template #default="{ row }">{{ runStatus(row.status) }}</template></el-table-column>
           <el-table-column label="结果" min-width="170"><template #default="{ row }">{{ runMessage(row) }}</template></el-table-column>
-          <el-table-column v-if="!isEvaluation" label="操作" min-width="100"><template #default="{ row }"><el-button link :loading="syncingRun === (row.collection_run_id || row.run_id)" @click="syncRun(row)">重试回传</el-button></template></el-table-column>
+          <el-table-column v-if="!isEvaluation" label="操作" min-width="100"><template #default="{ row }"><el-button link :loading="syncingRun === (row.collection_run_id || row.run_id)" :disabled="pipelineContext.isPipelineRoute.value || managedBatchIds.includes(row.batch_id)" @click="syncRun(row)">重试回传</el-button></template></el-table-column>
         </el-table>
         <section v-if="isEvaluation" data-testid="evaluation-reports">
           <div class="report-heading"><h3 class="sub-title">模型迭代评估报告</h3><el-button :loading="loadingReports" @click="reportPoller.start()">刷新报告</el-button></div>
@@ -222,10 +226,14 @@
         </el-dialog>
       </section>
     </div>
+    </template>
   </div>
 </template>
 
 <script setup lang="ts">
+import PipelineStatusBar from '@/components/PipelineStatusBar.vue'
+import { usePipelineContext } from '@/composables/usePipelineContext'
+import { api } from '@/api'
 import BatchPublishedNotice from '@/components/BatchPublishedNotice.vue'
 import { useBatchLifecycle } from '@/composables/useBatchLifecycle'
 import { eventMatchesRoute, publishedBatch, withoutBatchQuery, type PublishedBatchEvent } from '@/utils/batchLifecycle'
@@ -302,15 +310,24 @@ const collection = usePhoneCollectionBatches(factoryBatchesApi, factoryApi, {
   runOptions: () => ({ vla: newVla.value.trim(), run_mode: props.mode, config: { ...config } }),
 })
 const { batches: collectionBatches, selectedBatchId, selectedBatch, loadingBatches, loadingBatch, downloading: downloadingBatch, error: batchError } = collection
+const pipelineContext = usePipelineContext({ batchId: () => isEvaluation ? '' : selectedBatchId.value, stepId: 'collection' })
+const managedBatchIds = ref<string[]>([])
+const isManagedTask = (task: TaskRow) => Boolean(task.source_batch_id && (managedBatchIds.value.includes(task.source_batch_id) || (pipelineContext.managed.value && pipelineContext.pipeline.value?.batch_id === task.source_batch_id)))
+async function loadManagedBatches() {
+  if (isEvaluation || typeof api.listPipelines !== 'function') return
+  const pipelines = await api.listPipelines({ active_only: true })
+  if (!disposed) managedBatchIds.value = pipelines.map(item => item.batch_id)
+}
 // A production task keeps its batch identity even before its workbook is registered.
 const runTaskOptions = computed(() => {
   const options = new Map<string, { key: string; label: string; task: TaskRow }>()
   for (const task of activeFactoryTasks(tasks.value)) {
     const key = !isEvaluation && task.source_batch_id ? `batch:${task.source_batch_id}` : `task:${task.filename}`
+    if (isManagedTask(task)) continue
     options.set(key, { key, label: `${task.description} · ${task.source_batch_id || task.filename}`, task })
   }
   if (!isEvaluation) for (const batch of collectionBatches.value) {
-    if (publishedBatch(batch.batch_id)) continue
+    if (publishedBatch(batch.batch_id) || managedBatchIds.value.includes(batch.batch_id)) continue
     const key = `batch:${batch.batch_id}`
     const task = options.get(key)?.task || { description: `采集批次 ${batch.batch_id}`, filename: batch.filename, source_batch_id: batch.batch_id, status: '未运行' }
     options.set(key, { key, label: collectionBatchOptionLabel(batch), task })
@@ -324,6 +341,7 @@ const lifecycle = useBatchLifecycle({
   currentBatch: () => isEvaluation ? '' : selectedBatchId.value || String(route.query.collection_batch_id ?? route.query.batch_id ?? ''),
   onPublished,
   async refreshChoices() {
+    if (pipelineContext.historyOnly.value) return
     if (isEvaluation) return
     // The batch area and the phone's draft can refer to two independent batches.
     const target = runDialogVisible.value && runDialogTaskKey.value.startsWith('batch:') ? runDialogTaskKey.value.slice(6) : ''
@@ -345,7 +363,7 @@ function onPublished(event: PublishedBatchEvent) {
   publishedNotice.value = event
   if (selectedPublished) void router.replace({ query: withoutBatchQuery(route.query) })
 }
-const taskBusy = computed(() => loadingFactory.value || manualTaskBusy.value || collection.busy.value || Boolean(deletingKey.value))
+const taskBusy = computed(() => pipelineContext.isPipelineRoute.value || loadingFactory.value || manualTaskBusy.value || collection.busy.value || Boolean(deletingKey.value))
 const collectionBatchKindLabel = (kind: FactoryBatchSummary['kind']) => kind === 'manual_collection' ? '手动上传' : kind === 'augmentation' ? '泛化扩增' : '任务生成'
 const collectionBatchTimeLabel = (createdAt: string) => createdAt.slice(0, 19).replace('T', ' ')
 const collectionBatchOptionLabel = (batch: FactoryBatchSummary) =>
@@ -357,7 +375,7 @@ const selectedBatchRow = computed<TaskRow | null>(() => {
     description: `采集批次 ${batch.batch_id}`, filename: batch.filename, source_batch_id: batch.batch_id, status: '未运行',
   }
 })
-async function selectCollectionBatch(value: unknown) { const id = typeof value === 'string' ? value : ''; if (!await lifecycle.checkBatch(id)) return; publishedNotice.value = null; await collection.selectBatch(id) }
+async function selectCollectionBatch(value: unknown) { if (pipelineContext.isPipelineRoute.value) return; const id = typeof value === 'string' ? value : ''; if (!await lifecycle.checkBatch(id)) return; publishedNotice.value = null; await collection.selectBatch(id) }
 async function downloadCollectionBatch() {
   if (taskBusy.value) return
   try { await collection.downloadBatch() }
@@ -386,6 +404,7 @@ async function loadState() {
 
 // ---------- 1. 新增手机 ----------
 async function handleAddPhoneApp() {
+  if (pipelineContext.isPipelineRoute.value) return
   const phoneId = newPhoneId.value.trim()
   const app = newApp.value.trim()
   if (!phoneId) return ElMessage.warning('请输入手机ID')
@@ -428,6 +447,7 @@ async function handleRemovePhoneApp(row: PhoneAppRow) {
 
 // ---------- 3.1 保存VLA接口 ----------
 async function handleSaveVla() {
+  if (pipelineContext.isPipelineRoute.value) return
   const value = newVla.value.trim()
   if (!value) return ElMessage.warning('请输入VLA接口（ip:port）')
   if (savingVla.value) return
@@ -527,6 +547,9 @@ async function handleStartTask(row: TaskRow) {
   if (!newVla.value.trim()) return ElMessage.warning('请选择 VLA 接口')
   startingTask.value = row.filename; stateEpoch++
   try {
+    await loadManagedBatches()
+    if (disposed) return
+    if (isManagedTask(row)) return ElMessage.warning('该批次由 Pipeline 管理，请返回 Pipeline 查看')
     if (!isEvaluation && row.source_batch_id) {
       const remote = await collection.runBatch(row.source_batch_id)
       if (!disposed && !publishedBatch(row.source_batch_id)) ElMessage.success(remote.message || '采集批次已下发')
@@ -546,6 +569,9 @@ async function confirmRun() {
   const task = runTargetTask.value
   confirmingRun.value = true; stateEpoch++
   try {
+    await loadManagedBatches()
+    if (disposed) return
+    if (isManagedTask(task)) return ElMessage.warning('该批次由 Pipeline 管理')
     if (!isEvaluation && task.source_batch_id) {
       const remote = await collection.runBatch(task.source_batch_id, runDialogPhoneId.value, runDialogApp.value, { vla: runDialogVla.value.trim(), run_mode: 'generate', config: { ...runDialogConfig } })
       if (!disposed && !publishedBatch(task.source_batch_id)) ElMessage.success(remote.message || '定制采集任务已下发')
@@ -569,6 +595,7 @@ async function dispatchTask(task: TaskRow, phoneId: string, app: string, vla: st
 }
 
 async function handleConfigChange() {
+  if (pipelineContext.isPipelineRoute.value) return
   savingConfig.value = true
   try {
     const saved = await factoryApi.saveConfig({ ...config })
@@ -585,7 +612,8 @@ function applyState(state: FactoryState) {
   apps.value = state.apps; phoneApps.value = state.phoneApps; vla.value = state.vla; tasks.value = activeFactoryTasks(state.tasks)
 }
 useFactoryPolling(async (signal, current) => {
-  const epoch = stateEpoch
+  if (pipelineContext.historyOnly.value || (pipelineContext.isPipelineRoute.value && !pipelineContext.resolved.value)) return
+  const epoch = stateEpoch, pipelineId = pipelineContext.pipeline.value?.pipeline_id
   try {
     const state = await factoryApi.state(signal)
     if (!current()) return
@@ -601,7 +629,7 @@ useFactoryPolling(async (signal, current) => {
   if (!current()) return
   try {
     const result = await factoryApi.runs(signal)
-    if (current()) { runs.value = result.runs.filter(item => isEvaluation || !publishedBatch(item.batch_id)); runError.value = '' }
+    if (current() && !pipelineContext.historyOnly.value && pipelineId === pipelineContext.pipeline.value?.pipeline_id) { runs.value = result.runs.filter(item => isEvaluation || ((!publishedBatch(item.batch_id)) && (!pipelineContext.isPipelineRoute.value || (pipelineContext.pipeline.value?.collection_run_ids || []).includes(item.collection_run_id || item.run_id || '')))); runError.value = '' }
   } catch (error) { if (current()) runError.value = `运行状态暂不可用：${(error as Error).message}` }
 })
 const reportPoller = isEvaluation ? useFactoryPolling(async (signal, current) => {
@@ -616,6 +644,7 @@ const reportTime = (value?: number) => value != null && Number.isFinite(value) ?
 const runStatus = (status: string) => ({ dispatching: '正在下发', queued: '排队中', running: '运行中', completed: '已完成', succeeded: '已完成', failed: '失败', cancelled: '已取消', interrupted: '已中断', partial: '部分完成', ready: '结果已就绪', waiting: '等待回传', syncing: '正在回传', pending: '等待中' } as Record<string, string>)[status] || status
 const runMessage = (run: FactoryRun) => run.transfer_error || run.dispatch_error || run.error || run.errors?.map(item => item.error || item.message).filter(Boolean).join('；') || (run.trajectory_count != null ? `${run.trajectory_count} 条轨迹` : runStatus(run.transfer_status || ''))
 async function syncRun(run: FactoryRun) {
+  if (pipelineContext.isPipelineRoute.value || managedBatchIds.value.includes(run.batch_id || '')) return
   const id = run.collection_run_id || run.run_id
   if (!id || syncingRun.value) return
   syncingRun.value = id
@@ -636,13 +665,17 @@ async function downloadReport(folder: ReportFolder, file: ReportFile) {
   finally { downloadingReport.value = '' }
 }
 
-onMounted(() => {
+onMounted(async () => {
   document.body.classList.add('factory-responsive')
+  await pipelineContext.refresh()
+  if (pipelineContext.historyOnly.value) { loadingFactory.value = false; return }
   loadState().catch((error) => ElMessage.error(`加载数据失败：${(error as Error).message}`)).finally(() => { loadingFactory.value = false })
   if (isEvaluation) return
+  void loadManagedBatches().catch(() => { /* Backend enforces ownership if list lookup fails. */ })
   const requested = typeof route.query.batch_id === 'string' ? route.query.batch_id : typeof route.query.collection_batch_id === 'string' ? route.query.collection_batch_id : undefined
   void lifecycle.checkBatch(requested || '').then(active => collection.loadBatches(active ? requested : undefined)).catch(cause => { batchError.value = (cause as Error).message })
 })
+watch(pipelineContext.historyOnly, value => { if (value) { stateEpoch++; runs.value = []; void collection.selectBatch('') } })
 onBeforeUnmount(() => { document.body.classList.remove('factory-responsive'); disposed = true; collection.dispose() })
 </script>
 

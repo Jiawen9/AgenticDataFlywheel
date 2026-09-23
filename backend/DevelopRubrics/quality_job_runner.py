@@ -141,7 +141,9 @@ def _ensure_workbook(run_id: str, manifest: dict[str, Any], task_ids: list[str])
 async def run(run_id: str, task_ids: list[str], job_id: str) -> dict[str, Any]:
     alias = RecordStore(DATA_ROOT).get("batch_run_aliases", run_id)
     operation_batch = alias["batch_id"] if alias else run_id
-    with batch_operation(operation_batch, "quality", DATA_ROOT):
+    from backend.pipeline_access import internal_pipeline
+    job_owner = (RecordStore(DATA_ROOT).get("quality_jobs", job_id) or {}).get("pipeline_id")
+    with internal_pipeline(job_owner), batch_operation(operation_batch, "quality", DATA_ROOT):
         current = current_tree_payload(run_id, DATA_ROOT)
         if current.get("trees"):
             job = RecordStore(DATA_ROOT).get("quality_jobs", job_id) or {}

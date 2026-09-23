@@ -3,7 +3,7 @@ import type { CorrectionGroup, CorrectionRow } from '@/types'
 import { correctionAssetUrl } from '@/api'
 import CorrectionActionEditor from '@/components/CorrectionActionEditor.vue'
 
-const props = defineProps<{ sessionId: string; group: CorrectionGroup; row: CorrectionRow | null; revision: number; saving: boolean }>()
+const props = defineProps<{ sessionId: string; group: CorrectionGroup; row: CorrectionRow | null; revision: number; saving: boolean; readOnly?: boolean }>()
 const emit = defineEmits<{
   select: [row: CorrectionRow]
   delete: [row: CorrectionRow]
@@ -19,7 +19,7 @@ function rowClassName({ row }: { row: CorrectionRow }) {
   <section class="workbench" aria-label="轨迹修正台">
     <aside class="editor-pane">
       <template v-if="row">
-        <CorrectionActionEditor :key="`${sessionId}:${group.group_id}:${row.excel_row}:${revision}`" :row="row" :image-url="correctionAssetUrl(sessionId, row.image)" :saving="saving" @save="emit('action', $event)" @draft="emit('draft', $event)" />
+        <CorrectionActionEditor :key="`${sessionId}:${group.group_id}:${row.excel_row}:${revision}`" :row="row" :image-url="correctionAssetUrl(sessionId, row.image)" :saving="saving" :read-only="readOnly" @save="emit('action', $event)" @draft="emit('draft', $event)" />
       </template>
       <el-empty v-else description="该轨迹没有可修正步骤" :image-size="80" />
     </aside>
@@ -33,7 +33,7 @@ function rowClassName({ row }: { row: CorrectionRow }) {
         <el-table-column prop="summary" label="Action Summary" min-width="140" show-overflow-tooltip />
         <el-table-column prop="thought" label="Thought" min-width="180" show-overflow-tooltip />
         <el-table-column label="状态" width="105"><template #default="scope"><el-tag v-if="scope.row.deleted" type="danger" size="small">已删除</el-tag><el-tag v-else-if="scope.row.edited" type="warning" size="small">{{ scope.row.edit_status }}</el-tag><span v-else>—</span></template></el-table-column>
-        <el-table-column label="操作" width="65" fixed="right"><template #default="scope"><el-button link :type="scope.row.deleted ? 'primary' : 'danger'" :disabled="saving" @click.stop="emit('delete', scope.row)">{{ scope.row.deleted ? '恢复' : '删除' }}</el-button></template></el-table-column>
+        <el-table-column label="操作" width="65" fixed="right"><template #default="scope"><el-button link :type="scope.row.deleted ? 'primary' : 'danger'" :disabled="saving || readOnly" @click.stop="emit('delete', scope.row)">{{ scope.row.deleted ? '恢复' : '删除' }}</el-button></template></el-table-column>
       </el-table>
     </div>
   </section>

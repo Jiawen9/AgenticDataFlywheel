@@ -88,6 +88,10 @@ class CollectionRunStore:
         manual = ManualCollectionStore(self.root).get(batch_id, require_workbook=require_workbook)
         if manual is not None:
             return manual
+        from .rollout_imports import RolloutImportStore
+        imported = RolloutImportStore(self.root).get_batch(batch_id, require_workbook=require_workbook)
+        if imported is not None:
+            return imported
         directory = contained_path(self.root, "system", "task_generation", "collection_batches", batch_id)
         path = directory / "batch.json"
         if not path.is_file():
@@ -152,6 +156,8 @@ class CollectionRunStore:
                metadata: dict | None = None, workbook_sha256: str | None = None) -> tuple[dict, bool]:
         with active_batch_lock(batch_id, self.root):
             """Reserve one dispatch. Repeated keys never create or dispatch twice."""
+            from .pipeline_access import ensure_pipeline_write
+            ensure_pipeline_write(batch_id, self.root, action="collect")
             batch = self.batch(batch_id, require_workbook=True)
             if dispatch_key is not None:
                 _identifier(dispatch_key, "request_id")
@@ -286,8 +292,8 @@ class CollectionRunStore:
                 "collected_at": _timestamp(entry.get("collected_at"), completed_at),
                 "files": sorted(files, key=lambda item: item["path"]),
                 **({"phone_id": entry["phone_id"]} if entry.get("phone_id") is not None else {}),
-                **({"source_row_id": source_task["source_row_id"], "source_kind": "manual_collection"}
-                   if source_task.get("source_kind") == "manual_collection" else {}),
+                **({"source_row_id": source_task["source_row_id"], "source_kind": source_task["source_kind"]}
+                   if source_task.get("source_kind") in {"manual_collection", "rollout_import"} else {}),
             })
         normalized_errors = []
         for item in errors:

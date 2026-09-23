@@ -236,6 +236,8 @@ class PhoneFactoryStore:
             tasks.append(row)
 
         with active_batch_lock(batch, self.root):
+            from .pipeline_access import ensure_pipeline_write
+            ensure_pipeline_write(batch, self.root, action="collect")
             state = self.runtime.public_state(self._public(self._update(mutate)), mode)
             imported = next(row for row in state["tasks"] if row["filename"] == filename)
             return {**state, "imported_task": dict(imported)}
@@ -251,12 +253,16 @@ class PhoneFactoryStore:
 
         task = next((row for row in self._current()["tasks"] if row.get("filename") == filename), {})
         with active_batch_lock(task.get("source_batch_id"), self.root):
+            from .pipeline_access import ensure_pipeline_write
+            ensure_pipeline_write(task.get("source_batch_id"), self.root, action="collect")
             return self._public(self._update(mutate))
 
     def remove_task(self, filename) -> dict:
         filename = _filename(filename)
         task = next((row for row in self._current()["tasks"] if row.get("filename") == filename), {})
         with active_batch_lock(task.get("source_batch_id"), self.root):
+            from .pipeline_access import ensure_pipeline_write
+            ensure_pipeline_write(task.get("source_batch_id"), self.root, action="collect")
             return self._public(self._update(lambda state: state.update(tasks=[row for row in state["tasks"] if row.get("filename") != filename])))
 
     def _remote_result(self, args: list[str]):

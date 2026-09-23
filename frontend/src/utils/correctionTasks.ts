@@ -3,10 +3,14 @@ import type { CorrectionGroupSummary, CorrectionRecommendation, CorrectionTaskIt
 /** Join against the session's saved selection, never the latest recommendation. */
 export function correctionTasks(selection: CorrectionRecommendation, groups: CorrectionGroupSummary[]): CorrectionTaskItem[] {
   const byTrajectory = new Map(groups.map((group) => [group.meta_task, group]))
+  const byGroup = new Map(groups.map(group => [group.group_id, group]))
   const tasks = new Map<string, CorrectionTaskItem>()
   const usedGroups = new Set<string>()
-  for (const item of selection.tasks) {
-    const group = byTrajectory.get(item.trajectory_id)
+  // Pipeline retains all candidates so a reviewer can replace its default Top1.
+  const candidates = (selection as CorrectionRecommendation & { candidates?: Array<CorrectionRecommendation['tasks'][number] & { group_id?: string }> }).candidates
+  for (const item of candidates ?? selection.tasks) {
+    const groupId = 'group_id' in item ? String(item.group_id || '') : ''
+    const group = groupId ? byGroup.get(groupId) : byTrajectory.get(item.trajectory_id)
     if (!group || usedGroups.has(group.group_id)) continue
     usedGroups.add(group.group_id)
     let task = tasks.get(item.task_id)

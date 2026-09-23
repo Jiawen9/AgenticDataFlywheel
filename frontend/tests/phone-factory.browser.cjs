@@ -94,6 +94,7 @@ async function main() {
       const method = route.request().method(), body = route.request().postDataJSON()
       calls.push({ path: url.pathname, method, body, query: Object.fromEntries(url.searchParams), at: Date.now() })
       const send = json => route.fulfill({ json })
+      if (url.pathname === '/api/pipelines') return send({ pipelines: [] })
       if (url.pathname.endsWith('/lifecycle')) {
         const id = url.pathname.split('/')[3]
         return send({ status: published.has(id) ? 'published' : 'active', batch_id: id, release_id: published.has(id) ? 'rel-browser' : null })

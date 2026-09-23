@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .pipeline_access import submit_with_context, execution_pipeline_id
+
 import json
 import os
 import subprocess
@@ -96,6 +98,8 @@ class QualityJobManager:
         self.mark_interrupted_jobs()
 
     def _write(self, payload: dict[str, Any]) -> None:
+        if execution_pipeline_id():
+            payload.setdefault("pipeline_id", execution_pipeline_id())
         payload.update(self.records.put("quality_jobs", payload["job_id"], payload))
 
     def get(self, job_id: str) -> dict[str, Any] | None:
@@ -147,6 +151,8 @@ class QualityJobManager:
             run_id = alias["batch_id"]
         store = ArtifactStore(self.data_root)
         with active_batch_lock(run_id, self.data_root), self._lock:
+            from .pipeline_access import ensure_pipeline_write
+            ensure_pipeline_write(run_id, self.data_root)
             trees = current_tree_payload(run_id, self.data_root)
             if trees.get("trees"):
                 return self._submit_batch(run_id, task_ids, trees)
@@ -196,7 +202,7 @@ class QualityJobManager:
         with self._lock:
             self._write(payload)
         if task_ids:
-            self._executor.submit(self._run, payload["job_id"], run_id, task_ids)
+            submit_with_context(self._executor, self._run, payload["job_id"], run_id, task_ids)
         return payload
 
     def _progress(self, job_id: str, changes: dict[str, Any]) -> None:

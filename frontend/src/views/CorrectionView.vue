@@ -1,9 +1,11 @@
 <script setup lang="ts">
+import PipelineStatusBar from '@/components/PipelineStatusBar.vue'
+import { usePipelineContext } from '@/composables/usePipelineContext'
 import BatchPublishedNotice from '@/components/BatchPublishedNotice.vue'
 import { useBatchLifecycle } from '@/composables/useBatchLifecycle'
 import { activeBatchItems, eventMatchesRoute, withoutBatchQuery, type PublishedBatchEvent } from '@/utils/batchLifecycle'
 
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
@@ -16,6 +18,8 @@ import { useCorrectionWorkspace, type ActionDecision } from '@/composables/useCo
 const route = useRoute(), router = useRouter()
 const batches = ref<CorrectionBatch[]>([])
 const selectedBatchId = ref('')
+const pipelineContext = usePipelineContext({ batchId: selectedBatchId, stepId: 'correction' })
+const pipelineReadOnly = pipelineContext.readOnly
 const loading = ref(true)
 const pageError = ref('')
 const actionPrompt = ref(false)
@@ -24,6 +28,8 @@ let batchRequest = 0, routeSelectionRequest = 0
 let initialized = false, choicesRequest = 0
 let disposed = false
 const ws = useCorrectionWorkspace(api, {
+  readOnly: () => pipelineReadOnly.value,
+  managed: () => pipelineContext.managed.value || pipelineContext.isPipelineRoute.value,
   error: (message) => ElMessage.error(message),
   actionDecision: () => new Promise((resolve) => { resolveDecision = resolve; actionPrompt.value = true }),
 })
@@ -45,6 +51,7 @@ function onPublished(event: PublishedBatchEvent) {
   void router.replace({ query: withoutBatchQuery(route.query) })
 }
 async function loadChoices() {
+  if (pipelineContext.historyOnly.value) return
   const request = ++choicesRequest
   const [result, existing] = await Promise.all([api.correctionBatches(), api.correctionSessions()])
   if (disposed || request !== choicesRequest) return
@@ -66,6 +73,18 @@ async function loadBatch(batchId: string) {
   ws.setSession(null); visibleExpandedTasks.value = []; loading.value = true; pageError.value = ''
   try {
     if (!batchId) { pageError.value = '请先完成轨迹质检，再进入专家动作纠偏。'; return }
+    await nextTick()
+    await pipelineContext.refresh()
+    if (disposed || request !== batchRequest || pipelineContext.historyOnly.value) return
+    if (pipelineContext.isPipelineRoute.value || pipelineContext.managed.value) {
+      const id = pipelineContext.sessionId.value
+      if (!id) return
+      const saved = await api.correctionSession(id)
+      if (saved.batch_id !== batchId) throw new Error('Pipeline 修正会话与当前批次不一致')
+      if (!disposed && request === batchRequest) ws.setSession(saved)
+      return
+    }
+    if (pipelineContext.error.value) throw new Error(pipelineContext.error.value)
     const existing = (await api.correctionSessions()).find(item => item.batch_id === batchId)
     if (disposed || request !== batchRequest) return
     const saved = existing ? await api.correctionSession(existing.session_id) : await api.createCorrectionSession(batchId)
@@ -101,10 +120,11 @@ async function onTrajectoryCollapse(next: string | string[]) {
 }
 
 async function changeBatch(batchId: string) {
+  if (pipelineContext.isPipelineRoute.value) return
   if (batchId === selectedBatchId.value) return
   if (!await lifecycle.checkBatch(batchId)) return
   publishedNotice.value = null
-  await router.replace({ query: { batch_id: batchId } })
+  await router.replace({ query: { ...route.query, batch_id: batchId, tree_run_id: undefined } })
 }
 
 async function toggleDeleted(row: CorrectionRow) {
@@ -125,6 +145,30 @@ async function exportData() {
   }
 }
 
+async function chooseExport(taskId: string, groupId: string) {
+  if (pipelineReadOnly.value || !session.value) return
+  const group = session.value.groups.find(value => value.group_id === groupId)
+  if (!group) return
+  if (!pipelineContext.managed.value) { await ws.toggleExport(group); return }
+  if (!await ws.prepareTransition() || group.export) return
+  const task = tasks.value.find(value => value.task_id === taskId)
+  for (const trajectory of task?.trajectories || []) {
+    if (trajectory.group.export && trajectory.group.group_id !== groupId) await ws.toggleExport(trajectory.group)
+  }
+  const current = session.value?.groups.find(value => value.group_id === groupId)
+  if (current && !current.export) await ws.toggleExport(current)
+}
+async function confirmCorrection() {
+  if (!session.value || !pipelineContext.canCorrect.value || !await ws.prepareTransition()) return
+  try {
+    await pipelineContext.confirmCorrection(session.value.storage_revision)
+    ElMessage.success('修正已确认，Pipeline 将继续处理并发布')
+  } catch (cause) { ElMessage.error((cause as Error).message) }
+}
+watch(pipelineContext.historyOnly, value => { if (value) { ++batchRequest; ws.setSession(null); visibleExpandedTasks.value = []; loading.value = false } })
+watch(pipelineContext.sessionId, id => {
+  if (initialized && id && id !== session.value?.session_id && !publishedNotice.value) void loadBatch(pipelineContext.pipeline.value!.batch_id)
+})
 function beforeUnload(event: BeforeUnloadEvent) {
   if (hasUnsaved.value || busy.value) { event.preventDefault(); event.returnValue = '' }
 }
@@ -137,6 +181,7 @@ async function loadRouteBatch(defaultBatchId?: string) {
   loading.value = true; pageError.value = ''
   try {
     if (typeof route.query.batch_id === 'string' && !await lifecycle.checkBatch(route.query.batch_id)) return
+    if (pipelineContext.isPipelineRoute.value) { await loadBatch(pipelineContext.pipeline.value?.batch_id || String(route.query.batch_id || '')); return }
     const id = await resolveBatchSelection(batches.value.map(batch => batch.batch_id), {
       batchId: typeof route.query.batch_id === 'string' ? route.query.batch_id : undefined,
       legacyRunId: typeof route.query.tree_run_id === 'string' ? route.query.tree_run_id : undefined,
@@ -145,7 +190,7 @@ async function loadRouteBatch(defaultBatchId?: string) {
     if (disposed || request !== routeSelectionRequest) return
     if (!await lifecycle.checkBatch(id)) return
     await loadBatch(id)
-    if (!disposed && request === routeSelectionRequest && id && selectedBatchId.value === id) await router.replace({ query: { batch_id: id } })
+    if (!disposed && request === routeSelectionRequest && id && selectedBatchId.value === id) await router.replace({ query: { ...route.query, batch_id: id, tree_run_id: undefined } })
   } catch (error) {
     if (!disposed && request === routeSelectionRequest) { pageError.value = (error as Error).message; loading.value = false }
   }
@@ -158,6 +203,8 @@ watch(() => [route.query.batch_id, route.query.tree_run_id], ([batchId, legacyRu
 onMounted(async () => {
   window.addEventListener('beforeunload', beforeUnload)
   try {
+    await pipelineContext.refresh()
+    if (pipelineContext.historyOnly.value) { loading.value = false; return }
     const preferred = typeof route.query.batch_id === 'string' ? route.query.batch_id : ''
     const active = await lifecycle.checkBatch(preferred)
     const defaultBatch = await loadChoices()
@@ -177,6 +224,8 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="page correction-page">
+    <PipelineStatusBar :context="pipelineContext" />
+    <template v-if="!pipelineContext.historyOnly.value">
     <BatchPublishedNotice :notice="publishedNotice" />
     <header class="page-hero">
       <div><span class="eyebrow">EXPERT ACTION CORRECTION</span><h1>专家动作纠偏</h1><p>展开任务与轨迹，直接在截图上修正 Action。当前每个任务选择质检 Top-1。</p></div>
@@ -185,12 +234,13 @@ onBeforeUnmount(() => {
 
     <section class="toolbar">
       <label for="correction-batch">业务批次</label>
-      <el-select id="correction-batch" :model-value="selectedBatchId" :loading="loading" :disabled="loading || busy || !batches.length" placeholder="选择已质检批次" @change="changeBatch">
+      <el-select id="correction-batch" :model-value="selectedBatchId" :loading="loading" :disabled="pipelineContext.isPipelineRoute.value || loading || busy || !batches.length" placeholder="选择已质检批次" @change="changeBatch">
         <el-option v-for="batch in batches" :key="batch.batch_id" :label="`${batch.batch_id} · 已质检 ${batch.reviewed_task_count}/${batch.total_task_count} 个任务`" :value="batch.batch_id" />
       </el-select>
       <el-button :disabled="busy || loading" @click="refreshBatch">刷新当前结果</el-button>
       <span class="save-status" role="status">{{ savingCount ? '正在保存…' : hasUnsaved ? '有未保存修改' : session ? '草稿已加载' : '' }}</span>
-      <el-button type="success" :loading="savingCount > 0" :disabled="!session || busy || loading" @click="exportData">导出 SFT / RL / 原生数据（{{ exportCount }} 条）</el-button>
+      <el-button v-if="!pipelineContext.managed.value && !pipelineContext.isPipelineRoute.value" type="success" :loading="savingCount > 0" :disabled="!session || busy || loading" @click="exportData">导出 SFT / RL / 原生数据（{{ exportCount }} 条）</el-button>
+      <el-button v-if="pipelineContext.canCorrect.value" type="success" :loading="pipelineContext.controlling.value" :disabled="!session || busy || loading" @click="confirmCorrection">完成修正并继续</el-button>
     </section>
     <el-alert v-if="session?.pending_review_count" :title="`上游数据已更新，保留的 ${session.pending_review_count} 项人工修改需要复核；导出仅包含不受影响的任务。`" type="warning" :closable="false" show-icon />
     <el-alert v-if="pageError" :title="pageError" type="warning" :closable="false" show-icon />
@@ -220,7 +270,7 @@ onBeforeUnmount(() => {
                     <el-tag size="small" :type="trajectory.passed_threshold ? 'success' : 'warning'">{{ trajectory.passed_threshold ? '质检通过' : '质检未通过' }}</el-tag>
                     <el-tag v-if="trajectory.group.pending_review" type="warning">人工修改待复核</el-tag>
                     <span>{{ trajectory.group.active_row_count }}/{{ trajectory.group.row_count }} 步 · 已改 {{ trajectory.group.edited_row_count }} 步</span>
-                    <el-button class="trajectory-export" size="small" :type="trajectory.group.export ? 'success' : 'default'" plain :disabled="busy || trajectory.group.pending_review" @click.stop="ws.toggleExport(trajectory.group)">{{ trajectory.group.export ? '取消导出' : '加入导出' }}</el-button>
+                    <el-button class="trajectory-export" size="small" :type="trajectory.group.export ? 'success' : 'default'" plain :disabled="pipelineReadOnly || busy || trajectory.group.pending_review" @click.stop="chooseExport(task.task_id, trajectory.group.group_id)">{{ pipelineContext.managed.value ? (trajectory.group.export ? '已选择' : '选择此轨迹') : (trajectory.group.export ? '取消导出' : '加入导出') }}</el-button>
                   </div>
                 </template>
                 <div v-if="openGroupId === trajectory.group.group_id" v-loading="loadingGroup" class="trajectory-detail">
@@ -230,10 +280,10 @@ onBeforeUnmount(() => {
                     <el-alert title="对照当前步骤，决定是否采用上次人工修改" type="warning" :closable="false" />
                     <article v-for="item in activeGroup.pending_reviews" :key="item.step_key"><b>Step {{ item.step ?? item.baseline?.step ?? '—' }}</b><p>{{ item.reason }}</p><table><thead><tr><th>字段</th><th>上次基线</th><th>保留的人工修改</th><th>当前步骤</th></tr></thead><tbody><tr v-for="field in Object.keys(item.changes).filter(key => reviewFields[key])" :key="field"><th>{{ reviewFields[field] }}</th><td>{{ reviewText(item.baseline?.[field]) }}</td><td>{{ reviewText(item.changes[field]) }}</td><td>{{ reviewText(currentReviewValue(item.step_key, field)) }}</td></tr></tbody></table></article>
                     <p v-if="activeGroup.can_adopt_review === false">当前来源尚未就绪，或原步骤已不在当前入选轨迹中；暂时无法直接采用。</p>
-                    <el-button type="primary" :disabled="busy || activeGroup.can_adopt_review === false" @click="reviewGroup(activeGroup.group_id, 'adopt')">采用保留的修改</el-button>
-                    <el-button :disabled="busy" @click="reviewGroup(activeGroup.group_id, 'discard')">放弃保留的修改</el-button>
+                    <el-button type="primary" :disabled="pipelineReadOnly || busy || activeGroup.can_adopt_review === false" @click="reviewGroup(activeGroup.group_id, 'adopt')">采用保留的修改</el-button>
+                    <el-button :disabled="pipelineReadOnly || busy" @click="reviewGroup(activeGroup.group_id, 'discard')">放弃保留的修改</el-button>
                   </div>
-                  <CorrectionWorkbench v-if="activeGroup && session && !loadingGroup && !groupError" :session-id="session.session_id" :group="activeGroup" :row="activeRow" :revision="actionRevision" :saving="busy"
+                  <CorrectionWorkbench v-if="activeGroup && session && !loadingGroup && !groupError" :session-id="session.session_id" :group="activeGroup" :row="activeRow" :revision="actionRevision" :saving="busy" :read-only="pipelineReadOnly"
                     @select="ws.chooseRow" @delete="toggleDeleted" @action="ws.saveAction" @draft="actionDraft = $event" />
                 </div>
               </el-collapse-item>
@@ -248,6 +298,7 @@ onBeforeUnmount(() => {
       <p>当前步骤的 Action 有修改，请选择如何处理。</p>
       <template #footer><el-button @click="decideAction('cancel')">取消</el-button><el-button @click="decideAction('discard')">放弃修改</el-button><el-button type="primary" @click="decideAction('save')">保存后继续</el-button></template>
     </el-dialog>
+    </template>
   </div>
 </template>
 
