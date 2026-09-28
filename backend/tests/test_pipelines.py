@@ -1,5 +1,7 @@
 """Offline state-machine, ownership, exact-job and restart tests."""
 from copy import deepcopy
+from datetime import datetime, timezone
+from unittest.mock import patch
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from tempfile import TemporaryDirectory
@@ -48,15 +50,18 @@ class OfflineRuntime:
         self.calls.append((step, retry))
         if step == "cot" and not self.cot_needed:
             return None
-        job = {"job_id": uuid.uuid4().hex, "batch_id": p["batch_id"], "status": "queued", "percent": 0}
+        job = {"job_id": uuid.uuid4().hex, "batch_id": p["batch_id"], "pipeline_id": p["pipeline_id"],
+               "status": "queued", "percent": 0}
         self.children.setdefault(step, []).append(job)
         self.records.put({"tree": "tree_jobs", "quality": "quality_jobs", "preprocessing": "preprocessing_jobs",
                           "cot": "correction_cot_jobs"}[step], job["job_id"], job)
         return deepcopy(job)
 
-    def complete(self, step, *, fail=False):
+    def complete(self, step, *, fail=False, failure=None):
         job = self.children[step][-1]
         job.update(status="failed" if fail else "succeeded", percent=100, error="mock failure" if fail else None)
+        if failure is not None:
+            job["failure"] = failure
         self.records.put({"tree": "tree_jobs", "quality": "quality_jobs", "preprocessing": "preprocessing_jobs",
                           "cot": "correction_cot_jobs"}[step], job["job_id"], job)
         if not fail:
@@ -165,6 +170,347 @@ class PipelineTests(unittest.TestCase):
         self.assertIn(old, p["steps"][1]["previous_job_ids"])
         self.runtime.complete("preprocessing")
         self.assertEqual(self.tick(p)["steps"][1]["status"], "succeeded")
+
+    def test_transient_job_retries_twice_and_persists_schedule_across_restart(self):
+        p = self.tick(self.create(), 2)
+        self.assertEqual(p["retry_policy"], {"version": 1, "max_attempts": 3, "delays_seconds": [30, 120]})
+        self.assertEqual(p["steps"][1]["retry_info"]["attempts"], 1)
+        transient = {"category": "server_error", "http_status": 500, "retryable": True,
+                     "request_id": "req-500", "message": "provider body is never copied"}
+        self.runtime.complete("preprocessing", fail=True, failure=transient)
+        before = datetime.now(timezone.utc)
+        p = self.tick(p)
+        info = p["steps"][1]["retry_info"]
+        self.assertEqual(p["status"], "retry_waiting")
+        self.assertEqual(info["attempts"], 1)
+        self.assertEqual(info["max_attempts"], 3)
+        self.assertIn("HTTP 500", info["last_error"])
+        self.assertNotIn("provider body", info["last_error"])
+        first_due = datetime.fromisoformat(info["next_retry_at"].replace("Z", "+00:00"))
+        self.assertLess(abs((first_due - before).total_seconds() - 30), 3)
+        self.assertEqual(len(self.runtime.calls), 1)
+        self.manager = PipelineManager(self.runtime, self.root)
+        self.assertEqual(self.tick(p)["status"], "retry_waiting")
+        self.assertEqual(len(self.runtime.calls), 1)
+        with patch("backend.pipelines._retry_due", return_value=True):
+            p = self.tick(p)
+        self.assertEqual(p["steps"][1]["retry_info"]["attempts"], 2)
+        self.assertEqual(len(self.runtime.calls), 2)
+        self.runtime.complete("preprocessing", fail=True, failure=transient)
+        before = datetime.now(timezone.utc)
+        p = self.tick(p)
+        second_due = datetime.fromisoformat(p["steps"][1]["retry_info"]["next_retry_at"].replace("Z", "+00:00"))
+        self.assertLess(abs((second_due - before).total_seconds() - 120), 3)
+        with patch("backend.pipelines._retry_due", return_value=True):
+            p = self.tick(p)
+        self.assertEqual(p["steps"][1]["retry_info"]["attempts"], 3)
+        self.assertEqual(len(self.runtime.calls), 3)
+        self.runtime.complete("preprocessing", fail=True, failure=transient)
+        p = self.tick(p, 2)
+        self.assertEqual(p["status"], "failed")
+        self.assertIsNone(p["steps"][1]["retry_info"]["next_retry_at"])
+        self.assertEqual(len(self.runtime.calls), 3)
+        p = self.tick(self.control(p, "retry"))
+        self.assertEqual(p["steps"][1]["retry_info"]["attempts"], 1)
+        self.assertEqual(len(self.runtime.calls), 4)
+
+    def test_concurrent_due_polls_submit_only_one_retry_job(self):
+        p = self.tick(self.create(), 2)
+        self.runtime.complete("preprocessing", fail=True, failure={"category": "server_error", "http_status": 502})
+        p = self.tick(p)
+        self.assertEqual(p["status"], "retry_waiting")
+        with patch("backend.pipelines._retry_due", return_value=True), ThreadPoolExecutor(max_workers=2) as executor:
+            list(executor.map(self.manager.tick, [p["pipeline_id"], p["pipeline_id"]]))
+        p = self.manager.get(p["pipeline_id"])
+        self.assertEqual(p["steps"][1]["retry_info"]["attempts"], 2)
+        self.assertEqual(len(self.runtime.calls), 2)
+        self.assertEqual(len(p["steps"][1]["job_ids"]), 1)
+
+    def test_pause_and_terminate_stop_scheduled_retry(self):
+        p = self.tick(self.create(), 2)
+        self.runtime.complete("preprocessing", fail=True, failure={"category": "timeout"})
+        p = self.tick(p)
+        self.assertEqual(p["status"], "retry_waiting")
+        p = self.control(p, "pause")
+        with patch("backend.pipelines._retry_due", return_value=True):
+            self.assertEqual(self.tick(p)["status"], "paused")
+        self.assertEqual(len(self.runtime.calls), 1)
+        p = self.control(p, "resume")
+        with patch("backend.pipelines._retry_due", return_value=True):
+            p = self.tick(p)
+        self.assertEqual(len(self.runtime.calls), 2)
+        self.runtime.complete("preprocessing", fail=True, failure={"category": "connection"})
+        p = self.tick(p)
+        self.assertEqual(p["status"], "retry_waiting")
+        p = self.control(p, "terminate")
+        self.assertEqual(self.tick(p)["status"], "terminated")
+        self.assertEqual(len(self.runtime.calls), 2)
+
+    def test_quota_stale_and_unknown_failure_never_auto_retry(self):
+        for failure, status in (({"category": "quota", "http_status": 403}, "failed"),
+                                ({"category": "server_error", "http_status": 500}, "stale"),
+                                (None, "failed")):
+            with self.subTest(failure=failure, status=status), TemporaryDirectory() as directory:
+                root = Path(directory)
+                runtime = OfflineRuntime(root)
+                manager = PipelineManager(runtime, root)
+                p = manager.create({"request_id": "case", "name": "case", "batch_id": "batch-case",
+                                    "mode": "automatic", "start_mode": "existing", "threshold": 4})
+                manager.tick(p["pipeline_id"])
+                manager.tick(p["pipeline_id"])
+                job = runtime.children["preprocessing"][-1]
+                job.update(status=status, error="opaque exit 1", failure=failure)
+                manager.tick(p["pipeline_id"])
+                result = manager.get(p["pipeline_id"])
+                self.assertEqual(result["status"], "failed")
+                if status == "stale":
+                    self.assertIn("输入已变化", result["error"])
+                self.assertEqual(len(runtime.calls), 1)
+                self.assertIsNone(result["steps"][1]["retry_info"]["next_retry_at"])
+
+    def test_old_pipeline_without_policy_keeps_manual_retry_behavior(self):
+        p = self.tick(self.create(), 2)
+        stored = self.manager.get(p["pipeline_id"], public=False)
+        stored.pop("retry_policy")
+        for step in stored["steps"]:
+            step.pop("retry_info", None)
+        self.manager._save(stored)
+        self.runtime.complete("preprocessing", fail=True, failure={"category": "server_error", "http_status": 500})
+        result = self.tick(p)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(len(self.runtime.calls), 1)
+
+    def test_collection_lost_ack_uses_bound_run_without_restarting_phone(self):
+        options = {"phone_id": "phone-a", "app": "App", "vla": "http://mock.invalid", "config": {}}
+        p = self.create(start_mode="collect", collection_config=options)
+        original = self.runtime.dispatch_collection
+        calls = []
+
+        def lost_ack(pipeline):
+            calls.append(1)
+            original(pipeline)
+            raise TimeoutError("collector acknowledgement was lost")
+
+        self.runtime.dispatch_collection = lost_ack
+        p = self.tick(p)
+        self.assertEqual(p["status"], "retry_waiting")
+        self.assertEqual(len(p["collection_run_ids"]), 1)
+        with patch("backend.pipelines._retry_due", return_value=True):
+            p = self.tick(p)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(p["status"], "running")
+        self.runtime.collection_values[0]["status"] = "completed"
+        self.assertEqual(self.tick(p)["steps"][0]["status"], "succeeded")
+
+    def test_collection_communication_failure_exhausts_three_attempts(self):
+        options = {"phone_id": "phone-a", "app": "App", "vla": "http://mock.invalid", "config": {}}
+        p = self.create(start_mode="collect", collection_config=options)
+        original = self.runtime.dispatch_collection
+        calls = []
+
+        def always_lose_ack(pipeline):
+            calls.append(pipeline["pipeline_id"])
+            if not self.runtime.collection_values:
+                original(pipeline)
+            self.runtime.collection_values[0].update(status="failed", dispatch_error="response lost")
+            raise TimeoutError("collector acknowledgement lost")
+
+        self.runtime.dispatch_collection = always_lose_ack
+        p = self.tick(p)
+        self.assertEqual((p["status"], p["steps"][0]["retry_info"]["attempts"]), ("retry_waiting", 1))
+        run_id = p["collection_run_ids"][0]
+        with patch("backend.pipelines._retry_due", return_value=True):
+            p = self.tick(p)
+        self.assertEqual((p["status"], p["steps"][0]["retry_info"]["attempts"]), ("retry_waiting", 2))
+        with patch("backend.pipelines._retry_due", return_value=True):
+            p = self.tick(p)
+        self.assertEqual((p["status"], p["steps"][0]["retry_info"]["attempts"]), ("failed", 3))
+        self.assertIsNone(p["steps"][0]["retry_info"]["next_retry_at"])
+        self.assertEqual(calls, [p["pipeline_id"]] * 3)
+        self.assertEqual(p["collection_run_ids"], [run_id])
+        self.assertEqual(len(self.runtime.collection_values), 1)
+
+    def test_collection_failed_ack_reconciles_same_run_identity(self):
+        options = {"phone_id": "phone-a", "app": "App", "vla": "http://mock.invalid", "config": {}}
+        p = self.create(start_mode="collect", collection_config=options)
+        original = self.runtime.dispatch_collection
+        calls = []
+
+        def recover_by_same_request(pipeline):
+            calls.append(pipeline["pipeline_id"])
+            if len(calls) == 1:
+                original(pipeline)
+                self.runtime.collection_values[0].update(status="failed", dispatch_error="response lost")
+                raise TimeoutError("collector acknowledgement was lost")
+            run = self.runtime.collection_values[0]
+            run.update(status="running", dispatch_error=None)
+            return run
+
+        self.runtime.dispatch_collection = recover_by_same_request
+        p = self.tick(p)
+        self.assertEqual(p["status"], "retry_waiting")
+        run_id = p["collection_run_ids"][0]
+        with patch("backend.pipelines._retry_due", return_value=True):
+            p = self.tick(p)
+        self.assertEqual(calls, [p["pipeline_id"], p["pipeline_id"]])
+        self.assertEqual(p["collection_run_ids"], [run_id])
+        self.assertEqual(len(self.runtime.collection_values), 1)
+        self.assertEqual(p["steps"][0]["retry_info"]["attempts"], 2)
+        self.runtime.collection_values[0]["status"] = "completed"
+        self.assertEqual(self.tick(p)["steps"][0]["status"], "succeeded")
+
+    def test_late_valid_result_cancels_scheduled_retry_before_due(self):
+        p = self.tick(self.create(), 2)
+        self.runtime.complete("preprocessing", fail=True, failure={"category": "server_error", "http_status": 503})
+        p = self.tick(p)
+        self.assertEqual(p["status"], "retry_waiting")
+        self.runtime.ready_stages.add("preprocessing")
+        p = self.tick(p)
+        self.assertEqual(p["status"], "running")
+        self.assertEqual(p["steps"][1]["status"], "succeeded")
+        self.assertEqual(len(self.runtime.calls), 1)
+
+    def test_publish_lost_ack_during_retry_wait_reconciles_without_republish(self):
+        self.runtime.lost_publish_response = True
+        original = self.runtime.publish
+
+        def transient_lost_ack(pipeline):
+            try:
+                return original(pipeline)
+            except OSError as exc:
+                raise TimeoutError("publication acknowledgement lost") from exc
+
+        self.runtime.publish = transient_lost_ack
+        p = self.tick(self.ready(), 7)
+        self.assertEqual(p["status"], "retry_waiting")
+        self.assertEqual(self.runtime.publish_count, 1)
+        p = self.tick(p)
+        self.assertEqual(p["current_step"], "overview")
+        self.assertEqual(p["status"], "running")
+        self.assertEqual(self.runtime.publish_count, 1)
+        self.assertIsNone(p["steps"][-2]["retry_info"]["next_retry_at"])
+
+    def test_overview_retry_uses_registered_release_and_preserves_summary_failure(self):
+        p = self.tick(self.ready(), 8)
+        self.runtime.records.put("training_overview_conversions", "release-test", {
+            "status": "failed", "error": "provider body", "failure": {"category": "server_error", "http_status": 503}})
+        p = self.tick(p)
+        self.assertEqual(p["status"], "retry_waiting")
+        self.assertEqual(self.runtime.publish_count, 1)
+        with patch("backend.pipelines._retry_due", return_value=True):
+            p = self.tick(p)
+        self.assertEqual(p["status"], "running")
+        self.assertEqual(self.runtime.publish_count, 1)
+        self.runtime.records.put("training_overview_conversions", "release-test", {"status": "succeeded"})
+        self.assertEqual(self.tick(p)["status"], "succeeded")
+
+    def test_pause_and_terminate_after_publish_stop_overview_retries(self):
+        p = self.tick(self.ready(), 8)
+        self.assertEqual(p["current_step"], "overview")
+        p = self.control(p, "pause")
+        self.runtime.records.put("training_overview_conversions", "release-test", {
+            "status": "failed", "failure": {"category": "server_error", "http_status": 503}})
+        self.assertEqual(self.tick(p)["status"], "paused")
+        p = self.control(p, "resume")
+        p = self.tick(p)
+        self.assertEqual(p["status"], "retry_waiting")
+        p = self.control(p, "terminate")
+        self.assertEqual(p["status"], "terminated")
+        with patch("backend.pipelines._retry_due", return_value=True):
+            self.assertEqual(self.tick(p)["status"], "terminated")
+        self.assertEqual(self.runtime.publish_count, 1)
+        self.assertEqual(self.runtime.records.get("training_overview_conversions", "release-test")["status"], "failed")
+
+    def test_terminate_after_uncertain_publication_records_release_without_overview(self):
+        self.runtime.lost_publish_response = True
+        original = self.runtime.publish
+
+        def transient_lost_ack(pipeline):
+            try:
+                return original(pipeline)
+            except OSError as exc:
+                raise TimeoutError("publication acknowledgement lost") from exc
+
+        self.runtime.publish = transient_lost_ack
+        p = self.tick(self.ready(), 7)
+        self.assertEqual(p["status"], "retry_waiting")
+        p = self.control(p, "terminate")
+        p = self.tick(p)
+        self.assertEqual(p["status"], "terminated")
+        self.assertEqual(p["release_id"], "release-test")
+        self.assertEqual(self.runtime.publish_count, 1)
+        self.assertIsNone(self.runtime.records.get("training_overview_conversions", "release-test"))
+
+    def test_restart_after_job_dispatch_intent_does_not_count_a_second_attempt(self):
+        p = self.tick(self.create())
+        stored = self.manager.get(p["pipeline_id"], public=False)
+        step = stored["steps"][1]
+        step.update(status="running", started_at="frozen", retry_info={"attempts": 1,
+                    "max_attempts": 3, "last_error": None, "next_retry_at": None})
+        self.manager._save(stored)
+        self.manager = PipelineManager(self.runtime, self.root)
+        p = self.tick(p)
+        self.assertEqual(p["steps"][1]["retry_info"]["attempts"], 1)
+        self.assertEqual(len(self.runtime.calls), 1)
+        self.assertEqual(len(p["steps"][1]["job_ids"]), 1)
+
+    def test_restart_adopts_unbound_child_job_without_duplicate_submit(self):
+        p = self.tick(self.create(), 2)
+        child_id = p["steps"][1]["job_ids"][0]
+        stored = self.manager.get(p["pipeline_id"], public=False)
+        stored["steps"][1]["job_ids"] = []
+        self.manager._save(stored)
+        self.manager = PipelineManager(self.runtime, self.root)
+        p = self.tick(p)
+        self.assertEqual(p["steps"][1]["job_ids"], [child_id])
+        self.assertEqual(p["steps"][1]["retry_info"]["attempts"], 1)
+        self.assertEqual(len(self.runtime.calls), 1)
+
+    def test_restart_after_collection_and_publication_intents_preserves_attempts(self):
+        options = {"phone_id": "phone-a", "app": "App", "vla": "http://mock.invalid", "config": {}}
+        p = self.create(start_mode="collect", collection_config=options)
+        stored = self.manager.get(p["pipeline_id"], public=False)
+        stored["steps"][0].update(status="running", retry_info={"attempts": 1,
+            "max_attempts": 3, "last_error": None, "next_retry_at": None})
+        self.manager._save(stored)
+        self.manager = PipelineManager(self.runtime, self.root)
+        p = self.tick(p)
+        self.assertEqual(p["steps"][0]["retry_info"]["attempts"], 1)
+        self.assertEqual(len(self.runtime.collection_values), 1)
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = OfflineRuntime(root)
+            runtime.ready_stages.update({"preprocessing", "tree", "quality"})
+            manager = PipelineManager(runtime, root)
+            other = manager.create({"request_id": "other", "name": "other", "batch_id": "batch-other",
+                                    "mode": "automatic", "start_mode": "existing", "threshold": 4})
+            for _ in range(6):
+                manager.tick(other["pipeline_id"])
+            stored = manager.get(other["pipeline_id"], public=False)
+            stored["steps"][6].update(status="running", retry_info={"attempts": 1,
+                "max_attempts": 3, "last_error": None, "next_retry_at": None})
+            manager._save(stored)
+            manager = PipelineManager(runtime, root)
+            manager.tick(other["pipeline_id"])
+            result = manager.get(other["pipeline_id"])
+            self.assertEqual(result["steps"][6]["retry_info"]["attempts"], 1)
+            self.assertEqual(runtime.publish_count, 1)
+
+    def test_restart_binds_existing_collection_run_before_remote_dispatch(self):
+        options = {"phone_id": "phone-a", "app": "App", "vla": "http://mock.invalid", "config": {}}
+        p = self.create(start_mode="collect", collection_config=options)
+        existing = self.runtime.dispatch_collection(p)
+        stored = self.manager.get(p["pipeline_id"], public=False)
+        stored["steps"][0].update(status="running", retry_info={"attempts": 1,
+            "max_attempts": 3, "last_error": None, "next_retry_at": None})
+        self.manager._save(stored)
+        self.manager = PipelineManager(self.runtime, self.root)
+        with patch.object(self.runtime, "dispatch_collection", wraps=self.runtime.dispatch_collection) as dispatch:
+            p = self.tick(p)
+            dispatch.assert_not_called()
+        self.assertEqual(p["collection_run_ids"], [existing["collection_run_id"]])
+        self.assertEqual(p["steps"][0]["retry_info"]["attempts"], 1)
 
     def test_restart_reads_persisted_exact_job_without_repeating_submit(self):
         p = self.tick(self.create(), 2)

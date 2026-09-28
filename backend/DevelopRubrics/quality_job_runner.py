@@ -28,6 +28,7 @@ from backend.batch_results import (current_tree_payload, current_tree_batch, mer
                                    quality_task_fingerprints, StaleTaskInput)
 from backend.trajectory_data import resolve_tree_run_dir
 from backend.quality_data import quality_manifest
+from backend.pipeline_retry_errors import failure_from_exception
 
 WORKSPACE = DATA_ROOT / "system"
 TREE_RUNS = WORKSPACE / "trajectory_tree_runs"
@@ -321,10 +322,17 @@ def main() -> int:
     parser.add_argument("--job-id", required=True)
     args = parser.parse_args()
     try:
+        from backend.pipeline_access import retry_enabled_for_pipeline
+        job_owner = (RecordStore(DATA_ROOT).get("quality_jobs", args.job_id) or {}).get("pipeline_id")
+        if retry_enabled_for_pipeline(job_owner, DATA_ROOT):
+            os.environ["PIPELINE_MODEL_SINGLE_ATTEMPT"] = "1"
+        else:
+            os.environ["PIPELINE_MODEL_SINGLE_ATTEMPT"] = "0"
         result = asyncio.run(run(args.run_id, args.task_id, args.job_id))
-    except StaleTaskInput as exc:
-        print("ERROR " + json.dumps({"kind": "stale", "message": str(exc)}, ensure_ascii=False), flush=True)
-        return 2
+    except Exception as exc:
+        failure = failure_from_exception(exc)
+        print("ERROR " + json.dumps(failure, ensure_ascii=False), flush=True)
+        return 2 if failure["category"] == "stale" else 1
     print("RESULT " + json.dumps(result, ensure_ascii=False), flush=True)
     return 0
 

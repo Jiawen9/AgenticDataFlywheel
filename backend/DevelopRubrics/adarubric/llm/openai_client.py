@@ -92,9 +92,12 @@ class OpenAIClient(LLMClient):
         extra_body: dict[str, Any] | None = None,
     ) -> None:
         self.model = model
-        self._max_retries = max(1, max_retries)
+        # A new Pipeline owns the retry budget across durable stage attempts.
+        # Leave standalone and existing Pipeline behavior unchanged.
+        single_attempt = os.environ.get("PIPELINE_MODEL_SINGLE_ATTEMPT") == "1"
+        self._max_retries = 1 if single_attempt else max(1, max_retries)
         self._extra_body = extra_body if extra_body is not None else _extra_body_from_env()
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url, **({"max_retries": 0} if single_attempt else {}))
 
     async def _chat(
         self,

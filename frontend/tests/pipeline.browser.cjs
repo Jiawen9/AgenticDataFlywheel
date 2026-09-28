@@ -63,7 +63,7 @@ async function main() {
       if (name === '/api/pipelines') return send({ pipelines: pipelines.filter(p => (!url.searchParams.get('batch_id') || p.batch_id === url.searchParams.get('batch_id')) && (!url.searchParams.get('active_only') || !['succeeded', 'terminated', 'published_summary_failed'].includes(p.status))) })
       if (name.startsWith('/api/pipelines/')) {
         const id = name.split('/')[3], value = pipelines.find(p => p.pipeline_id === id), action = name.split('/')[4]
-        if (action) { assert.equal(body.expected_revision, value.storage_revision); value.storage_revision++; if (action === 'confirm-correction') { assert.equal(body.session_revision, sessionRevision); value.status = 'running'; value.current_step = 'cot'; value.steps.find(s => s.id === 'correction').status = 'succeeded' } else value.status = ({ pause: 'paused', resume: 'running', retry: 'running', terminate: 'terminated' })[action] }
+        if (action) { assert.equal(body.expected_revision, value.storage_revision); value.storage_revision++; if (action === 'retry' && value.status === 'failed') { const step = value.steps.find(s => s.id === value.current_step); if (step) { step.status = 'pending'; step.retry_info = { attempts: 0, max_attempts: 3, last_error: null, next_retry_at: null }; step.error = null } value.error = null } if (action === 'confirm-correction') { assert.equal(body.session_revision, sessionRevision); value.status = 'running'; value.current_step = 'cot'; value.steps.find(s => s.id === 'correction').status = 'succeeded' } else value.status = ({ pause: 'paused', resume: 'running', retry: 'running', terminate: 'terminated' })[action] }
         return send({ pipeline: value })
       }
       if (name.endsWith('/lifecycle')) return send({ batch_id: name.split('/')[3], status: releases.some(r => r.batch_ids.includes(name.split('/')[3])) ? 'published' : 'active', release_id: releases[0]?.release_id || null, published_at: null })
@@ -206,6 +206,40 @@ async function main() {
     await pause(350); assert.equal(await page.getByTestId('pipeline-node-rubrics-ranking').evaluate(element => getComputedStyle(element).backgroundColor), 'rgb(238, 242, 255)')
     Object.assign(quality, { status: 'pending', job_ids: [], jobs: [], percent: 0 })
     cases.push('多任务多子作业在页面总结/建树和Rubrics阶段交替，整批成功前子节点不提前完成；原运行/完成配色保留')
+    const retryDeadline = seconds => new Date(Date.now() + seconds * 1000).toISOString()
+    Object.assign(manual, { status: 'retry_waiting', current_step: 'quality', error: null })
+    Object.assign(quality, { status: 'retry_waiting', message: '临时故障', error: null, job_ids: ['quality-transient'], jobs: [], retry_info: {
+      attempts: 1, max_attempts: 3, last_error: 'HTTP 500 · 请求 mock-r-1', next_retry_at: retryDeadline(30),
+    } })
+    await page.goto(base + '/pipeline?pipeline_id=pipeline-1')
+    const retryStatus = page.getByTestId('pipeline-retry-status')
+    await retryStatus.getByText(/临时故障，\d+ 秒后进行第 2\/3 次尝试/).waitFor()
+    assert.match(await retryStatus.innerText(), /最近错误：HTTP 500 · 请求 mock-r-1/)
+    assert.equal(await page.getByTestId('pipeline-stage-quality').getAttribute('data-status'), 'waiting')
+    const firstRemaining = Number((await retryStatus.innerText()).match(/(\d+) 秒后/)[1])
+    await pause(1200)
+    const nextRemaining = Number((await retryStatus.innerText()).match(/(\d+) 秒后/)[1])
+    assert.ok(nextRemaining < firstRemaining, 'countdown must advance without a new request')
+    quality.retry_info = { ...quality.retry_info, attempts: 2, next_retry_at: retryDeadline(120) }
+    await page.reload()
+    await retryStatus.getByText(/临时故障，\d+ 秒后进行第 3\/3 次尝试/).waitFor()
+    assert.match(await retryStatus.innerText(), /11[89]|120 秒后/)
+    await page.getByRole('button', { name: '暂停', exact: true }).click()
+    await retryStatus.getByText('已暂停自动重试；继续后进行第 3/3 次尝试').waitFor()
+    await page.getByRole('button', { name: '继续', exact: true }).click()
+    Object.assign(manual, { status: 'failed', error: 'HTTP 500 · 请求 mock-r-3' })
+    Object.assign(quality, { status: 'failed', error: 'HTTP 500 · 请求 mock-r-3', retry_info: {
+      attempts: 3, max_attempts: 3, last_error: 'HTTP 500 · 请求 mock-r-3', next_retry_at: null,
+    } })
+    await page.reload()
+    await retryStatus.getByText('已尝试 3/3 次，自动重试已停止；可手动重试').waitFor()
+    assert.equal(await page.getByRole('button', { name: '重试', exact: true }).count(), 1)
+    await page.getByRole('button', { name: '重试', exact: true }).click()
+    await page.getByRole('button', { name: '暂停', exact: true }).waitFor()
+    assert.equal(await retryStatus.count(), 0)
+    Object.assign(quality, { status: 'pending', message: null, error: null, retry_info: null, job_ids: [], jobs: [], percent: 0 })
+    manual.error = null
+    cases.push('临时故障30/120秒倒计时、原因与次数、暂停、耗尽后的手动新周期；七模块图仍可跳转')
     await page.goto(base + '/quality?pipeline_id=pipeline-1&step_id=quality&batch_id=batch-manual')
     await page.getByTestId('pipeline-status-bar').getByText('轨迹质检 · 等待前置步骤', { exact: true }).waitFor()
     const waitingCalls = mutations().length

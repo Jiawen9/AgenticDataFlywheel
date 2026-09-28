@@ -8,6 +8,7 @@ import logging
 import math
 import threading
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .batch_lifecycle import active_jobs, ensure_batch_active, lifecycle
@@ -22,6 +23,23 @@ STEPS = [("collection", "采集与回传"), ("preprocessing", "预处理与标�
          ("publication", "数据发布"), ("overview", "看板汇总")]
 ACTIVE_JOBS = {"queued", "running", "dispatching", "pending"}
 FAILED_JOBS = {"failed", "interrupted", "cancelled", "stale"}
+RETRY_POLICY = {"version": 1, "max_attempts": 3, "delays_seconds": [30, 120]}
+RETRYABLE_STEPS = {"collection", "preprocessing", "tree", "quality", "cot", "publication", "overview"}
+
+
+def _stage_failure_message(step_id, failure):
+    """Use the real stage name for transport errors outside model processing."""
+    source = {"collection": "采集服务", "publication": "发布登记", "overview": "汇总转换"}.get(step_id)
+    reason = {"timeout": "请求超时", "connection": "连接中断",
+              "rate_limit": "服务限流", "server_error": "服务临时故障"}.get(failure.get("category"))
+    if not source or not reason:
+        return failure.get("message")
+    details = []
+    if failure.get("http_status"):
+        details.append(f"HTTP {failure['http_status']}")
+    if failure.get("request_id"):
+        details.append(f"请求编号 {failure['request_id']}")
+    return source + reason + ("（" + "，".join(details) + "）" if details else "")
 
 
 def digest(value):
@@ -33,6 +51,22 @@ class PipelineError(RuntimeError):
     def __init__(self, message, status=409):
         super().__init__(message)
         self.status = status
+
+
+class PipelineStepFailure(PipelineError):
+    """A child job failed and supplied a bounded, structured diagnosis."""
+
+    def __init__(self, message, failure=None):
+        super().__init__(message)
+        self.failure = failure
+
+
+def _retry_due(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00")) <= datetime.now(timezone.utc)
+
+
+def _retry_at(delay):
+    return (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 class PipelineRuntime:
@@ -272,11 +306,14 @@ class PipelineManager:
             pipeline = {"pipeline_id": identifier, "batch_id": batch, "name": name, "mode": mode,
                 "start_mode": start, "threshold": threshold if mode == "automatic" else None,
                 "task_ids": snapshot["task_ids"], "batch_snapshot": snapshot, "collection_config": options,
-                "config_fingerprints": self.runtime.configurations(), "status": "running", "current_step": "collection",
+                "config_fingerprints": self.runtime.configurations(), "retry_policy": dict(RETRY_POLICY),
+                "status": "running", "current_step": "collection",
                 "created_at": now, "updated_at": now, "error": None, "session_id": None, "release_id": None,
                 "selection": None, "confirmation": None, "collection_run_ids": [], "logs": [],
                 "steps": [{"id": key, "label": label, "status": "pending", "job_ids": [], "percent": 0,
-                           "message": "等待前置步骤", "error": None, "started_at": None, "completed_at": None}
+                           "message": "等待前置步骤", "error": None, "started_at": None, "completed_at": None,
+                           "retry_info": {"attempts": 0, "max_attempts": RETRY_POLICY["max_attempts"],
+                                          "last_error": None, "next_retry_at": None}}
                           for key, label in STEPS]}
             owner = self.records.get("pipeline_owners", batch)
             self.records.put_many([
@@ -303,9 +340,12 @@ class PipelineManager:
                 self.runtime.conversion(p["release_id"], retry=True)
                 p.update(status="running", error=None)
                 p["steps"][-1].update(status="running", error=None)
+                if p.get("retry_policy"):
+                    p["steps"][-1]["retry_info"] = {"attempts": 1, "max_attempts": p["retry_policy"]["max_attempts"],
+                                                   "last_error": None, "next_retry_at": None}
             elif p["status"] in TERMINAL:
                 raise PipelineError("该 Pipeline 已结束")
-            elif action == "pause" and p["status"] in {"running", "waiting_for_correction"} and not p.get("release_id"):
+            elif action == "pause" and p["status"] in {"running", "retry_waiting", "waiting_for_correction"}:
                 p["paused_from"] = p["status"]
                 p["status"] = "paused"
             elif action == "resume" and p["status"] == "paused":
@@ -315,9 +355,12 @@ class PipelineManager:
                 step["retry_job_id"] = step["job_ids"][-1] if step["job_ids"] else None
                 step.setdefault("previous_job_ids", []).extend(step["job_ids"])
                 step.update(status="pending", error=None, retry=True, job_ids=[])
+                if p.get("retry_policy"):
+                    step["retry_info"] = {"attempts": 0, "max_attempts": p["retry_policy"]["max_attempts"],
+                                          "last_error": None, "next_retry_at": None}
                 p.update(status="running", error=None)
-            elif action == "terminate" and not p.get("release_id"):
-                p["status"] = "terminating"
+            elif action == "terminate":
+                p["status"] = "terminated" if p.get("release_id") else "terminating"
             elif action == "confirm-correction" and p["status"] == "waiting_for_correction":
                 if session_revision is None:
                     raise PipelineError("请携带修正会话修订号确认", 422)
@@ -335,8 +378,86 @@ class PipelineManager:
             self._save(p)
             return self.get(pipeline_id)
 
+    def _start_attempt(self, pipeline, step):
+        if pipeline.get("retry_policy") and step.get("retry_info"):
+            step["retry_info"]["attempts"] += 1
+            step["retry_info"]["next_retry_at"] = None
+
+    def _schedule_or_fail(self, pipeline, step, exc):
+        from .pipeline_retry_errors import failure_from_exception, failure_from_payload
+
+        child_failure = getattr(exc, "failure", None)
+        failure = failure_from_payload(child_failure) if child_failure else failure_from_exception(exc)
+        message = (str(exc) if isinstance(exc, PipelineError) and not isinstance(exc, PipelineStepFailure)
+                   else str(_stage_failure_message(step["id"], failure) or str(exc)) if pipeline.get("retry_policy")
+                   else str(exc))[:600]
+        info = step.get("retry_info")
+        policy = pipeline.get("retry_policy")
+        if (policy and info and step["id"] in RETRYABLE_STEPS and failure.get("retryable")
+                and int(info["attempts"]) < int(policy["max_attempts"])):
+            # A network failure before an acknowledgement is still one attempt.
+            if not info["attempts"]:
+                info["attempts"] = 1
+            delay = int(policy["delays_seconds"][int(info["attempts"]) - 1])
+            info.update(last_error=message, next_retry_at=_retry_at(delay))
+            pipeline.update(status="retry_waiting", error=message)
+            step.update(status="retry_waiting", error=message,
+                        message=f"临时故障，{delay} 秒后进行第 {info['attempts'] + 1}/{info['max_attempts']} 次尝试")
+            self._log(pipeline, step["label"] + f"临时故障，{delay} 秒后重试：" + message)
+            return
+        if info:
+            info.update(last_error=message, next_retry_at=None)
+        pipeline.update(status="published_summary_failed" if step["id"] == "overview" and pipeline.get("release_id")
+                        else "failed", error=message)
+        step.update(status="failed", error=message,
+                    message="已发布，汇总失败；可单独重试转换" if step["id"] == "overview" and pipeline.get("release_id")
+                    else "执行失败，可重试或终止")
+        self._log(pipeline, step["label"] + "失败：" + message)
+
+    def _resume_scheduled_retry(self, pipeline, step):
+        info = step.get("retry_info")
+        if not info or not info.get("next_retry_at") or not _retry_due(info["next_retry_at"]):
+            return False
+        step["retry_job_id"] = step["job_ids"][-1] if step["job_ids"] else None
+        step.setdefault("previous_job_ids", []).extend(step["job_ids"])
+        step.update(status="pending", error=None, retry=True, job_ids=[])
+        if step["id"] == "collection":
+            self._start_attempt(pipeline, step)
+        info["next_retry_at"] = None
+        pipeline.update(status="running", error=None)
+        attempt = info["attempts"] if step["id"] == "collection" else info["attempts"] + 1
+        self._log(pipeline, step["label"] + f"开始第 {attempt}/{info['max_attempts']} 次尝试")
+        return True
+
+    def _completed_while_waiting(self, pipeline, step):
+        """A late child result or recovered artifact wins over a scheduled retry."""
+        key = step["id"]
+        if key == "collection":
+            runs = {run["collection_run_id"]: run for run in self.runtime.collection_runs(pipeline["batch_id"])}
+            bound = [runs.get(run_id) for run_id in pipeline.get("collection_run_ids", [])]
+            completed = (all(run and run.get("status") == "completed" for run in bound)
+                         and self.runtime.input_ready(pipeline))
+        elif key in {"preprocessing", "tree", "quality"}:
+            completed = self.runtime.ready(key, pipeline)
+        elif key == "cot":
+            by_id = {job.get("job_id"): job for job in self.runtime.jobs(key, pipeline)}
+            completed = bool(step["job_ids"]) and all(
+                by_id.get(job_id, {}).get("status") == "succeeded" for job_id in step["job_ids"])
+        elif key == "overview":
+            conversion = self.records.get("training_overview_conversions", pipeline["release_id"])
+            completed = bool(conversion and conversion.get("status") == "succeeded")
+        else:
+            completed = False
+        if completed:
+            self._done(step, "迟到结果已完成，继续后续步骤")
+            pipeline.update(status="succeeded" if key == "overview" else "running", error=None)
+            self._log(pipeline, step["label"] + "：" + step["message"])
+        return completed
+
     def _done(self, step, message="已完成", *, skipped=False):
         step.update(status="skipped" if skipped else "succeeded", percent=100, completed_at=step.get("completed_at") or utc_now(), message=message, error=None)
+        if step.get("retry_info"):
+            step["retry_info"].update(last_error=None, next_retry_at=None)
 
     def _job_step(self, p, step):
         key = step["id"]
@@ -352,7 +473,14 @@ class PipelineManager:
                 return
             failed = next((j for j in known if j["status"] in FAILED_JOBS), None)
             if failed:
-                raise PipelineError(failed.get("error") or "关联作业中断，请重试")
+                failure = ({"category": "stale"} if failed["status"] == "stale"
+                           else failed.get("failure") if failed["status"] in {"failed", "interrupted"}
+                           else None)
+                if (not failure and failed["status"] == "interrupted"
+                        and "服务重启导致作业中断" in str(failed.get("error") or "")):
+                    failure = {"category": "service_restart", "retryable": True,
+                               "message": failed["error"]}
+                raise PipelineStepFailure(failed.get("error") or "关联作业中断，请重试", failure)
             if key == "cot" and known and all(j["status"] == "succeeded" for j in known):
                 self._done(step)
                 return
@@ -363,8 +491,18 @@ class PipelineManager:
         if key != "cot" and self.runtime.ready(key, p):
             self._done(step, "复用当前有效结果")
             return
+        if step["status"] == "running" and not step["job_ids"]:
+            previous = set(step.get("previous_job_ids", []))
+            recovered = [job for job in jobs.values() if job.get("pipeline_id") == p["pipeline_id"]
+                         and job["job_id"] not in previous]
+            if recovered:
+                recovered.sort(key=lambda job: (str(job.get("created_at") or ""), job["job_id"]))
+                step["job_ids"].append(recovered[-1]["job_id"])
+                return
         # Persist intent before submission. Child services durably deduplicate the
         # exact input, so losing the response does not create another computation.
+        if step["status"] != "running":
+            self._start_attempt(p, step)
         step.update(status="running", started_at=step["started_at"] or utc_now(), message="提交并跟踪作业")
         saved = self._save(p)
         p["storage_revision"] = saved["storage_revision"]
@@ -379,7 +517,7 @@ class PipelineManager:
             if child["status"] in ACTIVE_JOBS and child["job_id"] not in step["job_ids"]:
                 step["job_ids"].append(child["job_id"])
         if job["status"] in FAILED_JOBS:
-            raise PipelineError(job.get("error") or "作业提交失败")
+            raise PipelineStepFailure(job.get("error") or "作业提交失败", job.get("failure"))
 
     def tick(self, pipeline_id):
         with self.artifacts.batch_lock("pipeline_" + pipeline_id), internal_pipeline(pipeline_id):
@@ -391,7 +529,24 @@ class PipelineManager:
             if state["status"] == "published":
                 p["release_id"] = state["release_id"]
                 self._done(p["steps"][-2], "已发布，批次处理结束")
-                p.update(status="running", current_step="overview", error=None)
+                if p["status"] == "terminating":
+                    p["status"] = "terminated"
+                    self._log(p, "发布已提交，流程终止后续派发")
+                    self._save(p)
+                    return
+                if p["current_step"] == "publication":
+                    # Commit succeeded even if its acknowledgement was lost.
+                    if p["steps"][-2].get("retry_info"):
+                        p["steps"][-2]["retry_info"]["next_retry_at"] = None
+                    if p["status"] == "retry_waiting":
+                        p.update(status="running", error=None)
+                    elif p["status"] == "paused" and p.get("paused_from") == "retry_waiting":
+                        p["paused_from"] = "running"
+                    elif p["status"] not in {"paused", "terminating"}:
+                        p.update(status="running", error=None)
+                elif p["status"] not in {"retry_waiting", "paused"}:
+                    p.update(status="running", error=None)
+                p["current_step"] = "overview"
             elif p["status"] == "terminating":
                 if not self._busy(p["batch_id"]):
                     p["status"] = "terminated"
@@ -408,12 +563,35 @@ class PipelineManager:
                 self._save(p)
                 return
             p["current_step"] = step["id"]
+            if p["status"] in {"paused", "failed", "waiting_for_correction"}:
+                return
             try:
                 if not p.get("release_id") and self.runtime.snapshot(p["batch_id"]) != p["batch_snapshot"]:
                     raise PipelineError("批次任务范围或来源已变化，请结束流程后重新创建")
+                if p["status"] == "retry_waiting":
+                    if (step["id"] in p["config_fingerprints"] and
+                            self.runtime.configurations().get(step["id"]) != p["config_fingerprints"][step["id"]]):
+                        raise PipelineError("处理配置已变化，请结束流程后重新创建")
+                    if self._completed_while_waiting(p, step):
+                        self._save(p)
+                        return
+                    if not self._resume_scheduled_retry(p, step):
+                        return
                 key = step["id"]
                 if key == "collection":
-                    if p["start_mode"] == "collect" and (not p["collection_run_ids"] or step.pop("retry", False)):
+                    runs_by_id = {run["collection_run_id"]: run for run in self.runtime.collection_runs(p["batch_id"])}
+                    if p["start_mode"] == "collect" and not p["collection_run_ids"]:
+                        recovered = [run for run in runs_by_id.values() if run.get("dispatch_key") == pipeline_id]
+                        p["collection_run_ids"] = [run["collection_run_id"] for run in recovered]
+                    bound = [runs_by_id.get(run_id) for run_id in p["collection_run_ids"]]
+                    dispatch_needed = not bound or any(run and run.get("dispatch_error")
+                                                       and run.get("status") in {"failed", "dispatching"}
+                                                       for run in bound)
+                    if p["start_mode"] == "collect" and dispatch_needed:
+                        retrying = bool(step.pop("retry", False))
+                        if (step["status"] != "running"
+                                and (not retrying or not step.get("retry_info", {}).get("attempts"))):
+                            self._start_attempt(p, step)
                         step.update(status="running", started_at=step["started_at"] or utc_now(), message="下发采集")
                         saved = self._save(p)
                         p["storage_revision"] = saved["storage_revision"]
@@ -451,6 +629,8 @@ class PipelineManager:
                     else:
                         self._job_step(p, step)
                 elif key == "publication":
+                    if step["status"] != "running":
+                        self._start_attempt(p, step)
                     step.update(status="running", message="准备冻结文件并登记发布", started_at=step["started_at"] or utc_now())
                     saved = self._save(p)
                     p["storage_revision"] = saved["storage_revision"]
@@ -458,21 +638,26 @@ class PipelineManager:
                     p["release_id"] = release["release_id"]
                     self._done(step, "已发布，批次处理结束")
                 elif key == "overview":
-                    conversion = self.runtime.conversion(p["release_id"])
+                    if step["status"] == "pending":
+                        self._start_attempt(p, step)
+                    conversion = self.runtime.conversion(p["release_id"], retry=bool(step.pop("retry", False)))
                     step.update(status="running", message="累计到最终汇总表和看板")
                     if conversion["status"] == "succeeded":
                         self._done(step)
                         p.update(status="succeeded", error=None)
                     elif conversion["status"] == "failed":
+                        if (p.get("retry_policy") and conversion.get("failure")):
+                            raise PipelineStepFailure(conversion.get("error") or "汇总失败", conversion["failure"])
                         p.update(status="published_summary_failed", error=conversion.get("error"))
                         step.update(status="failed", error=p["error"], message="已发布，汇总失败；可单独重试转换")
                 if step["status"] in {"succeeded", "skipped"}:
                     self._log(p, step["label"] + "：" + step["message"])
             except Exception as exc:
-                LOG.exception("Pipeline %s stage %s failed", pipeline_id, step["id"])
-                p.update(status="failed", error=str(exc))
-                step.update(status="failed", error=str(exc), message="执行失败，可重试或终止")
-                self._log(p, step["label"] + "失败：" + str(exc))
+                self._schedule_or_fail(p, step, exc)
+                if p.get("retry_policy"):
+                    LOG.warning("Pipeline %s stage %s failed: %s", pipeline_id, step["id"], p["error"])
+                else:
+                    LOG.exception("Pipeline %s stage %s failed", pipeline_id, step["id"])
                 # Dispatch may have been accepted even when its HTTP response was
                 # lost; retain the durable run identity before returning an error.
                 if step["id"] == "collection":

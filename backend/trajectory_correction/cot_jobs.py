@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..pipeline_access import submit_with_context, execution_pipeline_id
+from ..pipeline_access import submit_with_context, execution_pipeline_id, retry_enabled_for_pipeline
 
 import hashlib
 import json
@@ -25,6 +25,7 @@ from .draft_store import load_session, update_session, storage_root, session_bat
 from .service import _snapshot, session_asset, publish_stage_snapshot, publish_cot_snapshot, _check_revision, active_session_lock
 from .session_state import identified, row_index, fingerprint
 from ..batch_lifecycle import BatchPublishedError, is_batch_active
+from ..pipeline_retry_errors import failure_from_exception, failure_from_payload
 
 
 Progress = Callable[[dict[str, Any]], None]
@@ -116,7 +117,8 @@ class CotJobManager:
     def mark_interrupted_jobs(self) -> None:
         for payload in self.list_jobs():
             if payload.get("status") in {"queued", "running"}:
-                payload.update(status="interrupted", completed_at=_now(), error="服务重启导致 COT 生成中断；重新提交可复用已完成结果。")
+                payload.update(status="interrupted", completed_at=_now(), error="服务重启导致 COT 生成中断；重新提交可复用已完成结果。",
+                               failure=failure_from_payload({"category": "service_restart"}))
                 self._write(payload)
 
     @staticmethod
@@ -276,6 +278,12 @@ class CotJobManager:
                 raise RuntimeError("模型配置已更新，请重新提交 COT 任务")
             generator = self.generator_factory()
             reviewer = _bbox_reviewer() if payload.get("generate_bbox") else None
+            if retry_enabled_for_pipeline(payload.get("pipeline_id"), storage_root()):
+                # The durable Pipeline controls the three-request budget.
+                if isinstance(generator, QwenCotGenerator):
+                    generator.client = generator.client.with_options(max_retries=0)
+                if reviewer is not None:
+                    reviewer.client = reviewer.client.with_options(max_retries=0)
             completed = int(payload.get("completed_steps") or 0)
             completed_bbox = int(payload.get("completed_bbox") or 0)
             completed_cot = int(payload.get("completed_cot") or 0)
@@ -341,7 +349,10 @@ class CotJobManager:
                                    "error": str(exc), "error_code": "batch_published", "detail": exc.detail})
             return
         except Exception as exc:
-            self._progress(job_id, {"status": "failed", "stage": "failed", "completed_at": _now(), "error": str(exc)})
+            failure = failure_from_exception(exc)
+            self._progress(job_id, {"status": "failed", "stage": "failed", "completed_at": _now(),
+                                    "error": (failure["message"] if retry_enabled_for_pipeline(payload.get("pipeline_id"), storage_root())
+                                              else str(exc)), "failure": failure})
             return
         try:
             artifact = publish_cot_snapshot(str(payload["session_id"]))

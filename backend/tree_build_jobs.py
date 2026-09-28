@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .pipeline_access import submit_with_context, execution_pipeline_id
+from .pipeline_access import submit_with_context, execution_pipeline_id, retry_enabled_for_pipeline
 
 import json
 import threading
@@ -14,6 +14,7 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from .batch_operations import active_batch_lock, batch_operation
+from .pipeline_retry_errors import failure_from_exception, failure_from_payload
 from .trajectory_data import TREE_JOBS_DIR
 from .tree_build_service import build_tree_run, tree_build_config
 from .data_store import RecordStore, ArtifactStore
@@ -82,6 +83,7 @@ class TreeBuildJobManager:
                         "stage": "interrupted",
                         "completed_at": _now(),
                         "error": "服务重启导致作业中断；可重新提交并复用已有模型缓存。",
+                        "failure": failure_from_payload({"category": "service_restart"}),
                     }
                 )
                 self._write(payload)
@@ -215,7 +217,10 @@ class TreeBuildJobManager:
                         "status": "stale" if isinstance(exc, StaleTaskInput) else "failed",
                         "stage": "stale" if isinstance(exc, StaleTaskInput) else "failed",
                         "completed_at": _now(),
-                        "error": str(exc),
+                        "error": (failure_from_exception(exc)["message"]
+                                  if retry_enabled_for_pipeline(payload.get("pipeline_id"), self.data_root)
+                                  else str(exc)),
+                        "failure": failure_from_exception(exc),
                     }
                 )
                 self._write(payload)

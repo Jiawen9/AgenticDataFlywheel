@@ -55,6 +55,14 @@ def execution_pipeline_id() -> str | None:
     return _execution.get()
 
 
+def retry_enabled_for_pipeline(pipeline_id: str | None, root: Path | None = None) -> bool:
+    """Only flows created with the persisted retry policy get one-shot model calls."""
+    if not pipeline_id:
+        return False
+    pipeline = RecordStore(root or DATA_ROOT).get("pipelines", pipeline_id)
+    return bool(pipeline and (pipeline.get("retry_policy") or {}).get("version") == 1)
+
+
 def submit_with_context(executor, function, *args, **kwargs):
     """Carry trusted in-process authority into the existing model worker pool."""
     return executor.submit(copy_context().run, function, *args, **kwargs)

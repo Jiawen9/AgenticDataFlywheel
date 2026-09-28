@@ -1,13 +1,15 @@
 import type { FactoryConfig } from '@/phoneFactoryApi'
 
 export type PipelineMode = 'manual' | 'automatic'
-export type PipelineStatus = 'running' | 'paused' | 'waiting_for_correction' | 'failed' | 'terminating' | 'terminated' | 'no_publishable_data' | 'succeeded' | 'published_summary_failed'
+export type PipelineStatus = 'running' | 'retry_waiting' | 'paused' | 'waiting_for_correction' | 'failed' | 'terminating' | 'terminated' | 'no_publishable_data' | 'succeeded' | 'published_summary_failed'
 export type PipelineStepId = 'collection' | 'preprocessing' | 'tree' | 'quality' | 'correction' | 'cot' | 'publication' | 'overview'
-export type PipelineStepStatus = 'pending' | 'running' | 'waiting' | 'succeeded' | 'skipped' | 'failed'
+export type PipelineStepStatus = 'pending' | 'running' | 'retry_waiting' | 'waiting' | 'succeeded' | 'skipped' | 'failed'
 export interface PipelineJob { job_id?: string; collection_run_id?: string; run_id?: string; status: string; [key: string]: unknown }
+export interface PipelineRetryInfo { attempts: number; max_attempts: number; last_error: string | null; next_retry_at: string | null }
 export interface PipelineStep {
   id: PipelineStepId; label: string; status: PipelineStepStatus; job_ids: string[];
   percent?: number; message?: string | null; error?: string | null; jobs?: PipelineJob[];
+  retry_info?: PipelineRetryInfo | null;
   started_at?: string | null; completed_at?: string | null
 }
 export interface PipelineCollectionConfig { phone_id: string; app: string; vla: string; config: FactoryConfig }
@@ -25,12 +27,12 @@ export interface CreatePipeline {
 export type PipelineAction = 'pause' | 'resume' | 'retry' | 'confirm-correction' | 'terminate'
 export const PIPELINE_TERMINAL: PipelineStatus[] = ['terminated', 'no_publishable_data', 'succeeded', 'published_summary_failed']
 export const pipelineStatusLabels: Record<PipelineStatus, string> = {
-  running: '正在执行', paused: '已暂停', waiting_for_correction: '等待人工修正', failed: '执行失败',
+  running: '正在执行', retry_waiting: '等待自动重试', paused: '已暂停', waiting_for_correction: '等待人工修正', failed: '执行失败',
   terminating: '正在终止，等待作业结束', terminated: '已终止', no_publishable_data: '无可发布数据',
   succeeded: '已发布并完成汇总', published_summary_failed: '已发布，汇总失败',
 }
 export const pipelineStepLabels: Record<PipelineStepStatus, string> = {
-  pending: '等待前置步骤', running: '执行中', waiting: '等待人工确认', succeeded: '已完成', skipped: '已跳过', failed: '失败',
+  pending: '等待前置步骤', running: '执行中', retry_waiting: '等待自动重试', waiting: '等待人工确认', succeeded: '已完成', skipped: '已跳过', failed: '失败',
 }
 export const pipelineStepPaths: Record<PipelineStepId, string> = {
   collection: '/collection/phone-factory', preprocessing: '/collection/tree-building', tree: '/collection/tree-building',

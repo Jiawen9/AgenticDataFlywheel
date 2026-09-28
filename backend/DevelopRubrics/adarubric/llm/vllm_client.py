@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from typing import Any, TypeVar, cast
 
 from pydantic import BaseModel, ValidationError
@@ -66,9 +67,12 @@ class VLLMClient(LLMClient):
         self.model = model
         self.base_url = base_url
         self.use_guided_decoding = use_guided_decoding
-        self._max_retries = max(1, max_retries)
+        # A new Pipeline owns the retry budget across durable stage attempts.
+        # Leave standalone and existing Pipeline behavior unchanged.
+        single_attempt = os.environ.get("PIPELINE_MODEL_SINGLE_ATTEMPT") == "1"
+        self._max_retries = 1 if single_attempt else max(1, max_retries)
 
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url, **({"max_retries": 0} if single_attempt else {}))
 
     async def _chat(
         self,

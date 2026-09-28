@@ -10,6 +10,7 @@ import { PIPELINE_DIAGRAM_STAGES, diagramNodeState, diagramStageState, diagramSt
 import { factoryBatchesApi, newRunRequestId, phoneFactoryApi, type FactoryState } from '@/phoneFactoryApi'
 import { usePipelineContext } from '@/composables/usePipelineContext'
 import { activeBatchItems, subscribeBatchLifecycle } from '@/utils/batchLifecycle'
+import { retryProgress } from '@/utils/pipelineRetry'
 import { PIPELINE_TERMINAL, pipelineStatusLabels, pipelineStepLabels, pipelineStepLocation, type CreatePipeline, type Pipeline, type PipelineAction, type PipelineStepId } from '@/types/pipeline'
 const route = useRoute(), router = useRouter(), context = usePipelineContext()
 const pipeline = context.pipeline, history = ref<Pipeline[]>([])
@@ -29,6 +30,16 @@ const auxiliarySteps: Array<{ id: PipelineStepId; label: string }> = [
   { id: 'correction', label: '人工修正' }, { id: 'cot', label: 'COT' }, { id: 'overview', label: '看板汇总' },
 ]
 const currentStep = computed(() => pipeline.value?.steps.find(step => step.id === pipeline.value?.current_step))
+const retryInfo = computed(() => currentStep.value?.retry_info)
+const retryClock = ref(Date.now())
+const retryMessage = computed(() => retryProgress(retryInfo.value, pipeline.value?.status || 'running', retryClock.value))
+let retryClockTimer: ReturnType<typeof setInterval> | undefined
+function stopRetryClock() { if (retryClockTimer) clearInterval(retryClockTimer); retryClockTimer = undefined }
+watch([() => pipeline.value?.status, () => retryInfo.value?.next_retry_at], ([status, deadline]) => {
+  stopRetryClock()
+  retryClock.value = Date.now()
+  if (status === 'retry_waiting' && deadline) retryClockTimer = setInterval(() => { retryClock.value = Date.now() }, 1000)
+})
 const currentDetails = computed(() => {
   const nodes = stages.value.flatMap(stage => stage.children).filter(node => node.stepId === currentStep.value?.id)
   const activeNodes = nodes.filter(node => node.state.active)
@@ -38,6 +49,7 @@ const runSignal = computed(() => {
   const status = pipeline.value?.status
   if (status === 'succeeded') return 'completed'
   if (status === 'failed' || status === 'published_summary_failed') return 'failed'
+  if (status === 'retry_waiting') return 'retry'
   if (status === 'paused' || status === 'waiting_for_correction') return 'paused'
   if (status === 'running' || status === 'terminating') return 'running'
   return 'pending'
@@ -135,7 +147,7 @@ function focus() { void loadHistory() }
 function visible() { if (document.visibilityState === 'visible') void loadHistory() }
 const unsubscribe = subscribeBatchLifecycle(event => { batches.value = batches.value.filter(batch => !event.batch_ids.includes(batch.batch_id)); if (event.batch_ids.includes(draft.batch_id)) draft.batch_id = '' })
 onMounted(() => { localStorage.removeItem('automatic-pipeline-circuit-v3'); void loadHistory(); window.addEventListener('focus', focus); document.addEventListener('visibilitychange', visible) })
-onBeforeUnmount(() => { disposed = true; listGeneration++; choicesGeneration++; listController?.abort(); unsubscribe(); window.removeEventListener('focus', focus); document.removeEventListener('visibilitychange', visible) })
+onBeforeUnmount(() => { disposed = true; stopRetryClock(); listGeneration++; choicesGeneration++; listController?.abort(); unsubscribe(); window.removeEventListener('focus', focus); document.removeEventListener('visibilitychange', visible) })
 </script>
 
 <template>
@@ -148,7 +160,7 @@ onBeforeUnmount(() => { disposed = true; listGeneration++; choicesGeneration++; 
         <span v-if="pipeline" class="run-name">{{ pipeline.name }} · {{ pipeline.batch_id }}</span>
         <span class="run-current">{{ pipeline ? currentStep?.label : '点击“新建 Pipeline”配置并启动一次迭代' }}</span>
         <div v-if="pipeline" class="run-controls">
-          <el-button v-if="pipeline.status === 'running' || pipeline.status === 'waiting_for_correction'" size="small" :loading="controlling" @click="control('pause')">暂停</el-button>
+          <el-button v-if="pipeline.status === 'running' || pipeline.status === 'retry_waiting' || pipeline.status === 'waiting_for_correction'" size="small" :loading="controlling" @click="control('pause')">暂停</el-button>
           <el-button v-if="pipeline.status === 'paused'" size="small" type="primary" :loading="controlling" @click="control('resume')">继续</el-button>
           <el-button v-if="pipeline.status === 'failed' || pipeline.status === 'published_summary_failed'" size="small" type="primary" :loading="controlling" @click="control('retry')">{{ pipeline.status === 'published_summary_failed' ? '重试汇总' : '重试' }}</el-button>
           <el-button v-if="!PIPELINE_TERMINAL.includes(pipeline.status) && pipeline.status !== 'terminating'" size="small" :disabled="controlling" @click="control('terminate')">终止</el-button>
@@ -164,7 +176,11 @@ onBeforeUnmount(() => { disposed = true; listGeneration++; choicesGeneration++; 
           <span>{{ currentStep.label }} · {{ pipelineStepLabels[currentStep.status] }}</span>
           <el-progress v-if="currentStep.status === 'running' && percentage(currentStep.percent) !== undefined" :percentage="percentage(currentStep.percent)" />
           <span v-if="currentDetails">{{ currentDetails }}</span>
-          <span v-if="currentStep.error" class="run-error">{{ currentStep.error }}</span>
+          <div v-if="retryMessage" class="run-retry" data-testid="pipeline-retry-status" role="status">
+            <strong>{{ retryMessage }}</strong>
+            <span v-if="retryInfo?.last_error">最近错误：{{ retryInfo.last_error }}</span>
+          </div>
+          <span v-if="currentStep.error && currentStep.error !== retryInfo?.last_error" class="run-error">{{ currentStep.error }}</span>
           <span v-for="job in currentStep.job_ids" :key="job" class="job-id">{{ job }}</span>
         </div>
         <div class="run-links">
@@ -357,4 +373,8 @@ onBeforeUnmount(() => { disposed = true; listGeneration++; choicesGeneration++; 
 .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 16px}
 .el-alert{margin:14px 0}
 @media(max-width:760px){.run-current{flex-basis:100%}.run-controls{margin-left:0}.form-grid{grid-template-columns:1fr}}
+</style>
+
+<style scoped>
+.run-retry{display:flex;flex-wrap:wrap;align-items:center;gap:5px 12px;width:100%;padding:8px 10px;border:1px solid #fcd34d;border-radius:8px;background:#fffbeb;color:#92400e;font-size:12px;overflow-wrap:anywhere}.run-retry strong{font-weight:600}.run-retry span{min-width:0}.run-signal.is-retry{color:#b45309}.run-signal.is-retry i{background:#f59e0b;box-shadow:0 0 0 4px rgba(245,158,11,.13)}
 </style>

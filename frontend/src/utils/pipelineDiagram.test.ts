@@ -136,6 +136,16 @@ describe('original Pipeline diagram with real execution state', () => {
     expect(diagramStageState(p, stage('collection')).status).toBe('completed')
   })
 
+  it('keeps a scheduled retry navigable without marking the module completed or failed', () => {
+    const p = pipeline({ id: 'quality', status: 'retry_waiting', message: '临时故障', retry_info: {
+      attempts: 1, max_attempts: 3, last_error: 'HTTP 500', next_retry_at: '2026-09-23T04:00:30Z',
+    } })
+    p.current_step = 'quality'
+    expect(diagramNodeState(p, node('rubrics-generation'))).toMatchObject({ status: 'waiting', active: false })
+    expect(diagramStageState(p, stage('quality')).status).toBe('waiting')
+    expect(diagramStageTarget(p, stage('quality'))).toBe('quality')
+  })
+
   it('does not complete a module while a dependent backend step is pending', () => {
     const p = pipeline({ id: 'collection', status: 'succeeded' }, { id: 'preprocessing', status: 'succeeded' })
     expect(diagramStageState(p, stage('collection')).status).toBe('pending')

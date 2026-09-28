@@ -110,7 +110,7 @@ export function diagramNodeState(pipeline: Pipeline | null | undefined, node: Di
   if (!node.stepId) return unavailable()
   const step = pipeline?.steps.find(item => item.id === node.stepId)
   if (!step) return { status: 'pending', active: false, detail: pipeline ? '等待前置步骤' : '等待创建 Pipeline' }
-  const status = step.status === 'succeeded' ? 'completed' : step.status
+  const status = step.status === 'succeeded' ? 'completed' : step.status === 'retry_waiting' ? 'waiting' : step.status
   const shared = step.id === 'tree' || step.id === 'quality'
   let active = step.status === 'running' || step.status === 'waiting'
   if (shared && step.status === 'running') {
@@ -122,7 +122,7 @@ export function diagramNodeState(pipeline: Pipeline | null | undefined, node: Di
 }
 
 export function diagramStageTarget(pipeline: Pipeline | null | undefined, stage: DiagramStage): PipelineStepId | undefined {
-  const actionable = (step: PipelineStep) => step.status === 'running' || step.status === 'waiting' || step.status === 'failed'
+  const actionable = (step: PipelineStep) => step.status === 'running' || step.status === 'retry_waiting' || step.status === 'waiting' || step.status === 'failed'
   const steps = stage.stepIds.map(id => pipeline?.steps.find(step => step.id === id)).filter((step): step is PipelineStep => Boolean(step))
   return steps.find(step => step.id === pipeline?.current_step && actionable(step))?.id
     ?? steps.find(actionable)?.id ?? stage.stepIds[0]
