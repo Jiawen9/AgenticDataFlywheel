@@ -125,6 +125,27 @@ class OverviewTests(unittest.TestCase):
         self.manager.submit("rel_two"); self.manager.wait()
         self.assertEqual(self.manager.query()["overview"]["total_trajectories"], 2)
 
+    def test_transient_conversion_failure_is_classified_and_same_release_retry_does_not_duplicate(self):
+        original = self.manager.converter
+        attempts = []
+
+        def convert(*args):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise TimeoutError("simulated unavailable converter")
+            return original(*args)
+
+        self.manager.converter = convert
+        self.manager.start(); self.manager.wait()
+        failed = self.manager.records.get(CONVERSIONS, "rel_one")
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["failure"]["category"], "timeout")
+        self.assertTrue(failed["failure"]["retryable"])
+        self.manager.submit("rel_one"); self.manager.wait()
+        self.assertEqual(self.manager.query()["overview"]["total_trajectories"], 1)
+        self.assertEqual(self.calls, ["rel_one"])
+        self.assertIsNone(self.manager.records.get(CONVERSIONS, "rel_one")["failure"])
+
     def test_write_and_commit_failure_do_not_expose_half_outputs(self):
         self.manager.start(); self.manager.wait()
         original = self.manager.query()["version"]

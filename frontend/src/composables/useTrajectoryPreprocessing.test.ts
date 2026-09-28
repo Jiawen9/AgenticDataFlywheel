@@ -19,7 +19,7 @@ const record = (text = 'click'): TrajectoryRecord => ({ trajectory_id: 'same-1',
 const buildJob = (id = 'a') => ({ job_id: 'tree-' + id, batch_id: id, annotation_version: 'v1', status: 'running', created_at: '2026-09-15', stage: 'classifying' }) as BuildJob
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(yes => { resolve = yes }); return { promise, resolve } }
 const disposers: Array<() => void> = []
-function setup(protect = vi.fn(async () => true)) {
+function setup(protect = vi.fn(async () => true), options: Parameters<typeof useTrajectoryPreprocessing>[2] = {}) {
   const client = {
     preprocessingBatches: vi.fn(async () => [batch('a'), batch('b'), batch('waiting', null)]),
     collectionSourceTasks: vi.fn(async (_id: string) => [] as CollectionSourceTask[]), collectionSourceRuns: vi.fn(async (_id: string) => [] as CollectionSourceRun[]),
@@ -32,13 +32,26 @@ function setup(protect = vi.fn(async () => true)) {
     createBuild: vi.fn(async (_ids: string[], _scope?: TrajectoryScope) => buildJob()),
     build: vi.fn(async () => buildJob()), builds: vi.fn(async () => [] as BuildJob[]),
   }
-  const flow = useTrajectoryPreprocessing(client, protect)
+  const flow = useTrajectoryPreprocessing(client, protect, options)
   disposers.push(flow.dispose)
   return { flow, client, protect }
 }
 afterEach(() => { disposers.splice(0).forEach(dispose => dispose()); vi.useRealTimers() })
 
 describe('batch preprocessing workspace', () => {
+  it('reads imported Rollout task mappings through their own source endpoint before preprocessing', async () => {
+    const { flow, client } = setup()
+    client.preprocessingBatches.mockResolvedValue([{ ...batch('local-rollout', null), kind: 'rollout_import' }])
+    const importedTask = { task_id: 'case-A', collection_case_id: 'case-A', task: 'Imported goal', app: 'Demo' }
+    client.collectionSourceTasks.mockResolvedValue([importedTask])
+    await flow.loadBatches('local-rollout')
+    expect(client.collectionSourceTasks).toHaveBeenCalledWith('local-rollout', 'rollout_import')
+    expect(flow.sourceTasks.value).toEqual([importedTask])
+    expect(flow.scope.value).toBeNull()
+    expect(client.createPreprocessing).not.toHaveBeenCalled()
+    expect(client.tasks).not.toHaveBeenCalled()
+  })
+
   it('retires the selected batch without saving drafts and rejects its delayed trajectory', async () => {
     const { flow, client, protect } = setup(), pending = deferred<TrajectoryRecord>()
     await flow.loadBatches('a'); await flow.expandTasks(['same'])
@@ -218,4 +231,65 @@ describe('batch preprocessing workspace', () => {
     expect(flow.preprocessingJob.value).toBeNull()
     expect(flow.tasks.value[0]?.goal).toBe('b')
   })
+})
+
+
+describe('Pipeline preprocessing bindings', () => {
+  it('ignores a newer unrelated build and displays only the authoritative jobs', async () => {
+    const { flow, client } = setup(undefined, { readOnly: () => true, boundJobs: () => ({ preprocessing: ['bound-pre'], tree: ['bound-tree'] }) })
+    client.preprocessingBatches.mockResolvedValue([{ ...batch('a'), latest_job: { ...job(), job_id: 'unrelated-pre' } }])
+    client.preprocessingJob.mockResolvedValue({ ...job(), job_id: 'bound-pre' })
+    client.build.mockResolvedValue({ ...buildJob(), job_id: 'bound-tree' })
+    client.builds.mockResolvedValue([{ ...buildJob(), job_id: 'unrelated-tree' }])
+    await flow.loadBatches('a')
+    expect(flow.preprocessingJob.value?.job_id).toBe('bound-pre')
+    expect(flow.buildJob.value?.job_id).toBe('bound-tree')
+    expect(client.builds).not.toHaveBeenCalled()
+    expect(client.createPreprocessing).not.toHaveBeenCalled()
+    expect(client.createBuild).not.toHaveBeenCalled()
+  })
+  it('waits with no job and can bind a later dispatch without submitting work', async () => {
+    let ids: string[] = []
+    const { flow, client } = setup(undefined, { readOnly: () => true, boundJobs: () => ({ preprocessing: ids, tree: [] }) })
+    client.preprocessingBatches.mockResolvedValue([{ ...batch('a'), latest_job: job() }])
+    await flow.loadBatches('a')
+    expect(flow.preprocessingJob.value).toBeNull()
+    expect(client.preprocessingJob).not.toHaveBeenCalled()
+    ids = ['pre-a']; await flow.bindJobs()
+    expect(flow.preprocessingJob.value?.job_id).toBe('pre-a')
+    expect(client.createPreprocessing).not.toHaveBeenCalled()
+  })
+  it('rejects read-only writes while keeping trajectory inspection available', async () => {
+    const { flow, client } = setup(undefined, { readOnly: () => true, boundJobs: () => ({ preprocessing: [], tree: [] }) })
+    await flow.loadBatches('a'); await flow.expandTasks(['same']); await flow.expandTrajectory('same', 'same-1')
+    flow.selectedTasks.value = ['same']
+    expect(await flow.start()).toBe(false)
+    expect(await flow.submitBuild()).toBe(false)
+    await expect(flow.saveBBox('same', 'same-1', record().steps[0]!, [1, 1, 10, 10])).rejects.toThrow('Pipeline')
+    expect(client.trajectory).toHaveBeenCalled()
+    expect(client.updateBBox).not.toHaveBeenCalled()
+    expect(client.createBuild).not.toHaveBeenCalled()
+  })
+  it('does not accept an old job response after the authoritative binding changes', async () => {
+    let ids: string[] = []
+    const { flow, client } = setup(undefined, { boundJobs: () => ({ preprocessing: ids, tree: [] }) })
+    await flow.loadBatches('a')
+    const slow = deferred<PreprocessingJob>()
+    ids = ['old']; client.preprocessingJob.mockReturnValueOnce(slow.promise)
+    const old = flow.bindJobs()
+    ids = ['new']; client.preprocessingJob.mockResolvedValue({ ...job(), job_id: 'new' })
+    await flow.bindJobs()
+    slow.resolve({ ...job(), job_id: 'old' }); await old
+    expect(flow.preprocessingJob.value?.job_id).toBe('new')
+  })
+})
+
+
+it('does not read the current batch artifacts through an ended Pipeline history link', async () => {
+  const { flow, client } = setup(undefined, { historyOnly: () => true, readOnly: () => true })
+  await flow.loadBatches('a')
+  expect(client.preprocessingBatches).not.toHaveBeenCalled()
+  expect(client.tasks).not.toHaveBeenCalled()
+  expect(client.builds).not.toHaveBeenCalled()
+  expect(flow.scope.value).toBeNull()
 })

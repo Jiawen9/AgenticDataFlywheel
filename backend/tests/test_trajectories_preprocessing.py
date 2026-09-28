@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from openpyxl import load_workbook
 from PIL import Image
@@ -12,6 +14,7 @@ from backend.bounding_box.build_annotations import resolve_action_box
 from backend.export_vla_trajectories import collect_rows, write_xlsx
 from backend.trajectories_preprocessing import (
     annotate_trajectory_workbook,
+    configure_reviewer_environment,
     format_actions_box,
     swipe_direction,
 )
@@ -26,6 +29,39 @@ UI_XML = """<?xml version="1.0" encoding="UTF-8"?>
   </node>
 </hierarchy>
 """
+
+
+class ModelConfigurationTests(unittest.TestCase):
+    def test_configured_models_replace_previous_environment(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {}, clear=True):
+            env = Path(directory) / ".env"
+            for model in ("qwen3.8-max", "qwen3-vl-plus", "provider-model"):
+                with self.subTest(model=model):
+                    env.write_text(
+                        f"YUNAI_API_KEY=test-key\nMODEL_URL=https://example.invalid/v1\nMODEL_NAME={model}\n",
+                        encoding="utf-8",
+                    )
+                    self.assertEqual(configure_reviewer_environment(env), model)
+                    self.assertEqual(os.environ["TRAJECTORY_MODEL"], model)
+                    self.assertEqual(os.environ["TRAJECTORY_API_KEY"], "test-key")
+                    self.assertEqual(os.environ["TRAJECTORY_API_BASE_URL"], "https://example.invalid/v1")
+
+    def test_missing_settings_remain_non_retryable_config_errors(self):
+        from backend.pipeline_retry_errors import ModelConfigurationError, failure_from_exception
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {}, clear=True):
+            env = Path(directory) / ".env"
+            env.write_text("YUNAI_API_KEY=test-key\nMODEL_NAME=qwen3-vl-plus\n", encoding="utf-8")
+            with self.assertRaises(ModelConfigurationError) as captured:
+                configure_reviewer_environment(env)
+            self.assertIn("MODEL_URL", str(captured.exception))
+            self.assertNotIn("TRAJECTORY_MODEL", os.environ)
+            try:
+                raise RuntimeError("wrapper test-key") from captured.exception
+            except RuntimeError as wrapped:
+                failure = failure_from_exception(wrapped)
+            self.assertEqual(failure["category"], "config")
+            self.assertFalse(failure["retryable"])
+            self.assertNotIn("test-key", json.dumps(failure))
 
 
 class FakeReviewResult:

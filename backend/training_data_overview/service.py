@@ -16,6 +16,7 @@ from ..data_store import RecordStore
 from ..data_store.artifacts import _write_bytes, _write_tables, _json_bytes, _sha256
 from ..data_store.paths import contained_path
 from ..data_store.registry import utc_now
+from ..pipeline_retry_errors import failure_from_exception
 from .converter import ALL_DATA_COLUMNS, convert_release
 
 log = logging.getLogger(__name__)
@@ -186,14 +187,15 @@ class TrainingOverviewManager:
             if current and current["status"] in {"queued", "running"} and not recover and not self._started:
                 return current
             queued = {"release_id": release_id, "name": release["name"], "status": "queued", "error": None,
-                      "warnings": [], "updated_at": utc_now(), "converter_version": 1}
+                      "failure": None, "warnings": [], "updated_at": utc_now(), "converter_version": 1}
             saved = self.records.put(CONVERSIONS, release_id, queued, expected_revision=current.get("storage_revision", 0) if current else 0)
             if self._started:
                 try:
                     self._futures[release_id] = self._executor.submit(self._run, release_id)
                 except Exception as exc:
                     saved = self.records.update(CONVERSIONS, release_id, lambda c: c.update(
-                        status="failed", error=f"汇总任务排队失败：{exc}", updated_at=utc_now()))
+                        status="failed", error=f"汇总任务排队失败：{exc}",
+                        failure=failure_from_exception(exc), updated_at=utc_now()))
             return saved
 
     def _outputs_valid(self, state: dict) -> bool:
@@ -222,7 +224,8 @@ class TrainingOverviewManager:
                 self._publish(release_id, converted)
             except Exception as exc:
                 log.exception("Training overview conversion failed for %s", release_id)
-                self.records.update(CONVERSIONS, release_id, lambda c: c.update(status="failed", error=str(exc), updated_at=utc_now()))
+                self.records.update(CONVERSIONS, release_id, lambda c: c.update(
+                    status="failed", error=str(exc), failure=failure_from_exception(exc), updated_at=utc_now()))
 
     def _publish(self, release_id: str, converted: dict) -> None:
         # A single worker assembles immutable files, then atomically exposes one catalog.
@@ -241,7 +244,7 @@ class TrainingOverviewManager:
                      for name in ("conversion.json", "all_data.json", "all_data.xlsx")}
             temporary.rename(final)
             state = self.records.get(CONVERSIONS, release_id)
-            state.update(status="succeeded", error=None, warnings=converted.get("warnings", []), updated_at=utc_now(),
+            state.update(status="succeeded", error=None, failure=None, warnings=converted.get("warnings", []), updated_at=utc_now(),
                          version=version, files=files, trajectory_count=len(converted["rows"]))
             self.records.put_many([
                 {"namespace": CATALOG, "key": "current", "expected_revision": catalog.get("storage_revision", 0),

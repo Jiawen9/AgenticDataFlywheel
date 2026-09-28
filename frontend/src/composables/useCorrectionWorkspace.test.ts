@@ -12,7 +12,7 @@ function deferred<T>() {
 }
 const tick = async () => { for (let i = 0; i < 8; i++) await Promise.resolve() }
 
-function fixture() {
+function fixture(controls: { readOnly?: () => boolean; managed?: () => boolean } = {}) {
   const groups: CorrectionGroup[] = [0, 1, 2, 3].map((index) => {
     const trajectory = index < 3 ? `TASK-A-${index + 1}` : 'TASK-B-1'
     const rows: CorrectionRow[] = [0, 1].map((step) => ({
@@ -49,7 +49,7 @@ function fixture() {
     }),
     correctionExport: vi.fn(async (_session: string) => ({ export_id: 'export', filename: 'review.xlsx', created_at: '', download_url: '', sheets: {} })),
   }
-  const feedback = { error: vi.fn(), actionDecision: vi.fn(async (): Promise<ActionDecision> => 'save') }
+  const feedback = { ...controls, error: vi.fn(), actionDecision: vi.fn(async (): Promise<ActionDecision> => 'save') }
   const ws = useCorrectionWorkspace(api, feedback)
   ws.setSession(clone(saved))
   return { ws, api, feedback, groups, saved }
@@ -276,5 +276,34 @@ describe('current batch correction reviews', () => {
     expect(ws.session.value?.session_id).toBe('old-session')
     expect(ws.session.value?.storage_revision).toBe(5)
     expect(api.correctionGroup).toHaveBeenCalledTimes(2)
+  })
+})
+
+
+describe('Pipeline correction checkpoint', () => {
+  it('retains every candidate in the workbench while keeping default Top1 selection distinct', () => {
+    const { saved } = fixture()
+    const allCandidates = [...saved.selection.tasks]
+    Object.assign(saved.selection, { candidates: allCandidates, tasks: [allCandidates[0], allCandidates[3]] })
+    saved.groups[0]!.export = true; saved.groups[3]!.export = true
+    const result = correctionTasks(saved.selection, saved.groups)
+    expect(result[0]!.trajectories).toHaveLength(3)
+    expect(result.map(task => task.export_count)).toEqual([1, 1])
+    expect(saved.selection.tasks).toHaveLength(2)
+  })
+  it('allows reads but blocks saves and selection changes after the human checkpoint closes', async () => {
+    let readOnly = false
+    const { ws, api } = fixture({ readOnly: () => readOnly, managed: () => true })
+    await ws.loadGroup('group_0')
+    expect(await ws.saveAction('{"action":"wait"}')).toBe(true)
+    readOnly = true; api.patchCorrectionRow.mockClear()
+    expect(await ws.saveAction('{"action":"terminate"}')).toBe(false)
+    await ws.toggleExport(ws.session.value!.groups[0]!)
+    expect(await ws.exportData()).toBeNull()
+    expect(api.patchCorrectionRow).not.toHaveBeenCalled()
+    expect(api.patchCorrectionExport).not.toHaveBeenCalled()
+    expect(api.correctionExport).not.toHaveBeenCalled()
+    await ws.loadGroup('group_1')
+    expect(ws.activeGroup.value?.group_id).toBe('group_1')
   })
 })

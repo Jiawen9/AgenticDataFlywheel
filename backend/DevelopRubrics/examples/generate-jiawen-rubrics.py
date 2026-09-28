@@ -777,7 +777,8 @@ async def generate_rubric(
         extra_body=_extra_body_setting(config),
     )
     validator = build_validator(config)
-    attempts = _int_setting(
+    single_attempt = os.environ.get("PIPELINE_MODEL_SINGLE_ATTEMPT") == "1"
+    attempts = 1 if single_attempt else _int_setting(
         config,
         "validation_attempts",
         "ADARUBRIC_VALIDATION_ATTEMPTS",
@@ -809,6 +810,9 @@ async def generate_rubric(
                     raw_response_path=raw_response_path,
                 )
             except Exception as exc:
+                if single_attempt:
+                    # Preserve the typed provider exception for Pipeline retry policy.
+                    raise
                 last_error = f"invalid JSON rubric output: {exc}"
                 print(f"Rejected rubric: {last_error}")
                 continue

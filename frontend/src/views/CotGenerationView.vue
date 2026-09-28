@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import PipelineStatusBar from '@/components/PipelineStatusBar.vue'
+import { usePipelineContext } from '@/composables/usePipelineContext'
 import BatchPublishedNotice from '@/components/BatchPublishedNotice.vue'
 import { useBatchLifecycle } from '@/composables/useBatchLifecycle'
 import { activeBatchItems, eventMatchesRoute, publishedBatch, withoutBatchQuery, type PublishedBatchEvent } from '@/utils/batchLifecycle'
@@ -31,6 +33,7 @@ const bboxEditing = ref(false)
 const editingField = ref<EditableTextField | null>(null)
 const textDraft = ref('')
 let timer: number | null = null
+let jobPollRequest = 0
 let detailRequest = 0, listRequest = 0, disposed = false, initialized = false, choicesRequest = 0
 
 const groups = computed(() => sessionCot.value?.groups ?? [])
@@ -44,14 +47,18 @@ const selectedBatchId = computed({
   get: () => selectedSession.value?.batch_id || '',
   set: (id: string) => { void chooseBatch(id) },
 })
+const pipelineContext = usePipelineContext({ batchId: selectedBatchId, stepId: 'cot' })
+const pipelineReadOnly = computed(() => pipelineContext.readOnly.value || pipelineContext.managed.value)
 const lifecycle = useBatchLifecycle({ currentBatch: () => selectedBatchId.value || String(route.query.batch_id ?? ''), onPublished, refreshChoices: loadChoices })
 const { notice: publishedNotice } = lifecycle
 async function chooseBatch(id: string) {
+  if (pipelineContext.isPipelineRoute.value) return
   if (!await lifecycle.checkBatch(id)) return
   publishedNotice.value = null
   selectedSessionId.value = sessions.value.find(item => item.batch_id === id)?.session_id || ''
 }
 async function loadChoices() {
+  if (pipelineContext.historyOnly.value) return
   const request = ++choicesRequest
   const values = await api.correctionSessions()
   if (!disposed && request === choicesRequest) sessions.value = activeBatchItems(values)
@@ -92,7 +99,8 @@ const textDirty = computed(() => editingField.value !== null && textDraft.value 
 const hasUnsaved = computed(() => bboxEditing.value || textDirty.value)
 
 function stopPolling() {
-  if (timer !== null) { window.clearInterval(timer); timer = null }
+  ++jobPollRequest
+  if (timer !== null) { window.clearTimeout(timer); timer = null }
 }
 
 function resetLocalEditing() {
@@ -135,10 +143,11 @@ async function refreshCot() {
 
 async function pollJob() {
   if (!activeJob.value) return
+  const request = jobPollRequest
   try {
     const jobId = activeJob.value.job_id, sessionId = selectedSessionId.value
     const next = await api.correctionCotJob(jobId)
-    if (disposed || activeJob.value?.job_id !== jobId || selectedSessionId.value !== sessionId) return
+    if (disposed || request !== jobPollRequest || activeJob.value?.job_id !== jobId || selectedSessionId.value !== sessionId) return
     activeJob.value = next
     if (next.status === 'succeeded') {
       stopPolling()
@@ -146,9 +155,10 @@ async function pollJob() {
       ElMessage.success(next.generate_bbox ? 'bbox 与 COT 批量生成完成' : 'COT 重新生成完成')
     } else if (next.status === 'failed' || next.status === 'interrupted') {
       stopPolling()
-    }
+    } else { timer = window.setTimeout(() => void pollJob(), 1200) }
   } catch (cause) {
-    stopPolling()
+    if (disposed || request !== jobPollRequest) return
+    timer = window.setTimeout(() => void pollJob(), 1200)
     error.value = cause instanceof Error ? cause.message : String(cause)
   }
 }
@@ -158,7 +168,7 @@ function startPolling(job: CorrectionCotJob) {
   activeJob.value = job
   stopPolling()
   if (job.status === 'queued' || job.status === 'running') {
-    timer = window.setInterval(() => void pollJob(), 1200)
+    timer = window.setTimeout(() => void pollJob(), 1200)
   } else if (job.status === 'succeeded') { void refreshCot() }
 }
 
@@ -166,6 +176,26 @@ async function loadSessions() {
   const request = ++listRequest
   loading.value = true; error.value = ''
   try {
+    await pipelineContext.refresh()
+    if (disposed || request !== listRequest) return
+    if (pipelineContext.historyOnly.value) { selectedSessionId.value = ''; sessionCot.value = null; activeJob.value = null; stopPolling(); return }
+    if (pipelineContext.isPipelineRoute.value || pipelineContext.managed.value) {
+      const sessionId = pipelineContext.sessionId.value
+      initialized = true
+      if (!sessionId) { sessions.value = []; selectedSessionId.value = ''; sessionCot.value = null; return }
+      const saved = await api.correctionSession(sessionId)
+      if (disposed || request !== listRequest) return
+      if (saved.batch_id !== pipelineContext.pipeline.value?.batch_id) throw new Error('Pipeline COT 会话与当前批次不一致')
+      sessions.value = [saved]; selectedSessionId.value = sessionId
+      const ids = pipelineContext.pipeline.value?.steps.find(step => step.id === 'cot')?.job_ids || []
+      const jobs = await Promise.all(ids.map(id => api.correctionCotJob(id)))
+      if (disposed || request !== listRequest) return
+      const job = jobs.find(item => ['queued', 'running'].includes(item.status)) || jobs.at(-1)
+      if (job) startPolling(job)
+      await refreshCot()
+      return
+    }
+    if (pipelineContext.error.value) throw new Error(pipelineContext.error.value)
     if (typeof route.query.batch_id === 'string' && !await lifecycle.checkBatch(route.query.batch_id)) { await loadChoices(); return }
     const values = await api.correctionSessions()
     if (disposed || request !== listRequest) return
@@ -214,6 +244,7 @@ function serializeBBox(row: CorrectionCotRow, box: BBox): string {
 }
 
 async function saveBBox(value: [number, number, number, number]) {
+  if (pipelineReadOnly.value) return
   const row = activeRow.value
   if (!row || !selectedSessionId.value) return
   const box: BBox = { x1: value[0], y1: value[1], x2: value[2], y2: value[3] }
@@ -232,6 +263,7 @@ async function saveBBox(value: [number, number, number, number]) {
 }
 
 function beginTextEdit(field: EditableTextField) {
+  if (pipelineReadOnly.value) return
   if (!activeRow.value || bboxEditing.value) return
   editingField.value = field
   textDraft.value = String(activeRow.value[field] || '')
@@ -243,6 +275,7 @@ function cancelTextEdit() {
 }
 
 async function saveTextField(field: EditableTextField) {
+  if (pipelineReadOnly.value) return
   const row = activeRow.value
   if (!row || !selectedSessionId.value || editingField.value !== field) return
   saving.value = true; error.value = ''
@@ -259,6 +292,7 @@ async function saveTextField(field: EditableTextField) {
 }
 
 async function regenerateCot() {
+  if (pipelineReadOnly.value) return
   const row = activeRow.value
   if (!row || !selectedSessionId.value || saving.value || hasUnsaved.value || activeGroup.value?.pending_review) return
   saving.value = true; error.value = ''
@@ -277,6 +311,7 @@ async function regenerateCot() {
 }
 
 async function generateAll() {
+  if (pipelineReadOnly.value) return
   if (!selectedSessionId.value || saving.value || hasUnsaved.value) return
   const rows = eligibleGroups.value.flatMap((group) => group.rows)
   if (!rows.length) return
@@ -299,6 +334,7 @@ async function generateAll() {
 }
 
 async function exportDataset() {
+  if (pipelineReadOnly.value) return
   if (!selectedSessionId.value || hasUnsaved.value || jobRunning.value || exporting.value) return
   exporting.value = true; error.value = ''
   const sessionId = selectedSessionId.value
@@ -318,7 +354,7 @@ async function exportDataset() {
 watch(selectedSessionId, () => {
   ++detailRequest
   sessionCot.value = null
-  if (selectedBatchId.value) void router.replace({ query: { batch_id: selectedBatchId.value } })
+  if (selectedBatchId.value) void router.replace({ query: { ...route.query, batch_id: selectedBatchId.value, session_id: undefined, session: undefined } })
   activeJob.value = null
   stopPolling()
   resetLocalEditing()
@@ -335,25 +371,31 @@ watch(() => [route.query.batch_id, route.query.session_id, route.query.session],
   publishedNotice.value = null
   void loadSessions()
 })
+watch(pipelineContext.historyOnly, value => { if (value) void loadSessions() })
+watch(() => `${pipelineContext.sessionId.value}:${pipelineContext.pipeline.value?.steps.find(step => step.id === 'cot')?.job_ids.join(',') || ''}`, () => {
+  if (initialized && !disposed && !publishedNotice.value) void loadSessions()
+})
 onMounted(() => { void loadSessions() })
 onBeforeUnmount(() => { disposed = true; ++detailRequest; ++listRequest; stopPolling() })
 </script>
 
 <template>
   <div class="page cot-page">
+    <PipelineStatusBar :context="pipelineContext" />
+    <template v-if="!pipelineContext.historyOnly.value">
     <BatchPublishedNotice :notice="publishedNotice" />
     <header class="page-hero cot-hero">
       <div><span class="eyebrow">CORRECTED TRAJECTORY COT</span><h1>COT 生成</h1><p>批量生成后直接采用，单步可继续调整 bbox、Thought 和 Summary。</p></div>
       <div class="hero-metrics"><div><b>{{ editedRows }}</b><span>纠偏步骤</span></div><div><b>{{ generatedRows }}</b><span>模型生成</span></div></div>
     </header>
     <section class="toolbar">
-      <div class="toolbar-field"><span>业务批次</span><el-select v-model="selectedBatchId" :loading="loading" :disabled="loading || !sessions.length || hasUnsaved || jobRunning || saving || exporting" placeholder="选择批次"><el-option v-for="item in sessions" :key="item.batch_id" :label="item.batch_id" :value="item.batch_id" /></el-select></div>
+      <div class="toolbar-field"><span>业务批次</span><el-select v-model="selectedBatchId" :loading="loading" :disabled="pipelineContext.isPipelineRoute.value || loading || !sessions.length || hasUnsaved || jobRunning || saving || exporting" placeholder="选择批次"><el-option v-for="item in sessions" :key="item.batch_id" :label="item.batch_id" :value="item.batch_id" /></el-select></div>
       <div class="toolbar-stats"><span>任务 {{ selectedSession?.group_count ?? 0 }}</span><span>修改步骤 {{ editedRows }}</span></div>
-      <el-button type="primary" :loading="saving && jobRunning" :disabled="!selectedSessionId || !editedRows || jobRunning || hasUnsaved || !eligibleGroups.length" @click="generateAll">批量生成 bbox + COT</el-button>
-      <el-button type="success" :loading="exporting" :disabled="!selectedSessionId || !editedRows || jobRunning || hasUnsaved || saving" @click="exportDataset">导出数据集</el-button>
+      <el-button type="primary" :loading="saving && jobRunning" :disabled="pipelineReadOnly || !selectedSessionId || !editedRows || jobRunning || hasUnsaved || !eligibleGroups.length" @click="generateAll">批量生成 bbox + COT</el-button>
+      <el-button type="success" :loading="exporting" :disabled="pipelineReadOnly || !selectedSessionId || !editedRows || jobRunning || hasUnsaved || saving" @click="exportDataset">导出数据集</el-button>
       <el-button :icon="Refresh" text :disabled="loadingCot || jobRunning || hasUnsaved" @click="refreshCot">刷新</el-button>
     </section>
-    <el-alert v-if="pendingReview" :title="`${pendingReview} 项人工修改待复核；生成和导出会排除这些任务。`" type="warning" :closable="false" show-icon><router-link :to="{ path: '/correction', query: { batch_id: selectedBatchId } }">进入当前批次复核</router-link></el-alert>
+    <el-alert v-if="pendingReview" :title="`${pendingReview} 项人工修改待复核；生成和导出会排除这些任务。`" type="warning" :closable="false" show-icon><router-link :to="{ path: '/correction', query: { ...route.query, batch_id: selectedBatchId, ...(pipelineContext.isPipelineRoute.value ? { step_id: 'correction' } : {}) } }">进入当前批次复核</router-link></el-alert>
     <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />
     <section v-if="activeJob" class="job-status">
       <div><b>{{ activeJob.status === 'succeeded' ? '生成完成' : activeJob.status === 'failed' ? '生成失败' : activeJob.stage === 'generating_bbox' ? '正在生成 bbox' : '正在生成 COT' }}</b><span v-if="activeJob.current_trajectory">{{ activeJob.current_trajectory }} · Step {{ activeJob.current_step }}</span><span v-if="activeJob.generate_bbox">bbox {{ activeJob.completed_bbox ?? 0 }}/{{ activeJob.total_steps }}</span><span>COT {{ activeJob.completed_cot ?? activeJob.completed_steps }}/{{ activeJob.total_steps }}</span><em v-if="activeJob.error">{{ activeJob.error }}</em></div>
@@ -378,7 +420,7 @@ onBeforeUnmount(() => { disposed = true; ++detailRequest; ++listRequest; stopPol
             :action="parsedAction"
             :actions-box="activeRow.actions_box"
             :alt="`${activeRow.trajectory_id} Step ${activeRow.step}`"
-            :editable="canEditBBox && !jobRunning && !saving"
+            :editable="!pipelineReadOnly && canEditBBox && !jobRunning && !saving"
             :show-edit-trigger="true"
             :on-save-bbox="saveBBox"
             @editing-change="bboxEditing = $event"
@@ -395,15 +437,16 @@ onBeforeUnmount(() => { disposed = true; ++detailRequest; ++listRequest; stopPol
           <div class="bbox-card"><div class="card-head"><label>当前 bbox</label><code>{{ bboxText }}</code></div><div class="source-line">来源：{{ activeRow.bbox_source || 'original' }}</div><div class="original-value"><span>原始 bbox</span><code>{{ activeRow.original_actions_box || '未标框' }}</code></div></div>
           <div class="compare-card">
             <div><label>旧 Thought</label><p>{{ activeRow.original_thought || '暂无' }}</p></div>
-            <div class="editable-result"><div class="result-head"><label>新 Thought</label><el-button v-if="editingField !== 'thought'" link type="primary" :disabled="saving || jobRunning || bboxEditing || editingField !== null" @click="beginTextEdit('thought')">编辑</el-button></div><template v-if="editingField === 'thought'"><el-input v-model="textDraft" type="textarea" :rows="4" /><div class="inline-actions"><el-button size="small" @click="cancelTextEdit">取消</el-button><el-button size="small" type="primary" :loading="saving" :disabled="!textDirty" @click="saveTextField('thought')">保存</el-button></div></template><p v-else>{{ activeRow.thought || '暂无' }}</p></div>
+            <div class="editable-result"><div class="result-head"><label>新 Thought</label><el-button v-if="editingField !== 'thought'" link type="primary" :disabled="pipelineReadOnly || saving || jobRunning || bboxEditing || editingField !== null" @click="beginTextEdit('thought')">编辑</el-button></div><template v-if="editingField === 'thought'"><el-input v-model="textDraft" type="textarea" :rows="4" /><div class="inline-actions"><el-button size="small" @click="cancelTextEdit">取消</el-button><el-button size="small" type="primary" :loading="saving" :disabled="pipelineReadOnly || !textDirty" @click="saveTextField('thought')">保存</el-button></div></template><p v-else>{{ activeRow.thought || '暂无' }}</p></div>
             <div><label>旧 Summary</label><p>{{ activeRow.original_summary || '暂无' }}</p></div>
-            <div class="editable-result"><div class="result-head"><label>新 Summary</label><el-button v-if="editingField !== 'summary'" link type="primary" :disabled="saving || jobRunning || bboxEditing || editingField !== null" @click="beginTextEdit('summary')">编辑</el-button></div><template v-if="editingField === 'summary'"><el-input v-model="textDraft" type="textarea" :rows="4" /><div class="inline-actions"><el-button size="small" @click="cancelTextEdit">取消</el-button><el-button size="small" type="primary" :loading="saving" :disabled="!textDirty" @click="saveTextField('summary')">保存</el-button></div></template><p v-else>{{ activeRow.summary || '暂无' }}</p></div>
+            <div class="editable-result"><div class="result-head"><label>新 Summary</label><el-button v-if="editingField !== 'summary'" link type="primary" :disabled="pipelineReadOnly || saving || jobRunning || bboxEditing || editingField !== null" @click="beginTextEdit('summary')">编辑</el-button></div><template v-if="editingField === 'summary'"><el-input v-model="textDraft" type="textarea" :rows="4" /><div class="inline-actions"><el-button size="small" @click="cancelTextEdit">取消</el-button><el-button size="small" type="primary" :loading="saving" :disabled="pipelineReadOnly || !textDirty" @click="saveTextField('summary')">保存</el-button></div></template><p v-else>{{ activeRow.summary || '暂无' }}</p></div>
           </div>
           <div class="history-card"><label>History</label><pre>{{ activeRow.history || 'Empty' }}</pre></div>
-          <div class="detail-actions"><el-button type="primary" :loading="saving || jobRunning" :disabled="saving || jobRunning || hasUnsaved || activeGroup?.pending_review" @click="regenerateCot">重新生成 COT</el-button></div>
+          <div class="detail-actions"><el-button type="primary" :loading="saving || jobRunning" :disabled="pipelineReadOnly || saving || jobRunning || hasUnsaved || activeGroup?.pending_review" @click="regenerateCot">重新生成 COT</el-button></div>
         </template>
       </aside>
     </section>
+    </template>
   </div>
 </template>
 

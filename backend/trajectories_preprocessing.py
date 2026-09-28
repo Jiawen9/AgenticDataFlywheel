@@ -20,6 +20,7 @@ from openpyxl.utils import get_column_letter
 try:
     from .bounding_box.build_annotations import resolve_action_box
     from .bounding_box.qwen_reviewer import QwenBoxReviewer
+    from .pipeline_retry_errors import ModelConfigurationError
     from .export_vla_trajectories import collect_rows, write_xlsx
     from .batch_operations import batch_operation, active_batch_lock
     from .data_store import DATA_ROOT, ArtifactStore
@@ -30,6 +31,7 @@ except ImportError:  # Keep direct `python backend/trajectories_preprocessing.py
     from export_vla_trajectories import collect_rows, write_xlsx
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from backend.batch_operations import batch_operation, active_batch_lock
+    from backend.pipeline_retry_errors import ModelConfigurationError
     from backend.data_store import DATA_ROOT, ArtifactStore
     from backend.stage_artifacts import publish_workbooks, store_root, workbook_payload, write_sidecar, assert_unmanaged_output, register_annotation_view
 
@@ -42,7 +44,6 @@ DEFAULT_EXPORT_OUTPUT = WORKSPACE_DIR / "trajectories_to_excel.xlsx"
 DEFAULT_ANNOTATED_OUTPUT = WORKSPACE_DIR / "annotated_trajectories.xlsx"
 DEFAULT_ENV_FILE = BACKEND_DIR / ".env"
 DEFAULT_CACHE_FILE = DATA_ROOT / "cache" / "bounding_box" / "qwen_review_cache.json"
-REQUIRED_MODEL = "qwen3.8-max"
 TARGET_ACTIONS = {"click", "swipe", "long_press"}
 STEP_IMAGE_RE = re.compile(r"^step(?P<step>\d+)_vla_input\.jpg$", re.IGNORECASE)
 REQUIRED_COLUMNS = ("文件夹名", "image", "xml", "action", "summary")
@@ -76,11 +77,11 @@ def configure_reviewer_environment(env_file: Path) -> str:
     values = read_env_file(env_file)
     missing = [name for name in ("YUNAI_API_KEY", "MODEL_URL", "MODEL_NAME") if not values.get(name)]
     if missing:
-        raise ValueError(f"missing required .env settings: {', '.join(missing)}")
+        raise ModelConfigurationError(f"missing required .env settings: {', '.join(missing)}")
 
+    # The configured provider owns model availability; do not pin processing
+    # to a historical deployment name. Jobs fingerprint MODEL_NAME separately.
     model = values["MODEL_NAME"]
-    if model != REQUIRED_MODEL:
-        raise ValueError(f"MODEL_NAME must be {REQUIRED_MODEL!r}, got {model!r}")
 
     os.environ["TRAJECTORY_API_KEY"] = values["YUNAI_API_KEY"]
     os.environ["TRAJECTORY_API_BASE_URL"] = values["MODEL_URL"]

@@ -1,11 +1,13 @@
 <script setup lang="ts">
+import PipelineStatusBar from '@/components/PipelineStatusBar.vue'
+import { usePipelineContext } from '@/composables/usePipelineContext'
 import BatchPublishedNotice from '@/components/BatchPublishedNotice.vue'
 import { useBatchLifecycle } from '@/composables/useBatchLifecycle'
 import { activeBatchItems, type PublishedBatchEvent } from '@/utils/batchLifecycle'
 import { notifyBatchesPublished } from '@/utils/batchLifecycle'
 import { useRoute } from 'vue-router'
 
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { CopyDocument, Download, Plus, Refresh, Search, Upload, View } from '@element-plus/icons-vue'
 import { api, datasetReleaseExcelUrl } from '@/api'
@@ -16,6 +18,8 @@ import { datasetUploadMessage } from '@/utils/datasetUploadMessage'
 import type { DatasetRelease, DatasetReleaseCandidate, DatasetUploadJob, DatasetUploadStatus, DatasetUploadCapabilities } from '@/types'
 
 const route = useRoute()
+const pipelineContext = usePipelineContext({ stepId: 'publication' })
+const managedBatchIds = ref<string[]>([])
 const ACTIVE_UPLOAD_KEY = 'agentic-data-flywheel.active-internal-dataset-upload'
 const capabilities = ref<DatasetUploadCapabilities>({ internal: { configured: false, reason: '正在检查云道S3上传配置' } })
 const submitting = ref(false)
@@ -52,6 +56,8 @@ function onPublished(event: PublishedBatchEvent) {
 const readyCandidates = computed(() => candidates.value.filter(item => item.ready))
 const selectedReadyCount = computed(() => selectedSessionIds.value.filter(id => readyCandidates.value.some(item => item.session_id === id)).length)
 const isExternalRelease = (item: DatasetRelease) => item.source_kind === 'external_manual'
+const isPipelineRelease = (item: DatasetRelease) => Boolean((item as DatasetRelease & { pipeline_id?: string }).pipeline_id)
+const releaseSource = (item: DatasetRelease) => isExternalRelease(item) ? '外部表格' : isPipelineRelease(item) ? 'Pipeline' : '专家纠偏'
 const internalStatus = (item: DatasetRelease): DatasetUploadStatus => item.internal_upload?.status || 'not_uploaded'
 const uploadedCount = computed(() => releases.value.filter(item => internalStatus(item) === 'succeeded').length)
 const failedCount = computed(() => releases.value.filter(item => ['failed', 'interrupted'].includes(internalStatus(item))).length)
@@ -92,18 +98,21 @@ function statusType(status: DatasetUploadStatus) {
 }
 
 async function loadData(silent = false) {
+  if (pipelineContext.historyOnly.value) { loading.value = false; return }
   const epoch = ++loadEpoch
   const history = ++historyEpoch
   if (!silent) loading.value = true
   pageError.value = ''
   try {
-    const [nextCandidates, nextReleases, nextCapabilities] = await Promise.all([
+    const [nextCandidates, nextReleases, nextCapabilities, pipelines] = await Promise.all([
       api.datasetReleaseCandidates(), api.datasetReleases(),
       api.datasetUploadCapabilities().catch(() => ({ internal: { configured: false, reason: '无法读取云道S3上传配置，请刷新重试' } })),
+      typeof api.listPipelines === 'function' ? api.listPipelines({ active_only: true }) : Promise.resolve([]),
     ])
-    if (disposed || epoch !== loadEpoch) return
+    if (disposed || pipelineContext.historyOnly.value || epoch !== loadEpoch) return
     capabilities.value = nextCapabilities
-    candidates.value = activeBatchItems(nextCandidates)
+    managedBatchIds.value = pipelines.map(item => item.batch_id)
+    candidates.value = activeBatchItems(nextCandidates).filter(item => !managedBatchIds.value.includes(item.batch_id || ''))
     if (history === historyEpoch) {
       releases.value = nextReleases
       if (detailRelease.value) detailRelease.value = nextReleases.find(item => item.release_id === detailRelease.value?.release_id) || detailRelease.value
@@ -126,6 +135,7 @@ function selectAll() {
 }
 
 async function createRelease() {
+  if (pipelineContext.isPipelineRoute.value) return
   const name = datasetName.value.trim()
   if (!name) { ElMessage.warning('请输入数据集名称'); return }
   if (!selectedSessionIds.value.length) { ElMessage.warning('至少选择一个可发布批次'); return }
@@ -243,13 +253,21 @@ async function copyS3(uri: string | null) {
   catch { ElMessage.error('复制失败，请在详情中手动复制') }
 }
 
+async function openBoundRelease(id: string) {
+  if (!id || detailRelease.value?.release_id === id) return
+  const token = ++detailEpoch
+  try {
+    const release = await api.datasetRelease(id)
+    if (!disposed && token === detailEpoch) { detailRelease.value = release; detailVisible.value = true }
+  } catch (cause) { if (!disposed && token === detailEpoch) pageError.value = (cause as Error).message }
+}
+watch(() => pipelineContext.releaseId.value || String(route.query.release_id || ''), id => { void openBoundRelease(id) })
 onMounted(async () => {
+  await pipelineContext.refresh()
+  if (pipelineContext.historyOnly.value) { loading.value = false; return }
   await loadData()
   if (disposed) return
-  if (typeof route.query.release_id === 'string') {
-    try { const release = await api.datasetRelease(route.query.release_id); if (!disposed) { detailRelease.value = release; detailVisible.value = true } }
-    catch (cause) { if (!disposed) pageError.value = (cause as Error).message }
-  }
+  await openBoundRelease(pipelineContext.releaseId.value || String(route.query.release_id || ''))
   const remembered = localStorage.getItem(ACTIVE_UPLOAD_KEY)
   if (remembered && !pollEpoch) void pollUpload(remembered, ++pollEpoch)
 })
@@ -259,6 +277,8 @@ onBeforeUnmount(() => { disposed = true; ++pollEpoch; clearPoll() })
 
 <template>
   <div class="page release-page">
+    <PipelineStatusBar :context="pipelineContext" />
+    <template v-if="!pipelineContext.historyOnly.value">
     <BatchPublishedNotice :notice="publishedNotice" />
     <header class="page-hero release-hero">
       <div><span class="eyebrow">DATASET RELEASE</span><h1>数据发布</h1><p>发布专家纠偏数据或已有的轨迹表格，将发布记录中的全部 Excel 上传到云道S3。</p></div>
@@ -276,7 +296,7 @@ onBeforeUnmount(() => { disposed = true; ++pollEpoch; clearPoll() })
     <el-alert v-if="!capabilities.internal.configured" :title="datasetUploadMessage(capabilities.internal.reason) || '云道S3上传尚未配置'" type="warning" :closable="false" show-icon />
     <el-alert v-if="pollError" :title="pollError" type="warning" :closable="false" show-icon />
 
-    <section class="panel create-panel" v-loading="loading">
+    <section v-if="!pipelineContext.isPipelineRoute.value" class="panel create-panel" v-loading="loading">
       <div class="section-heading">
         <div><h2>创建数据集</h2><p>每个业务批次使用当前有效的“专家纠偏完整数据集”导出文件。</p></div>
         <div class="selection-actions"><el-button text @click="selectAll">全选可发布</el-button><el-button text @click="selectedSessionIds = []">取消选择</el-button></div>
@@ -315,7 +335,7 @@ onBeforeUnmount(() => { disposed = true; ++pollEpoch; clearPoll() })
       </div>
       <el-table v-if="filteredReleases.length" :data="filteredReleases" row-key="release_id" class="release-table">
         <el-table-column label="数据集" min-width="250"><template #default="{ row }"><div class="release-name"><b>{{ row.name }}</b><code>{{ row.release_id }}</code></div></template></el-table-column>
-        <el-table-column label="来源" min-width="120"><template #default="{ row }"><el-tag :type="isExternalRelease(row) ? 'info' : 'success'">{{ isExternalRelease(row) ? '外部表格' : '专家纠偏' }}</el-tag><small v-if="isExternalRelease(row)" class="release-progress">{{ row.external_import?.data_source || '人工采集' }}</small></template></el-table-column>
+        <el-table-column label="来源" min-width="120"><template #default="{ row }"><el-tag :type="isExternalRelease(row) ? 'info' : 'success'">{{ releaseSource(row) }}</el-tag><small v-if="isExternalRelease(row)" class="release-progress">{{ row.external_import?.data_source || '人工采集' }}</small></template></el-table-column>
         <el-table-column label="发布时间" min-width="170"><template #default="{ row }">{{ formatDate(row.created_at) }}</template></el-table-column>
         <el-table-column label="规模" min-width="180"><template #default="{ row }">{{ row.excel_paths.length }} Excel · {{ row.trajectory_count }} 轨迹 · {{ row.step_count }} 步</template></el-table-column>
         <el-table-column label="云道S3" min-width="130"><template #default="{ row }"><el-tag :type="statusType(internalStatus(row))" effect="light">{{ statusText(internalStatus(row)) }}</el-tag><small v-if="row.internal_upload" class="release-progress">{{ row.internal_upload.completed_files }}/{{ row.internal_upload.total_files }} 个 Excel</small></template></el-table-column>
@@ -329,8 +349,9 @@ onBeforeUnmount(() => { disposed = true; ++pollEpoch; clearPoll() })
         <div class="detail-title"><h3>{{ detailRelease.name }}</h3><code>{{ detailRelease.release_id }}</code></div>
         <el-descriptions :column="2" border>
           <el-descriptions-item label="发布时间">{{ formatDate(detailRelease.created_at) }}</el-descriptions-item><el-descriptions-item label="云道S3上传"><el-tag :type="statusType(internalStatus(detailRelease))">{{ statusText(internalStatus(detailRelease)) }}</el-tag></el-descriptions-item>
-          <el-descriptions-item label="数据来源">{{ isExternalRelease(detailRelease) ? '外部表格' : '专家纠偏' }}</el-descriptions-item>
-          <el-descriptions-item v-if="!isExternalRelease(detailRelease)" label="会话来源数">{{ detailRelease.source_count }}</el-descriptions-item>
+          <el-descriptions-item label="数据来源">{{ releaseSource(detailRelease) }}</el-descriptions-item>
+          <el-descriptions-item v-if="isPipelineRelease(detailRelease)" label="批次来源数">{{ detailRelease.batch_ids.length }}</el-descriptions-item>
+          <el-descriptions-item v-else-if="!isExternalRelease(detailRelease)" label="会话来源数">{{ detailRelease.source_count }}</el-descriptions-item>
           <el-descriptions-item label="数据规模"><template v-if="!isExternalRelease(detailRelease)">{{ detailRelease.task_count }} 任务 / </template>{{ detailRelease.trajectory_count }} 轨迹 / {{ detailRelease.step_count }} 步</el-descriptions-item>
           <template v-if="isExternalRelease(detailRelease) && detailRelease.external_import">
             <el-descriptions-item label="来源名称">{{ detailRelease.external_import.data_source }}</el-descriptions-item>
@@ -351,10 +372,11 @@ onBeforeUnmount(() => { disposed = true; ++pollEpoch; clearPoll() })
           <DatasetUploadReceipts :files="detailRelease.internal_upload.file_results" />
         </template>
         <ReleaseOverviewStatus v-if="detailVisible" :key="detailRelease.release_id" :release-id="detailRelease.release_id" />
-        <h4>{{ isExternalRelease(detailRelease) ? '发布 Excel' : '纠偏 Excel' }}</h4>
+        <h4>{{ isExternalRelease(detailRelease) || isPipelineRelease(detailRelease) ? '发布 Excel' : '纠偏 Excel' }}</h4>
         <div v-for="(excel, index) in detailRelease.excel_paths" :key="excel.path" class="excel-detail"><div><b>{{ excel.filename }}</b><span>{{ excel.rows }} 行 · {{ excel.available ? '本地可用' : '本地缺失' }}</span></div><code v-if="!isExternalRelease(detailRelease)">{{ excel.path }}</code><small>SHA256 {{ excel.sha256 }}</small><el-button text :icon="Download" tag="a" :href="datasetReleaseExcelUrl(detailRelease.release_id, index)" target="_blank" :disabled="excel.available === false">下载</el-button></div>
       </template>
     </el-dialog>
+    </template>
   </div>
 </template>
 

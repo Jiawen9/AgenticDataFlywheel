@@ -228,6 +228,8 @@ class CollectionTransferManager:
         run = self.runs.get(run_id)
         if run is None:
             raise CollectionRunError("采集运行不存在", 404)
+        if run.get("source_kind") == "rollout_import":
+            return run  # Local imports have no remote execution to synchronize.
         if run["status"] == "interrupted":
             return run
         if run["status"] == "completed" and (run.get("transfer_status") == "completed" or not is_batch_active(run["batch_id"], self.root)):

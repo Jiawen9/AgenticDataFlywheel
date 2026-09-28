@@ -1,9 +1,13 @@
 <script setup lang="ts">
+import PipelineStatusBar from '@/components/PipelineStatusBar.vue'
+import RolloutImportDialog from '@/components/RolloutImportDialog.vue'
+import type { RolloutImportResult } from '@/rolloutImportApi'
+import { usePipelineContext } from '@/composables/usePipelineContext'
 import BatchPublishedNotice from '@/components/BatchPublishedNotice.vue'
 import { useBatchLifecycle } from '@/composables/useBatchLifecycle'
 import { eventMatchesRoute, withoutBatchQuery, type PublishedBatchEvent } from '@/utils/batchLifecycle'
 
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowDown, Check, Clock, Download, Refresh, Select } from '@element-plus/icons-vue'
@@ -18,11 +22,26 @@ async function protectEditors() {
   for (const editor of editors.values()) if (!(await editor.protect())) return false
   return true
 }
-const flow = useTrajectoryPreprocessing(api, protectEditors)
+const pipelineBatchId = ref(String(route.query.batch_id || ''))
+const pipelineContext = usePipelineContext({ batchId: pipelineBatchId, stepId: 'preprocessing' })
+const pipelineReadOnly = pipelineContext.readOnly
+const flow = useTrajectoryPreprocessing(api, protectEditors, {
+  readOnly: () => pipelineReadOnly.value,
+  historyOnly: () => pipelineContext.historyOnly.value,
+  boundJobs: () => pipelineContext.pipeline.value ? {
+    preprocessing: pipelineContext.pipeline.value.steps.find(step => step.id === 'preprocessing')?.job_ids || [],
+    tree: pipelineContext.pipeline.value.steps.find(step => step.id === 'tree')?.job_ids || [],
+  } : pipelineContext.isPipelineRoute.value ? { preprocessing: [], tree: [] } : null,
+})
 const { batches, batchId, selectedBatch, scope, error, busy, processing, building,
   sourceTasks, sourceRuns, loadingSources, sourceError,
   loadingBatches, loading, submitting, tasks, selectedTasks, expandedTasks, expandedTrajectories,
   taskData, trajectoryData, loadingTasks, loadingTrajectories, preprocessingJob, buildJob } = flow
+watch(batchId, id => { pipelineBatchId.value = id })
+watch(() => pipelineContext.pipeline.value?.steps.map(step => `${step.id}:${step.status}:${step.job_ids.join(',')}`).join('|'), () => {
+  if (batchId.value && pipelineContext.pipeline.value?.batch_id === batchId.value) void flow.loadBatches()
+})
+watch(pipelineContext.historyOnly, value => { if (value) void flow.selectBatch('') })
 const lifecycle = useBatchLifecycle({ currentBatch: () => batchId.value || String(route.query.batch_id ?? route.query.collection_batch_id ?? ''), onPublished, refreshChoices: () => flow.loadBatches() })
 const { notice: publishedNotice } = lifecycle
 function onPublished(event: PublishedBatchEvent) {
@@ -33,6 +52,7 @@ function onPublished(event: PublishedBatchEvent) {
   void router.replace({ query: withoutBatchQuery(route.query) })
 }
 const mounted = ref(false)
+const rolloutImportVisible = ref(false)
 let disposed = false
 const treeCounts = computed(() => {
   const completed = tasks.value.filter(task => task.tree_status === 'succeeded').length
@@ -50,7 +70,7 @@ const labels: Record<string, string> = {
   dispatching: '下发中',
 }
 const statusText = (status: string) => labels[status] || status || '待开始'
-const kinds: Record<string, string> = { collection: '采集批次', collection_batch: '采集批次', imported: '导入批次', import: '导入批次', existing_trajectories: '已有轨迹', task_generation: '任务生成', augmentation: '任务扩增' }
+const kinds: Record<string, string> = { collection: '采集批次', collection_batch: '采集批次', imported: '导入批次', import: '导入批次', existing_trajectories: '已有轨迹', rollout_import: 'Rollout 导入', task_generation: '任务生成', augmentation: '任务扩增' }
 const kindText = (kind: string) => kinds[kind] || kind
 const percentage = (value: number) => Number.isFinite(value) ? Math.min(100, Math.max(0, value)) : 0
 const collecting = computed(() => preprocessingJob.value?.stage === 'scanning' && !preprocessingJob.value.total_steps)
@@ -74,9 +94,22 @@ function registerEditor(key: string, value: unknown) {
   else editors.delete(key)
 }
 async function chooseBatch(id: string) {
+  if (pipelineContext.isPipelineRoute.value) return
   if (!await lifecycle.checkBatch(id)) return
   publishedNotice.value = null
+  pipelineBatchId.value = id; await nextTick(); await pipelineContext.refresh()
   if (await flow.selectBatch(id)) await router.replace({ query: { ...route.query, batch_id: id || undefined, collection_batch_id: undefined } })
+}
+async function openRolloutImport() {
+  if (pipelineContext.isPipelineRoute.value || pipelineReadOnly.value || !await flow.guard() || disposed) return
+  rolloutImportVisible.value = true
+}
+async function importedRollout(result: RolloutImportResult) {
+  if (disposed || pipelineContext.isPipelineRoute.value) return
+  await flow.loadBatches()
+  if (disposed || pipelineContext.isPipelineRoute.value) return
+  await chooseBatch(result.batch_id)
+  if (!disposed) ElMessage.success('原始轨迹已登记，可点击“开始预处理”，或在 Pipeline 中选择此批次。')
 }
 function toggleSelectAll() { selectedTasks.value = allSelected.value ? [] : eligibleTasks.value.map(task => task.task_id) }
 async function toggleTask(name: string | number) {
@@ -104,6 +137,7 @@ watch(() => route.query.batch_id ?? route.query.collection_batch_id, async value
 onBeforeRouteLeave(() => flow.guard())
 onMounted(async () => {
   document.body.classList.add('preprocessing-responsive')
+  await pipelineContext.refresh()
   const requested = route.query.batch_id ?? route.query.collection_batch_id
   try {
     const active = typeof requested !== 'string' || await lifecycle.checkBatch(requested)
@@ -118,6 +152,8 @@ onBeforeUnmount(() => { disposed = true; flow.dispose(); window.removeEventListe
 
 <template>
   <div class="page collection-page">
+    <PipelineStatusBar :context="pipelineContext" />
+    <template v-if="!pipelineContext.historyOnly.value">
     <BatchPublishedNotice :notice="publishedNotice" />
     <header class="page-hero">
       <div>
@@ -133,11 +169,11 @@ onBeforeUnmount(() => { disposed = true; flow.dispose(); window.removeEventListe
     </header>
 
     <section class="batch-directory" aria-label="预处理批次">
-      <div class="section-heading"><h2>轨迹批次</h2><el-button :icon="Refresh" :loading="loadingBatches" :disabled="busy" @click="flow.loadBatches()">刷新批次</el-button></div>
+      <div class="section-heading"><h2>轨迹批次</h2><div><el-button v-if="!pipelineContext.isPipelineRoute.value && !pipelineReadOnly" :disabled="busy" data-testid="open-rollout-import" @click="openRolloutImport">导入已有 Rollout</el-button><el-button :icon="Refresh" :loading="loadingBatches" :disabled="busy" @click="flow.loadBatches()">刷新批次</el-button></div></div>
       <el-empty v-if="!loadingBatches && !batches.length" description="暂无轨迹批次，请先采集或登记原始轨迹" :image-size="70" />
       <div v-loading="loadingBatches" class="batch-list">
         <section v-for="batch in batches" :key="batch.batch_id" class="batch-item" :class="{ selected: batchId === batch.batch_id }">
-          <button class="batch-toggle" type="button" :aria-expanded="batchId === batch.batch_id" :aria-label="'选择批次 ' + batch.batch_id" :disabled="busy" @click="chooseBatch(batchId === batch.batch_id ? '' : batch.batch_id)">
+          <button class="batch-toggle" type="button" :aria-expanded="batchId === batch.batch_id" :aria-label="'选择批次 ' + batch.batch_id" :disabled="busy || pipelineContext.isPipelineRoute.value" @click="chooseBatch(batchId === batch.batch_id ? '' : batch.batch_id)">
             <span class="batch-identity"><strong>{{ batch.label || batch.batch_id }}</strong><code>{{ batch.batch_id }}</code></span>
             <span class="batch-kind">{{ kindText(batch.kind) }}</span>
             <span class="batch-counts">{{ batch.task_count }} 任务 · {{ batch.ready_trajectory_count }} 就绪轨迹 · {{ batch.ready_step_count }} 步</span>
@@ -147,9 +183,9 @@ onBeforeUnmount(() => { disposed = true; flow.dispose(); window.removeEventListe
           <div v-if="batchId === batch.batch_id" class="batch-detail">
             <div class="batch-actions">
               <span>采集状态：{{ statusText(batch.collection_status) }}</span>
-              <el-button v-if="preprocessingJob && ['failed', 'interrupted'].includes(preprocessingJob.status)" type="primary" :loading="submitting" :disabled="busy || processing || building" @click="flow.start(true)">重试预处理</el-button>
-              <el-button v-if="preprocessingJob && ['failed', 'interrupted'].includes(preprocessingJob.status)" :loading="submitting" :disabled="busy || processing || building || !batch.can_start" @click="flow.start()">开始新预处理</el-button>
-              <el-button v-else type="primary" :loading="submitting" :disabled="busy || processing || building || !batch.can_start" @click="flow.start()">{{ processing ? '预处理中' : '开始预处理' }}</el-button>
+              <el-button v-if="preprocessingJob && ['failed', 'interrupted'].includes(preprocessingJob.status)" type="primary" :loading="submitting" :disabled="pipelineReadOnly || busy || processing || building" @click="flow.start(true)">重试预处理</el-button>
+              <el-button v-if="preprocessingJob && ['failed', 'interrupted'].includes(preprocessingJob.status)" :loading="submitting" :disabled="pipelineReadOnly || busy || processing || building || !batch.can_start" @click="flow.start()">开始新预处理</el-button>
+              <el-button v-else type="primary" :loading="submitting" :disabled="pipelineReadOnly || busy || processing || building || !batch.can_start" @click="flow.start()">{{ processing ? '预处理中' : '开始预处理' }}</el-button>
             </div>
             <p v-if="batch.reason" class="batch-reason">{{ batch.reason }}</p>
             <div v-loading="loadingSources" v-if="batch.kind !== 'existing_trajectories'" class="source-preview">
@@ -201,8 +237,8 @@ onBeforeUnmount(() => { disposed = true; flow.dispose(); window.removeEventListe
       <el-empty v-if="!scope && !processing" description="完成预处理后，可查看步骤、编辑动作框并建树" :image-size="80" />
       <template v-if="scope">
         <section class="toolbar-card">
-          <div class="selection-summary"><el-button :icon="Select" :disabled="busy || processing || building" @click="toggleSelectAll">{{ allSelected ? '取消全选' : '全选可用任务' }}</el-button><span>已选择 <b>{{ selectedTasks.length }}</b> / {{ eligibleTasks.length }} 个任务</span></div>
-          <el-button type="primary" :loading="submitting" :disabled="busy || !selectedTasks.length || processing || building" @click="submitBuild">提交轨迹树构建</el-button>
+          <div class="selection-summary"><el-button :icon="Select" :disabled="pipelineReadOnly || busy || processing || building" @click="toggleSelectAll">{{ allSelected ? '取消全选' : '全选可用任务' }}</el-button><span>已选择 <b>{{ selectedTasks.length }}</b> / {{ eligibleTasks.length }} 个任务</span></div>
+          <el-button type="primary" :loading="submitting" :disabled="pipelineReadOnly || busy || !selectedTasks.length || processing || building" @click="submitBuild">提交轨迹树构建</el-button>
         </section>
         <section v-if="buildJob" class="job-card" :class="'job-card--' + buildJob.status" aria-label="建树进度">
           <div class="job-card__body">
@@ -211,7 +247,7 @@ onBeforeUnmount(() => { disposed = true; flow.dispose(); window.removeEventListe
             <p>分类与 Observation {{ buildJob.classified_steps }} / {{ buildJob.total_steps }}<span v-if="buildJob.current_task"> · {{ buildJob.current_task }}</span></p>
             <p v-if="buildJob.stage === 'summarizing_trajectories'">轨迹摘要 {{ buildJob.summarized_trajectories || 0 }} / {{ buildJob.total_trajectories || 0 }}</p>
             <p v-if="buildJob.error" class="job-error">{{ buildJob.error }}</p>
-            <router-link v-if="buildJob.status === 'succeeded'" :to="{ path: '/quality', query: { batch_id: batchId } }">进入本批次质检 →</router-link>
+            <router-link v-if="buildJob.status === 'succeeded'" :to="{ path: '/quality', query: { ...route.query, batch_id: batchId, ...(pipelineContext.isPipelineRoute.value ? { step_id: 'quality' } : {}) } }">进入本批次质检 →</router-link>
           </div>
         </section>
         <section v-loading="loading" class="task-list">
@@ -219,7 +255,7 @@ onBeforeUnmount(() => { disposed = true; flow.dispose(); window.removeEventListe
           <el-collapse v-else :model-value="expandedTasks" :before-collapse="toggleTask">
             <el-collapse-item v-for="task in tasks" :key="task.task_id" :name="task.task_id">
               <template #title><div class="task-title">
-                <el-checkbox v-model="selectedTasks" :value="task.task_id" :disabled="!task.annotated || busy || processing || building" @click.stop />
+                <el-checkbox v-model="selectedTasks" :value="task.task_id" :disabled="pipelineReadOnly || !task.annotated || busy || processing || building" @click.stop />
                 <b>{{ task.task_id }}</b><span class="task-goal" :title="task.goal">{{ task.goal }}</span><el-tag :type="task.annotated ? 'success' : 'warning'">{{ task.annotated ? '已预处理' : '待预处理' }}</el-tag><el-tag v-if="task.tree_status" :type="task.tree_status === 'succeeded' ? 'success' : 'warning'">{{ task.tree_status === 'succeeded' ? '已建树' : ['stale', 'invalidated'].includes(task.tree_status) ? '建树已失效' : '待建树' }}</el-tag><small>{{ task.trajectory_count }} 轨迹 · {{ task.step_count }} 步</small>
               </div></template>
               <el-alert v-if="task.warning" :title="task.warning" type="warning" :closable="false" show-icon />
@@ -231,7 +267,7 @@ onBeforeUnmount(() => { disposed = true; flow.dispose(); window.removeEventListe
                     <div v-loading="loadingTrajectories[flow.key(task.task_id, trajectory.trajectory_id)]" class="trajectory-detail">
                       <TrajectoryExplorer v-if="trajectoryData[flow.key(task.task_id, trajectory.trajectory_id)]"
                         :ref="value => registerEditor(flow.key(task.task_id, trajectory.trajectory_id), value)"
-                        :task-id="task.task_id" :trajectory="trajectoryData[flow.key(task.task_id, trajectory.trajectory_id)]" :scope="scope" :disabled="busy || processing || building"
+                        :task-id="task.task_id" :trajectory="trajectoryData[flow.key(task.task_id, trajectory.trajectory_id)]" :scope="scope" :disabled="pipelineReadOnly || busy || processing || building"
                         :save-bbox="(step: TrajectoryStep, bbox: [number, number, number, number]) => flow.saveBBox(task.task_id, trajectory.trajectory_id, step, bbox)" />
                     </div>
                   </el-collapse-item>
@@ -243,6 +279,8 @@ onBeforeUnmount(() => { disposed = true; flow.dispose(); window.removeEventListe
       </template>
     </template>
     <el-empty v-else-if="batches.length" description="选择一个批次开始预处理或查看结果" :image-size="80" />
+    </template>
+    <RolloutImportDialog v-model="rolloutImportVisible" @imported="importedRollout" />
   </div>
 </template>
 

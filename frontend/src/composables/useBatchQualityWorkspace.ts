@@ -5,7 +5,11 @@ import { resolveBatchSelection } from '@/utils/batchSelection'
 import type { CorrectionRecommendation, PreprocessingBatch, QualityTaskSummary, TaskQualityResult, TrajectoryTreeNode, TreeRun } from '@/types'
 
 type Client = Pick<typeof api, 'preprocessingBatches' | 'batchTree' | 'runQuality' | 'tree' | 'taskQuality' | 'correctionRecommendation' | 'treeRun'>
-export function useBatchQualityWorkspace(client: Client) {
+export function useBatchQualityWorkspace(client: Client, options: {
+  historyOnly?: () => boolean
+  waitingForTree?: () => boolean
+  waitingForQuality?: () => boolean
+} = {}) {
   const retiredIds = new Set<string>()
   const batches = ref<PreprocessingBatch[]>([]), batchId = ref('')
   const currentTree = ref<TreeRun | null>(null), summaries = ref<Record<string, QualityTaskSummary>>({})
@@ -24,22 +28,24 @@ export function useBatchQualityWorkspace(client: Client) {
   async function selectBatch(id: string) {
     const token = ++epoch
     batchId.value = id; clearDetail(); currentTree.value = null; summaries.value = {}; recommendation.value = null; error.value = ''
-    if (!id || publishedBatch(id) || retiredIds.has(id)) { batchId.value = ''; loadingBatch.value = false; return }
+    if (!id || options.historyOnly?.() || publishedBatch(id) || retiredIds.has(id)) { batchId.value = ''; loadingBatch.value = false; return }
     if (batches.value.length && !batches.value.some(batch => batch.batch_id === id)) {
       batchId.value = ''; loadingBatch.value = false; error.value = '指定批次不存在或当前不可用，请重新选择批次'; return
     }
+    if (options.waitingForTree?.()) { loadingBatch.value = false; return }
     loadingBatch.value = true
-    const results = await Promise.allSettled([client.batchTree(id), client.runQuality(id), client.correctionRecommendation(id)])
+    const results = await Promise.allSettled([client.batchTree(id), options.waitingForQuality?.() ? Promise.resolve(null) : client.runQuality(id), options.waitingForQuality?.() ? Promise.resolve(null) : client.correctionRecommendation(id)])
     if (disposed || epoch !== token) return
     const [built, reviewed, suggested] = results
     if (built.status === 'fulfilled') currentTree.value = built.value
     else error.value = (built.reason as Error).message
-    if (reviewed.status === 'fulfilled') summaries.value = Object.fromEntries(reviewed.value.tasks.map(task => [task.task_id, task]))
-    else if (!error.value) error.value = (reviewed.reason as Error).message
+    if (reviewed.status === 'fulfilled' && reviewed.value) summaries.value = Object.fromEntries(reviewed.value.tasks.map(task => [task.task_id, task]))
+    else if (reviewed.status === 'rejected' && !error.value) error.value = (reviewed.reason as Error).message
     if (suggested.status === 'fulfilled') recommendation.value = suggested.value
     loadingBatch.value = false
   }
   async function loadBatches(preferredId?: string, legacyRunId?: string) {
+    if (options.historyOnly?.()) { await selectBatch(''); return }
     const request = ++listRequest
     loadingBatches.value = true
     await selectBatch('')
@@ -70,6 +76,7 @@ export function useBatchQualityWorkspace(client: Client) {
     if (!disposed && batchId.value === id && taskId && readyTasks.value.some(task => task.task_id === taskId)) await viewTree(taskId)
   }
   async function refreshChoices() {
+    if (options.historyOnly?.()) return
     const request = ++listRequest
     const result = await client.preprocessingBatches()
     if (!disposed && request === listRequest) batches.value = activeBatchItems(result).filter(batch => !retiredIds.has(batch.batch_id))

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from .pipeline_access import submit_with_context, execution_pipeline_id
+
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -19,10 +22,46 @@ from .trajectory_data import BACKEND_DIR, QUALITY_JOBS_DIR
 from .data_store import RecordStore, DATA_ROOT, ArtifactStore
 from .batch_results import (current_tree_payload, current_quality_payload, quality_task_fingerprints, StaleTaskInput)
 from .stage_artifacts import store_root
+from .pipeline_retry_errors import failure_from_exception, failure_from_payload
 
 
 Progress = Callable[[dict[str, Any]], None]
 QualityRunner = Callable[..., dict[str, Any]]
+
+
+_PROGRESS_STAGES = {"preparing", "generating_rubric", "evaluating", "publishing"}
+_PROGRESS_IDENT = re.compile(r"^[A-Za-z0-9_.:-]{1,96}$")
+
+
+def _safe_progress_frame(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    safe: dict[str, Any] = {}
+    if value.get("stage") in _PROGRESS_STAGES:
+        safe["stage"] = value["stage"]
+    for key in ("current_task", "current_trajectory"):
+        item = value.get(key)
+        if isinstance(item, str) and _PROGRESS_IDENT.fullmatch(item):
+            safe[key] = item
+    for key in ("task_index", "total_tasks", "completed_trajectories",
+                "total_trajectories", "percent"):
+        item = value.get(key)
+        if type(item) is int and 0 <= item <= 10000000:
+            safe[key] = item
+    return safe
+
+
+class QualitySubprocessError(RuntimeError):
+    """A sanitized failure sent by the isolated quality worker."""
+
+    def __init__(self, failure: dict[str, Any], exit_code: int) -> None:
+        self.failure = failure_from_payload(failure)
+        self.diagnostic_log = [
+            f"quality worker exit={exit_code}; category={self.failure['category']}; "
+            f"http_status={self.failure['http_status']}; "
+            f"request_id={self.failure['request_id'] or '-'}"
+        ]
+        super().__init__(self.failure["message"])
 
 
 def _now() -> str:
@@ -61,24 +100,30 @@ def run_quality_subprocess(run_id: str, task_ids: list[str], *, job_id: str, pro
         encoding="utf-8",
         errors="replace",
         bufsize=1,
-        env={**os.environ, "ADF_DATA_ROOT": str(data_root or DATA_ROOT)},
+        env={**os.environ, "ADF_DATA_ROOT": str(data_root or DATA_ROOT), "PIPELINE_MODEL_SINGLE_ATTEMPT": "0"},
     )
     final: dict[str, Any] | None = None
     failure: dict[str, Any] | None = None
     assert process.stdout is not None
     for line in process.stdout:
         line = line.rstrip()
-        if line.startswith("PROGRESS "):
-            progress(json.loads(line[9:]))
-        elif line.startswith("RESULT "):
-            final = json.loads(line[7:])
-        elif line.startswith("ERROR "):
-            failure = json.loads(line[6:])
+        try:
+            if line.startswith("PROGRESS "):
+                progress(_safe_progress_frame(json.loads(line[9:])))
+            elif line.startswith("RESULT "):
+                final = json.loads(line[7:])
+            elif line.startswith("ERROR "):
+                failure = failure_from_payload(json.loads(line[6:]))
+        except (ValueError, TypeError, json.JSONDecodeError):
+            # Ignore non-protocol output, including unstructured tracebacks.
+            continue
     code = process.wait()
-    if failure and failure.get("kind") == "stale":
-        raise StaleTaskInput(failure.get("message") or "质检输入已失效")
+    if failure and failure.get("category") == "stale":
+        exc = StaleTaskInput(failure["message"])
+        exc.failure = failure
+        raise exc
     if code != 0 or final is None:
-        raise RuntimeError((failure or {}).get("message") or f"质检子进程失败，退出码 {code}")
+        raise QualitySubprocessError(failure or {"category": "unknown"}, code)
     return final
 
 
@@ -96,6 +141,8 @@ class QualityJobManager:
         self.mark_interrupted_jobs()
 
     def _write(self, payload: dict[str, Any]) -> None:
+        if execution_pipeline_id():
+            payload.setdefault("pipeline_id", execution_pipeline_id())
         payload.update(self.records.put("quality_jobs", payload["job_id"], payload))
 
     def get(self, job_id: str) -> dict[str, Any] | None:
@@ -128,7 +175,10 @@ class QualityJobManager:
             except (OSError, ValueError, json.JSONDecodeError):
                 continue
             if payload.get("status") in {"queued", "running"}:
-                payload.update(status="interrupted", stage="interrupted", completed_at=_now(), error="服务重启导致质检中断；重新提交可复用 checkpoint。")
+                failure = failure_from_payload({"category": "service_restart"})
+                payload.update(status="interrupted", stage="interrupted", completed_at=_now(),
+                               error=failure["message"], failure=failure,
+                               diagnostic_log=["quality worker interrupted by service restart"])
                 self._write(payload)
 
     def submit(self, run_id: str | None = None, task_ids: list[str] | None = None,
@@ -147,6 +197,8 @@ class QualityJobManager:
             run_id = alias["batch_id"]
         store = ArtifactStore(self.data_root)
         with active_batch_lock(run_id, self.data_root), self._lock:
+            from .pipeline_access import ensure_pipeline_write
+            ensure_pipeline_write(run_id, self.data_root)
             trees = current_tree_payload(run_id, self.data_root)
             if trees.get("trees"):
                 return self._submit_batch(run_id, task_ids, trees)
@@ -188,7 +240,7 @@ class QualityJobManager:
             "started_at": None, "completed_at": None, "current_task": None,
             "current_trajectory": None, "task_index": 0, "total_tasks": len(task_ids),
             "completed_trajectories": 0, "total_trajectories": 0, "percent": 0,
-            "error": None,
+            "error": None, "failure": None, "diagnostic_log": [],
         }
         payload.update(extra or {})
         if not task_ids:
@@ -196,7 +248,7 @@ class QualityJobManager:
         with self._lock:
             self._write(payload)
         if task_ids:
-            self._executor.submit(self._run, payload["job_id"], run_id, task_ids)
+            submit_with_context(self._executor, self._run, payload["job_id"], run_id, task_ids)
         return payload
 
     def _progress(self, job_id: str, changes: dict[str, Any]) -> None:
@@ -222,10 +274,18 @@ class QualityJobManager:
                                      progress=lambda value: self._progress(job_id, value), **options)
         except Exception as exc:
             status = "stale" if isinstance(exc, StaleTaskInput) else "failed"
-            self._progress(job_id, {"status": status, "stage": status, "completed_at": _now(), "error": str(exc)})
+            failure = failure_from_payload(getattr(exc, "failure", None)) if getattr(exc, "failure", None) else failure_from_exception(exc)
+            diagnostic = exc.diagnostic_log if isinstance(exc, QualitySubprocessError) else [
+                f"quality worker category={failure['category']}; "
+                f"http_status={failure['http_status']}; request_id={failure['request_id'] or '-'}"
+            ]
+            self._progress(job_id, {"status": status, "stage": status, "completed_at": _now(),
+                                    "error": failure["message"], "failure": failure,
+                                    "diagnostic_log": diagnostic[:8]})
             return
         self._progress(job_id, {"status": "succeeded", "stage": "succeeded", "completed_at": _now(), "percent": 100,
-                                "error": None, "warnings": report.get("warnings", []) if isinstance(report, dict) else []})
+                                "error": None, "failure": None, "diagnostic_log": [],
+                                "warnings": report.get("warnings", []) if isinstance(report, dict) else []})
 
     def shutdown(self) -> None:
         if self._owns_executor:

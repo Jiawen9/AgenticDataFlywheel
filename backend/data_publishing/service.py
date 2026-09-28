@@ -269,6 +269,8 @@ class DatasetReleaseRegistry:
                 batch_id = session_batch_id(session, self.data_root)
                 if expected_batches[session_id] != batch_id:
                     raise ValueError("会话来源已变化，请刷新后重试")
+                from ..pipeline_access import ensure_pipeline_write
+                ensure_pipeline_write(batch_id, self.data_root, action="publish")
                 ensure_publishable(batch_id, [session], self.data_root)
                 latest, path = self._latest_full_export(session, require_file=True)
                 sheets = latest.get("sheets") if isinstance(latest.get("sheets"), dict) else {}
@@ -350,6 +352,11 @@ class DatasetReleaseRegistry:
                         self.session_saver(session)
                 release = self._records.put_many(entries)[0]
             except Exception:
+                # A commit can succeed before its response is lost. A failed
+                # database read must retain frozen files for recovery too.
+                committed = self._records.get("dataset_releases", release_id)
+                if committed is not None:
+                    return self._with_availability(committed)
                 if self.session_saver is not save_session:
                     for original in originals:
                         try:

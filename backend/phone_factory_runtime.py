@@ -231,6 +231,10 @@ class FactoryRuntime:
                         args.append("--sampling")
                     if options["config"]["use_experience_lib"]:
                         args.append("--exp")
+                    if mode == "generate":
+                        with active_batch_lock(task["source_batch_id"], self.root):
+                            self.records.update("collection_runs", run_id,
+                                lambda item: item.update(dispatch_attempted=True))
                     response = self.store._remote_result(args)
                     if response.get("ok") is False:
                         raise PhoneFactoryError(response.get("error") or response.get("message") or "远端未接受运行", 502)
@@ -316,6 +320,8 @@ class FactoryRuntime:
     def dispatch(self, action, method, data, mode):
         if method == "GET" and action in {"runs", "collection-runs"}:
             runs = self.run_views(mode)
+            if mode == "generate" and not data.get("batch_id"):
+                runs = [run for run in runs if run.get("source_kind") != "rollout_import"]
             if mode == "generate" and data.get("include_published") != "true":
                 runs = [run for run in runs if is_batch_active(run["batch_id"], self.root)]
             if data.get("batch_id"):

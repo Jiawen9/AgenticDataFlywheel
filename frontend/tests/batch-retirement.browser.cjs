@@ -48,6 +48,7 @@ async function main() {
       if (!name.startsWith('/api/')) return route.continue()
       requests.push({ name, method: request.method(), query: url.search })
       const json = value => route.fulfill({ json: copy(value) })
+      if (name === '/api/pipelines') return json({ pipelines: [] })
       if (name === '/api/training-data-overview') return json({ conversions: [], workbook_url: null })
       if (name.endsWith('/lifecycle')) { const id = name.split('/')[3]; return json({ batch_id: id, status: published.has(id) ? 'published' : 'active', published_at: published.has(id) ? 'now' : null, release_id: published.has(id) ? 'release-new' : null }) }
       if (name === '/api/data-batches/batch-a/tasks/TASK-A/tree') return new Promise(resolve => { markTreeRequested(); releaseTree = async () => { await json({ id: 999, label: 'SHOULD-NOT-REAPPEAR' }); resolve() } })

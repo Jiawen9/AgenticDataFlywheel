@@ -44,6 +44,7 @@ async function main() {
       if (!name.startsWith('/api/')) return route.continue()
       requests.push({ name, method: request.method(), query: url.search })
       const json = value => route.fulfill({ json: copy(value) })
+      if (name === '/api/pipelines') return json({ pipelines: [] })
       if (name.endsWith('/lifecycle')) return json({ batch_id: name.split('/')[3], status: 'active', published_at: null, release_id: null })
       if (name === '/api/trajectory-preprocessing/batches') return json({ batches: [batch('batch-a'), batch('batch-b')] })
       if (name === '/api/tree-runs/current-run') return json({ run_id: 'current-run', batch_id: 'batch-b' })

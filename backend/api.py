@@ -49,6 +49,11 @@ from .preprocessing_jobs import PreprocessingJobManager
 from .preprocessing_router import router as preprocessing_router, configure_preprocessing_manager
 from .trajectory_context import AnnotationVersionConflict
 from .training_data_overview.router import router as training_overview_router, get_manager as get_overview_manager
+from .pipeline_router import router as pipeline_router
+from .pipelines import PipelineManager, PipelineRuntime
+from .pipeline_access import PipelineManagedError
+from .rollout_imports import RolloutImportStore
+from .rollout_import_router import router as rollout_import_router, configure_rollout_import_store
 
 
 FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
@@ -119,17 +124,25 @@ async def lifespan(app: FastAPI):
     from contextlib import suppress
     from .data_publishing.router import recover_dataset_imports
     await asyncio.to_thread(recover_dataset_imports)
+    await asyncio.to_thread(rollout_import_store.recover)
     manager = get_overview_manager()
     manager.start()
     start_phone_factory()
+    from .phone_factory import store as factory_store
+    pipeline_manager = PipelineManager(PipelineRuntime(DATA_ROOT, preprocessing=preprocessing_job_manager,
+        tree=job_manager, quality=quality_job_manager, cot=cot_job_manager,
+        factory=factory_store, overview=manager), DATA_ROOT)
+    app.state.pipelines = pipeline_manager
+    pipeline_manager.start()
 
     async def clean_expired_imports():
         while True:
             await asyncio.sleep(3600)
             try:
                 await asyncio.to_thread(recover_dataset_imports)
+                await asyncio.to_thread(rollout_import_store.recover)
             except Exception:
-                logging.getLogger(__name__).exception("外部表格暂存清理失败")
+                logging.getLogger(__name__).exception("导入暂存清理失败")
 
     cleanup = asyncio.create_task(clean_expired_imports())
     try:
@@ -138,12 +151,20 @@ async def lifespan(app: FastAPI):
         cleanup.cancel()
         with suppress(asyncio.CancelledError):
             await cleanup
+        pipeline_manager.close()
         close_phone_factory()
         manager.close()
 
 
 app = FastAPI(title="Agentic Data Flywheel", version="1.0.0", lifespan=lifespan)
 install_lifecycle_handlers(app)
+
+
+@app.exception_handler(PipelineManagedError)
+async def pipeline_managed_handler(_request, exc):
+    return JSONResponse(status_code=409, content={"detail": exc.detail})
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -159,7 +180,9 @@ app.include_router(batch_results_router)
 app.include_router(phone_factory_router)
 app.include_router(model_iter_router)
 app.include_router(preprocessing_router)
+app.include_router(rollout_import_router)
 app.include_router(training_overview_router)
+app.include_router(pipeline_router)
 model_job_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="model-job")
 job_manager = TreeBuildJobManager(executor=model_job_executor)
 quality_job_manager = QualityJobManager(executor=model_job_executor)
@@ -169,6 +192,8 @@ configure_job_manager(task_generation_job_manager)
 configure_cot_job_manager(cot_job_manager)
 preprocessing_job_manager = PreprocessingJobManager(executor=model_job_executor)
 configure_preprocessing_manager(preprocessing_job_manager)
+rollout_import_store = RolloutImportStore(DATA_ROOT)
+configure_rollout_import_store(rollout_import_store)
 
 
 def _batch_options(batch_id: str | None, annotation_version: str | None) -> dict:

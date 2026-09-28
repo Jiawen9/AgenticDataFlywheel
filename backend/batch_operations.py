@@ -85,6 +85,8 @@ def batch_operation(batch_id: str | None, kind: str, root: Path | None = None):
     records = RecordStore(root or DATA_ROOT)
     operation_id = uuid.uuid4().hex
     with active_batch_lock(batch_id, root):
+        from .pipeline_access import ensure_pipeline_write
+        ensure_pipeline_write(batch_id, root)
         records.put("batch_operations", operation_id, {
             "job_id": operation_id, "batch_id": batch_id, "kind": kind,
             "status": "running", "started_at": utc_now(),

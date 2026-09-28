@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from functools import partial
@@ -95,6 +96,54 @@ def prepare_source(root: Path) -> tuple[Path, Path]:
 
 
 class TreeBuildServiceTests(unittest.TestCase):
+    def test_configured_model_builds_trees_with_real_environment_setup(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            trajectory_root, workbook_path = prepare_source(root)
+            env_path = root / ".env"
+            env_path.write_text(
+                "YUNAI_API_KEY=test-only\n"
+                "MODEL_URL=https://example.invalid/v1\n"
+                "MODEL_NAME=qwen3-vl-plus\n",
+                encoding="utf-8",
+            )
+            runs_dir = root / "runs"
+            classification_cache = root / "classification.json"
+            alignment_cache = root / "alignment.json"
+            updates = []
+            with (
+                patch.dict(os.environ),
+                patch("backend.tree_build_service.QwenIntermediateStateClassifier",
+                      side_effect=FakeClassifier) as classifier,
+                patch("backend.tree_build_service.QwenStateAlignmentReviewer",
+                      side_effect=FakeAlignmentReviewer) as alignment,
+            ):
+                run_id, manifest = build_tree_run(
+                    ["TASK-A", "TASK-B"],
+                    job_id="job-configured-model",
+                    progress=updates.append,
+                    xlsx_path=workbook_path,
+                    trajectory_root=trajectory_root,
+                    runs_dir=runs_dir,
+                    env_path=env_path,
+                    classification_cache=classification_cache,
+                    alignment_cache=alignment_cache,
+                    quality_builder=partial(build_quality_workbook, summarizer=FakeSummarizer()),
+                )
+                self.assertEqual(os.environ["TRAJECTORY_MODEL"], "qwen3-vl-plus")
+                classifier.assert_called_once_with("qwen3-vl-plus", classification_cache)
+                alignment.assert_called_once_with("qwen3-vl-plus", alignment_cache)
+
+            published = runs_dir / run_id
+            self.assertEqual(manifest["task_count"], 2)
+            self.assertTrue((published / "manifest.json").is_file())
+            self.assertTrue((published / "rubric_trajectories.xlsx").is_file())
+            for task_id in ("TASK-A", "TASK-B"):
+                tree = json.loads((published / f"{task_id}.json").read_text(encoding="utf-8"))
+                self.assertEqual(tree["task_id"], task_id)
+                self.assertEqual(tree["original_step_count"], 1)
+            self.assertEqual(updates[-1]["stage"], "publishing")
+
     def test_batch_publishes_separate_task_trees_and_manifest(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

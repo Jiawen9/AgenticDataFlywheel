@@ -308,6 +308,8 @@ def create_session(tree_run_id: str | None = None, *, batch_id: str | None = Non
     store = ArtifactStore(storage_root())
     with store.batch_lock(selected_batch):
         ensure_batch_active(selected_batch, storage_root())
+        from ..pipeline_access import ensure_pipeline_write
+        ensure_pipeline_write(selected_batch, storage_root())
         ensure_correction_dirs()
         selection = top1_selection_for_run(identifier)
         if str(selection.get("storage_batch_id") or identifier) != selected_batch:
@@ -458,6 +460,11 @@ def review_group(session_id: str, group_id: str, decision: str, expected_revisio
 
 def get_session(session_id: str) -> dict[str, Any]:
     session = _session_or_raise(session_id)
+    if session.get("pipeline_selection"):
+        from ..pipeline_release import pipeline_session_source_current
+        if pipeline_session_source_current(session, root=storage_root()):
+            # Terminating a Pipeline does not erase its saved choices or edits.
+            return _public_session(session, _snapshot(session))
     batch_id = str(session.get("storage_batch_id") or session.get("batch_id") or session.get("tree_run_id"))
     if ArtifactStore(storage_root()).get(batch_id, "04_tree") is not None:
         try:
@@ -686,7 +693,11 @@ def active_session_lock(session_id: str):
 def _locked_session(function):
     @wraps(function)
     def locked(session_id, *args, **kwargs):
-        with active_session_lock(session_id):
+        with active_session_lock(session_id) as session:
+            if not function.__name__.startswith("get_"):
+                from ..pipeline_access import ensure_pipeline_write
+                action = "correction" if function.__name__ in {"patch_row", "patch_group_export", "review_group"} else "export"
+                ensure_pipeline_write(session_batch_id(session), storage_root(), action=action, session_id=session_id)
             return function(session_id, *args, **kwargs)
     return locked
 

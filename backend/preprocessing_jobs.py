@@ -1,6 +1,8 @@
 """SQLite-backed preprocessing jobs with immutable collection-input snapshots."""
 from __future__ import annotations
 
+from .pipeline_access import submit_with_context, execution_pipeline_id, retry_enabled_for_pipeline
+
 import copy
 import json
 import threading
@@ -10,6 +12,7 @@ from pathlib import Path
 
 from .batch_operations import active_batch_lock, batch_operation
 from .batch_lifecycle import is_batch_active
+from .pipeline_retry_errors import failure_from_exception, failure_from_payload
 from .collection_runs import CollectionRunStore
 from .data_store import ArtifactStore, DATA_ROOT, RecordStore
 from .data_store.paths import contained_path
@@ -17,7 +20,7 @@ from .data_store.registry import utc_now
 from .preprocessing_service import (COLUMNS, SHEET, PreprocessingError, annotate_input,
                                     convert_input, digest, processing_config, verify_input)
 from .stage_artifacts import fingerprint, write_payload_workbook
-from .trajectories_preprocessing import DEFAULT_ENV_FILE
+from .trajectories_preprocessing import DEFAULT_ENV_FILE, read_env_file
 
 ACTIVE = {"queued", "running"}
 
@@ -38,7 +41,8 @@ class PreprocessingJobManager:
         for job in self.records.list("preprocessing_jobs"):
             if job["status"] in ACTIVE:
                 self._update(job["job_id"], status="interrupted", stage="interrupted",
-                             completed_at=utc_now(), error="服务重启导致预处理中断，可使用原输入重试")
+                             completed_at=utc_now(), error="服务重启导致预处理中断，可使用原输入重试",
+                             failure=failure_from_payload({"category": "service_restart"}))
 
     @staticmethod
     def _public(job):
@@ -114,9 +118,11 @@ class PreprocessingJobManager:
                "fingerprint": digest({"input": snapshot["input_digest"], "config": config}),
                "resumed_from": resumed_from}
         job["base_annotation_version"] = base_annotation_version
+        if execution_pipeline_id():
+            job["pipeline_id"] = execution_pipeline_id()
         self.records.put("preprocessing_jobs", job_id, job, expected_revision=0)
         try:
-            self._executor.submit(self._run, job_id)
+            submit_with_context(self._executor, self._run, job_id)
         except Exception as exc:
             self._update(job_id, status="failed", stage="failed", error=str(exc), completed_at=utc_now())
             raise
@@ -124,6 +130,8 @@ class PreprocessingJobManager:
 
     def submit(self, batch_id):
         with active_batch_lock(batch_id, self.root), self._lock:
+            from .pipeline_access import ensure_pipeline_write
+            ensure_pipeline_write(batch_id, self.root)
             # Validate the identifier before any filesystem use.
             self.artifacts.list(batch_id=batch_id)
             active = self._active(batch_id)
@@ -156,6 +164,8 @@ class PreprocessingJobManager:
         if previous is None:
             raise PreprocessingError("预处理作业不存在", 404)
         with active_batch_lock(previous["batch_id"], self.root), self._lock:
+            from .pipeline_access import ensure_pipeline_write
+            ensure_pipeline_write(previous["batch_id"], self.root)
             previous = self._get(job_id)
             if previous is None:
                 raise PreprocessingError("预处理作业不存在", 404)
@@ -233,10 +243,32 @@ class PreprocessingJobManager:
                     output = work / "annotated_trajectories.xlsx"
                     cache = contained_path(self.root, "cache", "bounding_box", job["batch_id"],
                                            digest(job["config"]), "qwen_review_cache.json")
-                    result, counts = self.annotator(json_path, payload, output, snapshot=snapshot,
-                        config=job["config"], cache_path=cache, env_file=self.env_file,
-                        reviewer_factory=self.reviewer_factory, data_root=self.root,
-                        progress=lambda event: self._update(job_id, **event))
+                    reviewer_factory = self.reviewer_factory
+                    one_shot_reviewers = []
+                    if reviewer_factory is None and retry_enabled_for_pipeline(job.get("pipeline_id"), self.root):
+                        from .bounding_box.qwen_reviewer import QwenBoxReviewer, qwen_settings
+
+                        def reviewer_factory(*, config, cache_path):
+                            values = read_env_file(self.env_file)
+                            if (not values.get("YUNAI_API_KEY") or not config.get("model")
+                                    or not config.get("base_url")):
+                                raise PreprocessingError("标框模型尚未配置；初始转换结果已保存")
+                            if values.get("MODEL_NAME") != config["model"] or values.get("MODEL_URL") != config["base_url"]:
+                                raise PreprocessingError("排队后模型配置已变化，请重新开始预处理")
+                            settings = qwen_settings(api_key=values["YUNAI_API_KEY"], base_url=config["base_url"])
+                            reviewer = QwenBoxReviewer(model=config["model"], cache_path=cache_path,
+                                                       client_settings=settings)
+                            reviewer.client = reviewer.client.with_options(max_retries=0)
+                            one_shot_reviewers.append(reviewer)
+                            return reviewer
+                    try:
+                        result, counts = self.annotator(json_path, payload, output, snapshot=snapshot,
+                            config=job["config"], cache_path=cache, env_file=self.env_file,
+                            reviewer_factory=reviewer_factory, data_root=self.root,
+                            progress=lambda event: self._update(job_id, **event))
+                    finally:
+                        for reviewer in one_shot_reviewers:
+                            reviewer.client.close()
                     verify_input(snapshot, self.root)
                     self._update(job_id, stage="publishing")
                     from .batch_results import annotation_task_fingerprints, invalidation_record_entry, drain_batch_invalidations
@@ -270,7 +302,10 @@ class PreprocessingJobManager:
                 for name in ("trajectories_to_excel.xlsx", "trajectories_to_excel.json", "annotated_trajectories.xlsx", "annotated_trajectories.json"):
                     (work / name).unlink(missing_ok=True)
         except Exception as exc:
-            self._update(job_id, status="failed", stage="failed", completed_at=utc_now(), error=str(exc))
+            failure = failure_from_exception(exc)
+            self._update(job_id, status="failed", stage="failed", completed_at=utc_now(),
+                         error=(failure["message"] if retry_enabled_for_pipeline(job.get("pipeline_id"), self.root)
+                                else str(exc)), failure=failure)
 
     def batches(self):
         manifests = self.artifacts.list()
@@ -338,7 +373,7 @@ class PreprocessingJobManager:
                              [latest_job["created_at"] if latest_job else ""])
             result.append({"batch_id": batch_id, "kind": kind,
                 "label": {"task_generation": "任务生成", "augmentation": "任务泛化扩增",
-                          "manual_collection": "手工采集任务",
+                          "manual_collection": "手工采集任务", "rollout_import": "导入 Rollout",
                           "existing_trajectories": "已有轨迹批次"}.get(kind, kind),
                 "task_count": task_count, "ready_trajectory_count": len(source_trajectories) or old_count,
                 "ready_step_count": source_steps or old_steps, "collection_status": collection_status,

@@ -1,4 +1,5 @@
 import { activeBatchItems, notifyBatchesPublished } from '@/utils/batchLifecycle'
+import type { Pipeline, CreatePipeline, PipelineAction } from './types/pipeline'
 import type { BuildJob, CorrectionBatch, CorrectionCotJob, CorrectionCotResponse, CorrectionExport, CorrectionGroup, CorrectionGroupSummary, CorrectionRecommendation, CorrectionSession, DatasetRelease, DatasetReleaseCandidate, DatasetUploadJob, KnowledgeBaseSummary, QualityJob, RunQualitySummary, TaskGenerationExport, TaskGenerationJob, TaskGenerationResult, TaskGenerationTree, TaskGenerationSelection, TaskGenerationTreeNode, TaskQualityResult, TaskSummary, TrajectoryRecord, TrajectorySummary, TrajectoryTreeNode, TreeRun } from './types'
 
 import type { AugmentationPreview, CollectionSourceRun, CollectionSourceTask, DatasetUploadCapabilities, PreprocessingBatch, PreprocessingJob, StageArtifact, TrajectoryScope } from './types'
@@ -38,6 +39,21 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  async listPipelines(options: { batch_id?: string; active_only?: boolean } = {}, signal?: AbortSignal): Promise<Pipeline[]> {
+    const query = new URLSearchParams()
+    if (options.batch_id) query.set('batch_id', options.batch_id)
+    if (options.active_only !== undefined) query.set('active_only', String(options.active_only))
+    return (await request<{ pipelines: Pipeline[] }>('/api/pipelines' + (query.size ? '?' + query : ''), { cache: 'no-store', signal })).pipelines
+  },
+  async pipeline(id: string, signal?: AbortSignal): Promise<Pipeline> {
+    return (await request<{ pipeline: Pipeline }>('/api/pipelines/' + encodeURIComponent(id), { cache: 'no-store', signal })).pipeline
+  },
+  async createPipeline(value: CreatePipeline): Promise<Pipeline> {
+    return (await request<{ pipeline: Pipeline }>('/api/pipelines', { method: 'POST', body: JSON.stringify(value) })).pipeline
+  },
+  async controlPipeline(id: string, action: PipelineAction, expectedRevision: number, sessionRevision?: number): Promise<Pipeline> {
+    return (await request<{ pipeline: Pipeline }>(`/api/pipelines/${encodeURIComponent(id)}/${action}`, { method: 'POST', body: JSON.stringify({ expected_revision: expectedRevision, ...(sessionRevision !== undefined ? { session_revision: sessionRevision } : {}) }) })).pipeline
+  },
   batchLifecycle(batchId: string): Promise<{ batch_id: string; status: 'active' | 'published'; published_at: string | null; release_id: string | null }> {
     return request('/api/data-batches/' + encodeURIComponent(batchId) + '/lifecycle', { cache: 'no-store' })
   },
@@ -93,8 +109,9 @@ export const api = {
   async collectionSourceRuns(batchId: string): Promise<CollectionSourceRun[]> {
     return (await request<{ runs: CollectionSourceRun[] }>('/api/phone-factory/collection-runs?batch_id=' + encodeURIComponent(batchId))).runs
   },
-  async collectionSourceTasks(batchId: string): Promise<CollectionSourceTask[]> {
-    return (await request<{ snapshot: { tasks: CollectionSourceTask[] } }>(`/api/task-generation/collection-batches/${encodeURIComponent(batchId)}`)).snapshot.tasks
+  async collectionSourceTasks(batchId: string, sourceKind?: 'rollout_import'): Promise<CollectionSourceTask[]> {
+    const path = sourceKind === 'rollout_import' ? '/api/rollout-imports/batches/' : '/api/task-generation/collection-batches/'
+    return (await request<{ snapshot: { tasks: CollectionSourceTask[] } }>(path + encodeURIComponent(batchId))).snapshot.tasks
   },
   createPreprocessing(batchId: string): Promise<PreprocessingJob> {
     return request('/api/trajectory-preprocessing/jobs', { method: 'POST', body: JSON.stringify({ batch_id: batchId }) })

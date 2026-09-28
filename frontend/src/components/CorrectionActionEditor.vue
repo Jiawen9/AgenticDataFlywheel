@@ -3,7 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { CorrectionRow } from '@/types'
 import { parseBBox, type BBox, type Point } from '@/utils/actionOverlay'
 
-const props = defineProps<{ row: CorrectionRow; imageUrl: string; saving?: boolean }>()
+const props = defineProps<{ row: CorrectionRow; imageUrl: string; saving?: boolean; readOnly?: boolean }>()
 const emit = defineEmits<{ save: [actions: string]; draft: [actions: string | null] }>()
 
 interface ActionForm {
@@ -121,14 +121,14 @@ function pointFromEvent(event: MouseEvent | PointerEvent): Point {
 }
 
 function handleImageClick(event: MouseEvent) {
-  if (props.saving || !['click', 'long_press'].includes(actionType.value)) return
+  if (props.saving || props.readOnly || !['click', 'long_press'].includes(actionType.value)) return
   const point = pointFromEvent(event)
   form.value.x = point.x
   form.value.y = point.y
 }
 
 function startSwipe(event: PointerEvent) {
-  if (props.saving || actionType.value !== 'swipe') return
+  if (props.saving || props.readOnly || actionType.value !== 'swipe') return
   event.preventDefault()
   const point = pointFromEvent(event)
   swipeDragging.value = true
@@ -174,7 +174,7 @@ function clamp(value: number) {
 }
 
 function save() {
-  if (props.saving) return
+  if (props.saving || props.readOnly) return
   emit('save', JSON.stringify(actionPayload(), null, 2))
 }
 
@@ -210,14 +210,14 @@ onBeforeUnmount(() => resizeObserver?.disconnect())
         <div class="image-hint">{{ imageHint }}</div>
       </div>
     </div>
-    <fieldset class="editor-form" :disabled="props.saving">
+    <fieldset class="editor-form" :disabled="props.saving || props.readOnly">
       <div class="editor-heading"><span>STEP {{ String(row.step).padStart(3, '0') }}</span><el-tag v-if="row.edited" type="warning">{{ row.edit_status }}</el-tag></div>
       <label class="field-label" for="correction-action-type">修正动作</label>
-      <el-select id="correction-action-type" v-model="form.action" class="action-select" :disabled="props.saving" aria-label="动作类型"><el-option v-for="type in actionTypes" :key="type" :label="type" :value="type" /></el-select>
+      <el-select id="correction-action-type" v-model="form.action" class="action-select" :disabled="props.saving || props.readOnly" aria-label="动作类型"><el-option v-for="type in actionTypes" :key="type" :label="type" :value="type" /></el-select>
       <div v-if="['click', 'long_press', 'swipe'].includes(actionType)" class="interaction-hint">{{ imageHint }}<span v-if="coordinateBadge">{{ coordinateBadge }}</span></div>
       <el-input v-else-if="['type', 'open', 'answer'].includes(actionType)" v-model="form.text" :placeholder="actionType === 'open' ? '应用名称' : '输入内容'" />
-      <el-select v-else-if="actionType === 'system_button'" v-model="form.button" :disabled="props.saving"><el-option v-for="button in ['back', 'home', 'menu', 'enter']" :key="button" :label="button" :value="button" /></el-select>
-      <el-select v-else-if="actionType === 'terminate'" v-model="form.status" :disabled="props.saving"><el-option label="success" value="success" /><el-option label="failure" value="failure" /></el-select>
+      <el-select v-else-if="actionType === 'system_button'" v-model="form.button" :disabled="props.saving || props.readOnly"><el-option v-for="button in ['back', 'home', 'menu', 'enter']" :key="button" :label="button" :value="button" /></el-select>
+      <el-select v-else-if="actionType === 'terminate'" v-model="form.status" :disabled="props.saving || props.readOnly"><el-option label="success" value="success" /><el-option label="failure" value="failure" /></el-select>
       <el-alert v-else-if="actionType === 'wait'" title="wait 动作无需额外参数" type="info" :closable="false" />
 
       <div class="bbox-status">
@@ -227,7 +227,7 @@ onBeforeUnmount(() => resizeObserver?.disconnect())
       </div>
 
       <div class="editor-hint">坐标使用 0–999 归一化值；图片上的修改需要点击保存动作后写入。</div>
-      <el-button class="save-action" type="primary" :loading="props.saving" @click="save">保存动作</el-button>
+      <el-button class="save-action" type="primary" :loading="props.saving" :disabled="props.readOnly" @click="save">保存动作</el-button>
     </fieldset>
   </section>
 </template>

@@ -47,6 +47,7 @@ async function render(mode: 'generate' | 'modeliter' = 'generate') {
   const empty = defineComponent({ setup: () => () => h('div') })
   const passthrough = defineComponent({ setup: (_props, { slots }) => () => h('div', null, slots.default?.()) })
   app.component('el-input', empty)
+  app.component('el-progress', empty)
   app.component('el-switch', empty)
   app.component('el-button', passthrough)
   app.component('el-table', empty)
