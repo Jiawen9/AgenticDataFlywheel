@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from backend.file_io import io_path
+
 from ..data_store.paths import DATA_ROOT
 
 
@@ -45,4 +47,4 @@ def ensure_correction_dirs() -> None:
         CORRECTION_COT_CACHE_DIR,
         CORRECTION_BBOX_CACHE_DIR,
     ):
-        path.mkdir(parents=True, exist_ok=True)
+        io_path(path).mkdir(parents=True, exist_ok=True)

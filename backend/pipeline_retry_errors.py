@@ -8,6 +8,7 @@ worker boundary or enter persistent job records.
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any
 
 
@@ -23,6 +24,83 @@ _TRAJECTORY = re.compile(r"trajectory[=:]\s*([A-Za-z0-9_.:-]{1,96})", re.I)
 _STEP = re.compile(r"step[=:]\s*(\d{1,7})", re.I)
 _QUOTA_TERMS = ("insufficient_quota", "token_quota", "quota_not_enough", "quota is not enough",
                 "quota exceeded", "pre_consume_token_quota_failed", "billing_hard_limit")
+
+
+_FILE_FAILURES = {
+    "manifest_mismatch": "轨迹文件清单不一致",
+    "source_missing": "轨迹文件或目录缺失",
+    "source_hash_mismatch": "轨迹文件 SHA256 不匹配",
+    "source_size_mismatch": "轨迹文件大小不匹配",
+    "trajectory_invalid": "必要轨迹文件无效",
+    "source_unreadable": "轨迹文件无法读取",
+    "source_link": "轨迹目录包含不允许的链接",
+    "source_boundary": "轨迹文件路径超出允许范围",
+}
+_SENSITIVE_PATH = re.compile(r"(?:\bsk[-_][A-Za-z0-9]|bearer\b|(?:api[-_]?key|token|password|authorization)\s*[=:])", re.I)
+
+
+def _short(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    tail = limit // 2
+    return value[:limit - tail - 1] + "…" + value[-tail:]
+
+
+def _relative_file_reference(value: Any) -> str | None:
+    """Only relative file identifiers, never absolute paths or exception text."""
+    if not isinstance(value, str) or not value or len(value) > 4096:
+        return None
+    if (value.startswith(("/", "\\")) or any(char in value for char in ':<>"|?*{}')
+            or any(unicodedata.category(char).startswith("C") for char in value)
+            or _SENSITIVE_PATH.search(value)):
+        return None
+    value = value.replace("\\", "/")
+    if any(part in {"", ".", ".."} for part in value.split("/")):
+        return None
+    return _short(value, 320)
+
+
+def normalize_file_failure(payload: Any) -> dict[str, Any] | None:
+    """Bound the explicit local file diagnostic schema; ignore all raw messages."""
+    if (not isinstance(payload, dict) or not isinstance(payload.get("code"), str)
+            or payload["code"] not in _FILE_FAILURES):
+        return None
+    result: dict[str, Any] = {"code": payload["code"]}
+    trajectory = _relative_file_reference(payload.get("trajectory"))
+    if trajectory:
+        result["trajectory"] = trajectory
+    for key in ("missing_count", "unexpected_count"):
+        value = payload.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 1_000_000_000:
+            result[key] = value
+    paths = payload.get("paths")
+    if isinstance(paths, (list, tuple)):
+        samples = []
+        for item in paths[:20]:
+            path = _relative_file_reference(item)
+            if path and path not in samples:
+                samples.append(path)
+        if samples:
+            result["paths"] = samples
+    return result
+
+
+def file_failure_message(payload: Any) -> str:
+    """An old frontend can show useful details using its existing error string."""
+    detail = normalize_file_failure(payload)
+    if not detail:
+        return "处理输入无效"
+    prefix = "轨迹 " + _short(detail["trajectory"], 96) + "：" if detail.get("trajectory") else ""
+    message = prefix + _FILE_FAILURES[detail["code"]]
+    counts = []
+    for key, label in (("missing_count", "缺失"), ("unexpected_count", "新增未登记")):
+        if key in detail:
+            counts.append(f"{label} {detail[key]} 个文件")
+    if counts:
+        message += "（" + "，".join(counts) + "）"
+    if detail.get("paths"):
+        message += "；路径样例：" + "，".join(_short(path, 110) for path in detail["paths"][:3])
+    return message[:600]
 
 
 class ModelConfigurationError(ValueError):
@@ -120,6 +198,12 @@ def failure_from_payload(payload: Any) -> dict[str, Any]:
         "request_id": request_id,
     }
     result["message"] = safe_error_message(category, http_status, request_id, code)
+    # A persisted child-job failure is rebuilt from a strict schema. Provider
+    # messages and arbitrary extra fields are never copied across this boundary.
+    file_failure = normalize_file_failure(source.get("file_failure")) if category == "input" else None
+    if file_failure:
+        result["file_failure"] = file_failure
+        result["message"] = file_failure_message(file_failure)
     for key in ("trajectory_id", "task_id"):
         value = _identifier(source.get(key))
         if value:
@@ -163,6 +247,16 @@ def failure_from_exception(exc: BaseException) -> dict[str, Any]:
                    request_id: str | None = None) -> dict[str, Any]:
         return failure_from_payload({"category": category, "http_status": status,
                                      "code": code, "request_id": request_id, **location})
+
+    # Only our locally raised type may introduce file diagnostics. A model SDK
+    # exception with an identically named attribute is not trusted.
+    from .collection_runs import CollectionRunError
+
+    for cause in chain:
+        if isinstance(cause, CollectionRunError):
+            detail = normalize_file_failure(getattr(cause, "file_failure", None))
+            if detail:
+                return failure_from_payload({"category": "input", "file_failure": detail, **location})
 
     if any(isinstance(cause, ModelConfigurationError) for cause in chain):
         return classified("config")

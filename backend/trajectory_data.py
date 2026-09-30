@@ -9,6 +9,8 @@ import tempfile
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
+from backend.file_io import io_path, logical_path, iterdir, resolve_path
+
 from typing import Any
 from urllib.parse import quote
 
@@ -58,8 +60,8 @@ def _trajectory_number(task_id: str, path: Path) -> int | None:
 def first_trajectory_dir(task_dir: Path) -> Path | None:
     candidates = [
         (number, child)
-        for child in task_dir.iterdir()
-        if child.is_dir()
+        for child in iterdir(task_dir)
+        if io_path(child).is_dir()
         and (number := _trajectory_number(task_dir.name, child)) is not None
     ]
     return min(candidates, key=lambda item: item[0])[1] if candidates else None
@@ -78,7 +80,12 @@ def _message_text(content: Any) -> str:
 
 
 def extract_original_goal(request_path: Path) -> str:
-    payload = json.loads(request_path.read_text(encoding="utf-8-sig"))
+    payload = json.loads(io_path(request_path).read_text(encoding="utf-8-sig"))
+    return extract_original_goal_payload(payload)
+
+
+def extract_original_goal_payload(payload: dict[str, Any]) -> str:
+    """Extract the goal from an already parsed request during one file scan."""
     for message in payload.get("messages", []):
         if not isinstance(message, dict) or message.get("role") != "user":
             continue
@@ -89,11 +96,11 @@ def extract_original_goal(request_path: Path) -> str:
 
 
 def discover_tasks(trajectory_root: Path = TRAJECTORY_ROOT) -> dict[str, TaskMetadata]:
-    if not trajectory_root.is_dir():
+    if not io_path(trajectory_root).is_dir():
         return {}
     tasks: dict[str, TaskMetadata] = {}
     for task_dir in sorted(
-        (path for path in trajectory_root.iterdir() if path.is_dir()),
+        (path for path in iterdir(trajectory_root) if io_path(path).is_dir()),
         key=lambda path: path.name.casefold(),
     ):
         first = first_trajectory_dir(task_dir)
@@ -102,7 +109,7 @@ def discover_tasks(trajectory_root: Path = TRAJECTORY_ROOT) -> dict[str, TaskMet
         request_path = first / "turn001_orch_model_request.json"
         warning = ""
         goal = ""
-        if request_path.is_file():
+        if io_path(request_path).is_file():
             try:
                 goal = extract_original_goal(request_path)
             except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -147,7 +154,7 @@ def _load_annotated_trajectories(xlsx_path: Path = ANNOTATED_XLSX, *, payload: d
     from .stage_artifacts import read_workbook_payload, structured_input_exists
     if payload is None:
         if not structured_input_exists(xlsx_path):
-            if xlsx_path.is_file():
+            if io_path(xlsx_path).is_file():
                 raise FileNotFoundError(f"Required JSON snapshot is missing: {xlsx_path.with_suffix('.json')}")
             return {}
         payload = read_workbook_payload(xlsx_path)
@@ -196,7 +203,7 @@ def _load_trajectory_index(xlsx_path: Path = ANNOTATED_XLSX, *, payload: dict[st
     from .stage_artifacts import read_workbook_payload, structured_input_exists
     if payload is None:
         if not structured_input_exists(xlsx_path):
-            if xlsx_path.is_file():
+            if io_path(xlsx_path).is_file():
                 raise FileNotFoundError(f"Required JSON snapshot is missing: {xlsx_path.with_suffix('.json')}")
             return {}
         payload = read_workbook_payload(xlsx_path)
@@ -284,7 +291,7 @@ def update_action_bbox(
         previous = current.get("source_ref") or {"kind": "annotation_snapshot", "path": str(source_file), "sha256": fingerprint(source_file)}
         with active_batch_lock(str(previous.get("batch_id") or "manual-annotation"), data_root or store_root(xlsx_path)):
             write_payload_workbook(temporary_path, current)
-            workbook = load_workbook(temporary_path)
+            workbook = load_workbook(io_path(temporary_path))
             try:
                 sheet = workbook.active
                 headers = {
@@ -309,7 +316,7 @@ def update_action_bbox(
                     raise ValueError("Excel 行与 step 不匹配")
 
                 image_path = resolve_image_asset(image_value, trajectory_root)
-                with Image.open(image_path) as image:
+                with Image.open(io_path(image_path)) as image:
                     width, height = image.size
                 if x2 > width or y2 > height:
                     raise ValueError(f"bbox 超出截图范围 {width}x{height}")
@@ -317,19 +324,19 @@ def update_action_bbox(
                 action_text = str(sheet.cell(excel_row, headers["action"]).value or "")
                 actions_box = _format_manual_actions_box(action_override or parse_action(action_text), (x1, y1, x2, y2))
                 sheet.cell(excel_row, headers["actions_box"]).value = actions_box
-                if temporary_path.exists():
-                    temporary_path.unlink()
-                workbook.save(temporary_path)
+                if io_path(temporary_path).exists():
+                    io_path(temporary_path).unlink()
+                workbook.save(io_path(temporary_path))
                 workbook.close()
-                temporary_path.replace(xlsx_path)
+                io_path(temporary_path).replace(io_path(xlsx_path))
                 publish_workbook(xlsx_path, batch_id=str(previous.get("batch_id") or "manual-annotation"),
                                  data_root=data_root or store_root(xlsx_path), stage="02_annotation", source_refs=[previous] if previous else [],
                                  metadata={"manual_bbox": {"task_id": task_id, "trajectory_id": trajectory_id, "step": step}})
                 return actions_box
             finally:
                 workbook.close()
-                if temporary_path.exists():
-                    temporary_path.unlink()
+                if io_path(temporary_path).exists():
+                    io_path(temporary_path).unlink()
 
 
 def task_summaries(
@@ -366,32 +373,32 @@ def resolve_image_asset(relative_path: str, root: Path = TRAJECTORY_ROOT, *, bat
     if batch_id is not None:
         root = resolve_batch_context(batch_id, annotation_version, data_root).raw_root
     normalized = relative_path.replace("\\", "/").lstrip("/")
-    candidate = (root / Path(normalized)).resolve()
-    resolved_root = root.resolve()
+    candidate = resolve_path(root / Path(normalized))
+    resolved_root = resolve_path(root)
     try:
         candidate.relative_to(resolved_root)
     except ValueError as exc:
         raise ValueError("资源路径超出轨迹目录") from exc
     if candidate.suffix.lower() not in IMAGE_EXTENSIONS:
         raise ValueError("仅允许访问轨迹图片")
-    if not candidate.is_file():
+    if not io_path(candidate).is_file():
         raise FileNotFoundError(relative_path)
     return candidate
 
 
 def list_tree_runs(runs_dir: Path = TREE_RUNS_DIR) -> list[dict[str, Any]]:
-    if runs_dir.resolve() == TREE_RUNS_DIR.resolve():
+    if resolve_path(runs_dir) == resolve_path(TREE_RUNS_DIR):
         from .batch_results import list_current_tree_batches
         return [item for item in list_current_tree_batches(runs_dir.parent.parent)
                 if is_batch_active(item["batch_id"], runs_dir.parent.parent)]
-    if not runs_dir.is_dir():
+    if not io_path(runs_dir).is_dir():
         return []
     runs: list[dict[str, Any]] = []
-    for directory in runs_dir.iterdir():
+    for directory in iterdir(runs_dir):
         manifest_path = directory / "manifest.json"
-        if directory.is_dir() and not directory.name.startswith(".") and manifest_path.is_file():
+        if io_path(directory).is_dir() and not directory.name.startswith(".") and io_path(manifest_path).is_file():
             try:
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest = json.loads(io_path(manifest_path).read_text(encoding="utf-8"))
             except (OSError, ValueError, json.JSONDecodeError):
                 continue
             if isinstance(manifest, dict) and manifest.get("run_id") == directory.name:
@@ -401,7 +408,7 @@ def list_tree_runs(runs_dir: Path = TREE_RUNS_DIR) -> list[dict[str, Any]]:
 
 
 def find_tree_run(run_id: str, runs_dir: Path = TREE_RUNS_DIR) -> dict[str, Any] | None:
-    if runs_dir.resolve() == TREE_RUNS_DIR.resolve():
+    if resolve_path(runs_dir) == resolve_path(TREE_RUNS_DIR):
         from .batch_results import resolve_current_batch_id, current_tree_batch
         data_root = runs_dir.parent.parent
         batch_id = resolve_current_batch_id(run_id, data_root)
@@ -410,8 +417,8 @@ def find_tree_run(run_id: str, runs_dir: Path = TREE_RUNS_DIR) -> dict[str, Any]
 
 
 def resolve_tree_run_dir(run_id: str, runs_dir: Path = TREE_RUNS_DIR) -> Path:
-    candidate = (runs_dir / run_id).resolve()
-    if not candidate.is_relative_to(runs_dir.resolve()):
+    candidate = resolve_path(runs_dir / run_id)
+    if not candidate.is_relative_to(resolve_path(runs_dir)):
         raise ValueError("无效建树批次编号")
     return candidate
 
@@ -477,7 +484,7 @@ def batch_task_metadata(context: TrajectoryBatchContext) -> dict[str, TaskMetada
             warning = ""
             if not goal:
                 request = (context.raw_root / str(row["image"]).replace("\\", "/")).parent / "turn001_orch_model_request.json"
-                if request.is_file():
+                if io_path(request).is_file():
                     try:
                         goal = extract_original_goal(request)
                     except (OSError, ValueError):
@@ -492,7 +499,7 @@ def _update_batch_bbox(batch_id, task_id, trajectory_id, step, excel_row, bbox,
     from .stage_artifacts import write_payload_workbook
     if not expected_version:
         raise AnnotationVersionConflict("修改标框必须提供当前 annotation_version")
-    root = Path(data_root or DATA_ROOT).resolve()
+    root = resolve_path(Path(data_root or DATA_ROOT))
     with active_batch_lock(batch_id, root):
         from .pipeline_access import ensure_pipeline_write
         ensure_pipeline_write(batch_id, root)
@@ -513,7 +520,7 @@ def _update_batch_bbox(batch_id, task_id, trajectory_id, step, excel_row, bbox,
         if row_task_id(row) != task_id or row_trajectory_id(row) != trajectory_id or _step_number(str(row.get("image")), -1) != step:
             raise ValueError("行与任务、轨迹或步骤不匹配")
         image = resolve_image_asset(str(row["image"]), context.raw_root)
-        with Image.open(image) as screenshot:
+        with Image.open(io_path(image)) as screenshot:
             width, height = screenshot.size
         if x2 > width or y2 > height:
             raise ValueError(f"bbox 超出截图范围 {width}x{height}")
@@ -523,9 +530,9 @@ def _update_batch_bbox(batch_id, task_id, trajectory_id, step, excel_row, bbox,
                     "annotation_version": context.annotation_version, "annotation_ref": context.annotation_ref}
         row["actions_box"] = value
         temporary_root = root / "tmp" / "annotation_edits"
-        temporary_root.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=temporary_root) as directory:
-            path = Path(directory) / "annotated_trajectories.xlsx"
+        io_path(temporary_root).mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=io_path(temporary_root)) as directory:
+            path = logical_path(directory) / "annotated_trajectories.xlsx"
             write_payload_workbook(path, payload)
             from .batch_results import invalidation_record_entry, drain_batch_invalidations
             store = ArtifactStore(root)

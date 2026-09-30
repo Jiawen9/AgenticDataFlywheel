@@ -5,6 +5,8 @@ import base64, hashlib, io, json
 import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from backend.file_io import io_path
+
 from typing import Any
 import httpx
 from openai import OpenAI
@@ -66,10 +68,10 @@ def parse_classification_response(raw: str, *, require_observation: bool = False
     return IntermediateStateResult(bool(value["is_intermediate"]), category, confidence, reason, raw, False, observation)
 
 def _image_digest(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    return hashlib.sha256(io_path(path).read_bytes()).hexdigest()
 
 def _image_data_url(path: Path) -> str:
-    with Image.open(path) as opened:
+    with Image.open(io_path(path)) as opened:
         image = opened.convert("RGB")
     image.thumbnail((1080, 1920), Image.Resampling.LANCZOS)
     output = io.BytesIO(); image.save(output, format="JPEG", quality=88, optimize=True)
@@ -81,16 +83,16 @@ class QwenIntermediateStateClassifier:
         http_client = httpx.Client(proxy=settings["proxy"] or None, verify=settings["verify"], timeout=settings["timeout"], trust_env=settings["trust_env"])
         self.client = OpenAI(api_key=settings["api_key"], base_url=settings["base_url"], timeout=settings["timeout"], max_retries=0, http_client=http_client)
         self.model, self.cache_path = model, cache_path
-        self.cache: dict[str, Any] = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
+        self.cache: dict[str, Any] = json.loads(io_path(cache_path).read_text(encoding="utf-8")) if io_path(cache_path).exists() else {}
         if not isinstance(self.cache, dict):
             raise ValueError(f"classification cache must be a JSON object: {cache_path}")
         self._cache_lock = threading.RLock()
 
     def _save_cache_unlocked(self) -> None:
-        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        io_path(self.cache_path.parent).mkdir(parents=True, exist_ok=True)
         temporary = self.cache_path.with_name(f".{self.cache_path.name}.tmp")
-        temporary.write_text(json.dumps(self.cache, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(self.cache_path)
+        io_path(temporary).write_text(json.dumps(self.cache, ensure_ascii=False, indent=2), encoding="utf-8")
+        io_path(temporary).replace(io_path(self.cache_path))
 
     def _save_cache(self) -> None:
         with self._cache_lock:

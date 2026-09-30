@@ -7,6 +7,12 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+if __package__ in {None, ""}:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from backend.file_io import io_path, iterdir, resolve_path
+
 from typing import Any
 
 from PIL import Image
@@ -66,8 +72,8 @@ def _iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
 
 def xml_for_step(directory: Path, step: int, action_record: dict[str, Any]) -> tuple[str, str]:
     xml_path = directory / f"step{step:03d}_vla_input_ui.xml"
-    if xml_path.exists():
-        return xml_path.read_text(encoding="utf-8", errors="replace"), str(xml_path)
+    if io_path(xml_path).exists():
+        return io_path(xml_path).read_text(encoding="utf-8", errors="replace"), str(xml_path)
     raw = action_record.get("ui_tree_before_raw", "")
     if isinstance(raw, str) and raw.strip():
         return raw, "embedded:ui_tree_before_raw"
@@ -76,9 +82,9 @@ def xml_for_step(directory: Path, step: int, action_record: dict[str, Any]) -> t
 
 def action_summary_for_step(directory: Path, step: int, action_record: dict[str, Any]) -> str:
     response_path = directory / f"step{step:03d}_vla_model_response.json"
-    if response_path.exists():
+    if io_path(response_path).exists():
         try:
-            payload = json.loads(response_path.read_text(encoding="utf-8", errors="replace"))
+            payload = json.loads(io_path(response_path).read_text(encoding="utf-8", errors="replace"))
             match = SUMMARY_RE.search(str(payload.get("content", "")))
             if match:
                 return match.group(1).strip()
@@ -97,7 +103,7 @@ def resolve_action_box(
     max_review_rounds: int = 4,
 ) -> ActionBoxResolution:
     """Infer and optionally review one executable GUI action bounding box."""
-    with Image.open(image_path) as image:
+    with Image.open(io_path(image_path)) as image:
         image_size = image.size
 
     result = infer_box(action, xml_text, image_size)
@@ -185,11 +191,11 @@ def build(
         records: list[dict[str, Any]] = []
         missing: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
-        output_root.mkdir(parents=True, exist_ok=True)
+        io_path(output_root).mkdir(parents=True, exist_ok=True)
 
-        for directory in sorted(path for path in source_root.iterdir() if path.is_dir()):
+        for directory in sorted(path for path in iterdir(source_root) if io_path(path).is_dir()):
             evaluation = directory / "_trajectory_for_evaluate.json"
-            if not evaluation.exists():
+            if not io_path(evaluation).exists():
                 continue
             for item in load_trajectory_actions(evaluation):
                 step = int(item["global_step"])
@@ -203,7 +209,7 @@ def build(
                     })
                     continue
                 image_path = directory / f"step{step:03d}_vla_input_stability.jpg"
-                if not image_path.exists():
+                if not io_path(image_path).exists():
                     missing.append({
                         "trajectory": directory.name,
                         "step": step,
@@ -262,7 +268,7 @@ def build(
             "missing": missing,
             "skipped": skipped,
         }
-        (output_root / "manifest.json").write_text(
+        (io_path(output_root / "manifest.json")).write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         return manifest
@@ -297,8 +303,8 @@ def main() -> None:
             cache_path=PROJECT_DIR / "qwen_review_cache.json",
         )
     manifest = build(
-        args.source.resolve(),
-        args.output.resolve(),
+        resolve_path(args.source),
+        resolve_path(args.output),
         reviewer=reviewer,
         model=args.model,
         max_review_rounds=max(1, args.max_review_rounds),
@@ -307,7 +313,7 @@ def main() -> None:
     print(f"Generated: {manifest['generated_count']}")
     print(f"Missing:   {manifest['missing_count']}")
     print(f"Skipped:   {manifest['skipped_count']}")
-    print(f"Manifest:  {args.output.resolve() / 'manifest.json'}")
+    print(f"Manifest:  {resolve_path(args.output) / 'manifest.json'}")
 
 
 if __name__ == "__main__":

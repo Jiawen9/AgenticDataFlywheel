@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+from backend.file_io import io_path
+
 DEFAULT_ENV_FILE = REPOSITORY_ROOT / "backend" / ".env"
 
 
 def load_repository_env(path: Path = DEFAULT_ENV_FILE) -> dict[str, str]:
-    if not path.is_file():
+    if not io_path(path).is_file():
         raise FileNotFoundError(f"model configuration not found: {path}")
     values: dict[str, str] = {}
-    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for line_number, raw_line in enumerate(io_path(path).read_text(encoding="utf-8").splitlines(), 1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue

@@ -3,6 +3,12 @@ from __future__ import annotations
 import json
 import tkinter as tk
 from pathlib import Path
+
+if __package__ in {None, ""}:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from backend.file_io import io_path
+
 from tkinter import messagebox, ttk
 from typing import Any
 
@@ -104,10 +110,10 @@ class ActionBoxViewer(tk.Tk):
         self.bind("<Right>", lambda _event: self._move(1))
 
     def _load_manifest(self) -> None:
-        if not MANIFEST_PATH.exists():
+        if not io_path(MANIFEST_PATH).exists():
             messagebox.showerror("Missing manifest", f"Run build_annotations.py first:\n{MANIFEST_PATH}")
             return
-        data = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+        data = json.loads(io_path(MANIFEST_PATH).read_text(encoding="utf-8"))
         self.records = data.get("records", [])
         groups: dict[str, list[tuple[int, dict[str, Any]]]] = {}
         for index, record in enumerate(self.records):
@@ -175,7 +181,7 @@ class ActionBoxViewer(tk.Tk):
         else:
             path = Path(record["original"])
         try:
-            with Image.open(path) as opened:
+            with Image.open(io_path(path)) as opened:
                 self.original_image = opened.convert("RGB")
         except OSError as exc:
             messagebox.showerror("Unable to open image", f"{path}\n\n{exc}")

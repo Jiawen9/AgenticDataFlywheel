@@ -12,6 +12,8 @@ import threading
 from copy import deepcopy
 from datetime import date, datetime, time
 from pathlib import Path, PurePosixPath
+from backend.file_io import io_path, resolve_path, rglob
+
 from typing import Any, Iterable
 
 from openpyxl import Workbook, load_workbook
@@ -37,9 +39,9 @@ _SNAPSHOT_CACHE_LOCK = threading.RLock()
 
 def has_workbook_json(path: Path) -> bool:
     candidate = sidecar_path(path)
-    if not candidate.is_file():
+    if not io_path(candidate).is_file():
         return False
-    value = json.loads(candidate.read_text(encoding="utf-8"))
+    value = json.loads(io_path(candidate).read_text(encoding="utf-8"))
     if isinstance(value, dict) and isinstance(value.get("sheets"), dict):
         return True
     raise ValueError("轨迹 JSON 格式无效")
@@ -50,7 +52,7 @@ def open_source_workbook(path: Path, *, allow_excel_import: bool = False, **kwar
     if not has_workbook_json(path):
         if not allow_excel_import:
             raise FileNotFoundError(f"轨迹 JSON 输入不存在：{sidecar_path(path)}")
-        return load_workbook(path, **kwargs)
+        return load_workbook(io_path(path), **kwargs)
     payload = read_workbook_payload(path)
     workbook = Workbook()
     workbook.remove(workbook.active)
@@ -142,7 +144,7 @@ def _original_thought(image: str, asset_root: Path | None) -> str:
         return ""
     response_path = image_path.parent / f"{match.group(1)}_model_response.json"
     try:
-        value = json.loads(response_path.read_text(encoding="utf-8-sig"))
+        value = json.loads(io_path(response_path).read_text(encoding="utf-8-sig"))
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return ""
     content = str(value.get("content", "")) if isinstance(value, dict) else ""
@@ -230,9 +232,9 @@ def _safe_asset_path(value: str, root: Path) -> Path | None:
     normalized = text(value).replace("\\", "/").strip("/")
     if not normalized or normalized.startswith("..") or "/../" in f"/{normalized}/":
         return None
-    candidate = (root / PurePosixPath(normalized)).resolve()
+    candidate = resolve_path(root / PurePosixPath(normalized))
     try:
-        candidate.relative_to(root.resolve())
+        candidate.relative_to(resolve_path(root))
     except ValueError:
         return None
     return candidate
@@ -243,7 +245,7 @@ def _trajectory_json_path(
     trajectory_id: str,
     image: str,
 ) -> Path | None:
-    if asset_root is None or not asset_root.is_dir():
+    if asset_root is None or not io_path(asset_root).is_dir():
         return None
 
     image_path = _safe_asset_path(image, asset_root)
@@ -263,21 +265,21 @@ def _trajectory_json_path(
         # trajectory directory.  Match the exact directory name only.
         candidates.extend(
             path / "_trajectory_for_evaluate.json"
-            for path in asset_root.rglob(trajectory_id)
-            if path.is_dir()
+            for path in rglob(asset_root, trajectory_id)
+            if io_path(path).is_dir()
         )
 
     seen: set[Path] = set()
     for candidate in candidates:
-        resolved = candidate.resolve()
+        resolved = resolve_path(candidate)
         if resolved in seen:
             continue
         seen.add(resolved)
         try:
-            resolved.relative_to(asset_root.resolve())
+            resolved.relative_to(resolve_path(asset_root))
         except ValueError:
             continue
-        if resolved.is_file():
+        if io_path(resolved).is_file():
             return resolved
     return None
 
@@ -294,7 +296,7 @@ def _trajectory_task(
     json_path = _trajectory_json_path(asset_root, trajectory_id, image)
     if json_path is not None:
         try:
-            payload = json.loads(json_path.read_text(encoding="utf-8-sig"))
+            payload = json.loads(io_path(json_path).read_text(encoding="utf-8-sig"))
             if isinstance(payload, dict):
                 task = text(payload.get("task"))
         except (OSError, TypeError, ValueError):
@@ -431,7 +433,7 @@ def _load_snapshot_uncached(
     """Load the first sheet and return a JSON-safe immutable-ish snapshot."""
     if workbook_path.suffix.lower() not in WORKBOOK_SUFFIXES:
         raise ValueError("仅支持 .xlsx 或 .xlsm 文件；旧版 .xls 请先另存为 .xlsx")
-    if not structured_input_exists(workbook_path) and not (allow_excel_import and workbook_path.is_file()):
+    if not structured_input_exists(workbook_path) and not (allow_excel_import and io_path(workbook_path).is_file()):
         raise FileNotFoundError(f"Excel 文件不存在：{workbook_path}")
 
     workbook = open_source_workbook(workbook_path, allow_excel_import=allow_excel_import, read_only=True, data_only=True)
@@ -501,11 +503,11 @@ def _snapshot_cache_key(
     asset_root: Path | None,
     source_kind: str | None,
 ) -> tuple[str, str, str | None, int, int]:
-    resolved_workbook = workbook_path.resolve()
-    stat = resolved_workbook.stat()
+    resolved_workbook = resolve_path(workbook_path)
+    stat = io_path(resolved_workbook).stat()
     return (
         str(resolved_workbook),
-        str(asset_root.resolve()) if asset_root is not None else "",
+        str(resolve_path(asset_root)) if asset_root is not None else "",
         source_kind,
         int(stat.st_mtime_ns),
         int(stat.st_size),
@@ -533,7 +535,7 @@ def load_snapshot(
     workbook_path = Path(workbook_path)
     if workbook_path.suffix.lower() not in WORKBOOK_SUFFIXES:
         raise ValueError("仅支持 .xlsx 或 .xlsm 文件；旧版 .xls 请先另存为 .xlsx")
-    if not structured_input_exists(workbook_path) and not (allow_excel_import and workbook_path.is_file()):
+    if not structured_input_exists(workbook_path) and not (allow_excel_import and io_path(workbook_path).is_file()):
         raise FileNotFoundError(f"轨迹 JSON 输入不存在：{sidecar_path(workbook_path)}")
 
     if has_workbook_json(workbook_path):

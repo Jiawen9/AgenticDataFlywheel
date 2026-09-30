@@ -15,6 +15,7 @@ from typing import Any
 from .paths import DATA_ROOT, contained_path
 from .registry import RecordStore, utc_now, RevisionConflict
 from .locking import batch_lock
+from ..file_io import io_path, iterdir
 
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _RESERVED = re.compile(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?\Z", re.IGNORECASE)
@@ -38,14 +39,14 @@ def _json_bytes(value: Any) -> bytes:
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as source:
+    with io_path(path).open("rb") as source:
         for block in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
 
 
 def _write_bytes(path: Path, value: bytes) -> None:
-    with path.open("xb") as output:
+    with io_path(path).open("xb") as output:
         output.write(value)
         output.flush()
         os.fsync(output.fileno())
@@ -96,10 +97,10 @@ def _write_tables(path: Path, tables: dict[str, list[dict]]) -> None:
             sheet.freeze_panes = "A2"
             if columns:
                 sheet.auto_filter.ref = sheet.dimensions
-        workbook.save(path)
+        workbook.save(io_path(path))
     finally:
         workbook.close()
-    with path.open("r+b") as output:
+    with io_path(path).open("r+b") as output:
         os.fsync(output.fileno())
 
 
@@ -131,20 +132,20 @@ class ArtifactStore:
         target = contained_path(self.root, str(path))
         if target == self.root or not any(target.is_relative_to(self.root / part) for part in ("tmp", "batches")):
             raise ValueError("Refusing to remove outside artifact transaction directories")
-        if target.is_dir():
-            shutil.rmtree(target)
+        if io_path(target).is_dir():
+            shutil.rmtree(io_path(target))
 
     def _recover(self, batch_id: str) -> None:
         """Called with batch lock held, before any reading or writing."""
         parent = contained_path(self.root, "tmp", "artifact_transactions", batch_id)
-        if not parent.exists():
+        if not io_path(parent).exists():
             return
-        for transaction in sorted(parent.iterdir()):
+        for transaction in sorted(iterdir(parent)):
             journal = transaction / "commit.json"
-            if not journal.is_file():
+            if not io_path(journal).is_file():
                 self._remove(transaction)
                 continue
-            state = json.loads(journal.read_text(encoding="utf-8"))
+            state = json.loads(io_path(journal).read_text(encoding="utf-8"))
             if state.get("batch_id") != batch_id or state.get("op_id") != transaction.name:
                 raise ValueError("Invalid artifact recovery journal")
             committed = self.records.get("artifact_commits", batch_id)
@@ -154,18 +155,18 @@ class ArtifactStore:
                 final = contained_path(self.root, "batches", batch_id, stage)
                 previous, prepared = transaction / "previous" / stage, transaction / "prepared" / stage
                 if not saved:
-                    if previous.exists():
+                    if io_path(previous).exists():
                         self._remove(final)
-                        previous.rename(final)
-                    elif not change["had_previous"] and not prepared.exists():
+                        io_path(previous).rename(io_path(final))
+                    elif not change["had_previous"] and not io_path(prepared).exists():
                         self._remove(final)
             self._remove(transaction)
 
     def recover(self) -> None:
         parent = self.root / "tmp" / "artifact_transactions"
-        if parent.is_dir():
-            for directory in parent.iterdir():
-                if directory.is_dir():
+        if io_path(parent).is_dir():
+            for directory in iterdir(parent):
+                if io_path(directory).is_dir():
                     with self.batch_lock(directory.name):
                         self._recover(directory.name)
 
@@ -252,19 +253,19 @@ class ArtifactStore:
                     revision = int((current or {}).get("revision", 0)) + 1
                     final = contained_path(self.root, "batches", batch_id, stage)
                     prepared = transaction / "prepared" / stage
-                    prepared.mkdir(parents=True, exist_ok=False)
+                    io_path(prepared).mkdir(parents=True, exist_ok=False)
                     _write_bytes(prepared / "result.json", payload_bytes)
                     if tables is not None:
                         _write_tables(prepared / "result.xlsx", tables)
                     for name, source in workbooks.items():
-                        with Path(source).open("rb") as incoming, (prepared / name).open("xb") as output:
+                        with io_path(source).open("rb") as incoming, io_path(prepared / name).open("xb") as output:
                             shutil.copyfileobj(incoming, output)
                             output.flush()
                             os.fsync(output.fileno())
                     files = [{"name": file.name, "kind": "json" if file.suffix == ".json" else "excel",
                               "path": (final / file.name).relative_to(self.root).as_posix(),
-                              "sha256": _sha256(file), "size": file.stat().st_size}
-                             for file in sorted(prepared.iterdir())]
+                              "sha256": _sha256(file), "size": io_path(file).stat().st_size}
+                             for file in sorted(iterdir(prepared))]
                     manifest = {"schema_version": 2, "batch_id": batch_id, "stage": stage,
                                 "version": f"r{revision:012d}", "revision": revision, "created_at": utc_now(),
                                 "content_hash": hashlib.sha256(payload_bytes).hexdigest(),
@@ -273,7 +274,7 @@ class ArtifactStore:
                     if entry.get("legacy_aliases"):
                         manifest["legacy_aliases"] = list(entry["legacy_aliases"])
                     _write_bytes(prepared / "manifest.json", _json_bytes(manifest))
-                    changes.append({"stage": stage, "had_previous": final.exists(),
+                    changes.append({"stage": stage, "had_previous": io_path(final).exists(),
                                     "legacy_keys": [self._key(batch_id, stage, item["version"]) for item in legacy]})
                     writes.append({"namespace": "artifacts", "key": self._key(batch_id, stage),
                                    "payload": manifest, "expected_revision": (current or {}).get("storage_revision", 0)})
@@ -282,14 +283,14 @@ class ArtifactStore:
                     if record_entries:
                         self.records.put_many(record_entries)
                     return manifests
-                (transaction / "previous").mkdir(parents=True, exist_ok=True)
+                io_path(transaction / "previous").mkdir(parents=True, exist_ok=True)
                 _write_bytes(transaction / "commit.json", _json_bytes({"batch_id": batch_id, "op_id": op_id, "changes": changes}))
                 for change in changes:
                     final = contained_path(self.root, "batches", batch_id, change["stage"])
-                    final.parent.mkdir(parents=True, exist_ok=True)
-                    if final.exists():
-                        final.rename(transaction / "previous" / change["stage"])
-                    (transaction / "prepared" / change["stage"]).rename(final)
+                    io_path(final.parent).mkdir(parents=True, exist_ok=True)
+                    if io_path(final).exists():
+                        io_path(final).rename(io_path(transaction / "previous" / change["stage"]))
+                    io_path(transaction / "prepared" / change["stage"]).rename(io_path(final))
                 writes.extend(record_entries or [])
                 writes.append({"namespace": "artifact_commits", "key": batch_id, "payload": {"op_id": op_id}})
                 deletes = [{"namespace": "artifacts", "key": key} for change in changes for key in change["legacy_keys"]]
@@ -297,7 +298,7 @@ class ArtifactStore:
                 self._remove(transaction)
                 return manifests
             except BaseException:
-                if (transaction / "commit.json").exists():
+                if io_path(transaction / "commit.json").exists():
                     self._recover(batch_id)
                 else:
                     self._remove(transaction)
@@ -336,7 +337,7 @@ class ArtifactStore:
     def read_file(self, manifest: dict, filename: str) -> bytes:
         with self.batch_lock(manifest["batch_id"]):
             self._recover(manifest["batch_id"])
-            return self._resolve_file(manifest, filename).read_bytes()
+            return io_path(self._resolve_file(manifest, filename)).read_bytes()
 
     def read_payload(self, manifest: dict) -> Any:
         return json.loads(self.read_file(manifest, "result.json"))
@@ -355,8 +356,8 @@ class ArtifactStore:
             parts.append(registered["version"])
         if path.parent != contained_path(self.root, *parts):
             raise ValueError("Artifact file is outside its snapshot directory")
-        if not path.is_file():
+        if not io_path(path).is_file():
             raise FileNotFoundError("Artifact file is missing")
-        if path.stat().st_size != file["size"] or _sha256(path) != file["sha256"]:
+        if io_path(path).stat().st_size != file["size"] or _sha256(path) != file["sha256"]:
             raise ValueError("Artifact file checksum does not match the frozen snapshot")
         return path

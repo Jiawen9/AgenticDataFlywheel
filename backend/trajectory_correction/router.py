@@ -1,6 +1,8 @@
 """FastAPI routes for the isolated trajectory-correction workbench."""
 
 from __future__ import annotations
+from backend.file_io import io_path
+
 
 from typing import Optional
 
@@ -219,7 +221,7 @@ def correction_asset(session_id: str, image_path: str) -> FileResponse:
         raise HTTPException(status_code=404, detail="图片不存在") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return FileResponse(path, headers={"Cache-Control": "public, max-age=3600"})
+    return FileResponse(io_path(path), headers={"Cache-Control": "public, max-age=3600"})
 
 
 @router.post("/sessions/{session_id}/export")
@@ -255,7 +257,7 @@ def correction_export_download(session_id: str, filename: str) -> FileResponse:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return FileResponse(
-        path,
+        io_path(path),
         filename=path.name,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )

@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from backend.file_io import io_path
+
 from typing import Any, Callable
 
 from .DevelopRubrics.trajectory_tools.gui_trajectory_excel import (
@@ -17,7 +19,7 @@ FINAL_ANSWER_CACHE = DATA_ROOT / "cache" / "rubric_outputs" / "qwen_tree_final_a
 
 def _env(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
-    for raw in path.read_text(encoding="utf-8").splitlines():
+    for raw in io_path(path).read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if line and not line.startswith("#") and "=" in line:
             key, value = line.split("=", 1); values[key.strip()] = value.strip().strip('"').strip("'")

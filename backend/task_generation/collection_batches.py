@@ -15,6 +15,7 @@ from openpyxl.utils import get_column_letter
 from pydantic import BaseModel, ConfigDict
 
 from .collection_input import CollectionInput, CollectionInputError, CollectionTask
+from ..file_io import io_path
 
 
 COLLECTION_COLUMNS = [
@@ -67,7 +68,7 @@ def payload_digest(payload: dict[str, Any]) -> str:
 
 def workbook_digest(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
+    with io_path(path).open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()

@@ -18,6 +18,7 @@ from .pipeline_retry_errors import failure_from_exception, failure_from_payload
 from .trajectory_data import TREE_JOBS_DIR
 from .tree_build_service import build_tree_run, tree_build_config
 from .data_store import RecordStore, ArtifactStore
+from .file_io import io_path
 from .batch_results import (annotation_task_fingerprints, tree_task_fingerprints,
                             current_tree_payload, assert_task_inputs, StaleTaskInput)
 from .stage_artifacts import store_root
@@ -46,7 +47,7 @@ class TreeBuildJobManager:
         self._lock = threading.RLock()
         self._owns_executor = executor is None
         self._executor = executor or ThreadPoolExecutor(max_workers=1, thread_name_prefix="tree-build")
-        self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        io_path(self.jobs_dir).mkdir(parents=True, exist_ok=True)
         self.mark_interrupted_jobs()
 
     def _write(self, payload: dict[str, Any]) -> None:

@@ -9,6 +9,8 @@ import os
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from backend.file_io import io_path
+
 from typing import Any
 
 import httpx
@@ -85,7 +87,7 @@ def _boxed_image_data_url(
     bbox: tuple[int, int, int, int],
     action: dict[str, Any],
 ) -> str:
-    with Image.open(image_path) as opened:
+    with Image.open(io_path(image_path)) as opened:
         image = opened.convert("RGB")
     draw = ImageDraw.Draw(image)
     line_width = max(6, round(min(image.size) / 150))
@@ -175,12 +177,12 @@ class QwenBoxReviewer:
         self.model = model
         self.cache_path = cache_path
         self.cache: dict[str, str] = {}
-        if cache_path.exists():
-            self.cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        if io_path(cache_path).exists():
+            self.cache = json.loads(io_path(cache_path).read_text(encoding="utf-8"))
 
     def _save_cache(self) -> None:
-        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        self.cache_path.write_text(
+        io_path(self.cache_path.parent).mkdir(parents=True, exist_ok=True)
+        io_path(self.cache_path).write_text(
             json.dumps(self.cache, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
@@ -194,7 +196,7 @@ class QwenBoxReviewer:
         rule_context: dict[str, Any],
         round_index: int,
     ) -> ReviewResult:
-        image_digest = hashlib.sha256(image_path.read_bytes()).hexdigest()
+        image_digest = hashlib.sha256(io_path(image_path).read_bytes()).hexdigest()
         payload = {
             "version": "single-action-box-review-v3-action-marker",
             "model": self.model,

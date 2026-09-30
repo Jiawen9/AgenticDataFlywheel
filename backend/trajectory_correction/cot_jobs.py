@@ -12,6 +12,8 @@ import uuid
 from concurrent.futures import Executor, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+from backend.file_io import io_path
+
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -59,7 +61,7 @@ def _bbox_reviewer() -> QwenBoxReviewer:
 def _stable_image(image: Path) -> Path:
     name = image.name.replace("_vla_input.jpg", "_vla_input_stability.jpg")
     candidate = image.with_name(name)
-    return candidate if candidate.is_file() else image
+    return candidate if io_path(candidate).is_file() else image
 
 
 def _xml_text(image: Path, row: dict[str, Any]) -> str:
@@ -67,13 +69,13 @@ def _xml_text(image: Path, row: dict[str, Any]) -> str:
     if value and not value.startswith("embedded:") and not value.startswith("missing"):
         try:
             path = rebase_data_path(value, storage_root())
-            if path.is_file():
-                return path.read_text(encoding="utf-8", errors="replace")
+            if io_path(path).is_file():
+                return io_path(path).read_text(encoding="utf-8", errors="replace")
         except (OSError, ValueError):
             pass
     path = image.with_name(re.sub(r"_vla_input(?:_stability)?\.jpg$", "_vla_input_ui.xml", image.name, flags=re.IGNORECASE))
     try:
-        return path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+        return io_path(path).read_text(encoding="utf-8", errors="replace") if io_path(path).is_file() else ""
     except OSError:
         return ""
 
@@ -86,7 +88,7 @@ class CotJobManager:
         self._lock = threading.RLock()
         self._owns_executor = executor is None
         self._executor = executor or ThreadPoolExecutor(max_workers=1, thread_name_prefix="cot-generation")
-        self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        io_path(self.jobs_dir).mkdir(parents=True, exist_ok=True)
         self.mark_interrupted_jobs()
 
     def _path(self, job_id: str) -> Path:

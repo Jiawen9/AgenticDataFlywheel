@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from backend.file_io import io_path, resolve_path
+
 from typing import Any
 
 from .data_store import ArtifactStore, DATA_ROOT, rebase_data_path
@@ -16,7 +18,7 @@ class AnnotationVersionConflict(ValueError):
 
 
 def annotation_batch_lock(batch_id: str, root: Path | None = None):
-    return ArtifactStore(Path(root or DATA_ROOT).resolve()).batch_lock(batch_id)
+    return ArtifactStore(resolve_path(Path(root or DATA_ROOT))).batch_lock(batch_id)
 
 
 def row_task_id(row: dict[str, Any]) -> str:
@@ -72,7 +74,7 @@ def _resolve_batch_context_locked(batch_id: str, annotation_version: str | None 
     lineage, paths, and checksums raise ValueError. Historical new-store rows
     without identity fields retain their existing task/trajectory identifiers.
     """
-    data_root = Path(root or DATA_ROOT).resolve()
+    data_root = resolve_path(Path(root or DATA_ROOT))
     store = ArtifactStore(data_root)
     if annotation_version is None:
         versions = store.list(batch_id, "02_annotation")
@@ -94,7 +96,7 @@ def _resolve_batch_context_locked(batch_id: str, annotation_version: str | None 
 
     def add_root(value: str) -> None:
         target = rebase_data_path(value, data_root)
-        if not target.is_relative_to((data_root / "raw").resolve()):
+        if not target.is_relative_to(resolve_path(data_root / "raw")):
             raise ValueError("轨迹来源目录必须在当前 data/raw 下")
         roots.add(target)
 
@@ -110,7 +112,7 @@ def _resolve_batch_context_locked(batch_id: str, annotation_version: str | None 
             if not isinstance(input_ref, dict) or not isinstance(input_ref.get("path"), str) or not isinstance(input_ref.get("sha256"), str):
                 raise ValueError("预处理输入快照引用格式无效")
             reference_path = Path(input_ref["path"])
-            if reference_path.is_absolute() or not (data_root / reference_path).resolve().is_relative_to(data_root):
+            if reference_path.is_absolute() or not resolve_path(data_root / reference_path).is_relative_to(data_root):
                 raise ValueError("预处理输入快照路径超出数据目录")
             if len(input_ref["sha256"]) != 64 or any(value not in "0123456789abcdef" for value in input_ref["sha256"].lower()):
                 raise ValueError("预处理输入快照校验值无效")
@@ -137,7 +139,7 @@ def _resolve_batch_context_locked(batch_id: str, annotation_version: str | None 
     if len(roots) != 1:
         raise ValueError("同一标框版本引用了不同的原始轨迹根目录")
     raw_root = next(iter(roots))
-    if not raw_root.is_dir():
+    if not io_path(raw_root).is_dir():
         raise FileNotFoundError("已登记的原始轨迹根目录不存在")
     seen = set()
     for rows in payload["sheets"].values():
@@ -150,7 +152,7 @@ def _resolve_batch_context_locked(batch_id: str, annotation_version: str | None 
                 raise ValueError("标框 JSON 包含重复轨迹步骤")
             seen.add(key)
             image = str(row.get("image") or "").replace("\\", "/")
-            candidate = (raw_root / image).resolve()
+            candidate = resolve_path(raw_root / image)
             if Path(image).is_absolute() or not candidate.is_relative_to(raw_root):
                 raise ValueError("轨迹图片路径超出批次原始目录")
     return TrajectoryBatchContext(batch_id, manifest, path, raw_root, payload, goals, data_root,
@@ -166,16 +168,16 @@ def validate_batch_sources(context: TrajectoryBatchContext, root: Path | None = 
     """
     from .preprocessing_service import verify_input
     from .stage_artifacts import fingerprint
-    data_root = Path(root or context.data_root or DATA_ROOT).resolve()
+    data_root = resolve_path(Path(root or context.data_root or DATA_ROOT))
     for reference in context.input_snapshot_refs:
-        path = (data_root / reference["path"]).resolve()
+        path = resolve_path(data_root / reference["path"])
         if not path.is_relative_to(data_root):
             raise ValueError("预处理输入快照路径超出数据目录")
-        if not path.is_file():
+        if not io_path(path).is_file():
             raise FileNotFoundError("已登记的预处理输入 JSON 不存在")
         if fingerprint(path) != reference["sha256"]:
             raise ValueError("已登记的预处理输入 JSON 校验失败")
-        snapshot = json.loads(path.read_text(encoding="utf-8"))
+        snapshot = json.loads(io_path(path).read_text(encoding="utf-8"))
         if not isinstance(snapshot, dict) or snapshot.get("batch_id") != context.batch_id:
             raise ValueError("预处理输入快照批次不匹配")
         if rebase_data_path(snapshot.get("raw_root", ""), data_root) != context.raw_root:

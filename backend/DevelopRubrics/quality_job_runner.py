@@ -22,6 +22,7 @@ REPOSITORY_ROOT = HERE.parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 from backend.batch_operations import batch_operation
+from backend.file_io import io_path, logical_path, resolve_path
 from backend.data_store import DATA_ROOT, ArtifactStore, RecordStore
 from backend.stage_artifacts import load_quality_objects, quality_tables, write_payload_workbook, write_sidecar
 from backend.batch_results import (current_tree_payload, current_tree_batch, merge_quality_results,
@@ -62,9 +63,9 @@ def _now() -> str:
 
 def _tree_manifest(run_id: str) -> dict[str, Any]:
     path = resolve_tree_run_dir(run_id, TREE_RUNS) / "manifest.json"
-    if not path.is_file():
+    if not io_path(path).is_file():
         raise FileNotFoundError(f"tree run not found: {run_id}")
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(io_path(path).read_text(encoding="utf-8"))
 
 
 def _terminal_ids(tree: dict[str, Any]) -> set[str]:
@@ -87,10 +88,10 @@ def _rubric_candidates(task_id: str) -> list[Path]:
 
 def _matching_rubric(task_id: str) -> Path | None:
     for path in _rubric_candidates(task_id):
-        if not path.is_file():
+        if not io_path(path).is_file():
             continue
         try:
-            if json.loads(path.read_text(encoding="utf-8")).get("task_id") == task_id:
+            if json.loads(io_path(path).read_text(encoding="utf-8")).get("task_id") == task_id:
                 return path
         except (OSError, ValueError, json.JSONDecodeError):
             continue
@@ -109,12 +110,12 @@ async def _generate_rubric(task: Any, trajectories: list[Any], config: dict[str,
     )
     dimensions = GEN._int_setting(task_config, "num_dimensions", "ADARUBRIC_NUM_DIMENSIONS", default=5)
     messages = GEN.build_messages(task, trajectories, config=task_config, num_dimensions=dimensions)
-    evidence_path.parent.mkdir(parents=True, exist_ok=True)
-    evidence_path.write_text(GEN._evidence_from_messages(messages, workbook, task_config, trajectories), encoding="utf-8")
+    io_path(evidence_path.parent).mkdir(parents=True, exist_ok=True)
+    io_path(evidence_path).write_text(GEN._evidence_from_messages(messages, workbook, task_config, trajectories), encoding="utf-8")
     rubric = await GEN.generate_rubric(task=task, trajectories=trajectories, messages=messages, config=task_config, num_dimensions=dimensions)
     temporary = rubric_path.with_suffix(".json.tmp")
-    temporary.write_text(GEN._rubric_text(rubric) + "\n", encoding="utf-8")
-    os.replace(temporary, rubric_path)
+    io_path(temporary).write_text(GEN._rubric_text(rubric) + "\n", encoding="utf-8")
+    os.replace(io_path(temporary), io_path(rubric_path))
     return rubric_path
 
 
@@ -124,8 +125,8 @@ def _ensure_workbook(run_id: str, manifest: dict[str, Any], task_ids: list[str])
     name = manifest.get("quality_input_json")
     if not name:
         raise ValueError(f"tree run {run_id} has no required quality_input_json")
-    snapshot = (run_root / str(name)).resolve()
-    if not snapshot.is_relative_to(run_root.resolve()):
+    snapshot = resolve_path(run_root / str(name))
+    if not snapshot.is_relative_to(resolve_path(run_root)):
         raise ValueError("quality input JSON must belong to its tree run")
     tasks, trajectories = load_quality_objects(snapshot)
     if not all(task_id in tasks for task_id in task_ids):
@@ -152,9 +153,9 @@ async def run(run_id: str, task_ids: list[str], job_id: str) -> dict[str, Any]:
             if any(current["tree_hashes"].get(task) != value for task, value in expected.items()):
                 raise StaleTaskInput("所选任务的轨迹树已变化，请重新质检")
             parent = DATA_ROOT / "tmp" / "quality-jobs"
-            parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.TemporaryDirectory(prefix=f"{job_id}-", dir=parent) as directory:
-                work = Path(directory)
+            io_path(parent).mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix=f"{job_id}-", dir=io_path(parent)) as directory:
+                work = logical_path(directory)
                 quality_path = work / "rubric_trajectories.xlsx"
                 write_payload_workbook(quality_path, current["quality_input"])
                 write_sidecar(quality_path, current["quality_input"])
@@ -205,7 +206,7 @@ async def _run_frozen(run_id: str, task_ids: list[str], job_id: str,
             tree = current["trees"][task_id]
         else:
             tree_path = resolve_tree_run_dir(run_id, TREE_RUNS) / str(manifest_tasks[task_id]["tree_file"])
-            tree = json.loads(tree_path.read_text(encoding="utf-8"))
+            tree = json.loads(io_path(tree_path).read_text(encoding="utf-8"))
         terminals = _terminal_ids(tree)
         by_id = {item.trajectory_id: item for item in trajectories}
         if terminals != set(by_id):

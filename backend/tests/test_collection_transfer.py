@@ -17,10 +17,12 @@ from backend.batch_lifecycle import BatchPublishedError
 from backend.collection_runs import CollectionRunError, CollectionRunStore
 from backend.collection_transfer import CollectionTransferManager
 from backend.data_store import RecordStore
+from backend.file_io import io_path
 from backend.manual_collection import ManualCollectionStore
 from backend.preprocessing_service import convert_input
 from backend.tests.test_collection_runs import raw_trajectory, seed_batch
 from backend.tests.test_manual_collection import workbook_bytes
+from backend.task_generation.collection_batches import workbook_digest
 
 
 class MockRemote:
@@ -37,7 +39,7 @@ class MockRemote:
         with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
             for entry in self.manifest["trajectories"]:
                 for file in entry["files"]:
-                    archive.write(self.root / file["path"], file["path"])
+                    archive.write(io_path(self.root / file["path"]), file["path"])
             for name, value in (extra or {}).items():
                 archive.writestr(name, value)
         self.archive = target.getvalue()
@@ -91,6 +93,22 @@ class CollectionTransferTests(unittest.TestCase):
             values = list(pool.map(lambda _: self.manager.sync(self.run_id), range(4)))
         self.assertEqual({value["status"] for value in values}, {"completed"})
         self.assertEqual(self.remote.download_calls, 1)
+
+    def test_long_nested_files_roundtrip_with_original_hashes_and_logical_manifest(self):
+        entry = self.remote.manifest["trajectories"][0]
+        relative = entry["relative_dir"] + "/_prefetch_staging/" + "x" * 100 + "/" + "y" * 100 + "/state.json"
+        file = self.remote_root / relative
+        io_path(file.parent).mkdir(parents=True)
+        io_path(file).write_bytes(b'{"candidate":true}')
+        entry["files"].append({"path": relative, "size": io_path(file).stat().st_size, "sha256": workbook_digest(file)})
+        self.remote.build_archive()
+        result = self.manager.sync(self.run_id)
+        self.assertEqual(result["status"], "completed")
+        copied = Path(result["output_dir"]) / relative
+        self.assertGreater(len(str(copied)), 300)
+        self.assertEqual(workbook_digest(copied), workbook_digest(file))
+        self.assertNotIn("\\\\?\\", json.dumps(result))
+        self.assertEqual(len(self.runs.ready_input("batch-one")["trajectories"]), 2)
 
     def test_running_idle_does_not_mark_complete_and_missing_manifest_is_failure(self):
         self.remote.status = "running"

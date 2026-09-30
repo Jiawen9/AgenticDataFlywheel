@@ -6,6 +6,8 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from backend.file_io import io_path
+
 from typing import Any
 
 import httpx
@@ -97,19 +99,19 @@ class QwenStateAlignmentReviewer:
         self.model = model
         self.cache_path = cache_path
         self.cache: dict[str, str] = {}
-        if cache_path.exists():
-            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        if io_path(cache_path).exists():
+            payload = json.loads(io_path(cache_path).read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError(f"alignment cache must be a JSON object: {cache_path}")
             self.cache = {str(key): str(value) for key, value in payload.items()}
 
     def _save_cache(self) -> None:
-        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        io_path(self.cache_path.parent).mkdir(parents=True, exist_ok=True)
         temporary_path = self.cache_path.with_name(f".{self.cache_path.name}.tmp")
-        temporary_path.write_text(
+        io_path(temporary_path).write_text(
             json.dumps(self.cache, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        temporary_path.replace(self.cache_path)
+        io_path(temporary_path).replace(io_path(self.cache_path))
 
     def review(
         self,

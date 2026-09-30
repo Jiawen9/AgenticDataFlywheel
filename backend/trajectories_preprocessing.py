@@ -11,6 +11,12 @@ import sys
 import uuid
 from copy import copy
 from pathlib import Path
+
+if __package__ in {None, ""}:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from backend.file_io import io_path, logical_path, resolve_path
+
 from tempfile import TemporaryDirectory
 from typing import Any, Callable
 
@@ -51,11 +57,11 @@ REQUIRED_COLUMNS = ("文件夹名", "image", "xml", "action", "summary")
 
 def read_env_file(path: Path) -> dict[str, str]:
     """Read the small KEY=VALUE configuration used by this backend."""
-    if not path.is_file():
+    if not io_path(path).is_file():
         raise FileNotFoundError(f"environment file does not exist: {path}")
 
     values: dict[str, str] = {}
-    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
+    for line_number, raw_line in enumerate(io_path(path).read_text(encoding="utf-8-sig").splitlines(), 1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
@@ -91,13 +97,13 @@ def configure_reviewer_environment(env_file: Path) -> str:
 
 def export_trajectories(source_root: Path, output_path: Path) -> tuple[int, list[str]]:
     """Run the repository exporter against the complete rollout tree."""
-    source_root = source_root.expanduser().resolve()
-    if not source_root.is_dir():
+    source_root = resolve_path(source_root.expanduser())
+    if not io_path(source_root).is_dir():
         raise FileNotFoundError(f"trajectory source directory does not exist: {source_root}")
     rows, warnings = collect_rows(source_root)
     if not rows:
         raise ValueError(f"no final VLA trajectory steps found under {source_root}")
-    write_xlsx(rows, output_path.expanduser().resolve())
+    write_xlsx(rows, resolve_path(output_path.expanduser()))
     return len(rows), warnings
 
 
@@ -123,9 +129,9 @@ def step_from_image_path(image_path: Path) -> int:
 
 def load_executed_actions(run_dir: Path) -> dict[int, dict[str, Any]]:
     evaluation_path = run_dir / "_trajectory_for_evaluate.json"
-    if not evaluation_path.is_file():
+    if not io_path(evaluation_path).is_file():
         raise FileNotFoundError(f"evaluation trajectory does not exist: {evaluation_path}")
-    payload = json.loads(evaluation_path.read_text(encoding="utf-8-sig"))
+    payload = json.loads(io_path(evaluation_path).read_text(encoding="utf-8-sig"))
     actions = payload.get("actions_flat")
     if not isinstance(actions, list):
         raise ValueError(f"actions_flat is missing or invalid: {evaluation_path}")
@@ -182,10 +188,10 @@ def _header_map(sheet: Any) -> dict[str, int]:
 def resolve_artifact_path(value: Any, trajectory_root: Path | None) -> Path:
     path = Path(str(value)).expanduser()
     if path.is_absolute():
-        return path.resolve()
+        return resolve_path(path)
     if trajectory_root is None:
         raise ValueError(f"relative artifact path requires trajectory_root: {path}")
-    return (trajectory_root / path).resolve()
+    return resolve_path(trajectory_root / path)
 
 
 def annotate_trajectory_workbook(
@@ -199,12 +205,12 @@ def annotate_trajectory_workbook(
     progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, int]:
     """Append actions_box values, publishing the output only after all rows succeed."""
-    source_path = source_path.expanduser().resolve()
-    output_path = output_path.expanduser().resolve()
+    source_path = resolve_path(source_path.expanduser())
+    output_path = resolve_path(output_path.expanduser())
     if trajectory_root is not None:
-        trajectory_root = trajectory_root.expanduser().resolve()
+        trajectory_root = resolve_path(trajectory_root.expanduser())
     if allow_excel_import:
-        workbook = load_workbook(source_path)
+        workbook = load_workbook(io_path(source_path))
     else:
         if __package__:
             from .stage_artifacts import payload_workbook, read_workbook_payload
@@ -270,15 +276,15 @@ def annotate_trajectory_workbook(
                 )
 
             stability_path = run_dir / f"step{step:03d}_vla_input_stability.jpg"
-            if not stability_path.is_file():
+            if not io_path(stability_path).is_file():
                 raise FileNotFoundError(f"stability screenshot does not exist: {stability_path}")
             xml_path = resolve_artifact_path(
                 sheet.cell(row_number, headers["xml"]).value,
                 trajectory_root,
             )
-            if not xml_path.is_file():
+            if not io_path(xml_path).is_file():
                 raise FileNotFoundError(f"UI XML does not exist: {xml_path}")
-            xml_text = xml_path.read_text(encoding="utf-8", errors="replace")
+            xml_text = io_path(xml_path).read_text(encoding="utf-8", errors="replace")
             summary_value = sheet.cell(row_number, headers["summary"]).value
             resolution = resolve_action_box(
                 image_path=stability_path,
@@ -298,14 +304,14 @@ def annotate_trajectory_workbook(
             raise RuntimeError(f"failed to annotate {row_label}: {exc}") from exc
 
     sheet.auto_filter.ref = f"A1:{get_column_letter(sheet.max_column)}{sheet.max_row}"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    io_path(output_path.parent).mkdir(parents=True, exist_ok=True)
     temporary_path = output_path.with_name(f".{output_path.stem}.tmp{output_path.suffix}")
     try:
-        workbook.save(temporary_path)
-        temporary_path.replace(output_path)
+        workbook.save(io_path(temporary_path))
+        io_path(temporary_path).replace(io_path(output_path))
     finally:
-        if temporary_path.exists():
-            temporary_path.unlink()
+        if io_path(temporary_path).exists():
+            io_path(temporary_path).unlink()
     return counts
 
 
@@ -334,12 +340,12 @@ def run_pipeline(
     with batch_operation(batch_id, "preprocessing_cli", root):
         assert_unmanaged_output(export_output, root)
         assert_unmanaged_output(annotated_output, root)
-        if export_output.resolve() == annotated_output.resolve():
+        if resolve_path(export_output) == resolve_path(annotated_output):
             raise ValueError("转换和标框的导出路径必须不同")
         work_parent = root / "tmp" / "preprocessing-cli"
-        work_parent.mkdir(parents=True, exist_ok=True)
-        with TemporaryDirectory(prefix="run-", dir=work_parent) as directory:
-            temporary = Path(directory)
+        io_path(work_parent).mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix="run-", dir=io_path(work_parent)) as directory:
+            temporary = logical_path(directory)
             conversion_path = temporary / "conversion" / export_output.name
             annotation_path = temporary / "annotation" / annotated_output.name
             result = _run_pipeline(source=source, export_output=conversion_path, annotated_output=annotation_path,
@@ -350,20 +356,20 @@ def run_pipeline(
                        for ref in result["artifacts"]):
                     raise ValueError("处理完成后批次已有更新，已保留最新结果；请重新导出")
                 for source_path, target in ((conversion_path, export_output), (annotation_path, annotated_output)):
-                    target.parent.mkdir(parents=True, exist_ok=True)
+                    io_path(target.parent).mkdir(parents=True, exist_ok=True)
                     staging = target.with_name("." + target.name + "." + uuid.uuid4().hex + ".tmp")
                     try:
-                        shutil.copyfile(source_path, staging)
-                        staging.replace(target)
+                        shutil.copyfile(io_path(source_path), io_path(staging))
+                        io_path(staging).replace(io_path(target))
                     finally:
-                        staging.unlink(missing_ok=True)
+                        io_path(staging).unlink(missing_ok=True)
                 conversion, annotation = result["artifacts"]
                 write_sidecar(export_output, store.read_payload(conversion), source_ref=conversion)
                 payload = store.read_payload(annotation)
                 write_sidecar(annotated_output, payload, source_ref=annotation)
                 if register_annotation_export:
                     register_annotation_view(annotated_output, payload, annotation, root)
-            print(f"Current batch exports: {export_output.resolve()}; {annotated_output.resolve()}", flush=True)
+            print(f"Current batch exports: {resolve_path(export_output)}; {resolve_path(annotated_output)}", flush=True)
             return result
 
 
@@ -388,10 +394,10 @@ def _run_pipeline(
         converted = workbook_payload(export_output)
         # Model input is a worker snapshot; public 01/02 remain unchanged on failure.
         write_sidecar(export_output, converted)
-        print(f"Exported {row_count} steps to: {export_output.expanduser().resolve()}", flush=True)
+        print(f"Exported {row_count} steps to: {resolve_path(export_output.expanduser())}", flush=True)
         for warning in warnings:
             print(f"Warning: {warning}", file=sys.stderr)
-        model = configure_reviewer_environment(env_file.expanduser().resolve())
+        model = configure_reviewer_environment(resolve_path(env_file.expanduser()))
         from backend.preprocessing_service import processing_config
         configuration = {**processing_config(env_file), "model": model,
                          "base_url": os.environ.get("TRAJECTORY_VLA_API_BASE_URL")
@@ -413,7 +419,7 @@ def _run_pipeline(
             max_review_rounds=max(1, max_review_rounds), trajectory_root=source, allow_excel_import=False)
         converted_ref, annotation = publish_workbooks([
             {"stage": "01_conversion", "payload": converted, "workbooks": {export_output.name: export_output},
-             "source_refs": [{"kind": "raw_trajectories", "path": str(source.resolve())}], "metadata": {"warnings": warnings}},
+             "source_refs": [{"kind": "raw_trajectories", "path": str(resolve_path(source))}], "metadata": {"warnings": warnings}},
             {"stage": "02_annotation", "payload": workbook_payload(annotated_output),
              "workbooks": {annotated_output.name: annotated_output}, "source_stages": ["01_conversion"],
              "metadata": {"model": model, "cli_configuration": configuration, **counts}},
@@ -423,7 +429,7 @@ def _run_pipeline(
         write_sidecar(export_output, converted, source_ref=conversion)
         annotation_payload = workbook_payload(annotated_output)
         write_sidecar(annotated_output, annotation_payload, source_ref=annotation)
-        print(f"Annotated workbook: {annotated_output.expanduser().resolve()}", flush=True)
+        print(f"Annotated workbook: {resolve_path(annotated_output.expanduser())}", flush=True)
         print(
             f"Rows={counts['rows']} annotated={counts['annotated']} blank={counts['blank']}",
             flush=True,
@@ -436,14 +442,14 @@ def main() -> int:
     args = parse_args()
     try:
         args.batch_id = args.batch_id or uuid.uuid4().hex
-        args.data_root = args.data_root.expanduser().resolve()
+        args.data_root = resolve_path(args.data_root.expanduser())
         ArtifactStore(args.data_root).list(batch_id=args.batch_id)
         if args.source == DEFAULT_SOURCE:
             args.source = args.data_root / "raw" / "rollout_trajectories"
         work_parent = args.data_root / "tmp" / "preprocessing-cli-views"
-        work_parent.mkdir(parents=True, exist_ok=True)
-        with TemporaryDirectory(prefix="run-", dir=work_parent) as directory:
-            temporary = Path(directory)
+        io_path(work_parent).mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix="run-", dir=io_path(work_parent)) as directory:
+            temporary = logical_path(directory)
             run_pipeline(
                 source=args.source,
                 export_output=args.export_output or temporary / DEFAULT_EXPORT_OUTPUT.name,

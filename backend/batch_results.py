@@ -13,6 +13,7 @@ from typing import Any
 
 from .batch_operations import active_batch_lock
 from .data_store import ArtifactStore, DATA_ROOT, RecordStore
+from .file_io import io_path, resolve_path
 from .stage_artifacts import quality_tables, write_payload_workbook, write_sidecar
 
 
@@ -26,7 +27,7 @@ def digest(value: Any) -> str:
 
 
 def _root(root: Path | None) -> Path:
-    return Path(root or DATA_ROOT).resolve()
+    return resolve_path(root or DATA_ROOT)
 
 
 def annotation_task_fingerprints(payload: dict) -> dict[str, str]:
@@ -290,7 +291,7 @@ def materialize_tree_inputs(batch_id: str, output_dir: Path, root: Path | None =
     value = current_tree_payload(batch_id, root)
     if not value.get("trees"):
         raise FileNotFoundError("该批次没有当前轨迹树")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    io_path(output_dir).mkdir(parents=True, exist_ok=True)
     for filename, field in (("source_annotated.xlsx", "source_annotation"),
                             ("rubric_trajectories.xlsx", "quality_input")):
         path = output_dir / filename

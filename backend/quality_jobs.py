@@ -23,6 +23,7 @@ from .data_store import RecordStore, DATA_ROOT, ArtifactStore
 from .batch_results import (current_tree_payload, current_quality_payload, quality_task_fingerprints, StaleTaskInput)
 from .stage_artifacts import store_root
 from .pipeline_retry_errors import failure_from_exception, failure_from_payload
+from .file_io import io_path
 
 
 Progress = Callable[[dict[str, Any]], None]
@@ -70,8 +71,8 @@ def _now() -> str:
 
 def _env_values(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
-    if path.is_file():
-        for raw in path.read_text(encoding="utf-8").splitlines():
+    if io_path(path).is_file():
+        for raw in io_path(path).read_text(encoding="utf-8").splitlines():
             line = raw.strip()
             if line and not line.startswith("#") and "=" in line:
                 key, value = line.split("=", 1)
@@ -137,7 +138,7 @@ class QualityJobManager:
         self._lock = threading.RLock()
         self._owns_executor = executor is None
         self._executor = executor or ThreadPoolExecutor(max_workers=1, thread_name_prefix="quality")
-        self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        io_path(self.jobs_dir).mkdir(parents=True, exist_ok=True)
         self.mark_interrupted_jobs()
 
     def _write(self, payload: dict[str, Any]) -> None:

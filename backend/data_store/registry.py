@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 from .paths import DATA_ROOT, contained_path
+from ..file_io import io_path
 
 
 class RevisionConflict(ValueError):
@@ -30,7 +31,7 @@ class RecordStore:
     def _connection(self, *, write: bool = False) -> Iterator[sqlite3.Connection]:
         # Missing read-only stores are handled before connecting by public reads.
         if write:
-            self.database_path.parent.mkdir(parents=True, exist_ok=True)
+            io_path(self.database_path.parent).mkdir(parents=True, exist_ok=True)
             connection = sqlite3.connect(str(self.database_path), timeout=30, isolation_level=None)
         else:
             connection = sqlite3.connect(self.database_path.as_uri() + "?mode=ro", uri=True, timeout=30, isolation_level=None)
@@ -77,14 +78,14 @@ class RecordStore:
 
     def get(self, namespace: str, key: str) -> dict | None:
         self._validate_key(namespace, key)
-        if not self.database_path.exists():
+        if not io_path(self.database_path).exists():
             return None
         with self._connection() as connection:
             return self._read(connection, namespace, key)
 
     def list(self, namespace: str) -> list[dict]:
         self._validate_key(namespace, "*")
-        if not self.database_path.exists():
+        if not io_path(self.database_path).exists():
             return []
         with self._connection() as connection:
             if connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'records'").fetchone() is None:
@@ -189,7 +190,7 @@ class RecordStore:
 
     def delete(self, namespace: str, key: str, expected_revision: int | None = None) -> bool:
         self._validate_key(namespace, key)
-        if not self.database_path.exists():
+        if not io_path(self.database_path).exists():
             return False
         with self._connection(write=True) as connection:
             connection.execute("BEGIN IMMEDIATE")

@@ -5,6 +5,8 @@ import copy
 import hashlib
 import json
 from pathlib import Path
+from backend.file_io import io_path, resolve_path
+
 from typing import Any, Callable
 
 from .data_store.paths import contained_path, rebase_data_path
@@ -45,7 +47,7 @@ def processing_config(env_file: Path = DEFAULT_ENV_FILE) -> dict:
 
 def verify_input(snapshot: dict, root: Path) -> None:
     raw_root = rebase_data_path(snapshot["raw_root"], root)
-    if not raw_root.is_relative_to((Path(root) / "raw").resolve()):
+    if not raw_root.is_relative_to(resolve_path(Path(root) / "raw")):
         raise PreprocessingError("原始轨迹目录不在当前数据目录内")
     seen = set()
     for trajectory in snapshot["trajectories"]:
@@ -55,7 +57,7 @@ def verify_input(snapshot: dict, root: Path) -> None:
             if path in seen:
                 continue
             seen.add(path)
-            if not path.is_file() or fingerprint(path) != item["sha256"]:
+            if not io_path(path).is_file() or fingerprint(path) != item["sha256"]:
                 raise PreprocessingError(f"采集原文件缺失或校验值变化：{run_id}/{item['path']}")
 
 

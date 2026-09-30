@@ -7,6 +7,8 @@ from datetime import datetime
 import hashlib
 import json
 from pathlib import Path
+from backend.file_io import io_path
+
 from typing import Any
 
 from openpyxl import Workbook, load_workbook
@@ -168,7 +170,7 @@ def export_session_workbook(
         if not any(routed.values()):
             raise ValueError("当前没有符合导出条件的数据；请至少勾选一个任务")
 
-        output_dir.mkdir(parents=True, exist_ok=True)
+        io_path(output_dir).mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{workbook_path.stem}_精修与筛查_{timestamp}_{export_id[:6]}.xlsx"
         output_path = output_dir / filename
@@ -180,8 +182,8 @@ def export_session_workbook(
             if rows:
                 counts[name] = _append_sheet(exported, name, headers, rows)
         temporary = output_path.with_name(f".{output_path.name}.tmp")
-        exported.save(temporary)
-        temporary.replace(output_path)
+        exported.save(io_path(temporary))
+        io_path(temporary).replace(io_path(output_path))
         return {
             "filename": filename,
             "sheets": counts,
@@ -302,14 +304,14 @@ def export_full_dataset_workbook(
             sheet.cell(row_number, thought_column).value = thought_value
             changed_rows += 1
 
-        output_dir.mkdir(parents=True, exist_ok=True)
+        io_path(output_dir).mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         suffix = workbook_path.suffix.lower()
         filename = f"{workbook_path.stem}_专家纠偏完整数据集_{timestamp}_{export_id[:6]}{suffix}"
         output_path = output_dir / filename
         temporary = output_path.with_name(f".{output_path.name}.tmp")
-        workbook.save(temporary)
-        temporary.replace(output_path)
+        workbook.save(io_path(temporary))
+        io_path(temporary).replace(io_path(output_path))
         return {
             "filename": filename,
             "sheets": {sheet.title: max(0, sheet.max_row - 1)},

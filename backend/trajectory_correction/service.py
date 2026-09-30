@@ -10,6 +10,8 @@ from copy import deepcopy
 from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
+from backend.file_io import io_path, resolve_path
+
 from typing import Any
 from urllib.parse import quote
 
@@ -47,15 +49,15 @@ def _source_for_session(session: dict[str, Any], *, for_export: bool = False) ->
         if session.get("workbook_payload") and for_export:
             path = path.with_name("export_input.xlsx")
             data = session["workbook_payload"]
-            path.parent.mkdir(parents=True, exist_ok=True)
+            io_path(path.parent).mkdir(parents=True, exist_ok=True)
             write_payload_workbook(path, data)
-            path.with_suffix(".json").write_text(json.dumps(data, ensure_ascii=False, default=str), encoding="utf-8")
+            io_path(path.with_suffix(".json")).write_text(json.dumps(data, ensure_ascii=False, default=str), encoding="utf-8")
         if for_export and not session.get("workbook_payload"):
             if frozen.get("workbook_json_sha256"):
                 structured = path.with_suffix(".json")
-                if not structured.is_file():
+                if not io_path(structured).is_file():
                     raise FileNotFoundError("修正完整表格 JSON 快照不存在，请重新创建会话")
-                if hashlib.sha256(structured.read_bytes()).hexdigest() != frozen["workbook_json_sha256"]:
+                if hashlib.sha256(io_path(structured).read_bytes()).hexdigest() != frozen["workbook_json_sha256"]:
                     raise ValueError("修正输入 JSON 快照校验失败")
             else:
                 raise ValueError("修正会话缺少完整 JSON 输入校验信息")
@@ -77,11 +79,11 @@ def _snapshot(session: dict[str, Any]) -> dict[str, Any]:
     frozen = session.get("source_snapshot")
     if isinstance(frozen, dict):
         path = _frozen_input_path(session, str(frozen.get("json", "")))
-        if not path.is_file():
+        if not io_path(path).is_file():
             raise FileNotFoundError("修正步骤 JSON 快照不存在，请重新创建会话")
-        if hashlib.sha256(path.read_bytes()).hexdigest() != frozen.get("sha256"):
+        if hashlib.sha256(io_path(path).read_bytes()).hexdigest() != frozen.get("sha256"):
             raise ValueError("修正输入快照校验失败")
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(io_path(path).read_text(encoding="utf-8"))
     raise ValueError("修正会话缺少冻结 JSON 输入，请重新创建会话")
 
 
@@ -112,7 +114,7 @@ def _validate_actions_box(
         raise ValueError("actions_box 必须包含有效的 bbox 坐标")
     try:
         image_path = resolve_asset(asset_root, image)
-        with Image.open(image_path) as picture:
+        with Image.open(io_path(image_path)) as picture:
             width, height = picture.size
     except (OSError, ValueError) as exc:
         raise ValueError(f"无法读取步骤截图以校验 bbox：{exc}") from exc
@@ -245,7 +247,7 @@ def _session_source_info(session: dict[str, Any]) -> dict[str, Any]:
     workbook, root = _source_for_session(session)
     return {"source_id": FIXED_SOURCE_ID, "name": "当前批次标注表", "kind": "annotated_workbook",
             "relative_path": workbook.relative_to(storage_root()).as_posix(),
-            "size_bytes": workbook.stat().st_size if workbook.is_file() else 0, "package_root": root.name}
+            "size_bytes": io_path(workbook).stat().st_size if io_path(workbook).is_file() else 0, "package_root": root.name}
 
 
 def sessions() -> list[dict[str, Any]]:
@@ -339,18 +341,18 @@ def create_session(tree_run_id: str | None = None, *, batch_id: str | None = Non
                 tree_run_id=str(selection.get("tree_run_id") or identifier), selection=selection,
                 workbook_payload=table_payload, input_fingerprint=source_key, published=False)
             input_dir = CORRECTION_INPUTS_DIR / session["session_id"]
-            input_dir.mkdir(parents=True, exist_ok=True)
+            io_path(input_dir).mkdir(parents=True, exist_ok=True)
             # The database owns the current draft; these files only serve Excel export.
             path = input_dir / "source.xlsx"
             write_payload_workbook(path, table_payload)
             table_bytes = json.dumps(table_payload, ensure_ascii=False, indent=2, default=str).encode()
-            (input_dir / "source.json").write_bytes(table_bytes)
+            (io_path(input_dir / "source.json")).write_bytes(table_bytes)
             snapshot_bytes = json.dumps(session["snapshot_payload"], ensure_ascii=False, indent=2).encode()
-            (input_dir / "snapshot.json").write_bytes(snapshot_bytes)
+            (io_path(input_dir / "snapshot.json")).write_bytes(snapshot_bytes)
             session["source_snapshot"] = {"workbook": "source.xlsx", "json": "snapshot.json",
-                "raw_root": str(package_root.resolve()), "sha256": hashlib.sha256(snapshot_bytes).hexdigest(),
+                "raw_root": str(resolve_path(package_root)), "sha256": hashlib.sha256(snapshot_bytes).hexdigest(),
                 "workbook_json_sha256": hashlib.sha256(table_bytes).hexdigest(),
-                "workbook_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                "workbook_sha256": hashlib.sha256(io_path(path).read_bytes()).hexdigest()}
             save_session(session)
             return _public_session(session, _snapshot(session))
 
@@ -374,9 +376,9 @@ def on_batch_tasks_invalidated(batch_id: str, task_ids: list[str], root: Path | 
             snapshot = session.get("snapshot_payload")
             if not snapshot:
                 input_path = data_root / "system" / "trajectory_correction" / "inputs" / session["session_id"] / str(session.get("source_snapshot", {}).get("json", "snapshot.json"))
-                if input_path.is_file():
-                    snapshot = json.loads(input_path.read_text(encoding="utf-8"))
-                elif data_root.resolve() == storage_root().resolve():
+                if io_path(input_path).is_file():
+                    snapshot = json.loads(io_path(input_path).read_text(encoding="utf-8"))
+                elif resolve_path(data_root) == resolve_path(storage_root()):
                     snapshot = _snapshot(session)
                 else:
                     raise ValueError("无法读取待失效修正草稿的来源，请先迁移")
@@ -780,7 +782,7 @@ def _existing_export(session: dict, kind: str) -> dict | None:
         if Path(filename).name != filename:
             continue
         path = CORRECTION_EXPORTS_DIR / session["session_id"] / filename
-        if path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == record.get("sha256"):
+        if io_path(path).is_file() and hashlib.sha256(io_path(path).read_bytes()).hexdigest() == record.get("sha256"):
             return {**record, "storage_revision": session.get("storage_revision"), "reused": True}
     return None
 
@@ -792,12 +794,12 @@ def _remember_export(session_id: str, history: dict) -> dict:
         replaced.extend(item for item in current.get("exports", []) if str(item.get("kind") or "selected") == kind)
         current["exports"] = [history] + [item for item in current.get("exports", []) if str(item.get("kind") or "selected") != kind]
     session = update_session(session_id, apply)
-    directory = (CORRECTION_EXPORTS_DIR / session_id).resolve()
+    directory = resolve_path(CORRECTION_EXPORTS_DIR / session_id)
     for item in replaced:
         filename = str(item.get("filename", ""))
-        candidate = (directory / filename).resolve()
+        candidate = resolve_path(directory / filename)
         if filename != history["filename"] and Path(filename).name == filename and candidate.parent == directory:
-            candidate.unlink(missing_ok=True)
+            io_path(candidate).unlink(missing_ok=True)
     return session
 
 
@@ -808,14 +810,14 @@ def publish_cot_snapshot(session_id: str, expected_revision: int | None = None) 
     session, snapshot = _export_view(session, _snapshot(session))
     workbook_path, _ = _source_for_session(session, for_export=True)
     output_dir = CORRECTION_EXPORTS_DIR / session_id
-    output_dir.mkdir(parents=True, exist_ok=True)
+    io_path(output_dir).mkdir(parents=True, exist_ok=True)
     result = export_full_dataset_workbook(workbook_path=workbook_path, snapshot=snapshot, session=session,
                                           output_dir=output_dir, export_id=uuid.uuid4().hex[:16])
     generated = output_dir / result["filename"]
     try:
         return publish_stage_snapshot(session, snapshot, "07_cot", workbook=generated)
     finally:
-        generated.unlink(missing_ok=True)
+        io_path(generated).unlink(missing_ok=True)
 
 
 @_locked_session
@@ -829,7 +831,7 @@ def export_session(session_id: str, expected_revision: int | None = None) -> dic
     workbook_path, _ = _source_for_session(session, for_export=True)
     export_id = uuid.uuid4().hex[:16]
     output_dir = CORRECTION_EXPORTS_DIR / session_id
-    output_dir.mkdir(parents=True, exist_ok=True)
+    io_path(output_dir).mkdir(parents=True, exist_ok=True)
     result = export_session_workbook(
         workbook_path=workbook_path,
         snapshot=snapshot,
@@ -844,7 +846,7 @@ def export_session(session_id: str, expected_revision: int | None = None) -> dic
         "content_fingerprint": session["export_fingerprint"],
         "selection": session.get("selection"),
         "filename": result["filename"],
-        "sha256": hashlib.sha256((output_dir / result["filename"]).read_bytes()).hexdigest(),
+        "sha256": hashlib.sha256((io_path(output_dir / result["filename"])).read_bytes()).hexdigest(),
         "created_at": utc_now(),
         "download_url": f"/api/correction/sessions/{session_id}/exports/{quote(result['filename'], safe='')}" ,
         "sheets": result["sheets"],
@@ -866,7 +868,7 @@ def export_dataset_session(session_id: str, expected_revision: int | None = None
     workbook_path, _ = _source_for_session(session, for_export=True)
     export_id = uuid.uuid4().hex[:16]
     output_dir = CORRECTION_EXPORTS_DIR / session_id
-    output_dir.mkdir(parents=True, exist_ok=True)
+    io_path(output_dir).mkdir(parents=True, exist_ok=True)
     result = export_full_dataset_workbook(
         workbook_path=workbook_path,
         snapshot=snapshot,
@@ -881,7 +883,7 @@ def export_dataset_session(session_id: str, expected_revision: int | None = None
         "selection": session.get("selection"),
         "kind": "full_dataset",
         "filename": result["filename"],
-        "sha256": hashlib.sha256((output_dir / result["filename"]).read_bytes()).hexdigest(),
+        "sha256": hashlib.sha256((io_path(output_dir / result["filename"])).read_bytes()).hexdigest(),
         "created_at": utc_now(),
         "download_url": (
             f"/api/correction/sessions/{session_id}/exports/"
@@ -900,15 +902,15 @@ def download_export(session_id: str, filename: str) -> Path:
     safe_name = Path(filename).name
     if safe_name != filename or Path(safe_name).suffix.lower() not in {".xlsx", ".xlsm"}:
         raise ValueError("无效的导出文件名")
-    path = (CORRECTION_EXPORTS_DIR / session_id / safe_name).resolve()
+    path = resolve_path(CORRECTION_EXPORTS_DIR / session_id / safe_name)
     try:
-        path.relative_to((CORRECTION_EXPORTS_DIR / session_id).resolve())
+        path.relative_to(resolve_path(CORRECTION_EXPORTS_DIR / session_id))
     except ValueError as exc:
         raise ValueError("导出路径无效") from exc
-    if not path.is_file():
+    if not io_path(path).is_file():
         raise FileNotFoundError("导出文件不存在")
     record = next((item for item in session.get("exports", []) if item.get("filename") == filename), None)
-    if record is None or not record.get("sha256") or hashlib.sha256(path.read_bytes()).hexdigest() != record["sha256"]:
+    if record is None or not record.get("sha256") or hashlib.sha256(io_path(path).read_bytes()).hexdigest() != record["sha256"]:
         raise ValueError("导出文件与已保存版本的 SHA256 不一致，请重新导出")
     return path
 

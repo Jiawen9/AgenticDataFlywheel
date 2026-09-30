@@ -8,6 +8,8 @@ import shutil
 import threading
 from datetime import datetime
 from pathlib import Path
+from backend.file_io import io_path, resolve_path
+
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -54,7 +56,7 @@ DEFAULT_TREE_SUMMARY_MAX_CONCURRENT = 2
 
 def tree_build_config(env_path: Path = DEFAULT_ENV, *, confidence_threshold: float = 0.8,
                       max_incidental_skip: int = MAX_INCIDENTAL_SKIP) -> dict[str, Any]:
-    values = read_env_file(env_path) if env_path.is_file() else {}
+    values = read_env_file(env_path) if io_path(env_path).is_file() else {}
     return {"model": values.get("MODEL_NAME", ""), "model_url": values.get("MODEL_URL", ""),
             "confidence_threshold": confidence_threshold, "max_incidental_skip": max_incidental_skip,
             "prompt_version": "trajectory-intermediate-observation-v4",
@@ -112,12 +114,12 @@ def _task_for_trajectory(steps: list[Any]) -> str:
 
 
 def _file_fingerprint(path: Path) -> dict[str, Any]:
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256(io_path(path).read_bytes()).hexdigest()
     return {
         "name": path.name,
         "sha256": digest,
         "modified_at": datetime.fromtimestamp(
-            path.stat().st_mtime, ZoneInfo("Asia/Shanghai")
+            io_path(path).stat().st_mtime, ZoneInfo("Asia/Shanghai")
         ).isoformat(),
     }
 
@@ -126,7 +128,7 @@ def _new_run_id(runs_dir: Path, completed_at: datetime) -> str:
     base = completed_at.strftime("%Y%m%d_%H%M%S")
     candidate = base
     suffix = 2
-    while (runs_dir / candidate).exists():
+    while (io_path(runs_dir / candidate)).exists():
         candidate = f"{base}_{suffix}"
         suffix += 1
     return candidate
@@ -158,7 +160,7 @@ def build_tree_run(
     with batch_operation(operation_batch, "tree_build", data_root or store_root(runs_dir)):
         if data_root is not None:
             from .data_store import DATA_ROOT
-            data_root = Path(data_root).resolve()
+            data_root = resolve_path(Path(data_root))
             if runs_dir == TREE_RUNS_DIR:
                 runs_dir = data_root / "system" / "trajectory_tree_runs"
             if classification_cache == DEFAULT_CLASSIFICATION_CACHE:
@@ -192,7 +194,7 @@ def build_tree_run(
         columns: list[str] = []
         for path in source_paths:
             source = context.payload if context is not None else read_workbook_payload(path)
-            source_file = sidecar_path(path) if sidecar_path(path).is_file() else path
+            source_file = sidecar_path(path) if io_path(sidecar_path(path)).is_file() else path
             source_refs.append(context.annotation_ref if context is not None else source.get("source_ref") or {"kind": "annotation_snapshot", **_file_fingerprint(source_file), "path": str(source_file)})
             sheet_name = next(iter(source["sheets"]))
             columns = list(dict.fromkeys(columns + source.get("columns", {}).get(sheet_name, [])))
@@ -202,11 +204,11 @@ def build_tree_run(
                     combined_rows.append(row)
         source_payload = {"schema_version": 1, "columns": {"VLA trajectories": columns}, "sheets": {"VLA trajectories": combined_rows}}
         work_parent = (Path(data_root or store_root(runs_dir)) / "tmp" / "tree-builds") if context is not None else runs_dir
-        work_parent.mkdir(parents=True, exist_ok=True)
+        io_path(work_parent).mkdir(parents=True, exist_ok=True)
         temporary_dir = work_parent / f".building-{job_id}"
-        if temporary_dir.exists():
-            shutil.rmtree(temporary_dir)
-        temporary_dir.mkdir(parents=True)
+        if io_path(temporary_dir).exists():
+            shutil.rmtree(io_path(temporary_dir))
+        io_path(temporary_dir).mkdir(parents=True)
         frozen_source = temporary_dir / "source_annotated.xlsx"
         write_payload_workbook(frozen_source, source_payload)
         write_sidecar(frozen_source, source_payload)
@@ -218,7 +220,7 @@ def build_tree_run(
                 grouped.setdefault(task_id, []).append((trajectory, steps))
         missing = [task_id for task_id in task_ids if not grouped.get(task_id)]
         if missing:
-            shutil.rmtree(temporary_dir)
+            shutil.rmtree(io_path(temporary_dir))
             raise ValueError(f"任务尚未完成轨迹预处理：{', '.join(missing)}")
 
         metadata = batch_task_metadata(context) if context is not None else discover_tasks(trajectory_root)
@@ -234,7 +236,7 @@ def build_tree_run(
 
         try:
             model_name = configure_reviewer_environment(env_path)
-            env_values = read_env_file(env_path) if env_path.is_file() else {}
+            env_values = read_env_file(env_path) if io_path(env_path).is_file() else {}
             classification_max_concurrent = _positive_int(
                 env_values.get("TREE_CLASSIFICATION_MAX_CONCURRENT"),
                 name="TREE_CLASSIFICATION_MAX_CONCURRENT",
@@ -312,7 +314,7 @@ def build_tree_run(
                     json_path=tree_path,
                     extra_metadata={"task_id": task_id},
                 )
-                tree_payload = json.loads(tree_path.read_text(encoding="utf-8"))
+                tree_payload = json.loads(io_path(tree_path).read_text(encoding="utf-8"))
                 item = metadata.get(task_id)
                 task_manifests.append(
                     {
@@ -354,11 +356,11 @@ def build_tree_run(
             batch_id = batch_id or (next(iter(input_batches)) if len(input_batches) == 1 else run_id)
             observation, observation_rows = observation_payload({task_id: grouped[task_id] for task_id in task_ids}, confidence_threshold)
             if context is not None:
-                tree_payloads = {item["task_id"]: json.loads((temporary_dir / item["tree_file"]).read_text(encoding="utf-8"))
+                tree_payloads = {item["task_id"]: json.loads((io_path(temporary_dir / item["tree_file"])).read_text(encoding="utf-8"))
                                  for item in task_manifests}
                 incoming = {"schema_version": 2, "batch_id": batch_id, "run_id": batch_id,
                             "completed_at": completed_at.isoformat(), "model_name": model_name,
-                            "raw_root": str(trajectory_root.resolve()), "tasks": task_manifests,
+                            "raw_root": str(resolve_path(trajectory_root)), "tasks": task_manifests,
                             "trees": tree_payloads, "quality_input": read_workbook_payload(quality_workbook),
                             "source_annotation": source_payload,
                             "source_task_fingerprints": annotation_task_fingerprints(source_payload),
@@ -367,9 +369,9 @@ def build_tree_run(
                             "build_config": config, "quality_input_prompt_version": "trajectory-intermediate-observation-v4"}
                 incoming["tree_hashes"] = tree_result_hashes(tree_payloads, incoming["quality_input"], incoming["task_fingerprints"])
                 manifest = merge_tree_results(batch_id, incoming, observation, observation_rows, data_root)
-                shutil.rmtree(temporary_dir)
+                shutil.rmtree(io_path(temporary_dir))
                 return batch_id, manifest
-            tree_payloads = {item["task_id"]: json.loads((temporary_dir / item["tree_file"]).read_text(encoding="utf-8")) for item in task_manifests}
+            tree_payloads = {item["task_id"]: json.loads((io_path(temporary_dir / item["tree_file"])).read_text(encoding="utf-8")) for item in task_manifests}
             quality_input = read_workbook_payload(quality_workbook)
             observation_artifact, tree_artifact = artifact_store.publish_many(batch_id, [
                 {"stage": "03_observation", "payload": observation,
@@ -391,7 +393,7 @@ def build_tree_run(
                 "source_annotated_json": frozen_source.with_suffix(".json").name,
                 "source_json": _file_fingerprint(frozen_source.with_suffix(".json")),
                 "batch_id": batch_id,
-                "raw_root": str(trajectory_root.resolve()),
+                "raw_root": str(resolve_path(trajectory_root)),
                 "annotation_version": context.annotation_version if context is not None else None,
                 "source_refs": source_refs,
                 "artifacts": [observation_artifact, tree_artifact],
@@ -403,12 +405,12 @@ def build_tree_run(
                 "quality_final_answer_count": quality_trajectory_count,
                 "tasks": task_manifests,
             }
-            (temporary_dir / "manifest.json").write_text(
+            (io_path(temporary_dir / "manifest.json")).write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-            temporary_dir.replace(runs_dir / run_id)
+            io_path(temporary_dir).replace(io_path(runs_dir / run_id))
             return run_id, manifest
         except Exception:
-            if temporary_dir.exists():
-                shutil.rmtree(temporary_dir)
+            if io_path(temporary_dir).exists():
+                shutil.rmtree(io_path(temporary_dir))
             raise

@@ -14,6 +14,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+try:
+    from backend.file_io import io_path, logical_path, resolve_path, rglob
+except ModuleNotFoundError:  # Legacy examples import trajectory_tools directly.
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from backend.file_io import io_path, logical_path, resolve_path, rglob
+
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
@@ -70,17 +77,17 @@ class TaskRecord:
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8-sig"))
+    return json.loads(io_path(path).read_text(encoding="utf-8-sig"))
 
 
 def _relative(path: Path, root: Path) -> str:
-    return str(path.resolve().relative_to(root.resolve()))
+    return str(resolve_path(path).relative_to(resolve_path(root)))
 
 
 def discover_trajectory_directories(root: Path) -> list[Path]:
-    root = root.resolve()
+    root = resolve_path(root)
     found: set[Path] = set()
-    for marker in root.rglob("*_trajectory_for_evaluate.json"):
+    for marker in rglob(root, "*_trajectory_for_evaluate.json"):
         directory = marker.parent
         relative_parts = directory.relative_to(root).parts
         if any(part.startswith("_") for part in relative_parts):
@@ -97,7 +104,7 @@ def _screenshot(directory: Path, step_id: int) -> tuple[Path | None, str]:
         directory / f"{prefix}_done.jpg",
     ]
     for index, path in enumerate(candidates):
-        if path.is_file():
+        if io_path(path).is_file():
             warning = "" if index == 0 else f"screenshot fallback: {path.name}"
             return path, warning
     return None, ""
@@ -113,11 +120,11 @@ def _extract_summary(response: dict[str, Any]) -> str:
 
 
 def collect_rollouts(root: Path, summarizer: Summarizer | None = None) -> tuple[dict[str, TaskRecord], list[TrajectoryRecord]]:
-    root = root.resolve()
+    root = resolve_path(root)
     tasks: dict[str, TaskRecord] = {}
     trajectories: list[TrajectoryRecord] = []
     for directory in discover_trajectory_directories(root):
-        marker = next(iter(sorted(directory.glob("*_trajectory_for_evaluate.json"))))
+        marker = next(iter(sorted((logical_path(p) for p in io_path(directory).glob("*_trajectory_for_evaluate.json")))))
         evaluate = _read_json(marker)
         task_text = str(evaluate.get("task", "")).strip()
         if not task_text:
@@ -140,7 +147,7 @@ def collect_rollouts(root: Path, summarizer: Summarizer | None = None) -> tuple[
             prefix = f"step{step_id:03d}_vla"
             request_path = directory / f"{prefix}_model_request.json"
             response_path = directory / f"{prefix}_model_response.json"
-            if not request_path.is_file() or not response_path.is_file():
+            if not io_path(request_path).is_file() or not io_path(response_path).is_file():
                 raise FileNotFoundError(f"missing request/response for {trajectory_id} step {step_id}")
             image_path, warning = _screenshot(directory, step_id)
             if image_path is None:
@@ -230,8 +237,8 @@ def write_workbook(output: Path, tasks: dict[str, TaskRecord], trajectories: lis
             steps_sheet.append([step.trajectory_id, step.task_id, step.step_id, step.action, _json(step.action_input), step.observation, step.request_file, step.response_file, step.screenshot_path, step.source_warning])
     for sheet in (tasks_sheet, trajectories_sheet, steps_sheet):
         _style(sheet)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    workbook.save(output)
+    io_path(output.parent).mkdir(parents=True, exist_ok=True)
+    workbook.save(io_path(output))
 
 
 class QwenSummarizer:
@@ -241,16 +248,16 @@ class QwenSummarizer:
         self.model = model
         self.client = OpenAI(api_key=api_key, base_url=base_url, max_retries=2)
         self.cache_path = cache_path
-        self.cache = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.is_file() else {}
+        self.cache = json.loads(io_path(cache_path).read_text(encoding="utf-8")) if io_path(cache_path).is_file() else {}
         self._cache_lock = threading.RLock()
 
     def _save_unlocked(self) -> None:
-        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        io_path(self.cache_path.parent).mkdir(parents=True, exist_ok=True)
         temporary = self.cache_path.with_suffix(self.cache_path.suffix + ".tmp")
-        temporary.write_text(json.dumps(self.cache, ensure_ascii=False, indent=2), encoding="utf-8")
+        io_path(temporary).write_text(json.dumps(self.cache, ensure_ascii=False, indent=2), encoding="utf-8")
         for attempt in range(6):
             try:
-                os.replace(temporary, self.cache_path)
+                os.replace(io_path(temporary), io_path(self.cache_path))
                 return
             except PermissionError:
                 if attempt == 5:
@@ -285,7 +292,7 @@ class QwenSummarizer:
             return text
 
     def summarize_screenshot(self, image_path: Path, task: str, summary: str, action: str) -> str:
-        image = image_path.read_bytes()
+        image = io_path(image_path).read_bytes()
         digest = hashlib.sha256(image).hexdigest()
         key = "observation:" + hashlib.sha256(f"{self.model}\n{digest}\n{task}\n{summary}\n{action}".encode()).hexdigest()
         mime = mimetypes.guess_type(image_path.name)[0] or "image/jpeg"
@@ -312,5 +319,5 @@ def export_trajectory_workbook(root: Path, output: Path, summarizer: Summarizer 
     tasks, trajectories = collect_rollouts(root, summarizer)
     temporary = output.with_name(f".{output.stem}.tmp{output.suffix}")
     write_workbook(temporary, tasks, trajectories)
-    temporary.replace(output)
+    io_path(temporary).replace(io_path(output))
     return len(tasks), len(trajectories), sum(len(item.steps) for item in trajectories)
