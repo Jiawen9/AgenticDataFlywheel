@@ -17,6 +17,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
+
+if __package__ in {None, ""}:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from backend.file_io import io_path, resolve_path
+
 from typing import Any, Protocol
 
 from openpyxl import load_workbook
@@ -416,8 +422,8 @@ def load_trajectories(path: Path, sheet_name: str | None, *, allow_excel_import:
 
 def _artifact_path(root: Path, value: str, *, require_file: bool = True) -> Path:
     path = Path(value)
-    resolved = path.resolve() if path.is_absolute() else (root / path).resolve()
-    if require_file and not resolved.is_file():
+    resolved = resolve_path(path) if path.is_absolute() else resolve_path(root / path)
+    if require_file and not io_path(resolved).is_file():
         raise FileNotFoundError(f"轨迹资源不存在: {value} -> {resolved}")
     return resolved
 
@@ -479,7 +485,7 @@ def classify_trajectories(
                     step,
                     current_path,
                     next_path,
-                    done_path if done_path.is_file() else None,
+                    done_path if io_path(done_path).is_file() else None,
                     previous_summary,
                     next_step.summary if next_step is not None else "",
                     task,
@@ -720,13 +726,13 @@ def build_tree(
         if steps:
             initial_image = str(Path(steps[0].image).with_name("initial_orch.jpg"))
             initial_xml = str(Path(steps[0].xml).with_name("initial_orch_ui.xml"))
-            if not _artifact_path(
+            if not io_path(_artifact_path(
                 trajectory_root, initial_image, require_file=False
-            ).is_file():
+            )).is_file():
                 initial_image = steps[0].image
-            if not _artifact_path(
+            if not io_path(_artifact_path(
                 trajectory_root, initial_xml, require_file=False
-            ).is_file():
+            )).is_file():
                 initial_xml = steps[0].xml
             root.occurrences.append(
                 {
@@ -1018,12 +1024,12 @@ def write_output(
             **(extra_metadata or {}),
         }
     )
-    json_path.parent.mkdir(parents=True, exist_ok=True)
+    io_path(json_path.parent).mkdir(parents=True, exist_ok=True)
     temporary_path = json_path.with_name(f".{json_path.name}.tmp")
-    temporary_path.write_text(
+    io_path(temporary_path).write_text(
         json.dumps(tree, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    temporary_path.replace(json_path)
+    io_path(temporary_path).replace(io_path(json_path))
 
 
 def count_nodes(node: Node) -> int:
@@ -1031,7 +1037,7 @@ def count_nodes(node: Node) -> int:
 
 
 def _resolved(value: Path) -> Path:
-    return value.expanduser().resolve()
+    return resolve_path(value.expanduser())
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1129,13 +1135,13 @@ def main(argv: list[str] | None = None) -> int:
             # their separate trees instead of merging unrelated tasks into one tree.
             exported = next(iter(result["trees"].values())) if len(result["trees"]) == 1 else result
             if output_path:
-                output_path.parent.mkdir(parents=True, exist_ok=True)
+                io_path(output_path.parent).mkdir(parents=True, exist_ok=True)
                 temporary = output_path.with_name("." + output_path.name + "." + uuid.uuid4().hex + ".tmp")
                 try:
-                    temporary.write_text(json.dumps(exported, ensure_ascii=False, indent=2), encoding="utf-8")
-                    temporary.replace(output_path)
+                    io_path(temporary).write_text(json.dumps(exported, ensure_ascii=False, indent=2), encoding="utf-8")
+                    io_path(temporary).replace(io_path(output_path))
                 finally:
-                    temporary.unlink(missing_ok=True)
+                    io_path(temporary).unlink(missing_ok=True)
             destination = output_path or args.data_root / "batches" / batch_id / "04_tree"
             print(f"Batch: {batch_id}; tasks: {len(result['trees'])}; JSON: {destination}")
             return 0
@@ -1143,7 +1149,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("独立文件建树请用 --output 指定导出路径；批次建树使用 --batch-id")
     if not structured_input_exists(xlsx_path):
         parser.error(f"required JSON snapshot not found: {xlsx_path.with_suffix('.json')}")
-    if not trajectory_root.is_dir():
+    if not io_path(trajectory_root).is_dir():
         parser.error(f"trajectory root not found: {trajectory_root}")
 
     trajectories = load_trajectories(xlsx_path, args.sheet)

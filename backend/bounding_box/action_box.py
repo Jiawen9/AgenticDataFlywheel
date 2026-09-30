@@ -6,6 +6,8 @@ import re
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from backend.file_io import io_path
+
 from typing import Any, Iterable
 
 from PIL import Image, ImageDraw, ImageFont
@@ -316,7 +318,7 @@ def annotation_color(action_kind: str, confidence: float) -> tuple[int, int, int
 
 
 def annotate_image(source: Path, destination: Path, action: dict[str, Any], result: BoxResult) -> None:
-    with Image.open(source) as opened:
+    with Image.open(io_path(source)) as opened:
         image = opened.convert("RGB")
     draw = ImageDraw.Draw(image)
     color = annotation_color(str(action.get("action", "unknown")), result.confidence)
@@ -330,10 +332,10 @@ def annotate_image(source: Path, destination: Path, action: dict[str, Any], resu
     x1, y1, _, _ = result.bbox
     text_y = max(2, y1 - 32)
     draw.text((x1 + 2, text_y), label, fill=color, font=font, stroke_width=3, stroke_fill=(0, 0, 0))
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    image.save(destination, quality=94, subsampling=0)
+    io_path(destination.parent).mkdir(parents=True, exist_ok=True)
+    image.save(io_path(destination), quality=94, subsampling=0)
 
 
 def load_trajectory_actions(evaluation_file: Path) -> list[dict[str, Any]]:
-    data = json.loads(evaluation_file.read_text(encoding="utf-8"))
+    data = json.loads(io_path(evaluation_file).read_text(encoding="utf-8"))
     return list(data.get("actions_flat", []))

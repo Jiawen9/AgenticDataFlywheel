@@ -16,13 +16,18 @@ from typing import Callable
 from .batch_operations import active_batch_lock
 from .data_store import DATA_ROOT, RecordStore, RevisionConflict, rebase_data_path
 from .data_store.paths import contained_path
+from .file_io import io_path, iterdir, rglob, is_link_or_junction
 from .task_generation.collection_batches import (
     CollectionBatchDetail, collection_batch_payload, payload_digest, workbook_digest,
 )
 
 
 class CollectionRunError(ValueError):
-    def __init__(self, message: str, status: int = 409):
+    def __init__(self, message: str, status: int = 409, *, file_failure: dict | None = None):
+        if file_failure is not None:
+            from .pipeline_retry_errors import normalize_file_failure, file_failure_message
+            self.file_failure = normalize_file_failure(file_failure)
+            message = file_failure_message(self.file_failure)
         super().__init__(message)
         self.status = status
 
@@ -94,10 +99,10 @@ class CollectionRunStore:
             return imported
         directory = contained_path(self.root, "system", "task_generation", "collection_batches", batch_id)
         path = directory / "batch.json"
-        if not path.is_file():
+        if not io_path(path).is_file():
             raise CollectionRunError("采集批次不存在", 404)
         try:
-            stored = json.loads(path.read_text(encoding="utf-8"))
+            stored = json.loads(io_path(path).read_text(encoding="utf-8"))
             payload = CollectionBatchDetail.model_validate(stored).model_dump()
             if (payload["batch_id"] != batch_id or payload["source_job_id"] != batch_id
                     or payload["snapshot"]["job_id"] != batch_id
@@ -107,7 +112,7 @@ class CollectionRunStore:
             workbook_sha = stored["_integrity"].get("workbook_sha256")
             if require_workbook:
                 workbook = contained_path(directory, payload["filename"])
-                if not workbook.is_file() or workbook_digest(workbook) != workbook_sha:
+                if not io_path(workbook).is_file() or workbook_digest(workbook) != workbook_sha:
                     raise ValueError("批次 Excel 校验失败")
             return {**payload, "workbook_sha256": workbook_sha}
         except (OSError, ValueError, KeyError) as exc:
@@ -122,7 +127,7 @@ class CollectionRunStore:
         for candidate in (path, *path.parents):
             if candidate == self.root:
                 break
-            if candidate.is_symlink() or (hasattr(candidate, "is_junction") and candidate.is_junction()):
+            if is_link_or_junction(candidate):
                 raise CollectionRunError("采集源路径不允许符号链接或目录联接")
 
     def run_root(self, batch_id: str, run_id: str) -> Path:
@@ -190,7 +195,7 @@ class CollectionRunStore:
                 "batch_snapshot_sha256": payload_digest(batch["snapshot"]),
                 "trajectories": [], "errors": [], "dispatch_error": None,
             }
-            root.mkdir(parents=True, exist_ok=True)
+            io_path(root).mkdir(parents=True, exist_ok=True)
             try:
                 saved = self.records.put("collection_runs", run_id, payload, expected_revision=0)
                 return saved, True
@@ -313,45 +318,66 @@ class CollectionRunStore:
         except CollectionRunError:
             raise
         except (OSError, ValueError) as exc:
-            raise CollectionRunError(f"采集源文件无法校验：{exc}") from exc
+            raise CollectionRunError("采集源文件无法校验", file_failure={"code": "source_unreadable"}) from exc
+
+    @staticmethod
+    def _file_error(code: str, trajectory: str, *, paths=(), **counts) -> CollectionRunError:
+        return CollectionRunError("采集源文件校验失败", file_failure={
+            "code": code, "trajectory": trajectory, "paths": list(paths), **counts})
+
+    def _validate_trajectory_content(self, directory: Path, relative_dir: str, *, rows_and_warnings=None) -> None:
+        """Validate structure, optionally sharing the rows parsed in this same scan."""
+        evaluation = directory / "_trajectory_for_evaluate.json"
+        if not io_path(evaluation).is_file():
+            raise self._file_error("source_missing", relative_dir, paths=[relative_dir + "/" + evaluation.name])
+        try:
+            content = json.loads(io_path(evaluation).read_text(encoding="utf-8-sig"))
+            if not isinstance(content.get("actions_flat"), list) or not content["actions_flat"]:
+                raise ValueError("actions_flat missing")
+        except (OSError, ValueError, AttributeError) as exc:
+            raise self._file_error("trajectory_invalid", relative_dir, paths=[relative_dir + "/" + evaluation.name]) from exc
+        from .export_vla_trajectories import STEP_RESPONSE_RE, collect_rows
+        if not any(io_path(path).is_file() and STEP_RESPONSE_RE.fullmatch(path.name) for path in iterdir(directory)):
+            raise self._file_error("trajectory_invalid", relative_dir)
+        rows, warnings = rows_and_warnings if rows_and_warnings is not None else collect_rows(directory)
+        if not rows or any(not row[3] for row in rows) or any("skipped because" in warning for warning in warnings):
+            raise self._file_error("trajectory_invalid", relative_dir)
 
     def _validate_source_files(self, run: dict, manifest: dict, *, root_override: Path | None = None) -> None:
         root = root_override if root_override is not None else self.run_root(run["batch_id"], run["collection_run_id"])
         for trajectory in manifest["trajectories"]:
-            self._no_links(root / trajectory["relative_dir"])
-            directory = contained_path(root, trajectory["relative_dir"])
-            if not directory.is_dir():
-                raise CollectionRunError(f"轨迹目录不存在：{trajectory['relative_dir']}")
+            relative_dir = trajectory["relative_dir"]
+            try:
+                self._no_links(root / relative_dir)
+            except CollectionRunError as exc:
+                raise self._file_error("source_link", relative_dir) from exc
+            directory = contained_path(root, relative_dir)
+            if not io_path(directory).is_dir():
+                raise self._file_error("source_missing", relative_dir, paths=[relative_dir])
             declared = {item["path"] for item in trajectory["files"]}
             actual = set()
-            for path in directory.rglob("*"):
+            for path in rglob(directory):
+                if is_link_or_junction(path):
+                    raise self._file_error("source_link", relative_dir, paths=[path.relative_to(root).as_posix()])
                 checked = contained_path(root, path.relative_to(root).as_posix())
-                if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
-                    raise CollectionRunError("轨迹文件不允许符号链接或目录联接")
-                if checked.is_file():
+                if io_path(checked).is_file():
                     actual.add(path.relative_to(root).as_posix())
             if actual != declared:
-                raise CollectionRunError("轨迹文件清单不完整或有未声明文件")
+                missing, unexpected = sorted(declared - actual), sorted(actual - declared)
+                raise self._file_error("manifest_mismatch", relative_dir,
+                    missing_count=len(missing), unexpected_count=len(unexpected), paths=missing[:20] + unexpected[:20])
             for item in trajectory["files"]:
                 path = contained_path(root, item["path"])
-                stat = path.stat()
-                if not path.is_file() or ("size" in item and stat.st_size != item["size"]) or workbook_digest(path) != item["sha256"]:
-                    raise CollectionRunError(f"源文件缺失或 SHA256 不匹配：{item['path']}")
-            evaluation = directory / "_trajectory_for_evaluate.json"
-            if not evaluation.is_file():
-                raise CollectionRunError("轨迹缺少 _trajectory_for_evaluate.json")
-            try:
-                content = json.loads(evaluation.read_text(encoding="utf-8-sig"))
-                if not isinstance(content.get("actions_flat"), list) or not content["actions_flat"]:
-                    raise ValueError("actions_flat missing")
-            except (OSError, ValueError, AttributeError) as exc:
-                raise CollectionRunError("轨迹 evaluation JSON 缺少有效动作") from exc
-            from .export_vla_trajectories import STEP_RESPONSE_RE, collect_rows
-            if not any(path.is_file() and STEP_RESPONSE_RE.fullmatch(path.name) for path in directory.iterdir()):
-                raise CollectionRunError("指定目录不是包含最终步骤的原轨迹目录")
-            rows, warnings = collect_rows(directory)
-            if not rows or any(not row[3] for row in rows) or any("skipped because" in warning for warning in warnings):
-                raise CollectionRunError("轨迹缺少完整可转换的步骤文件")
+                try:
+                    if not io_path(path).is_file():
+                        raise self._file_error("source_missing", relative_dir, paths=[item["path"]])
+                    if "size" in item and io_path(path).stat().st_size != item["size"]:
+                        raise self._file_error("source_size_mismatch", relative_dir, paths=[item["path"]])
+                    if workbook_digest(path) != item["sha256"]:
+                        raise self._file_error("source_hash_mismatch", relative_dir, paths=[item["path"]])
+                except OSError as exc:
+                    raise self._file_error("source_unreadable", relative_dir, paths=[item["path"]]) from exc
+            self._validate_trajectory_content(directory, relative_dir)
 
     def complete(self, run_id: str, manifest: dict) -> tuple[dict, bool]:
         current = self.get(run_id)

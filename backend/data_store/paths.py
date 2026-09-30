@@ -5,15 +5,10 @@ import json
 import sqlite3
 from contextlib import closing
 from pathlib import Path
+from ..file_io import io_path, resolve_path
 
 def resolved_path(path: Path) -> Path:
-    resolved = str(Path(path).expanduser().resolve())
-    # Windows can expose an extended-length prefix while another process is
-    # creating a missing ancestor. Normalize that equivalent spelling before
-    # containment checks; symlinks are still resolved above.
-    if os.name == "nt" and resolved.startswith("\\\\?\\"):
-        resolved = "\\\\" + resolved[8:] if resolved.startswith("\\\\?\\UNC\\") else resolved[4:]
-    return Path(resolved)
+    return resolve_path(path)
 
 
 PROJECT_ROOT = resolved_path(Path(__file__)).parents[2]
@@ -50,7 +45,7 @@ def rebase_data_path(value: str | Path, data_root: Path | None = None) -> Path:
         return contained_path(root, str(candidate.relative_to(root)))
     database = root / "system" / "app.sqlite"
     matches = []
-    if database.is_file():
+    if io_path(database).is_file():
         with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=30)) as connection:
             if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='records'").fetchone():
                 for (serialized,) in connection.execute(

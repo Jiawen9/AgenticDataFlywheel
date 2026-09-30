@@ -68,6 +68,7 @@ REPOSITORY_ROOT = PROJECT_ROOT.parents[1]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "examples" / "jiawen_rubric_config.json"
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
+from backend.file_io import io_path
 from backend.data_store import DATA_ROOT
 from backend.stage_artifacts import load_quality_objects, structured_input_exists
 DEFAULT_WORKBOOK = DATA_ROOT / "system" / "rubric_trajectories.xlsx"
@@ -166,11 +167,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_config(path: Path) -> Config:
-    if not path.exists():
+    if not io_path(path).exists():
         print(f"Config file not found, using built-in defaults: {path}")
         return {}
 
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(io_path(path).read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError(f"Config file must contain a JSON object: {path}")
     return data
@@ -637,8 +638,8 @@ def _evidence_from_messages(
 
 
 def _write_raw_response(path: Path, *, stage: str, raw: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"## {stage}\n\n{strip_thinking(raw).rstrip()}\n", encoding="utf-8")
+    io_path(path.parent).mkdir(parents=True, exist_ok=True)
+    io_path(path).write_text(f"## {stage}\n\n{strip_thinking(raw).rstrip()}\n", encoding="utf-8")
 
 
 def _rubric_text(rubric: DynamicRubric) -> str:
@@ -895,8 +896,8 @@ async def main() -> None:
             config=task_config,
             num_dimensions=num_dimensions,
         )
-        evidence_path.parent.mkdir(parents=True, exist_ok=True)
-        evidence_path.write_text(
+        io_path(evidence_path.parent).mkdir(parents=True, exist_ok=True)
+        io_path(evidence_path).write_text(
             _evidence_from_messages(messages, workbook_path, task_config, trajectories),
             encoding="utf-8",
         )
@@ -909,8 +910,8 @@ async def main() -> None:
             num_dimensions=num_dimensions,
         )
 
-        rubric_path.parent.mkdir(parents=True, exist_ok=True)
-        rubric_path.write_text(_rubric_text(rubric) + "\n", encoding="utf-8")
+        io_path(rubric_path.parent).mkdir(parents=True, exist_ok=True)
+        io_path(rubric_path).write_text(_rubric_text(rubric) + "\n", encoding="utf-8")
 
         print("")
         print(f"Task {task.task_id}: {len(trajectories)} trajectory/trajectories")

@@ -16,13 +16,14 @@ from typing import Any
 from openpyxl import Workbook, load_workbook
 
 from .data_store import ArtifactStore, DATA_ROOT, RecordStore, rebase_data_path
+from .file_io import io_path, resolve_path
 
 
 def store_root(output: Path, data_root: Path | None = None) -> Path:
     if data_root is not None:
-        return Path(data_root).expanduser().resolve()
-    output = Path(output).resolve()
-    if output.is_relative_to(DATA_ROOT.resolve()):
+        return resolve_path(data_root)
+    output = resolve_path(output)
+    if output.is_relative_to(resolve_path(DATA_ROOT)):
         return DATA_ROOT
     # Explicit test / CLI output directories stay isolated from production data.
     return (output.parent if output.suffix.lower() in {".xlsx", ".json"} else output) / "data"
@@ -30,14 +31,14 @@ def store_root(output: Path, data_root: Path | None = None) -> Path:
 
 def fingerprint(path: Path) -> str:
     digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
+    with io_path(path).open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
 
 
 def workbook_payload(path: Path) -> dict[str, Any]:
-    workbook = load_workbook(path, read_only=True, data_only=False)
+    workbook = load_workbook(io_path(path), read_only=True, data_only=False)
     try:
         sheets: dict[str, list[dict[str, Any]]] = {}
         columns: dict[str, list[str]] = {}
@@ -74,8 +75,8 @@ def payload_workbook(payload: dict[str, Any]) -> Workbook:
 def write_payload_workbook(path: Path, payload: dict[str, Any]) -> None:
     workbook = payload_workbook(payload)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        workbook.save(path)
+        io_path(path.parent).mkdir(parents=True, exist_ok=True)
+        workbook.save(io_path(path))
     finally:
         workbook.close()
 
@@ -87,21 +88,21 @@ def write_sidecar(path: Path, payload: dict[str, Any], *, source_ref: dict[str, 
         value["source_ref"] = source_ref
     temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
     try:
-        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-        temporary.replace(target)
+        io_path(temporary).write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        io_path(temporary).replace(io_path(target))
     finally:
-        temporary.unlink(missing_ok=True)
+        io_path(temporary).unlink(missing_ok=True)
 
 
 def read_workbook_payload(path: Path, *, allow_excel_import: bool = False, data_root: Path | None = None) -> dict[str, Any]:
     path = rebase_data_path(path, data_root) if data_root is not None else Path(path)
     if path.suffix.lower() == ".json":
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(io_path(path).read_text(encoding="utf-8"))
         if not isinstance(value, dict) or not isinstance(value.get("sheets"), dict):
             raise ValueError(f"invalid trajectory snapshot: {path}")
         if value.get("source_ref", {}).get("stage") == "02_annotation":
             workbook_path = path.with_suffix(".xlsx")
-            key = hashlib.sha256(str(workbook_path.resolve()).encode("utf-8")).hexdigest()
+            key = hashlib.sha256(str(resolve_path(workbook_path)).encode("utf-8")).hexdigest()
             root = store_root(workbook_path, data_root)
             stored = RecordStore(root).get("trajectory_annotations", key)
             if stored is not None:
@@ -114,7 +115,7 @@ def read_workbook_payload(path: Path, *, allow_excel_import: bool = False, data_
                     return {**store.read_payload(current), "source_ref": current}
         return value
     candidate = sidecar_path(path)
-    if candidate.is_file():
+    if io_path(candidate).is_file():
         # Do not hash or parse the human-readable export on internal reads.
         # A deleted/edited Excel must not change its committed JSON version.
         return read_workbook_payload(candidate, data_root=data_root)
@@ -124,12 +125,12 @@ def read_workbook_payload(path: Path, *, allow_excel_import: bool = False, data_
 
 
 def structured_input_exists(path: Path) -> bool:
-    return sidecar_path(path).is_file()
+    return io_path(sidecar_path(path)).is_file()
 
 
 def assert_unmanaged_output(path: Path, data_root: Path) -> None:
     """CLI exports must not overwrite a store-managed artifact before commit."""
-    resolved, root = Path(path).resolve(), Path(data_root).resolve()
+    resolved, root = resolve_path(path), resolve_path(data_root)
     if any(resolved.is_relative_to(root / name) for name in ("batches", "releases")):
         raise ValueError("导出路径不能直接写入受管理的 batches 或 releases 目录")
 
@@ -199,9 +200,9 @@ def publish_workbooks(entries: list[dict], *, batch_id: str, data_root: Path,
 
 
 def register_annotation_view(path: Path, payload: dict, artifact: dict, root: Path) -> None:
-    key = hashlib.sha256(str(Path(path).resolve()).encode("utf-8")).hexdigest()
+    key = hashlib.sha256(str(resolve_path(path)).encode("utf-8")).hexdigest()
     RecordStore(root).put("trajectory_annotations", key,
-                         {"path": str(Path(path).resolve()), "payload": payload, "artifact": artifact})
+                         {"path": str(resolve_path(path)), "payload": payload, "artifact": artifact})
 
 
 def publish_workbook(path: Path, *, batch_id: str, stage: str, data_root: Path | None = None,

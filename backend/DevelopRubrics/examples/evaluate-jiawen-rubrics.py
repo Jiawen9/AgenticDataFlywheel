@@ -58,6 +58,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_ROOT = PROJECT_ROOT.parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
+from backend.file_io import io_path
 from backend.data_store import DATA_ROOT
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "examples" / "jiawen_rubric_config.json"
 DEFAULT_REPORT_PATH = DATA_ROOT / "system" / "rubric_outputs" / "evaluations" / "jiawen_gui_eval.md"
@@ -330,12 +331,12 @@ def _build_pipeline(config: Config) -> AdaRubricPipeline:
 
 
 def _load_rubric(path: Path, task: TaskDescription) -> DynamicRubric:
-    if not path.exists():
+    if not io_path(path).exists():
         raise FileNotFoundError(
             f"Rubric file not found for task {task.task_id}: {path}. "
             "Run examples\\generate-jiawen-rubrics.py first."
         )
-    rubric = DynamicRubric.model_validate_json(path.read_text(encoding="utf-8"))
+    rubric = DynamicRubric.model_validate_json(io_path(path).read_text(encoding="utf-8"))
     if rubric.task_id != task.task_id:
         raise ValueError(
             f"Rubric task_id mismatch for {path}: rubric has {rubric.task_id!r}, "
@@ -464,13 +465,13 @@ def build_report(bundles: list[TaskEvaluationBundle], config: Config) -> str:
 
 
 def save_report(report: str, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(report, encoding="utf-8")
+    io_path(path.parent).mkdir(parents=True, exist_ok=True)
+    io_path(path).write_text(report, encoding="utf-8")
 
 
 def save_evaluations_jsonl(bundles: list[TaskEvaluationBundle], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as file:
+    io_path(path.parent).mkdir(parents=True, exist_ok=True)
+    with io_path(path).open("w", encoding="utf-8") as file:
         for bundle in bundles:
             for run_number, result in enumerate(bundle.results, 1):
                 for evaluation in result.all_evaluations:
@@ -484,10 +485,10 @@ def save_evaluations_jsonl(bundles: list[TaskEvaluationBundle], path: Path) -> N
 
 
 def initialize_evaluations_jsonl(path: Path, *, resume: bool) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if resume and path.exists():
+    io_path(path.parent).mkdir(parents=True, exist_ok=True)
+    if resume and io_path(path).exists():
         return
-    path.write_text("", encoding="utf-8")
+    io_path(path).write_text("", encoding="utf-8")
 
 
 def _evaluation_settings(config: Config) -> dict[str, Any]:
@@ -582,11 +583,11 @@ def _evaluation_key(
 
 
 def load_existing_evaluations_jsonl(path: Path) -> dict[EvaluationKey, TrajectoryEvaluation]:
-    if not path.exists():
+    if not io_path(path).exists():
         return {}
 
     existing: dict[EvaluationKey, TrajectoryEvaluation] = {}
-    with path.open("r", encoding="utf-8") as file:
+    with io_path(path).open("r", encoding="utf-8") as file:
         for line_number, line in enumerate(file, 1):
             line = line.strip()
             if not line:
@@ -632,7 +633,7 @@ def append_evaluation_jsonl(
         "evaluation_settings_signature": _settings_signature(evaluation_settings),
         "evaluation": json.loads(evaluation.model_dump_json()),
     }
-    with path.open("a", encoding="utf-8") as file:
+    with io_path(path).open("a", encoding="utf-8") as file:
         file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 

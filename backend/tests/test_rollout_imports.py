@@ -5,6 +5,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +16,7 @@ from fastapi.testclient import TestClient
 from backend.batch_lifecycle import BatchPublishedError
 from backend.collection_runs import CollectionRunError, CollectionRunStore
 from backend.data_store import ArtifactStore, RecordStore
+from backend.file_io import io_path, logical_path, rglob
 from backend.rollout_imports import RolloutImportError, RolloutImportStore
 from backend.rollout_import_router import router, configure_rollout_import_store
 from backend.task_generation.collection_batches import workbook_digest
@@ -168,6 +170,16 @@ class RolloutImportTests(unittest.TestCase):
         with patch.dict(os.environ, {"ADF_ROLLOUT_IMPORT_ROOTS": str(external)}):
             self.assertTrue(self.preview(source_path=str(external))["valid"])
 
+    def test_extended_allowed_root_is_returned_and_frozen_as_ordinary_path(self):
+        external = Path(self.temp.name) / "external"
+        fixture(external)
+        with patch.dict(os.environ, {"ADF_ROLLOUT_IMPORT_ROOTS": str(io_path(external))}):
+            self.assertIn(str(external), self.store.options()["allowed_roots"])
+            self.assertNotIn("\\\\?\\", json.dumps(self.store.options()))
+            preview = self.preview(source_path=str(io_path(external)))
+        self.assertTrue(preview["valid"], preview["errors"])
+        self.assertEqual(preview["source_path"], str(external))
+
     def test_symlink_is_rejected_without_following_target(self):
         link = self.source / "TASK-A" / "linked"
         try:
@@ -216,7 +228,7 @@ class RolloutImportTests(unittest.TestCase):
         original = Path.rename
         def fail_after_rename(path, target):
             result = original(path, target)
-            if path == self.root / "tmp" / "rollout_imports" / value["import_id"]:
+            if logical_path(path) == self.root / "tmp" / "rollout_imports" / value["import_id"]:
                 raise OSError("rename acknowledgement lost")
             return result
         with patch.object(Path, "rename", fail_after_rename):
@@ -360,6 +372,116 @@ class RolloutImportTests(unittest.TestCase):
             self.store.records.put("batch_lifecycle", "rollout-test", {"batch_id": "rollout-test", "status": "published", "release_id": "r-one"})
             self.assertEqual(client.get("/api/rollout-imports/batches/rollout-test").status_code, 409)
             self.assertEqual(client.post("/api/rollout-imports", json={"import_id": preview.json()["import_id"], "request_id": "http"}).status_code, 409)
+
+    def test_final_long_paths_include_nested_prefetch_files_without_prefixes_in_records(self):
+        final_root = self.store.runs.run_root(self.data["batch_id"], "ri_" + "a" * 32)
+        relative_directory = self.directory.relative_to(self.source)
+        expected = {}
+        for length in (260, 261, 330):
+            parent = relative_directory / "_prefetch_staging" / ("nested-" + "中" * 20)
+            filler = length - len(str(final_root / parent / "payload.bin")) - 1
+            self.assertGreater(filler, 0)
+            relative = parent / ("x" * filler) / "payload.bin"
+            path = self.source / relative
+            io_path(path.parent).mkdir(parents=True, exist_ok=True)
+            io_path(path).write_bytes(b"nested candidate bytes are preserved")
+            expected[relative.as_posix()] = workbook_digest(path)
+            self.assertEqual(len(str(final_root / relative)), length)
+        preview = self.preview()
+        self.assertTrue(preview["valid"], preview["errors"])
+        result = self.store.commit(preview["import_id"], "long-path")
+        ready = CollectionRunStore(self.root).ready_input(result["batch_id"])
+        self.assertEqual(len(ready["trajectories"]), 1)
+        run = self.store.runs.get(result["collection_run_id"])
+        self.assertNotIn("\\\\?\\", json.dumps(run))
+        for item in ready["trajectories"][0]["files"]:
+            if item["path"] in expected:
+                self.assertEqual(item["sha256"], expected[item["path"]])
+                self.assertEqual(workbook_digest(Path(run["output_dir"]) / item["path"]), item["sha256"])
+        self.assertEqual(set(expected), {i["path"] for i in ready["trajectories"][0]["files"] if "_prefetch_staging" in i["path"]})
+
+    def test_final_validation_failure_never_registers_and_retries_owned_copy(self):
+        preview = self.preview()
+        final = self.store.runs.run_root(self.data["batch_id"], "ri_" + preview["import_id"])
+        validate = self.store.runs._validate_source_files
+        def unavailable(run, manifest, *, root_override=None):
+            if root_override == final:
+                raise self.store.runs._file_error("source_unreadable", "TASK-A/same-name")
+            return validate(run, manifest, root_override=root_override)
+        with patch.object(self.store.runs, "_validate_source_files", side_effect=unavailable):
+            with self.assertRaises(CollectionRunError):
+                self.store.commit(preview["import_id"], "final-check")
+        self.assertTrue(io_path(final).is_dir())
+        self.assertFalse(self.store.records.list("collection_runs"))
+        self.assertFalse(self.store.artifacts.list())
+        with patch("backend.rollout_imports.shutil.copyfileobj", side_effect=AssertionError("must reuse verified copy")):
+            result = self.store.commit(preview["import_id"], "final-check")
+        self.assertEqual(len(self.store.runs.ready_input(result["batch_id"])["trajectories"]), 1)
+
+    def test_same_size_and_mtime_change_after_preview_is_detected_by_hash(self):
+        preview = self.preview()
+        path = self.directory / "step001_vla_input.jpg"
+        before = path.stat()
+        content = bytearray(path.read_bytes())
+        content[-1] ^= 1
+        path.write_bytes(content)
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        with self.assertRaisesRegex(RolloutImportError, "已变化"):
+            self.store.commit(preview["import_id"], "same-mtime")
+        self.assertFalse(self.store.records.list("collection_runs"))
+
+    def test_scans_hash_each_file_once_but_source_copy_final_are_independent(self):
+        from backend.rollout_imports import collect_rows
+        files = {p for p in rglob(self.source) if io_path(p).is_file()}
+        seen = Counter()
+        def digest(path):
+            seen[logical_path(path)] += 1
+            return workbook_digest(path)
+        with patch("backend.rollout_imports.workbook_digest", side_effect=digest), \
+             patch("backend.collection_runs.workbook_digest", side_effect=digest), \
+             patch("backend.rollout_imports.collect_rows", wraps=collect_rows) as rows, \
+             patch("backend.export_vla_trajectories.collect_rows", wraps=collect_rows) as extra_rows:
+            preview = self.preview()
+            self.assertEqual(seen, Counter({path: 1 for path in files}))
+            self.assertEqual(rows.call_count, 1)
+            self.assertEqual(extra_rows.call_count, 0)
+            seen.clear()
+            with self.assertLogs("backend.rollout_imports", level="INFO") as logs:
+                result = self.store.commit(preview["import_id"], "single-scan")
+        final = self.store.runs.run_root(result["batch_id"], result["collection_run_id"])
+        staging = self.root / "tmp" / "rollout_imports" / preview["import_id"]
+        expected = Counter({path: 2 for path in files})  # precommit and after-copy source scans
+        expected.update({staging / path.relative_to(self.source): 1 for path in files})
+        expected.update({final / path.relative_to(self.source): 1 for path in files})
+        self.assertEqual(seen, expected)
+        self.assertEqual(rows.call_count, 3)
+        self.assertEqual(extra_rows.call_count, 2)  # staging and final reparse independently
+        for phase in ("scan", "copy", "validate_copy", "validate_source_after_copy", "validate_final", "register"):
+            self.assertTrue(any("phase=" + phase + " " in line for line in logs.output))
+
+    def test_preview_unreadable_file_keeps_relative_diagnostic_without_physical_path(self):
+        private_path = r"\\?\D:\private-machine\secret-directory\step001_vla_model_response.json"
+        with patch("backend.rollout_imports.collect_rows", side_effect=PermissionError(13, "Access denied", private_path)):
+            preview = self.preview()
+        self.assertFalse(preview["valid"])
+        self.assertTrue(any("TASK-A/same-name" in error and "读取" in error for error in preview["errors"]))
+        persisted = self.store.records.get("rollout_import_previews", preview["import_id"])
+        for value in (preview, persisted):
+            serialized = json.dumps(value, ensure_ascii=False)
+            self.assertNotIn("private-machine", serialized)
+            self.assertNotIn("secret-directory", serialized)
+            self.assertNotIn("Access denied", serialized)
+            self.assertNotIn("\\\\?\\", serialized)
+
+    def test_http_io_failure_keeps_existing_detail_shape_without_physical_path(self):
+        app = FastAPI()
+        app.include_router(router)
+        configure_rollout_import_store(self.store)
+        failure = PermissionError(13, "Access denied", r"\\?\D:\private-machine\source")
+        with TestClient(app) as client, patch.object(self.store, "preview", side_effect=failure):
+            response = client.post("/api/rollout-imports/preview", json=self.data)
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json(), {"detail": "轨迹文件无法读取"})
 
 
 if __name__ == "__main__":

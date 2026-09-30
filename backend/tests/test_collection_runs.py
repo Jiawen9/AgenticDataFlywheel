@@ -192,6 +192,27 @@ class CollectionRunTests(unittest.TestCase):
             self.complete(run, entry)
         self.assertEqual(self.store.get(run["collection_run_id"]), original)
 
+    def test_manifest_failure_identifies_trajectory_and_bounded_relative_files(self):
+        run = self.create()
+        entry = raw_trajectory(run)
+        completed, _ = self.complete(run, entry)
+        root = Path(run["output_dir"])
+        missing = entry["files"][0]["path"]
+        (root / missing).unlink()
+        for i in range(30):
+            (root / entry["relative_dir"] / f"new-{i}.log").write_text("extra")
+        with self.assertRaises(CollectionRunError) as raised:
+            self.store.ready_input("batch-one")
+        failure = raised.exception.file_failure
+        self.assertEqual(failure["code"], "manifest_mismatch")
+        self.assertEqual(failure["trajectory"], entry["relative_dir"])
+        self.assertEqual((failure["missing_count"], failure["unexpected_count"]), (1, 30))
+        self.assertLessEqual(len(failure["paths"]), 20)
+        self.assertIn(missing, failure["paths"])
+        self.assertIn(entry["relative_dir"], str(raised.exception))
+        self.assertNotIn(str(root), str(raised.exception))
+        self.assertEqual(self.store.get(run["collection_run_id"]), completed)
+
     def test_json_is_required_but_export_not_required_after_dispatch(self):
         run = self.create()
         self.complete(run)

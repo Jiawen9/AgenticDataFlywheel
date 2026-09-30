@@ -8,6 +8,12 @@ import re
 import sys
 import uuid
 from pathlib import Path
+
+if __package__ in {None, ""}:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from backend.file_io import io_path, logical_path, iterdir, resolve_path, rglob
+
 from tempfile import TemporaryDirectory
 from typing import Any
 
@@ -32,7 +38,7 @@ def json_object_after_tool_call(content: str, start: int) -> tuple[Any, int]:
 
 def extract_response_fields(response_path: Path) -> tuple[str, str]:
     """Return tool-call payloads and summary text from a VLA response."""
-    with response_path.open("r", encoding="utf-8-sig") as file:
+    with io_path(response_path).open("r", encoding="utf-8-sig") as file:
         response = json.load(file)
 
     content = response.get("content", "")
@@ -61,7 +67,7 @@ def extract_response_fields(response_path: Path) -> tuple[str, str]:
 def discover_case_dirs(run_dir: Path) -> list[Path]:
     """Return finalized trajectory directories, excluding nested runtime candidates."""
     case_dirs: set[Path] = set()
-    for evaluation_path in run_dir.rglob("_trajectory_for_evaluate.json"):
+    for evaluation_path in rglob(run_dir, "_trajectory_for_evaluate.json"):
         case_dir = evaluation_path.parent
         try:
             relative_parts = case_dir.relative_to(run_dir).parts
@@ -70,8 +76,8 @@ def discover_case_dirs(run_dir: Path) -> list[Path]:
         if any(part in IGNORED_DIRECTORY_NAMES for part in relative_parts):
             continue
         if any(
-            path.is_file() and STEP_RESPONSE_RE.match(path.name)
-            for path in case_dir.iterdir()
+            io_path(path).is_file() and STEP_RESPONSE_RE.match(path.name)
+            for path in iterdir(case_dir)
         ):
             case_dirs.add(case_dir)
     return sorted(
@@ -83,11 +89,11 @@ def discover_case_dirs(run_dir: Path) -> list[Path]:
 def collect_rows(run_dir: Path) -> tuple[list[list[str]], list[str]]:
     rows: list[list[str]] = []
     warnings: list[str] = []
-    run_dir = run_dir.expanduser().resolve()
+    run_dir = resolve_path(run_dir.expanduser())
 
     for case_dir in discover_case_dirs(run_dir):
         responses: list[tuple[int, Path]] = []
-        for path in case_dir.iterdir():
+        for path in iterdir(case_dir):
             match = STEP_RESPONSE_RE.match(path.name)
             if match:
                 responses.append((int(match.group(1)), path))
@@ -98,10 +104,10 @@ def collect_rows(run_dir: Path) -> tuple[list[list[str]], list[str]]:
             input_xml_path = case_dir / f"{prefix}_vla_input_ui.xml"
             previous_prefix = f"step{step_number - 1:03d}"
             fallback_xml_path = case_dir / f"{previous_prefix}_vla_done_ui.xml"
-            if input_xml_path.is_file():
-                xml_value = str(input_xml_path.resolve().relative_to(run_dir))
-            elif step_number > 1 and fallback_xml_path.is_file():
-                xml_value = str(fallback_xml_path.resolve().relative_to(run_dir))
+            if io_path(input_xml_path).is_file():
+                xml_value = str(resolve_path(input_xml_path).relative_to(run_dir))
+            elif step_number > 1 and io_path(fallback_xml_path).is_file():
+                xml_value = str(resolve_path(fallback_xml_path).relative_to(run_dir))
                 warnings.append(
                     f"{case_dir.name}/{prefix}: input UI XML missing; "
                     f"using {fallback_xml_path.name}"
@@ -110,7 +116,7 @@ def collect_rows(run_dir: Path) -> tuple[list[list[str]], list[str]]:
                 xml_value = "无"
                 warnings.append(f"{case_dir.name}/{prefix}: no matching UI XML")
 
-            if not image_path.is_file():
+            if not io_path(image_path).is_file():
                 warnings.append(f"{case_dir.name}/{prefix}: skipped because image is missing: {image_path}")
                 continue
             if xml_value == "无":
@@ -126,7 +132,7 @@ def collect_rows(run_dir: Path) -> tuple[list[list[str]], list[str]]:
 
             rows.append([
                 case_dir.name,
-                str(image_path.resolve().relative_to(run_dir)),
+                str(resolve_path(image_path).relative_to(run_dir)),
                 xml_value,
                 action,
                 summary,
@@ -153,8 +159,8 @@ def write_xlsx(rows: list[list[str]], output_path: Path) -> None:
     for index, width in enumerate(widths, start=1):
         sheet.column_dimensions[get_column_letter(index)].width = width
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    workbook.save(output_path)
+    io_path(output_path.parent).mkdir(parents=True, exist_ok=True)
+    workbook.save(io_path(output_path))
 
 
 def parse_args() -> argparse.Namespace:
@@ -173,8 +179,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    run_dir = args.run_dir.expanduser().resolve()
-    if not run_dir.is_dir():
+    run_dir = resolve_path(args.run_dir.expanduser())
+    if not io_path(run_dir).is_dir():
         print(f"Error: run directory does not exist: {run_dir}", file=sys.stderr)
         return 2
 
@@ -190,9 +196,9 @@ def main() -> int:
     from backend.batch_operations import batch_operation, active_batch_lock
     with batch_operation(batch_id, "conversion_cli", data_root):
         work_parent = data_root / "tmp" / "conversion-cli"
-        work_parent.mkdir(parents=True, exist_ok=True)
-        with TemporaryDirectory(prefix="run-", dir=work_parent) as directory:
-            output_path = (args.output or Path(directory) / "trajectories_to_excel.xlsx").expanduser().resolve()
+        io_path(work_parent).mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix="run-", dir=io_path(work_parent)) as directory:
+            output_path = resolve_path((args.output or logical_path(directory) / "trajectories_to_excel.xlsx").expanduser())
             rows, warnings = collect_rows(run_dir)
             if not rows:
                 print(f"Error: no step*_vla_model_response.json files found under {run_dir}", file=sys.stderr)

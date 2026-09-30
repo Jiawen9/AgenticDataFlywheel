@@ -6,6 +6,8 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from backend.file_io import io_path
+
 from typing import Any, Callable
 
 from ..data_store import ArtifactStore, RecordStore
@@ -28,7 +30,7 @@ def new_session_id() -> str:
 
 
 def ensure_correction_dirs() -> None:
-    CORRECTION_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    io_path(CORRECTION_SESSIONS_DIR).mkdir(parents=True, exist_ok=True)
 
 
 def storage_root() -> Path:

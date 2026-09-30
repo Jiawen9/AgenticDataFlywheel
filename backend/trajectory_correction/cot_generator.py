@@ -9,6 +9,8 @@ import mimetypes
 import os
 import re
 from pathlib import Path
+from backend.file_io import io_path
+
 from typing import Any
 
 from .constants import CORRECTION_COT_CACHE_DIR, PROJECT_ROOT
@@ -44,8 +46,8 @@ SYSTEM_PROMPT = r'''You are a GUI agent. You are given a task and your action hi
 def read_env(path: Path | None = None) -> dict[str, str]:
     path = path or PROJECT_ROOT / "backend" / ".env"
     values: dict[str, str] = {}
-    if path.is_file():
-        for raw in path.read_text(encoding="utf-8").splitlines():
+    if io_path(path).is_file():
+        for raw in io_path(path).read_text(encoding="utf-8").splitlines():
             line = raw.strip()
             if line and not line.startswith("#") and "=" in line:
                 key, value = line.split("=", 1)
@@ -91,7 +93,7 @@ def parse_cot_response(raw: str, expected_action: dict[str, Any] | None = None) 
 
 
 def _image_data_url(path: Path) -> str:
-    data = path.read_bytes()
+    data = io_path(path).read_bytes()
     mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
     return f"data:{mime};base64," + base64.b64encode(data).decode("ascii")
 
@@ -108,15 +110,15 @@ class QwenCotGenerator:
 
     @staticmethod
     def _key(*, task: str, trajectory_id: str, step: int, history: str, action: dict[str, Any], reference_answer: str, image: Path, model: str, endpoint: str = "") -> str:
-        digest = hashlib.sha256(image.read_bytes()).hexdigest()
+        digest = hashlib.sha256(io_path(image).read_bytes()).hexdigest()
         payload = {"version": "cot-v9-current-batch", "model": model, "endpoint": endpoint, "prompt": SYSTEM_PROMPT, "task": task, "trajectory_id": trajectory_id, "step": step, "history": history, "action": action, "image": digest}
         return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
     def generate(self, *, task: str, trajectory_id: str, step: int, history: str, action: dict[str, Any], image: Path, reference_answer: str = "") -> dict[str, str | bool]:
         key = self._key(task=task, trajectory_id=trajectory_id, step=step, history=history, action=action, reference_answer=reference_answer, image=image, model=self.model, endpoint=getattr(self, "endpoint", ""))
         path = self.cache_dir / f"{key}.json"
-        if path.is_file():
-            cached = json.loads(path.read_text(encoding="utf-8"))
+        if io_path(path).is_file():
+            cached = json.loads(io_path(path).read_text(encoding="utf-8"))
             if isinstance(cached, dict) and cached.get("thought") and cached.get("summary"):
                 return {"thought": str(cached["thought"]), "summary": str(cached["summary"]), "bbox_hash": hashlib.sha256(reference_answer.encode()).hexdigest(), "cached": True}
 
@@ -139,9 +141,9 @@ class QwenCotGenerator:
         )
         raw = (response.choices[0].message.content or "").strip()
         result = parse_cot_response(raw, action)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        io_path(self.cache_dir).mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(".tmp")
         bbox_hash = hashlib.sha256(reference_answer.encode()).hexdigest()
-        temporary.write_text(json.dumps({**result, "model": self.model, "content_tag": "thought_summary", "bbox_hash": bbox_hash}, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(temporary, path)
+        io_path(temporary).write_text(json.dumps({**result, "model": self.model, "content_tag": "thought_summary", "bbox_hash": bbox_hash}, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(io_path(temporary), io_path(path))
         return {**result, "bbox_hash": bbox_hash, "cached": False}

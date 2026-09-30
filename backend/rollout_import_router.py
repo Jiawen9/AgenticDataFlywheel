@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .batch_lifecycle import BatchPublishedError, ensure_batch_active
 from .collection_runs import CollectionRunError
 from .data_store import RevisionConflict
+from .pipeline_retry_errors import file_failure_message
 from .rollout_imports import RolloutImportStore
 
 
@@ -62,7 +63,11 @@ def _call(operation):
         raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
     except RevisionConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except (ValueError, OSError) as exc:
+    except OSError as exc:
+        # OS errors may contain an extended absolute path. Keep the legacy
+        # detail field, but leave physical paths and OS response text out of it.
+        raise HTTPException(status_code=422, detail=file_failure_message({"code": "source_unreadable"})) from exc
+    except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 

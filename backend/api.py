@@ -13,6 +13,7 @@ from typing import Any, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from .file_io import io_path, resolve_path
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -60,7 +61,7 @@ FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
 
 
 def _observation_index(workbook_path: Path, task_id: str) -> dict[tuple[str, int], str]:
-    if not workbook_path.is_file():
+    if not io_path(workbook_path).is_file():
         raise FileNotFoundError("质检输入 JSON 不存在")
     result = {}
     for row in read_workbook_payload(workbook_path)["sheets"].get("Steps", []):
@@ -439,20 +440,20 @@ def get_task_tree(run_id: str, task_id: str) -> JSONResponse:
     task = next((item for item in manifest.get("tasks", []) if item.get("task_id") == task_id), None)
     if task is None:
         raise HTTPException(status_code=404, detail="任务不在该任务集中")
-    run_dir = resolve_tree_run_dir(run_id).resolve()
-    tree_path = (run_dir / str(task.get("tree_file", ""))).resolve()
+    run_dir = resolve_path(resolve_tree_run_dir(run_id))
+    tree_path = resolve_path(run_dir / str(task.get("tree_file", "")))
     try:
         tree_path.relative_to(run_dir)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="无效的树文件路径") from exc
-    if not tree_path.is_file():
+    if not io_path(tree_path).is_file():
         raise HTTPException(status_code=404, detail="轨迹树文件缺失")
-    tree = json.loads(tree_path.read_text(encoding="utf-8"))
+    tree = json.loads(io_path(tree_path).read_text(encoding="utf-8"))
     try:
         name = manifest.get("quality_input_json")
         if not isinstance(name, str) or not name:
             raise ValueError("建树批次没有登记质检输入 JSON")
-        structured = (run_dir / name).resolve()
+        structured = resolve_path(run_dir / name)
         structured.relative_to(run_dir)
         if structured.suffix.lower() != ".json":
             raise ValueError("质检输入必须为 JSON")
@@ -471,7 +472,7 @@ def get_asset(relative_path: str, batch_id: str | None = None,
         raise HTTPException(status_code=404, detail="图片不存在") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return FileResponse(path, headers={"Cache-Control": "public, max-age=3600"})
+    return FileResponse(io_path(path), headers={"Cache-Control": "public, max-age=3600"})
 
 
 @app.api_route(

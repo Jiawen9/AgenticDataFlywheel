@@ -17,6 +17,7 @@ from .collection_runs import CollectionRunStore
 from .data_store import ArtifactStore, DATA_ROOT, RecordStore
 from .data_store.paths import contained_path
 from .data_store.registry import utc_now
+from .file_io import io_path, resolve_path
 from .preprocessing_service import (COLUMNS, SHEET, PreprocessingError, annotate_input,
                                     convert_input, digest, processing_config, verify_input)
 from .stage_artifacts import fingerprint, write_payload_workbook
@@ -29,7 +30,7 @@ class PreprocessingJobManager:
     def __init__(self, root: Path = DATA_ROOT, *, executor: Executor | None = None,
                  source_store=None, env_file: Path = DEFAULT_ENV_FILE,
                  config_loader=None, reviewer_factory=None, annotator=annotate_input):
-        self.root = Path(root).resolve()
+        self.root = resolve_path(root)
         self.records, self.artifacts = RecordStore(self.root), ArtifactStore(self.root)
         self.sources = source_store if source_store is not None else CollectionRunStore(self.root)
         self.env_file = Path(env_file)
@@ -79,9 +80,9 @@ class PreprocessingJobManager:
 
     def _snapshot(self, job):
         path = contained_path(self.root, job["input_path"])
-        if not path.is_file() or fingerprint(path) != job["input_sha256"]:
+        if not io_path(path).is_file() or fingerprint(path) != job["input_sha256"]:
             raise PreprocessingError("预处理输入 JSON 缺失或校验失败，不能通过重新扫描替代")
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(io_path(path).read_text(encoding="utf-8"))
 
     def _reuse_success(self, job):
         verify_input(self._snapshot(job), self.root)
@@ -99,9 +100,9 @@ class PreprocessingJobManager:
                  base_annotation_version=None):
         job_id = uuid.uuid4().hex
         directory = contained_path(self.root, "system", "preprocessing", batch_id, job_id)
-        directory.mkdir(parents=True, exist_ok=False)
+        io_path(directory).mkdir(parents=True, exist_ok=False)
         path = directory / "input.json"
-        path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        io_path(path).write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         saved_artifacts = artifacts or []
         annotation = next((item for item in saved_artifacts if item["stage"] == "02_annotation"), None)
         if resumed_from is None:
@@ -232,12 +233,12 @@ class PreprocessingJobManager:
                         self._update(job_id, artifacts=saved)
                     else:
                         json_path = work / "trajectories_to_excel.json"
-                        json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                        io_path(json_path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
                 if conversion is not None:
                     payload = self.artifacts.read_payload(conversion)
                     # The model consumes this frozen worker input, never a mutable path.
                     json_path = work / "trajectories_to_excel.json"
-                    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                    io_path(json_path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
                 if annotation is None:
                     self._update(job_id, stage="annotating", completed_steps=0, total_steps=len(payload["sheets"][SHEET]))
                     output = work / "annotated_trajectories.xlsx"
@@ -300,7 +301,7 @@ class PreprocessingJobManager:
                 # input.json remains the raw-input audit record; generated workbooks
                 # are now represented by the sole batch artifacts.
                 for name in ("trajectories_to_excel.xlsx", "trajectories_to_excel.json", "annotated_trajectories.xlsx", "annotated_trajectories.json"):
-                    (work / name).unlink(missing_ok=True)
+                    io_path(work / name).unlink(missing_ok=True)
         except Exception as exc:
             failure = failure_from_exception(exc)
             self._update(job_id, status="failed", stage="failed", completed_at=utc_now(),

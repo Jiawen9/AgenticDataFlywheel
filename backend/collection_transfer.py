@@ -17,6 +17,7 @@ from .collection_runs import CollectionRunError, CollectionRunStore, _identifier
 from .data_store import DATA_ROOT, RecordStore
 from .data_store.paths import contained_path
 from .data_store.registry import utc_now
+from .file_io import io_path, iterdir, rglob, resolve_path, is_link_or_junction
 from .task_generation.collection_batches import payload_digest, workbook_digest
 
 LOG = logging.getLogger(__name__)
@@ -91,10 +92,10 @@ class CollectionTransferManager:
     def _remove(self, path):
         path = Path(path)
         allowed = contained_path(self.root, "tmp", "collection_transfers")
-        if not path.resolve().is_relative_to(allowed) or path.resolve() == allowed or path.is_symlink():
+        if not resolve_path(path).is_relative_to(allowed) or resolve_path(path) == allowed or is_link_or_junction(path):
             raise CollectionRunError("拒绝清理回传暂存目录之外的文件")
-        if path.exists():
-            shutil.rmtree(path)
+        if io_path(path).exists():
+            shutil.rmtree(io_path(path))
 
     @staticmethod
     def _descriptor(item):
@@ -142,9 +143,9 @@ class CollectionTransferManager:
         return normalized, descriptors, archive_size, archive_hash
 
     def _extract(self, archive_path, destination, descriptors):
-        destination.mkdir(parents=True, exist_ok=False)
+        io_path(destination).mkdir(parents=True, exist_ok=False)
         try:
-            with zipfile.ZipFile(archive_path) as archive:
+            with io_path(archive_path).open("rb") as archive_file, zipfile.ZipFile(archive_file) as archive:
                 infos = archive.infolist()
                 if len(infos) > self.max_files * 2:
                     raise CollectionRunError("结果归档文件数量超限", 413)
@@ -168,10 +169,10 @@ class CollectionTransferManager:
                     raise CollectionRunError("ZIP 缺少清单中的文件")
                 for name, item in files.items():
                     target = contained_path(destination, name)
-                    target.parent.mkdir(parents=True, exist_ok=True)
+                    io_path(target.parent).mkdir(parents=True, exist_ok=True)
                     expected_size, expected_hash = descriptors[name]
                     checksum, received = hashlib.sha256(), 0
-                    with archive.open(item) as source, target.open("xb") as output:
+                    with archive.open(item) as source, io_path(target).open("xb") as output:
                         for block in iter(lambda: source.read(1024 * 1024), b""):
                             received += len(block)
                             if received > expected_size:
@@ -181,22 +182,31 @@ class CollectionTransferManager:
                         output.flush()
                         os.fsync(output.fileno())
                     if received != expected_size or checksum.hexdigest() != expected_hash:
-                        raise CollectionRunError(f"ZIP 源文件校验失败：{name}")
+                        raise self.runs._file_error("source_hash_mismatch", "/".join(name.split("/")[:2]), paths=[name])
         except (zipfile.BadZipFile, OSError) as exc:
-            raise CollectionRunError(f"无法读取采集归档：{exc}") from exc
+            raise CollectionRunError("无法读取采集归档", file_failure={"code": "source_unreadable"}) from exc
 
     def _validate_tree(self, directory, descriptors):
+        self.runs._no_links(directory)
         actual = set()
-        for path in directory.rglob("*"):
-            if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
-                raise CollectionRunError("回传文件不允许链接")
-            if path.is_file():
+        for path in rglob(directory):
+            if is_link_or_junction(path):
+                relative = path.relative_to(directory).as_posix()
+                raise self.runs._file_error("source_link", "/".join(relative.split("/")[:2]), paths=[relative])
+            if io_path(path).is_file():
                 relative = path.relative_to(directory).as_posix()
                 actual.add(relative)
-                if relative not in descriptors or path.stat().st_size != descriptors[relative][0] or workbook_digest(path) != descriptors[relative][1]:
-                    raise CollectionRunError("回传文件在提交前发生变化")
+                trajectory = "/".join(relative.split("/")[:2])
+                if relative not in descriptors:
+                    raise self.runs._file_error("manifest_mismatch", trajectory, unexpected_count=1, paths=[relative])
+                if io_path(path).stat().st_size != descriptors[relative][0]:
+                    raise self.runs._file_error("source_size_mismatch", trajectory, paths=[relative])
+                if workbook_digest(path) != descriptors[relative][1]:
+                    raise self.runs._file_error("source_hash_mismatch", trajectory, paths=[relative])
         if actual != set(descriptors):
-            raise CollectionRunError("回传文件在提交前缺失")
+            missing = sorted(set(descriptors) - actual)
+            raise CollectionRunError("回传文件在提交前缺失", file_failure={
+                "code": "manifest_mismatch", "missing_count": len(missing), "paths": missing[:20]})
 
     def _finish(self, run, journal):
         manifest = journal["manifest"]
@@ -205,15 +215,15 @@ class CollectionTransferManager:
         normalized, descriptors, _, _ = self._manifest(run, manifest)
         staging = self._temporary(run["collection_run_id"]) / "files"
         final = self.runs.run_root(run["batch_id"], run["collection_run_id"])
-        if staging.exists():
+        if io_path(staging).exists():
             self._validate_tree(staging, descriptors)
             self.runs._validate_source_files(run, normalized, root_override=staging)
-            if final.exists():
-                if any(final.iterdir()):
+            if io_path(final).exists():
+                if any(iterdir(final)):
                     raise CollectionRunError("目标运行目录已有文件，拒绝覆盖")
-                final.rmdir()
-            final.parent.mkdir(parents=True, exist_ok=True)
-            staging.rename(final)
+                io_path(final).rmdir()
+            io_path(final.parent).mkdir(parents=True, exist_ok=True)
+            io_path(staging).rename(io_path(final))
         self._validate_tree(final, descriptors)
         completed, _ = self.runs.complete(run["collection_run_id"], manifest)
         # If the process stops between complete and this update, the manifest is
@@ -273,12 +283,13 @@ class CollectionTransferManager:
                         transfer_error="远端运行结束但没有可用轨迹；请查看采集错误和报告")
                 temp = self._temporary(run_id)
                 self._remove(temp)
-                temp.mkdir(parents=True)
+                io_path(temp).mkdir(parents=True)
                 self._update(run_id, transfer_status="downloading", transfer_error=None)
                 archive = temp / "archive.zip"
-                self.remote.download_archive(run_id, archive)
-                if not archive.is_file() or archive.stat().st_size != size or workbook_digest(archive) != checksum:
-                    raise CollectionRunError("远端归档的大小或 SHA256 不匹配")
+                self.remote.download_archive(run_id, io_path(archive))
+                if not io_path(archive).is_file() or io_path(archive).stat().st_size != size or workbook_digest(archive) != checksum:
+                    raise CollectionRunError("远端归档的大小或 SHA256 不匹配", file_failure={
+                        "code": "source_hash_mismatch", "paths": ["archive.zip"]})
                 self._extract(archive, temp / "files", descriptors)
                 self.runs._validate_source_files(run, normalized, root_override=temp / "files")
                 # The same missing collected_at must stay stable across retries.

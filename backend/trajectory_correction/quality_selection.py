@@ -10,6 +10,8 @@ from copy import deepcopy
 from contextlib import contextmanager
 from tempfile import TemporaryDirectory
 from pathlib import Path
+from backend.file_io import io_path, iterdir, resolve_path
+
 from typing import Any
 
 from ..trajectory_data import QUALITY_RESULTS_DIR, TREE_RUNS_DIR, task_id_from_resource
@@ -79,7 +81,7 @@ class QualitySourceMismatch(QualitySelectionError):
 
 def _read_json(path: Path) -> dict[str, Any] | None:
     try:
-        value = json.loads(path.read_text(encoding="utf-8-sig"))
+        value = json.loads(io_path(path).read_text(encoding="utf-8-sig"))
     except (OSError, TypeError, ValueError):
         return None
     return value if isinstance(value, dict) else None
@@ -88,9 +90,9 @@ def _read_json(path: Path) -> dict[str, Any] | None:
 def _result_path(run_dir: Path, task_id: str) -> Path | None:
     if not task_id or Path(task_id).name != task_id:
         return None
-    path = (run_dir / f"{task_id}.json").resolve()
+    path = resolve_path(run_dir / f"{task_id}.json")
     try:
-        path.relative_to(run_dir.resolve())
+        path.relative_to(resolve_path(run_dir))
     except ValueError:
         return None
     return path
@@ -129,9 +131,9 @@ def _safe_task_file(run_dir: Path, filename: Any) -> Path | None:
     value = str(filename or "").strip()
     if not value or Path(value).name != value:
         return None
-    path = (run_dir / value).resolve()
+    path = resolve_path(run_dir / value)
     try:
-        path.relative_to(run_dir.resolve())
+        path.relative_to(resolve_path(run_dir))
     except ValueError:
         return None
     return path
@@ -150,7 +152,7 @@ def _tree_manifest_for(run_dir: Path) -> dict[str, Any] | None:
             if not isinstance(task, dict) or not str(task.get("task_id", "")).strip():
                 return None
             tree_file = _safe_task_file(run_dir, task.get("tree_file"))
-            if tree_file is None or not tree_file.is_file():
+            if tree_file is None or not io_path(tree_file).is_file():
                 return None
     return manifest
 
@@ -244,11 +246,11 @@ def _completed_quality_runs(
         # beside a temporary quality-results root.  Production uses the
         # project-level TREE_RUNS_DIR.
         sibling_tree_root = root / "_tree_runs"
-        tree_root = sibling_tree_root if not root_was_default and sibling_tree_root.is_dir() else TREE_RUNS_DIR
+        tree_root = sibling_tree_root if not root_was_default and io_path(sibling_tree_root).is_dir() else TREE_RUNS_DIR
     completed: list[dict[str, Any]] = []
-    directories = {path.name: path for path in tree_root.iterdir()} if tree_root.is_dir() else {}
+    directories = {path.name: path for path in iterdir(tree_root)} if io_path(tree_root).is_dir() else {}
     for tree_dir in directories.values():
-        if not tree_dir.is_dir() or tree_dir.name.startswith("."):
+        if not io_path(tree_dir).is_dir() or tree_dir.name.startswith("."):
             continue
         tree_manifest = _tree_manifest_for(tree_dir)
         if tree_manifest is None:
@@ -357,7 +359,7 @@ def correction_batches(
 
 def _source_sha256(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
+    with io_path(path).open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -591,7 +593,7 @@ def validate_selection_source(selection: dict[str, Any]) -> None:
     source, _ = source_for_tree_run(str(selection.get("tree_run_id") or selection.get("run_id") or ""))
     if selection.get("source_json_sha256"):
         structured = sidecar_path(source)
-        if not structured.is_file() or _source_sha256(structured) != selection["source_json_sha256"]:
+        if not io_path(structured).is_file() or _source_sha256(structured) != selection["source_json_sha256"]:
             raise QualitySourceMismatch("轨迹 JSON 已发生变化，该修正草稿对应的数据版本已失效")
         return
     raise QualitySourceMismatch("修正选择缺少 JSON 输入版本，请重新创建会话")

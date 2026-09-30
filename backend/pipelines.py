@@ -15,6 +15,7 @@ from .batch_lifecycle import active_jobs, ensure_batch_active, lifecycle
 from .data_store import DATA_ROOT, ArtifactStore, RecordStore, RevisionConflict
 from .data_store.artifacts import _identifier
 from .data_store.registry import utc_now
+from .file_io import io_path
 from .pipeline_access import TERMINAL, active_pipeline, internal_pipeline
 
 LOG = logging.getLogger(__name__)
@@ -115,7 +116,7 @@ class PipelineRuntime:
         path = Path(batch.get("workbook_path") or self.root / "system" / "task_generation" / "collection_batches"
                     / pipeline["batch_id"] / batch["filename"])
         self.factory.add_task({"filename": batch["filename"], "description": pipeline["name"],
-            "source_batch_id": pipeline["batch_id"], "content_base64": base64.b64encode(path.read_bytes()).decode()})
+            "source_batch_id": pipeline["batch_id"], "content_base64": base64.b64encode(io_path(path).read_bytes()).decode()})
         options = pipeline["collection_config"]
         current = self.collection_options(options)
         if current != options:

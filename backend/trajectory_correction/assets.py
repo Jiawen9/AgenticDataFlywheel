@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path, PurePosixPath
+from backend.file_io import io_path, resolve_path
+
 from ..stage_artifacts import structured_input_exists, sidecar_path
 from ..data_store import rebase_data_path
 
@@ -24,14 +26,14 @@ def trajectory_source() -> Path:
 
 def registered_asset_root(value: str, data_root: Path) -> Path:
     """Resolve an explicitly frozen raw root, including project-external data."""
-    data_root = Path(data_root).resolve()
+    data_root = resolve_path(Path(data_root))
     try:
         candidate = rebase_data_path(value, data_root)
     except ValueError as exc:
         raise ValueError("修正资源目录必须位于当前数据根目录的 raw 下") from exc
-    if not candidate.is_relative_to(data_root) or not candidate.is_relative_to((data_root / "raw").resolve()):
+    if not candidate.is_relative_to(data_root) or not candidate.is_relative_to(resolve_path(data_root / "raw")):
         raise ValueError("修正资源目录必须位于当前数据根目录的 raw 下")
-    if not candidate.is_dir():
+    if not io_path(candidate).is_dir():
         raise FileNotFoundError("已登记的修正原始轨迹目录不存在")
     return candidate
 
@@ -40,9 +42,9 @@ def _safe_path(value: str, root: Path) -> Path:
     normalized = value.replace("\\", "/").strip("/")
     if not normalized or normalized.startswith("..") or "/../" in f"/{normalized}/":
         raise ValueError("资源路径无效")
-    candidate = (root / PurePosixPath(normalized)).resolve()
+    candidate = resolve_path(root / PurePosixPath(normalized))
     try:
-        candidate.relative_to(root.resolve())
+        candidate.relative_to(resolve_path(root))
     except ValueError as exc:
         raise ValueError("资源路径超出允许目录") from exc
     return candidate
@@ -67,7 +69,7 @@ def fixed_source() -> dict[str, object]:
         "name": "项目内置 annotated_trajectories.xlsx",
         "kind": "annotated_workbook",
         "relative_path": workbook.relative_to(PROJECT_ROOT).as_posix() if workbook.is_relative_to(PROJECT_ROOT) else workbook.name,
-        "size_bytes": (sidecar_path(workbook) if sidecar_path(workbook).is_file() else workbook).stat().st_size,
+        "size_bytes": (io_path(sidecar_path(workbook) if io_path(sidecar_path(workbook)).is_file() else workbook)).stat().st_size,
         "package_root": trajectories.relative_to(PROJECT_ROOT).as_posix() if trajectories.is_relative_to(PROJECT_ROOT) else trajectories.name,
     }
 
@@ -78,7 +80,7 @@ def resolve_asset(package_root: Path, image_value: str) -> Path:
     if not normalized:
         raise FileNotFoundError("图片路径为空")
     candidate = _safe_path(normalized, package_root)
-    if candidate.suffix.lower() in IMAGE_SUFFIXES and candidate.is_file():
+    if candidate.suffix.lower() in IMAGE_SUFFIXES and io_path(candidate).is_file():
         return candidate
     if Path(normalized).suffix.lower() not in IMAGE_SUFFIXES:
         raise ValueError("仅允许访问截图资源")

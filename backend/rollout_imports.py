@@ -11,16 +11,19 @@ import logging
 import os
 import shutil
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from time import perf_counter
 
 from .collection_runs import CollectionRunError, CollectionRunStore, _component, _identifier
 from .data_store import ArtifactStore, DATA_ROOT, RecordStore
 from .data_store.paths import contained_path
 from .data_store.registry import utc_now
 from .export_vla_trajectories import collect_rows, STEP_RESPONSE_RE
+from .file_io import io_path, iterdir, logical_path, resolve_path, is_link_or_junction
 from .task_generation.collection_batches import payload_digest, workbook_digest
-from .trajectory_data import extract_original_goal
+from .trajectory_data import extract_original_goal_payload
 
 LOG = logging.getLogger(__name__)
 
@@ -34,8 +37,19 @@ def _text(value):
 
 
 def _linked(path: Path):
-    return (path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction())
-            or bool(path.exists() and getattr(path.stat(follow_symlinks=False), "st_file_attributes", 0) & 0x400))
+    return is_link_or_junction(path)
+
+
+@contextmanager
+def _phase(name: str, import_id: str, *, counts=None):
+    started, outcome = perf_counter(), "failed"
+    try:
+        yield
+        outcome = "completed"
+    finally:
+        files, size = counts or (0, 0)
+        LOG.info("Rollout import phase=%s import_id=%s outcome=%s elapsed_seconds=%.3f files=%d bytes=%d",
+                 name, import_id, outcome, perf_counter() - started, files, size)
 
 
 class RolloutImportStore:
@@ -47,7 +61,7 @@ class RolloutImportStore:
         self.max_bytes = int(os.environ.get("ADF_ROLLOUT_IMPORT_MAX_BYTES", str(20 * 1024 ** 3)))
 
     def options(self) -> dict:
-        extra = [str(Path(value).expanduser().absolute()) for value in
+        extra = [str(logical_path(value).expanduser().absolute()) for value in
                  os.environ.get("ADF_ROLLOUT_IMPORT_ROOTS", "").split(os.pathsep) if value.strip()]
         return {"default_source_path": str(self.root / "raw" / "rollout_trajectories"),
                 "allowed_roots": list(dict.fromkeys([str(self.root / "raw"), *extra]))}
@@ -64,15 +78,15 @@ class RolloutImportStore:
         if not original.is_absolute():
             raise RolloutImportError("Rollout 目录必须为服务器上的绝对路径", 422)
         self._no_links(original)
-        source = original.resolve()
-        allowed = [Path(value).resolve() for value in self.options()["allowed_roots"]]
+        source = resolve_path(original)
+        allowed = [resolve_path(value) for value in self.options()["allowed_roots"]]
         if not any(source.is_relative_to(parent) for parent in allowed):
             raise RolloutImportError("Rollout 目录不在允许导入的目录内", 422)
         protected = [self.root / "raw" / "collection_batches", *
                      [self.root / part for part in ("batches", "system", "releases", "tmp")]]
         if any(source.is_relative_to(parent) or parent.is_relative_to(source) for parent in protected):
             raise RolloutImportError("不能导入平台管理目录或其父目录；请选择独立的原始 Rollout 子目录", 422)
-        if not source.is_dir():
+        if not io_path(source).is_dir():
             raise RolloutImportError("Rollout 目录不存在或不是目录", 422)
         return source
 
@@ -81,26 +95,38 @@ class RolloutImportStore:
         while pending:
             parent = pending.pop()
             self._no_links(parent)
-            for path in sorted(parent.iterdir(), key=lambda p: p.name.casefold()):
+            for path in sorted(iterdir(parent), key=lambda p: p.name.casefold()):
                 self._no_links(path)
-                if path.is_dir():
+                if io_path(path).is_dir():
                     pending.append(path)
-                elif path.is_file():
+                elif io_path(path).is_file():
                     relative = path.relative_to(source).as_posix()
-                    size = path.stat().st_size
+                    try:
+                        size = io_path(path).stat().st_size
+                    except OSError as exc:
+                        raise self.runs._file_error("source_unreadable", directory.relative_to(source).as_posix(), paths=[relative]) from exc
                     budget[0] += 1
                     budget[1] += size
                     if budget[0] > self.max_files or budget[1] > self.max_bytes:
                         raise RolloutImportError("Rollout 文件数量或总大小超过导入限额", 413)
-                    files.append({"path": relative, "size": size, "sha256": workbook_digest(path)})
+                    try:
+                        digest = workbook_digest(path)
+                    except OSError as exc:
+                        raise self.runs._file_error("source_unreadable", directory.relative_to(source).as_posix(), paths=[relative]) from exc
+                    files.append({"path": relative, "size": size, "sha256": digest})
                 else:
                     raise RolloutImportError(f"不支持的源文件类型：{path.relative_to(source)}", 422)
         return sorted(files, key=lambda item: item["path"])
 
     def _scan(self, data: dict, import_id: str, created_at: str) -> dict:
+        budget = [0, 0]
+        with _phase("scan", import_id, counts=budget):
+            return self._scan_data(data, import_id, created_at, budget)
+
+    def _scan_data(self, data: dict, import_id: str, created_at: str, budget: list[int]) -> dict:
         source = self._source(data.get("source_path"))
         batch_id = _identifier(data.get("batch_id"), "新批次编号")
-        errors, warnings, tasks, trajectories, budget = [], [], [], [], [0, 0]
+        errors, warnings, tasks, trajectories = [], [], [], []
         overrides = {}
         for item in data.get("task_overrides") or []:
             if not isinstance(item, dict):
@@ -110,11 +136,11 @@ class RolloutImportStore:
                 raise RolloutImportError(f"任务补充信息重复：{case}", 422)
             overrides[case] = item
         seen_cases = set()
-        for task_dir in sorted(source.iterdir(), key=lambda path: path.name.casefold()):
+        for task_dir in sorted(iterdir(source), key=lambda path: path.name.casefold()):
             self._no_links(task_dir)
             if task_dir.name == "_prefetch_staging":
                 continue
-            if not task_dir.is_dir():
+            if not io_path(task_dir).is_dir():
                 warnings.append(f"{task_dir.name}：不是任务目录，未作为轨迹导入")
                 continue
             case = _component(task_dir.name, "任务目录编号")
@@ -128,11 +154,11 @@ class RolloutImportStore:
                     "task": "", "app": None, "scene": None, "capability": None,
                     "trajectory_count": 0, "step_count": 0}
             seen_names = set()
-            for directory in sorted(task_dir.iterdir(), key=lambda path: path.name.casefold()):
+            for directory in sorted(iterdir(task_dir), key=lambda path: path.name.casefold()):
                 self._no_links(directory)
                 if directory.name == "_prefetch_staging":
                     continue
-                if not directory.is_dir():
+                if not io_path(directory).is_dir():
                     warnings.append(f"{directory.relative_to(source)}：不是轨迹目录，未作为轨迹导入")
                     continue
                 relative = directory.relative_to(source).as_posix()
@@ -142,7 +168,7 @@ class RolloutImportStore:
                         raise RolloutImportError("轨迹目录编号重复或大小写冲突")
                     seen_names.add(directory.name.casefold())
                     files = self._files(directory, source, budget)
-                    responses = [p for p in directory.iterdir() if p.is_file() and STEP_RESPONSE_RE.fullmatch(p.name)]
+                    responses = [p for p in iterdir(directory) if io_path(p).is_file() and STEP_RESPONSE_RE.fullmatch(p.name)]
                     if not responses:
                         raise RolloutImportError("没有最终步骤动作响应文件")
                     steps = [int(STEP_RESPONSE_RE.fullmatch(p.name).group(1)) for p in responses]
@@ -157,18 +183,21 @@ class RolloutImportStore:
                              "relative_dir": relative, "collected_at": created_at, "files": files}
                     test_run = {"batch_id": batch_id, "collection_run_id": "ri_" + import_id,
                                 "batch_tasks": {case: task}}
-                    normalized = self.runs._normalize(test_run, {"batch_id": batch_id,
+                    self.runs._normalize(test_run, {"batch_id": batch_id,
                         "trajectories": [entry], "errors": []}, created_at)
-                    self.runs._validate_source_files(test_run, normalized, root_override=source)
+                    # _files has just enumerated and hashed this directory. Do
+                    # not hash the same bytes twice or reparse step responses;
+                    # later source/copy/final checks run independent full scans.
+                    self.runs._validate_trajectory_content(directory, relative, rows_and_warnings=(rows, row_warnings))
                     for warning in row_warnings:
                         warnings.append(f"{relative}：{warning}")
                     request = directory / "turn001_orch_model_request.json"
-                    if request.exists():
+                    if io_path(request).exists():
                         try:
-                            goal = extract_original_goal(request)
+                            content = json.loads(io_path(request).read_text(encoding="utf-8-sig"))
+                            goal = extract_original_goal_payload(content)
                             if goal:
                                 goals.add(goal)
-                            content = json.loads(request.read_text(encoding="utf-8-sig"))
                             for key in source_fields:
                                 if _text(content.get(key)):
                                     source_fields[key].add(_text(content[key]))
@@ -180,6 +209,10 @@ class RolloutImportStore:
                 except (CollectionRunError, OSError, ValueError) as exc:
                     if isinstance(exc, CollectionRunError) and exc.status == 413:
                         raise
+                    if isinstance(exc, OSError):
+                        # Physical Windows paths and OS exception text are not
+                        # preview data; retain only our bounded relative identity.
+                        exc = self.runs._file_error("source_unreadable", relative)
                     errors.append(f"{relative}：{exc}")
             task["task"] = _text(override.get("task")) or (next(iter(goals)) if len(goals) == 1 else "")
             if len(goals) > 1 and not _text(override.get("task")):
@@ -214,10 +247,10 @@ class RolloutImportStore:
         # are not yet represented by a current 00 artifact.
         intent = self.records.get("rollout_import_intents", import_id) if import_id else None
         batch_dir = self.root / "batches" / batch_id
-        owned_empty = bool(intent and intent.get("batch_id") == batch_id and batch_dir.is_dir() and not any(batch_dir.iterdir()))
-        if (batch_dir.exists() and not owned_empty) or (self.root / "system" / "task_generation" / "collection_batches" / batch_id).exists():
+        owned_empty = bool(intent and intent.get("batch_id") == batch_id and io_path(batch_dir).is_dir() and not any(iterdir(batch_dir)))
+        if (io_path(batch_dir).exists() and not owned_empty) or io_path(self.root / "system" / "task_generation" / "collection_batches" / batch_id).exists():
             raise RolloutImportError("批次编号已存在，请使用新的业务批次编号")
-        if self.records.database_path.exists():
+        if io_path(self.records.database_path).exists():
             with self.records._connection() as connection:
                 if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='records'").fetchone():
                     for namespace, key, serialized in connection.execute("SELECT namespace, record_key, payload FROM records"):
@@ -228,12 +261,12 @@ class RolloutImportStore:
                                 or batch_id in (record.get("batch_ids") or []) or record.get("job_id") == batch_id):
                             raise RolloutImportError("批次编号已被使用，请使用新的业务批次编号")
         raw = self.root / "raw" / "collection_batches" / batch_id
-        if raw.exists():
+        if io_path(raw).exists():
             intent = self.records.get("rollout_import_intents", import_id) if import_id else None
             if not intent or intent.get("batch_id") != batch_id:
                 raise RolloutImportError("该批次已有原始数据目录，请使用新的批次编号")
             run_root = self.runs.run_root(batch_id, "ri_" + import_id)
-            if any(path != raw / "runs" for path in raw.iterdir()) or (raw / "runs").is_dir() and any(path != run_root for path in (raw / "runs").iterdir()):
+            if any(path != raw / "runs" for path in iterdir(raw)) or io_path(raw / "runs").is_dir() and any(path != run_root for path in iterdir(raw / "runs")):
                 raise RolloutImportError("该批次原始数据目录存在其他运行，不能覆盖")
 
     def preview(self, data: dict) -> dict:
@@ -270,11 +303,11 @@ class RolloutImportStore:
 
     def _remove_owned(self, path: Path, parent: Path):
         self._no_links(path)
-        target, allowed = path.resolve(), parent.resolve()
+        target, allowed = resolve_path(path), resolve_path(parent)
         if target == allowed or not target.is_relative_to(allowed):
             raise RolloutImportError("拒绝清理导入暂存目录之外的路径")
-        if target.exists():
-            shutil.rmtree(target)
+        if io_path(target).exists():
+            shutil.rmtree(io_path(target))
 
     def commit(self, import_id: str, request_id: str) -> dict:
         from .batch_lifecycle import ensure_batch_active
@@ -338,25 +371,32 @@ class RolloutImportStore:
                     "trajectories": current["trajectories"], "errors": []}, created)
                 source = self._source(current["source_path"])
                 try:
-                    if final.exists():
+                    counts = [sum(len(t["files"]) for t in manifest["trajectories"]),
+                              sum(f.get("size", 0) for t in manifest["trajectories"] for f in t["files"])]
+                    if not io_path(final).exists():
+                        with _phase("copy", import_id, counts=counts):
+                            io_path(staging).mkdir(parents=True, exist_ok=False)
+                            for trajectory in manifest["trajectories"]:
+                                for item in trajectory["files"]:
+                                    self._no_links(source / item["path"])
+                                    incoming = contained_path(source, item["path"])
+                                    destination = contained_path(staging, item["path"])
+                                    io_path(destination.parent).mkdir(parents=True, exist_ok=True)
+                                    with io_path(incoming).open("rb") as reader, io_path(destination).open("xb") as writer:
+                                        shutil.copyfileobj(reader, writer)
+                                        writer.flush()
+                                        os.fsync(writer.fileno())
+                        with _phase("validate_copy", import_id, counts=counts):
+                            self.runs._validate_source_files(run, manifest, root_override=staging)
+                        with _phase("validate_source_after_copy", import_id, counts=counts):
+                            if payload_digest(self._scan(preview["data"], import_id, created)) != preview["scan_digest"]:
+                                raise RolloutImportError("复制期间源目录发生变化，请重新校验后导入")
+                        io_path(final.parent).mkdir(parents=True, exist_ok=True)
+                        io_path(staging).rename(io_path(final))
+                    with _phase("validate_final", import_id, counts=counts):
+                        # Final paths can exceed Windows' old 260-character
+                        # limit even when the shorter staging paths did not.
                         self.runs._validate_source_files(run, manifest, root_override=final)
-                    else:
-                        staging.mkdir(parents=True, exist_ok=False)
-                        for trajectory in manifest["trajectories"]:
-                            for item in trajectory["files"]:
-                                self._no_links(source / item["path"])
-                                incoming = contained_path(source, item["path"])
-                                destination = contained_path(staging, item["path"])
-                                destination.parent.mkdir(parents=True, exist_ok=True)
-                                with incoming.open("rb") as reader, destination.open("xb") as writer:
-                                    shutil.copyfileobj(reader, writer)
-                                    writer.flush()
-                                    os.fsync(writer.fileno())
-                        self.runs._validate_source_files(run, manifest, root_override=staging)
-                        if payload_digest(self._scan(preview["data"], import_id, created)) != preview["scan_digest"]:
-                            raise RolloutImportError("复制期间源目录发生变化，请重新校验后导入")
-                        final.parent.mkdir(parents=True, exist_ok=True)
-                        staging.rename(final)
                     # Freeze classification and task identity without fabricating a
                     # generated task workbook or any downstream process artifact.
                     snapshot = {"schema_version": 1, "batch_id": batch_id, "job_id": None,
@@ -377,7 +417,8 @@ class RolloutImportStore:
                     record = {"batch_id": batch_id, "collection_run_id": run_id, "import_id": import_id,
                               "created_at": created, "payload_sha256": payload_digest(payload),
                               **{key: current[key] for key in ("task_count", "trajectory_count", "step_count")}}
-                    self.artifacts.publish_many(batch_id, [{"stage": "00_collection", "payload": payload,
+                    with _phase("register", import_id, counts=counts):
+                        self.artifacts.publish_many(batch_id, [{"stage": "00_collection", "payload": payload,
                         "metadata": {"kind": "rollout_import", "task_count": current["task_count"]},
                         "source_refs": [{"kind": "rollout_import", "import_id": import_id, "sha256": preview["scan_digest"]}]}],
                         record_entries=[{"namespace": "collection_runs", "key": run_id, "payload": run, "expected_revision": 0},
@@ -422,8 +463,8 @@ class RolloutImportStore:
                     for parent in (self.runs.raw_root(batch_id) / "runs", self.runs.raw_root(batch_id),
                                    self.root / "batches" / batch_id):
                         self._no_links(parent)
-                        if parent.is_dir() and not any(parent.iterdir()):
-                            parent.rmdir()
+                        if io_path(parent).is_dir() and not any(iterdir(parent)):
+                            io_path(parent).rmdir()
                     self.records.delete("rollout_import_intents", import_id)
                 for request in self.records.list("rollout_import_request_intents"):
                     if request.get("import_id") == import_id:

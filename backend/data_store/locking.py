@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .paths import contained_path
+from ..file_io import io_path
 
 _guard = threading.Lock()
 _locks: dict[str, threading.RLock] = {}
@@ -29,8 +30,8 @@ def batch_lock(root: Path, batch_id: str):
         if key in held:
             yield
             return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a+b") as stream:
+        io_path(path.parent).mkdir(parents=True, exist_ok=True)
+        with io_path(path).open("a+b") as stream:
             if stream.seek(0, 2) == 0:
                 stream.write(b"0")
                 stream.flush()
