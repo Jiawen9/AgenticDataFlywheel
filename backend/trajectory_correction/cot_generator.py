@@ -8,12 +8,14 @@ import json
 import mimetypes
 import os
 import re
+from contextlib import suppress
 from pathlib import Path
 from backend.file_io import io_path
 
 from typing import Any
 
 from .constants import CORRECTION_COT_CACHE_DIR, PROJECT_ROOT
+from ..model_http import model_http_client, model_http_options
 
 
 SYSTEM_PROMPT = r'''You are a GUI agent. You are given a task and your action history, with screenshots. You need to perform the next action to complete the task.
@@ -105,8 +107,17 @@ class QwenCotGenerator:
         values = read_env(env_file)
         self.endpoint = values["MODEL_URL"]
         self.model = values.get("COT_MODEL_NAME") or "qwen3-vl-32b-instruct"
-        self.client = OpenAI(api_key=values["YUNAI_API_KEY"], base_url=values["MODEL_URL"], max_retries=2)
+        http_client = model_http_client(model_http_options(values, prefix="COT"))
+        try:
+            self.client = OpenAI(api_key=values["YUNAI_API_KEY"], base_url=values["MODEL_URL"], max_retries=2, http_client=http_client)
+        except Exception:
+            with suppress(Exception):
+                http_client.close()
+            raise
         self.cache_dir = cache_dir
+
+    def close(self) -> None:
+        self.client.close()
 
     @staticmethod
     def _key(*, task: str, trajectory_id: str, step: int, history: str, action: dict[str, Any], reference_answer: str, image: Path, model: str, endpoint: str = "") -> str:

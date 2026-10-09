@@ -18,6 +18,7 @@ from pydantic import BaseModel, ValidationError
 
 from adarubric.core.exceptions import LLMClientError
 from adarubric.llm.base import LLMClient
+from adarubric.llm.http_options import close_failed_http_client, resolve_http_options
 from adarubric.llm.json_extract import extract_json_substring
 
 try:
@@ -26,6 +27,7 @@ try:
         APIError,
         APITimeoutError,
         AsyncOpenAI,
+        DefaultAsyncHttpxClient,
         RateLimitError,
     )
 except ImportError as e:
@@ -53,6 +55,11 @@ class VLLMClient(LLMClient):
     max_retries : int
         Retries for transient transport/rate-limit errors (same policy as
         :class:`OpenAIClient`).
+    http_proxy_url : str | None
+        Explicit proxy, or ``ADARUBRIC_HTTP_PROXY_URL`` / ``HTTP_PROXY_URL``.
+    http_trust_env : bool | None
+        Whether to inherit system proxies. Defaults to False unless explicitly
+        enabled by ``ADARUBRIC_HTTP_TRUST_ENV`` / ``HTTP_TRUST_ENV``.
     """
 
     def __init__(
@@ -63,6 +70,8 @@ class VLLMClient(LLMClient):
         api_key: str = "EMPTY",
         use_guided_decoding: bool = True,
         max_retries: int = 3,
+        http_proxy_url: str | None = None,
+        http_trust_env: bool | str | None = None,
     ) -> None:
         self.model = model
         self.base_url = base_url
@@ -72,7 +81,19 @@ class VLLMClient(LLMClient):
         single_attempt = os.environ.get("PIPELINE_MODEL_SINGLE_ATTEMPT") == "1"
         self._max_retries = 1 if single_attempt else max(1, max_retries)
 
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url, **({"max_retries": 0} if single_attempt else {}))
+        http_client = DefaultAsyncHttpxClient(
+            **resolve_http_options(
+                http_proxy_url=http_proxy_url, http_trust_env=http_trust_env,
+            )
+        )
+        try:
+            self._client = AsyncOpenAI(
+                api_key=api_key, base_url=base_url, http_client=http_client,
+                **({"max_retries": 0} if single_attempt else {}),
+            )
+        except BaseException:
+            close_failed_http_client(http_client)
+            raise
 
     async def _chat(
         self,

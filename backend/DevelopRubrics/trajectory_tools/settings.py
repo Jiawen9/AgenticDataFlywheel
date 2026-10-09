@@ -35,6 +35,10 @@ def load_repository_env(path: Path = DEFAULT_ENV_FILE) -> dict[str, str]:
 
 def configure_model_environment(path: Path = DEFAULT_ENV_FILE) -> dict[str, str]:
     values = load_repository_env(path)
+    from backend.model_http import model_http_options
+    network = model_http_options(values, prefix="ADARUBRIC")
+    os.environ["ADARUBRIC_HTTP_PROXY_URL"] = network["proxy"] or ""
+    os.environ["ADARUBRIC_HTTP_TRUST_ENV"] = "true" if network["trust_env"] else "false"
     mapping = {
         "TRAJECTORY_API_KEY": values["YUNAI_API_KEY"],
         "TRAJECTORY_API_BASE_URL": values["MODEL_URL"],

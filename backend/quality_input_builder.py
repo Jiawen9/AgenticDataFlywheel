@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import suppress
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from backend.file_io import io_path
@@ -14,6 +15,7 @@ from .DevelopRubrics.trajectory_tools.gui_trajectory_excel import (
 )
 from .data_store import DATA_ROOT
 from .stage_artifacts import write_sidecar
+from .model_http import model_http_options
 
 FINAL_ANSWER_CACHE = DATA_ROOT / "cache" / "rubric_outputs" / "qwen_tree_final_answers.json"
 
@@ -34,8 +36,24 @@ def build_quality_workbook(*, grouped: dict[str, list[tuple[str, list[Any]]]], t
                            summarizer: Any | None = None,
                            max_concurrent: int = 1) -> tuple[int, int, int]:
     values = _env(env_path) if summarizer is None else {"MODEL_NAME": getattr(summarizer, "model", "test-model")}
-    if summarizer is None:
-        summarizer = QwenSummarizer(values["MODEL_NAME"], values["MODEL_URL"], values["YUNAI_API_KEY"], FINAL_ANSWER_CACHE)
+    owned = summarizer is None
+    if owned:
+        summarizer = QwenSummarizer(values["MODEL_NAME"], values["MODEL_URL"], values["YUNAI_API_KEY"], FINAL_ANSWER_CACHE,
+                                    http_options=model_http_options(values))
+    try:
+        return _build_quality_workbook(grouped=grouped, task_goals=task_goals, output=output,
+            progress=progress, summarizer=summarizer, max_concurrent=max_concurrent, model=values["MODEL_NAME"])
+    finally:
+        if owned:
+            with suppress(Exception):
+                summarizer.close()
+
+
+def _build_quality_workbook(*, grouped: dict[str, list[tuple[str, list[Any]]]],
+                            task_goals: dict[str, str], output: Path,
+                            progress: Callable[[dict[str, Any]], None] | None,
+                            summarizer: Any, max_concurrent: int,
+                            model: str) -> tuple[int, int, int]:
     tasks = {task_id: TaskRecord(task_id, task_goals.get(task_id, task_id)) for task_id in grouped}
     prepared: list[tuple[str, str, str, str, list[StepRecord]]] = []
     for task_id, items in grouped.items():
@@ -97,7 +115,7 @@ def build_quality_workbook(*, grouped: dict[str, list[tuple[str, list[Any]]]], t
         if final_answer is None:
             raise RuntimeError(f"missing trajectory summary: {trajectory_id}")
         trajectories.append(TrajectoryRecord(trajectory_id, task_id, source_directory, final_answer,
-            {"source_directory": source_directory, "observation_model": values["MODEL_NAME"],
+            {"source_directory": source_directory, "observation_model": model,
              "observation_prompt_version": "trajectory-intermediate-observation-v4",
              "source_identity": records[0].action_input.get("source_identity", {})}, records))
     write_workbook(output, tasks, trajectories)

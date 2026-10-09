@@ -10,6 +10,7 @@ import re
 import threading
 import uuid
 from concurrent.futures import Executor, ThreadPoolExecutor
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from backend.file_io import io_path
@@ -270,6 +271,7 @@ class CotJobManager:
         if payload is None:
             return
         self._progress(job_id, {"status": "running", "stage": "generating_bbox" if payload.get("generate_bbox") else "generating_cot", "started_at": _now()})
+        generator = reviewer = None
         try:
             session = load_session(str(payload["session_id"]))
             if session is None:
@@ -356,6 +358,14 @@ class CotJobManager:
                                     "error": (failure["message"] if retry_enabled_for_pipeline(payload.get("pipeline_id"), storage_root())
                                               else str(exc)), "failure": failure})
             return
+        finally:
+            # with_options() shares the transport; close the final client once.
+            if isinstance(generator, QwenCotGenerator):
+                with suppress(Exception):
+                    generator.close()
+            if reviewer is not None:
+                with suppress(Exception):
+                    reviewer.client.close()
         try:
             artifact = publish_cot_snapshot(str(payload["session_id"]))
             self._progress(job_id, {"artifact": artifact})

@@ -80,6 +80,15 @@ COT_MODEL_NAME=qwen3-vl-32b-instruct
 
 `backend/.env` 已被 Git 忽略，不要把真实密钥写入 `.env.example`、源码或日志。
 
+轨迹末尾摘要、质检（Rubrics 生成与评分）和 COT 默认不读取环境变量中的
+`HTTP_PROXY` / `HTTPS_PROXY` 或 Windows 系统代理，更新后端后无需在启动窗口设置
+`NO_PROXY=*`。SDK 原有超时和重试设置保持不变。需要代理时可在 `backend/.env`
+显式填写 `HTTP_PROXY_URL=http://代理主机:端口`；或设置 `HTTP_TRUST_ENV=true` 继承
+系统代理。质检和 COT 可分别使用 `ADARUBRIC_HTTP_*`、`COT_HTTP_*` 覆盖通用值，
+优先级为模块进程环境、模块文件配置、通用进程环境、通用文件配置；空值表示清空。
+标框、状态分类和对齐继续使用现有 `TRAJECTORY_VLA_HTTP_*` / `TRAJECTORY_HTTP_*`
+配置，默认也不读取系统代理。修改网络配置后应重启平台后端。
+
 ## 3. 放置原始轨迹
 
 先将本次要处理的原始任务目录显式复制到下面的路径，确认不会覆盖同名输入。保留完整任务／轨迹层级及截图、XML、响应文件；不要复制旧标框结果、作业记录、质检结果或缓存。后端不会自动查找旧目录。
