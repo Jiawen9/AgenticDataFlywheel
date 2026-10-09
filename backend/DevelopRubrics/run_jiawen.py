@@ -7,6 +7,7 @@ import asyncio
 import importlib.util
 import sys
 import os
+from contextlib import suppress
 from pathlib import Path
 
 from trajectory_tools.gui_trajectory_excel import QwenSummarizer, export_trajectory_workbook
@@ -19,6 +20,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 from backend.data_store import DATA_ROOT
 from backend.stage_artifacts import workbook_payload, write_sidecar
+from backend.model_http import model_http_options
 
 DEFAULT_SOURCE = DATA_ROOT / "raw" / "rollout_trajectories"
 DEFAULT_WORKBOOK = DATA_ROOT / "system" / "rubric_trajectories.xlsx"
@@ -60,8 +62,14 @@ def run_export(args: argparse.Namespace) -> None:
             base_url=values["MODEL_URL"],
             api_key=values["YUNAI_API_KEY"],
             cache_path=args.cache.resolve(),
+            http_options=model_http_options(values),
         )
-    counts = export_trajectory_workbook(source, output, summarizer)
+    try:
+        counts = export_trajectory_workbook(source, output, summarizer)
+    finally:
+        if summarizer is not None:
+            with suppress(Exception):
+                summarizer.close()
     write_sidecar(output, workbook_payload(output))
     print(f"Exported {counts[0]} task(s), {counts[1]} trajectories and {counts[2]} steps to {output}")
 

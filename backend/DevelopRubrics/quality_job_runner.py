@@ -216,59 +216,59 @@ async def _run_frozen(run_id: str, task_ids: list[str], job_id: str,
             progress(stage="generating_rubric", current_task=task_id, task_index=task_index, percent=max(5, round(15 * completed / max(total, 1))))
             rubric_path = await _generate_rubric(task, trajectories, config, workbook)
         rubric = EVAL._load_rubric(rubric_path, task)
-        pipeline = EVAL._build_pipeline(config)
-        checkpoint_key = quality_task_fingerprints(current).get(task_id) if current is not None else None
-        checkpoint = (CHECKPOINT_ROOT / run_id / checkpoint_key / f"{task_id}.jsonl" if checkpoint_key
-                      else CHECKPOINT_ROOT / run_id / f"{task_id}.jsonl")
-        EVAL.initialize_evaluations_jsonl(checkpoint, resume=True)
-        existing = EVAL.load_existing_evaluations_jsonl(checkpoint)
-        settings = EVAL._evaluation_settings(config)
-        signature = EVAL._settings_signature(settings)
-        cached_count = 0
-        for trajectory in trajectories:
-            key = EVAL._evaluation_key(
-                task_id=task_id,
+        async with EVAL.evaluation_pipeline(config) as pipeline:
+            checkpoint_key = quality_task_fingerprints(current).get(task_id) if current is not None else None
+            checkpoint = (CHECKPOINT_ROOT / run_id / checkpoint_key / f"{task_id}.jsonl" if checkpoint_key
+                          else CHECKPOINT_ROOT / run_id / f"{task_id}.jsonl")
+            EVAL.initialize_evaluations_jsonl(checkpoint, resume=True)
+            existing = EVAL.load_existing_evaluations_jsonl(checkpoint)
+            settings = EVAL._evaluation_settings(config)
+            signature = EVAL._settings_signature(settings)
+            cached_count = 0
+            for trajectory in trajectories:
+                key = EVAL._evaluation_key(
+                    task_id=task_id,
+                    run_number=1,
+                    trajectory_id=trajectory.trajectory_id,
+                    settings_signature=signature,
+                )
+                if key in existing:
+                    cached_count += 1
+            completed += cached_count
+            if cached_count:
+                progress(
+                    stage="evaluating", current_task=task_id, task_index=task_index,
+                    completed_trajectories=completed, total_trajectories=total,
+                    percent=20 + round(75 * completed / max(total, 1)),
+                )
+
+            def on_trajectory_complete(evaluation: Any) -> None:
+                nonlocal completed
+                completed += 1
+                progress(
+                    stage="evaluating", current_task=task_id,
+                    current_trajectory=evaluation.trajectory_id, task_index=task_index,
+                    completed_trajectories=completed, total_trajectories=total,
+                    percent=20 + round(75 * completed / max(total, 1)),
+                )
+
+            result = await EVAL.evaluate_run_incrementally(
+                pipeline=pipeline,
+                task=task,
+                trajectories=trajectories,
+                rubric=rubric,
+                rubric_path=rubric_path,
                 run_number=1,
-                trajectory_id=trajectory.trajectory_id,
-                settings_signature=signature,
+                temperature=float(config.get("evaluation_temperature", 0.0)),
+                eval_max_tokens=int(config.get("evaluation_max_tokens", 8192)),
+                max_concurrent=EVAL._int_setting(
+                    config, "evaluation_max_concurrent", "ADARUBRIC_EVAL_MAX_CONCURRENT", default=2
+                ),
+                evaluations_path=checkpoint,
+                config=config,
+                existing_evaluations=existing,
+                on_trajectory_complete=on_trajectory_complete,
             )
-            if key in existing:
-                cached_count += 1
-        completed += cached_count
-        if cached_count:
-            progress(
-                stage="evaluating", current_task=task_id, task_index=task_index,
-                completed_trajectories=completed, total_trajectories=total,
-                percent=20 + round(75 * completed / max(total, 1)),
-            )
-
-        def on_trajectory_complete(evaluation: Any) -> None:
-            nonlocal completed
-            completed += 1
-            progress(
-                stage="evaluating", current_task=task_id,
-                current_trajectory=evaluation.trajectory_id, task_index=task_index,
-                completed_trajectories=completed, total_trajectories=total,
-                percent=20 + round(75 * completed / max(total, 1)),
-            )
-
-        result = await EVAL.evaluate_run_incrementally(
-            pipeline=pipeline,
-            task=task,
-            trajectories=trajectories,
-            rubric=rubric,
-            rubric_path=rubric_path,
-            run_number=1,
-            temperature=float(config.get("evaluation_temperature", 0.0)),
-            eval_max_tokens=int(config.get("evaluation_max_tokens", 8192)),
-            max_concurrent=EVAL._int_setting(
-                config, "evaluation_max_concurrent", "ADARUBRIC_EVAL_MAX_CONCURRENT", default=2
-            ),
-            evaluations_path=checkpoint,
-            config=config,
-            existing_evaluations=existing,
-            on_trajectory_complete=on_trajectory_complete,
-        )
         evaluations = result.all_evaluations
         serialized = {}
         for evaluation in evaluations:

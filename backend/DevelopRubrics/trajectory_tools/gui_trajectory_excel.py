@@ -10,6 +10,7 @@ import os
 import re
 import threading
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -23,6 +24,7 @@ except ModuleNotFoundError:  # Legacy examples import trajectory_tools directly.
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
+from backend.model_http import model_http_client
 
 
 DOMAIN = "Mobile GUI Agent"
@@ -242,14 +244,24 @@ def write_workbook(output: Path, tasks: dict[str, TaskRecord], trajectories: lis
 
 
 class QwenSummarizer:
-    def __init__(self, model: str, base_url: str, api_key: str, cache_path: Path) -> None:
+    def __init__(self, model: str, base_url: str, api_key: str, cache_path: Path,
+                 *, http_options: dict[str, Any] | None = None) -> None:
         from openai import OpenAI
 
         self.model = model
-        self.client = OpenAI(api_key=api_key, base_url=base_url, max_retries=2)
         self.cache_path = cache_path
         self.cache = json.loads(io_path(cache_path).read_text(encoding="utf-8")) if io_path(cache_path).is_file() else {}
         self._cache_lock = threading.RLock()
+        http_client = model_http_client(http_options)
+        try:
+            self.client = OpenAI(api_key=api_key, base_url=base_url, max_retries=2, http_client=http_client)
+        except Exception:
+            with suppress(Exception):
+                http_client.close()
+            raise
+
+    def close(self) -> None:
+        self.client.close()
 
     def _save_unlocked(self) -> None:
         io_path(self.cache_path.parent).mkdir(parents=True, exist_ok=True)

@@ -22,6 +22,8 @@ import importlib.util
 import json
 import os
 import sys
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -295,7 +297,11 @@ def _build_filter(config: Config) -> Any:
     )
 
 
-def _build_pipeline(config: Config) -> AdaRubricPipeline:
+def _build_pipeline(
+    config: Config,
+    *,
+    on_client_created: Callable[[OpenAIClient], None] | None = None,
+) -> AdaRubricPipeline:
     client = OpenAIClient(
         model=str(_setting(config, "model", "ADARUBRIC_MODEL", "gpt-4o")),
         base_url=_setting(config, "base_url", "ADARUBRIC_BASE_URL", None),
@@ -306,6 +312,8 @@ def _build_pipeline(config: Config) -> AdaRubricPipeline:
         ),
         extra_body=GEN._extra_body_setting(config),
     )
+    if on_client_created is not None:
+        on_client_created(client)
     max_concurrent = _int_setting(
         config,
         "evaluation_max_concurrent",
@@ -328,6 +336,26 @@ def _build_pipeline(config: Config) -> AdaRubricPipeline:
         ),
         filter_=_build_filter(config),
     )
+
+
+@asynccontextmanager
+async def evaluation_pipeline(config: Config) -> AsyncIterator[AdaRubricPipeline]:
+    """Own the one client shared by rubric generation and trajectory evaluation."""
+    client: OpenAIClient | None = None
+
+    def own_client(created: OpenAIClient) -> None:
+        nonlocal client
+        client = created
+
+    try:
+        yield _build_pipeline(config, on_client_created=own_client)
+    finally:
+        if client is not None:
+            try:
+                await client.close()
+            except Exception:
+                # Cleanup must not discard a completed score or hide a model error.
+                pass
 
 
 def _load_rubric(path: Path, task: TaskDescription) -> DynamicRubric:
@@ -943,7 +971,7 @@ async def evaluate_run_incrementally(
             existing_evaluations[key] = evaluation
             if on_trajectory_complete is not None:
                 on_trajectory_complete(evaluation)
-    except Exception:
+    except BaseException:
         for task_handle in tasks:
             task_handle.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -970,49 +998,49 @@ async def evaluate_task(
 ) -> TaskEvaluationBundle:
     selected_trajectories = _select_eval_trajectories(trajectories, config)
     rubric = _load_rubric(rubric_path, task)
-    pipeline = _build_pipeline(config)
-    runs = _int_setting(config, "evaluation_runs", "ADARUBRIC_EVAL_RUNS", default=1)
-    temperature = _float_setting(
-        config,
-        "evaluation_temperature",
-        "ADARUBRIC_EVAL_TEMPERATURE",
-        default=0.0,
-    )
-    eval_max_tokens = _int_setting(
-        config,
-        "evaluation_max_tokens",
-        "ADARUBRIC_EVAL_MAX_TOKENS",
-        default=8192,
-    )
-    max_concurrent = _int_setting(
-        config,
-        "evaluation_max_concurrent",
-        "ADARUBRIC_EVAL_MAX_CONCURRENT",
-        default=2,
-    )
+    async with evaluation_pipeline(config) as pipeline:
+        runs = _int_setting(config, "evaluation_runs", "ADARUBRIC_EVAL_RUNS", default=1)
+        temperature = _float_setting(
+            config,
+            "evaluation_temperature",
+            "ADARUBRIC_EVAL_TEMPERATURE",
+            default=0.0,
+        )
+        eval_max_tokens = _int_setting(
+            config,
+            "evaluation_max_tokens",
+            "ADARUBRIC_EVAL_MAX_TOKENS",
+            default=8192,
+        )
+        max_concurrent = _int_setting(
+            config,
+            "evaluation_max_concurrent",
+            "ADARUBRIC_EVAL_MAX_CONCURRENT",
+            default=2,
+        )
 
-    results: list[PipelineResult] = []
-    for run_number in range(1, runs + 1):
-        print(
-            f"Task {task.task_id}: evaluation run {run_number}/{runs} "
-            f"({len(selected_trajectories)} trajectories)"
-        )
-        result = await evaluate_run_incrementally(
-            pipeline=pipeline,
-            task=task,
-            trajectories=selected_trajectories,
-            rubric=rubric,
-            rubric_path=rubric_path,
-            run_number=run_number,
-            temperature=temperature,
-            eval_max_tokens=eval_max_tokens,
-            max_concurrent=max_concurrent,
-            evaluations_path=evaluations_path,
-            config=config,
-            existing_evaluations=existing_evaluations,
-        )
-        results.append(result)
-    return TaskEvaluationBundle(task=task, rubric_path=rubric_path, results=results)
+        results: list[PipelineResult] = []
+        for run_number in range(1, runs + 1):
+            print(
+                f"Task {task.task_id}: evaluation run {run_number}/{runs} "
+                f"({len(selected_trajectories)} trajectories)"
+            )
+            result = await evaluate_run_incrementally(
+                pipeline=pipeline,
+                task=task,
+                trajectories=selected_trajectories,
+                rubric=rubric,
+                rubric_path=rubric_path,
+                run_number=run_number,
+                temperature=temperature,
+                eval_max_tokens=eval_max_tokens,
+                max_concurrent=max_concurrent,
+                evaluations_path=evaluations_path,
+                config=config,
+                existing_evaluations=existing_evaluations,
+            )
+            results.append(result)
+        return TaskEvaluationBundle(task=task, rubric_path=rubric_path, results=results)
 
 
 async def main() -> None:

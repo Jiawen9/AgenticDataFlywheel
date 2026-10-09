@@ -16,6 +16,7 @@ from pydantic import BaseModel, ValidationError
 
 from adarubric.core.exceptions import LLMClientError
 from adarubric.llm.base import LLMClient
+from adarubric.llm.http_options import close_failed_http_client, resolve_http_options
 from adarubric.llm.json_extract import extract_json_candidates
 
 try:
@@ -25,6 +26,7 @@ try:
         APIStatusError,
         APITimeoutError,
         AsyncOpenAI,
+        DefaultAsyncHttpxClient,
         RateLimitError,
     )
 except ImportError as e:
@@ -80,6 +82,11 @@ class OpenAIClient(LLMClient):
     extra_body : dict | None
         Optional OpenAI-compatible provider-specific request body fields.
         If omitted, ``ADARUBRIC_EXTRA_BODY_JSON`` is used when set.
+    http_proxy_url : str | None
+        Explicit proxy, or ``ADARUBRIC_HTTP_PROXY_URL`` / ``HTTP_PROXY_URL``.
+    http_trust_env : bool | None
+        Whether to inherit system proxies. Defaults to False; explicit settings
+        use ``ADARUBRIC_HTTP_TRUST_ENV`` / ``HTTP_TRUST_ENV``.
     """
 
     def __init__(
@@ -90,6 +97,8 @@ class OpenAIClient(LLMClient):
         base_url: str | None = None,
         max_retries: int = 3,
         extra_body: dict[str, Any] | None = None,
+        http_proxy_url: str | None = None,
+        http_trust_env: bool | str | None = None,
     ) -> None:
         self.model = model
         # A new Pipeline owns the retry budget across durable stage attempts.
@@ -97,7 +106,19 @@ class OpenAIClient(LLMClient):
         single_attempt = os.environ.get("PIPELINE_MODEL_SINGLE_ATTEMPT") == "1"
         self._max_retries = 1 if single_attempt else max(1, max_retries)
         self._extra_body = extra_body if extra_body is not None else _extra_body_from_env()
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url, **({"max_retries": 0} if single_attempt else {}))
+        http_client = DefaultAsyncHttpxClient(
+            **resolve_http_options(
+                http_proxy_url=http_proxy_url, http_trust_env=http_trust_env,
+            )
+        )
+        try:
+            self._client = AsyncOpenAI(
+                api_key=api_key, base_url=base_url, http_client=http_client,
+                **({"max_retries": 0} if single_attempt else {}),
+            )
+        except BaseException:
+            close_failed_http_client(http_client)
+            raise
 
     async def _chat(
         self,
