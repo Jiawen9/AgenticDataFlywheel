@@ -182,21 +182,23 @@ class ResponseParsingTests(unittest.TestCase):
             self.assertFalse(result.cached)
             self.assertFalse(calls[0]["extra_body"]["chat_template_kwargs"]["enable_thinking"])
             self.assertNotIn('"status": "success"', calls[0]["messages"][1]["content"][0]["text"].split("Observation action：", 1)[1])
-        with self.assertRaisesRegex(ValueError, "category='none'"):
+        with self.assertRaises(ValueError) as conflict:
             parse_classification_response(
                 '{"is_intermediate":false,"category":"advertisement",'
                 '"confidence":0.9,"reason":"bad"}'
             )
+        self.assertEqual(conflict.exception.code, "inconsistent_fields")
 
     def test_alignment_json_is_strict(self):
         parsed = parse_alignment_response(
             '{"same_task_state":true,"confidence":0.93,"reason":"页面一致"}'
         )
         self.assertTrue(parsed.same_task_state)
-        with self.assertRaisesRegex(ValueError, "same_task_state must be boolean"):
+        with self.assertRaises(ValueError) as schema_error:
             parse_alignment_response(
                 '{"same_task_state":"yes","confidence":0.9,"reason":"bad"}'
             )
+        self.assertEqual(schema_error.exception.code, "invalid_schema")
 
 
 class AllTrajectoryClassificationTests(unittest.TestCase):

@@ -6,6 +6,8 @@ import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from backend.file_io import io_path
+from backend.pipeline_retry_errors import ModelOutputError
+from backend.trajectories_tree.model_response import response_text
 
 from typing import Any
 import httpx
@@ -40,31 +42,45 @@ class IntermediateStateResult:
         return value
 
 def parse_classification_response(raw: str, *, require_observation: bool = False) -> IntermediateStateResult:
+    if not isinstance(raw, str):
+        raise ModelOutputError("invalid_content")
     start = raw.strip().find("{")
     if start < 0:
-        raise ValueError(f"Qwen response does not contain JSON: {raw[:300]!r}")
+        raise ModelOutputError("invalid_json")
     try:
         value, _ = json.JSONDecoder().raw_decode(raw.strip()[start:])
     except json.JSONDecodeError as exc:
-        raise ValueError(f"Qwen response contains invalid JSON: {raw[:300]!r}") from exc
+        raise ModelOutputError("invalid_json") from exc
     if not isinstance(value, dict) or not isinstance(value.get("is_intermediate"), bool):
-        raise ValueError("Qwen classification must contain boolean is_intermediate")
+        raise ModelOutputError("invalid_schema")
     category = str(value.get("category", "")).strip().lower()
     if category not in CATEGORIES:
-        raise ValueError(f"invalid intermediate-state category: {category!r}")
+        raise ModelOutputError("invalid_schema")
     if value["is_intermediate"] and category == "none":
-        raise ValueError("intermediate state must use a non-none category")
+        raise ModelOutputError("inconsistent_fields")
     if not value["is_intermediate"] and category != "none":
-        raise ValueError("stable state must use category='none'")
-    confidence = float(value.get("confidence", 0.0))
+        raise ModelOutputError("inconsistent_fields")
+    confidence_value = value.get("confidence")
+    if isinstance(confidence_value, bool):
+        raise ModelOutputError("invalid_schema")
+    try:
+        confidence = float(confidence_value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ModelOutputError("invalid_schema") from exc
     if not 0 <= confidence <= 1:
-        raise ValueError("confidence must be between 0 and 1")
-    reason = str(value.get("reason", "")).strip()
-    observation = str(value.get("observation", "")).strip()
-    if not reason:
-        raise ValueError("classification reason must not be empty")
+        raise ModelOutputError("invalid_schema")
+    reason = value.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ModelOutputError("invalid_schema")
+    reason = reason.strip()
+    observation = value.get("observation", "")
+    if not require_observation and observation is None:
+        observation = ""
+    if not isinstance(observation, str):
+        raise ModelOutputError("invalid_schema")
+    observation = observation.strip()
     if require_observation and not observation:
-        raise ValueError("observation must not be empty")
+        raise ModelOutputError("missing_observation")
     return IntermediateStateResult(bool(value["is_intermediate"]), category, confidence, reason, raw, False, observation)
 
 def _image_digest(path: Path) -> str:
@@ -116,9 +132,16 @@ class QwenIntermediateStateClassifier:
                   "next_image_digest": _image_digest(next_image_path) if next_image_path else "",
                   "action": action, "summary": summary, "previous_summary": previous_summary,
                   "next_summary": next_summary}
+        legacy_key = self._key({"version": LEGACY_PROMPT_VERSION, **common})
         with self._cache_lock:
-            legacy = self.cache.get(self._key({"version": LEGACY_PROMPT_VERSION, **common}))
-        legacy_result = parse_classification_response(legacy) if isinstance(legacy, str) else None
+            legacy = self.cache.get(legacy_key)
+        legacy_result = None
+        invalid_legacy = False
+        if isinstance(legacy, str):
+            try:
+                legacy_result = parse_classification_response(legacy)
+            except ModelOutputError:
+                invalid_legacy = True
         payload = {"version": PROMPT_VERSION, **common, "task": task, "after_image_digest": _image_digest(after)}
         cache_key = self._key(payload)
         with self._cache_lock:
@@ -127,7 +150,11 @@ class QwenIntermediateStateClassifier:
         if cached:
             item = cached_item
             raw = str(item.get("raw_response", "")) if isinstance(item, dict) else str(item)
-        else:
+            try:
+                parse_classification_response(raw, require_observation=True)
+            except ModelOutputError:
+                cached = False
+        if not cached:
             observation_action = {"action": "terminate"} if action.get("action") == "terminate" else action
             prompt = f"""同时完成两项工作。
 
@@ -164,19 +191,21 @@ Observation action：{json.dumps(observation_action, ensure_ascii=False)}
                 temperature=0.0, max_tokens=2048 if self.model.strip().lower() == "qwen3.8-max" else 700,
                 extra_body={"enable_thinking": False, "chat_template_kwargs": {"enable_thinking": False}},
                 **({"response_format": {"type": "json_object"}} if self.model.strip().lower() == "qwen3.8-max" else {}))
-            choice = response.choices[0]
-            if getattr(choice, "finish_reason", None) == "length":
-                raise ValueError("Qwen classification response was truncated (finish_reason=length); result was not cached")
-            raw = (choice.message.content or "").strip()
-            if not raw:
-                raise ValueError("Qwen returned an empty classification response")
+            raw = response_text(response)
             parse_classification_response(raw, require_observation=True)
             with self._cache_lock:
                 existing_item = self.cache.get(cache_key)
+                existing_raw = str(existing_item.get("raw_response", "")) if isinstance(existing_item, dict) else str(existing_item)
                 if existing_item is not None:
-                    cached = True
-                    raw = str(existing_item.get("raw_response", "")) if isinstance(existing_item, dict) else str(existing_item)
-                else:
+                    try:
+                        parse_classification_response(existing_raw, require_observation=True)
+                        cached = True
+                        raw = existing_raw
+                    except ModelOutputError:
+                        pass
+                if not cached:
+                    if invalid_legacy and self.cache.get(legacy_key) == legacy:
+                        self.cache.pop(legacy_key, None)
                     self.cache[cache_key] = {"version": PROMPT_VERSION, "raw_response": raw}
                     self._save_cache_unlocked()
         result = parse_classification_response(raw, require_observation=True)

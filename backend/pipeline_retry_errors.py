@@ -14,9 +14,9 @@ from typing import Any
 
 _CATEGORIES = {
     "timeout", "connection", "rate_limit", "server_error", "quota", "auth",
-    "bad_request", "input", "config", "stale", "published", "service_restart", "unknown",
+    "bad_request", "input", "config", "stale", "published", "service_restart", "model_output", "unknown",
 }
-_RETRYABLE = {"timeout", "connection", "rate_limit", "server_error", "service_restart"}
+_RETRYABLE = {"timeout", "connection", "rate_limit", "server_error", "service_restart", "model_output"}
 _TRANSIENT_STATUSES = {408, 429, 500, 502, 503, 504}
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9_.:-]{1,96}$")
 _REQUEST_ID = re.compile(r"request[_ -]?id[\s:：=]+([A-Za-z0-9_.:-]{1,96})", re.I)
@@ -24,6 +24,18 @@ _TRAJECTORY = re.compile(r"trajectory[=:]\s*([A-Za-z0-9_.:-]{1,96})", re.I)
 _STEP = re.compile(r"step[=:]\s*(\d{1,7})", re.I)
 _QUOTA_TERMS = ("insufficient_quota", "token_quota", "quota_not_enough", "quota is not enough",
                 "quota exceeded", "pre_consume_token_quota_failed", "billing_hard_limit")
+
+_MODEL_OUTPUT_FAILURES = {
+    "empty_choices": ("Qwen returned empty choices", "模型未返回候选结果"),
+    "empty_content": ("Qwen returned an empty classification response", "模型返回内容为空"),
+    "invalid_content": ("Qwen classification content must be text", "模型返回内容类型无效"),
+    "truncated": ("Qwen classification response was truncated (finish_reason=length); result was not cached",
+                  "模型返回内容被截断"),
+    "invalid_json": ("Qwen response contains invalid JSON", "模型返回的 JSON 格式无效"),
+    "invalid_schema": ("Qwen classification schema is invalid", "模型返回字段缺失或类型无效"),
+    "inconsistent_fields": ("Qwen classification fields are inconsistent", "模型返回字段相互矛盾"),
+    "missing_observation": ("observation must not be empty", "模型未返回有效的 Observation"),
+}
 
 
 _FILE_FAILURES = {
@@ -107,6 +119,16 @@ class ModelConfigurationError(ValueError):
     """Invalid local model settings, separate from trajectory input failures."""
 
 
+class ModelOutputError(ValueError):
+    """A locally validated response failure; never accepts provider text."""
+
+    def __init__(self, code: str):
+        if not isinstance(code, str) or code not in _MODEL_OUTPUT_FAILURES:
+            raise ValueError("unsupported model output failure code")
+        self.code = code
+        super().__init__(_MODEL_OUTPUT_FAILURES[code][0])
+
+
 def _identifier(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
@@ -164,6 +186,7 @@ def safe_error_message(category: str, http_status: int | None = None,
         "stale": "处理输入已变化，请重新提交",
         "published": "批次已发布，处理已结束",
         "service_restart": "服务重启导致作业中断",
+        "model_output": _MODEL_OUTPUT_FAILURES.get(code, ("", "模型返回内容无效"))[1],
         "unknown": "处理失败，原因未判定",
     }.get(category, "处理失败，原因未判定")
     details = []
@@ -184,6 +207,10 @@ def failure_from_payload(payload: Any) -> dict[str, Any]:
     http_status = _status(source.get("http_status"))
     code = _identifier(source.get("code"))
     request_id = _identifier(source.get("request_id"))
+    if category == "model_output" and (code not in _MODEL_OUTPUT_FAILURES or http_status is not None):
+        # Only the explicit local validation schema survives a worker/DB round trip.
+        # A model-output label must never turn an HTTP rejection into a retry.
+        category, code = "unknown", None
     if category == "rate_limit" and (code and "quota" in code.lower()):
         category = "quota"
     if category == "server_error" and http_status not in {500, 502, 503, 504}:
@@ -296,6 +323,12 @@ def failure_from_exception(exc: BaseException) -> dict[str, Any]:
             return classified("timeout", None, code, request_id)
         if name in {"APIConnectionError", "RemoteProtocolError", "ConnectError", "ReadError", "WriteError", "CloseError"} or isinstance(cause, (ConnectionError, EOFError, BrokenPipeError)):
             return classified("connection", None, code, request_id)
+    # Match our actual type, including wrappers, before generic local-input errors.
+    # API/config/file failures above retain their original stopping behavior even
+    # if a caller accidentally wraps one in ModelOutputError.
+    for cause in chain:
+        if isinstance(cause, ModelOutputError):
+            return classified("model_output", code=cause.code)
     if isinstance(exc, (ValueError, TypeError, FileNotFoundError)):
         return classified("input")
     return classified("unknown")
