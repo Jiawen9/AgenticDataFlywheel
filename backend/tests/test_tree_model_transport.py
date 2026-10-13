@@ -13,7 +13,7 @@ from backend.trajectories_tree.state_alignment_reviewer import QwenStateAlignmen
 from backend.pipeline_retry_errors import ModelOutputError, failure_from_exception
 
 
-CLASSIFICATION = json.dumps({"is_intermediate": False, "category": "none", "confidence": 0.95,
+CLASSIFICATION = json.dumps({"category": "none", "confidence": 0.95,
                              "reason": "正常业务页面", "observation": "页面显示订单列表。"}, ensure_ascii=False)
 ALIGNMENT = json.dumps({"same_task_state": True, "confidence": 0.95, "reason": "截图展示相同的订单列表"}, ensure_ascii=False)
 
@@ -105,28 +105,18 @@ class TreeModelTransportTests(unittest.TestCase):
                     self.assertEqual(instance.cache_path.read_bytes(), before)
                     self.assertEqual(instance.cache, {"unrelated-entry": "keep"})
 
-    def test_conflicting_classification_is_retryable_without_accepting_or_caching_it(self):
-        bad = json.dumps({"is_intermediate": False, "category": "loading", "confidence": 0.9,
-                          "reason": "secret-response", "observation": "secret-observation"})
+    def test_redundant_boolean_is_ignored_in_new_model_responses(self):
+        raw = json.dumps({"is_intermediate": False, "category": "loading", "confidence": 0.9,
+                          "reason": "加载页面", "observation": "加载图标仍然显示"})
         with tempfile.TemporaryDirectory() as directory:
-            instance, create, invoke = self.fixture(Path(directory), "classification", "mock", content=bad)
-            before = instance.cache_path.read_bytes()
-            with self.assertRaises(ModelOutputError) as caught:
-                invoke()
-            self.assertEqual(caught.exception.code, "inconsistent_fields")
-            failure = failure_from_exception(caught.exception)
-            self.assertEqual(failure["category"], "model_output")
-            self.assertTrue(failure["retryable"])
-            self.assertNotIn("secret", json.dumps(failure))
-            self.assertEqual(instance.cache_path.read_bytes(), before)
-            create.return_value.choices[0].message.content = CLASSIFICATION
+            instance, create, invoke = self.fixture(Path(directory), "classification", "mock", content=raw)
             result = invoke()
-            self.assertFalse(result.is_intermediate)
-            self.assertEqual(result.category, "none")
+            self.assertTrue(result.is_intermediate)
+            self.assertEqual(result.category, "loading")
+            self.assertEqual(result.raw_response, raw)
             self.assertEqual(instance.cache["unrelated-entry"], "keep")
-            self.assertEqual(create.call_count, 2)
             self.assertTrue(invoke().cached)
-            self.assertEqual(create.call_count, 2)
+            create.assert_called_once()
 
     def test_bad_cached_output_is_refreshed_without_losing_other_entries(self):
         for kind, content in (("classification", CLASSIFICATION), ("alignment", ALIGNMENT)):

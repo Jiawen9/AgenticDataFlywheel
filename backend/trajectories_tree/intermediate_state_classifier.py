@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64, hashlib, io, json
+import re
 import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -20,8 +21,10 @@ except ImportError:
     from bounding_box.qwen_reviewer import qwen_settings
 
 CATEGORIES = {"advertisement", "loading", "update_popup", "permission_privacy_popup", "transient_error", "system_overlay", "none"}
-PROMPT_VERSION = "trajectory-intermediate-observation-v4"
+PROMPT_VERSION = "trajectory-intermediate-observation-v5"
+PREVIOUS_PROMPT_VERSION = "trajectory-intermediate-observation-v4"
 LEGACY_PROMPT_VERSION = "trajectory-intermediate-state-v2"
+SUPPORTED_PROMPT_VERSIONS = {PROMPT_VERSION, PREVIOUS_PROMPT_VERSION, LEGACY_PROMPT_VERSION}
 
 @dataclass
 class IntermediateStateResult:
@@ -33,6 +36,8 @@ class IntermediateStateResult:
     cached: bool = False
     observation: str = ""
     classification_changed: bool = False
+    classification_source: dict[str, str] | None = None
+    observation_source: dict[str, str] | None = None
 
     def to_dict(self, confidence_threshold: float) -> dict[str, Any]:
         value = asdict(self)
@@ -41,7 +46,10 @@ class IntermediateStateResult:
         value["confidence_threshold"] = confidence_threshold
         return value
 
-def parse_classification_response(raw: str, *, require_observation: bool = False) -> IntermediateStateResult:
+def parse_classification_response(raw: str, *, require_observation: bool = False,
+                                  protocol_version: str = PROMPT_VERSION) -> IntermediateStateResult:
+    if not isinstance(protocol_version, str) or protocol_version not in SUPPORTED_PROMPT_VERSIONS:
+        raise ValueError("unsupported classification protocol")
     if not isinstance(raw, str):
         raise ModelOutputError("invalid_content")
     start = raw.strip().find("{")
@@ -51,15 +59,19 @@ def parse_classification_response(raw: str, *, require_observation: bool = False
         value, _ = json.JSONDecoder().raw_decode(raw.strip()[start:])
     except json.JSONDecodeError as exc:
         raise ModelOutputError("invalid_json") from exc
-    if not isinstance(value, dict) or not isinstance(value.get("is_intermediate"), bool):
+    if not isinstance(value, dict) or not isinstance(value.get("category"), str):
         raise ModelOutputError("invalid_schema")
-    category = str(value.get("category", "")).strip().lower()
+    category = value["category"].strip().lower()
     if category not in CATEGORIES:
         raise ModelOutputError("invalid_schema")
-    if value["is_intermediate"] and category == "none":
-        raise ModelOutputError("inconsistent_fields")
-    if not value["is_intermediate"] and category != "none":
-        raise ModelOutputError("inconsistent_fields")
+    is_intermediate = category != "none"
+    if protocol_version != PROMPT_VERSION:
+        # Old responses must satisfy the old contract before they can be reused.
+        # Never reinterpret contradictory legacy fields using the v5 contract.
+        if not isinstance(value.get("is_intermediate"), bool):
+            raise ModelOutputError("invalid_schema")
+        if value["is_intermediate"] != is_intermediate:
+            raise ModelOutputError("inconsistent_fields")
     confidence_value = value.get("confidence")
     if isinstance(confidence_value, bool):
         raise ModelOutputError("invalid_schema")
@@ -81,7 +93,44 @@ def parse_classification_response(raw: str, *, require_observation: bool = False
     observation = observation.strip()
     if require_observation and not observation:
         raise ModelOutputError("missing_observation")
-    return IntermediateStateResult(bool(value["is_intermediate"]), category, confidence, reason, raw, False, observation)
+    return IntermediateStateResult(is_intermediate, category, confidence, reason, raw, False, observation)
+
+
+def _normalized_result(result: IntermediateStateResult) -> dict[str, Any]:
+    return {"category": result.category, "confidence": result.confidence,
+            "reason": result.reason, "observation": result.observation}
+
+
+def parse_cached_classification(item: Any, *, version: str = PROMPT_VERSION) -> IntermediateStateResult:
+    """Read each cache using its own contract, including the effective v5 result."""
+    if version != PROMPT_VERSION:
+        if isinstance(item, dict) and item.get("version", version) != version:
+            raise ModelOutputError("invalid_schema")
+        raw = item.get("raw_response") if isinstance(item, dict) else item
+        result = parse_classification_response(raw, require_observation=version != LEGACY_PROMPT_VERSION,
+                                               protocol_version=version)
+    else:
+        if (not isinstance(item, dict) or item.get("version") != PROMPT_VERSION
+                or not isinstance(item.get("normalized_result"), dict)
+                or not isinstance(item.get("raw_response"), str) or not item["raw_response"].strip()):
+            raise ModelOutputError("invalid_schema")
+        result = parse_classification_response(json.dumps(item["normalized_result"], ensure_ascii=False),
+                                               require_observation=True)
+        for name in ("classification_source", "observation_source"):
+            source = item.get(name)
+            if (not isinstance(source, dict) or not isinstance(source.get("version"), str)
+                    or source["version"] not in SUPPORTED_PROMPT_VERSIONS
+                    or not isinstance(source.get("cache_key"), str)
+                    or re.fullmatch(r"[a-f0-9]{64}", source["cache_key"]) is None
+                    or (name == "observation_source" and source["version"] == LEGACY_PROMPT_VERSION)):
+                raise ModelOutputError("invalid_schema")
+            setattr(result, name, {"version": source["version"], "cache_key": source["cache_key"]})
+        result.raw_response = item["raw_response"]
+        result.classification_changed = item.get("classification_changed", False)
+        if not isinstance(result.classification_changed, bool):
+            raise ModelOutputError("invalid_schema")
+    result.cached = True
+    return result
 
 def _image_digest(path: Path) -> str:
     return hashlib.sha256(io_path(path).read_bytes()).hexdigest()
@@ -118,6 +167,45 @@ class QwenIntermediateStateClassifier:
     def _key(payload: dict[str, Any]) -> str:
         return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
+    def _cached_result(self, cache_key: str, version: str) -> IntermediateStateResult | None:
+        with self._cache_lock:
+            item = self.cache.get(cache_key)
+        if item is None:
+            return None
+        try:
+            return parse_cached_classification(item, version=version)
+        except ModelOutputError:
+            return None
+
+    def _store_result(self, cache_key: str, result: IntermediateStateResult) -> IntermediateStateResult:
+        entry = {"version": PROMPT_VERSION, "normalized_result": _normalized_result(result),
+                 # This is the unmodified response that supplied Observation. In
+                 # a legacy combination its classification may differ; the two
+                 # source references and normalized result make that explicit.
+                 "raw_response": result.raw_response,
+                 "classification_source": result.classification_source,
+                 "observation_source": result.observation_source,
+                 "classification_changed": result.classification_changed}
+        parse_cached_classification(entry)
+        with self._cache_lock:
+            existing = self._cached_result(cache_key, PROMPT_VERSION)
+            if existing is not None:
+                return existing
+            missing = object()
+            previous = self.cache.get(cache_key, missing)
+            self.cache[cache_key] = entry
+            try:
+                self._save_cache_unlocked()
+            except Exception:
+                # A failed disk write must not masquerade as a cache hit on the
+                # next attempt in this process. Other entries remain untouched.
+                if previous is missing:
+                    self.cache.pop(cache_key, None)
+                else:
+                    self.cache[cache_key] = previous
+                raise
+        return result
+
     def classify(self, *, trajectory: str, step_index: int, current_image_path: Path,
                  next_image_path: Path | None, action: dict[str, Any], summary: str,
                  previous_summary: str, next_summary: str, after_image_path: Path | None = None,
@@ -132,33 +220,29 @@ class QwenIntermediateStateClassifier:
                   "next_image_digest": _image_digest(next_image_path) if next_image_path else "",
                   "action": action, "summary": summary, "previous_summary": previous_summary,
                   "next_summary": next_summary}
+        combined = {**common, "task": task, "after_image_digest": _image_digest(after)}
+        cache_key = self._key({"version": PROMPT_VERSION, **combined})
+        current = self._cached_result(cache_key, PROMPT_VERSION)
+        if current is not None:
+            return current
+
         legacy_key = self._key({"version": LEGACY_PROMPT_VERSION, **common})
-        with self._cache_lock:
-            legacy = self.cache.get(legacy_key)
-        legacy_result = None
-        invalid_legacy = False
-        if isinstance(legacy, str):
-            try:
-                legacy_result = parse_classification_response(legacy)
-            except ModelOutputError:
-                invalid_legacy = True
-        payload = {"version": PROMPT_VERSION, **common, "task": task, "after_image_digest": _image_digest(after)}
-        cache_key = self._key(payload)
-        with self._cache_lock:
-            cached_item = self.cache.get(cache_key)
-        cached = cached_item is not None
-        if cached:
-            item = cached_item
-            raw = str(item.get("raw_response", "")) if isinstance(item, dict) else str(item)
-            try:
-                parse_classification_response(raw, require_observation=True)
-            except ModelOutputError:
-                cached = False
-        if not cached:
+        previous_key = self._key({"version": PREVIOUS_PROMPT_VERSION, **combined})
+        legacy_result = self._cached_result(legacy_key, LEGACY_PROMPT_VERSION)
+        result = self._cached_result(previous_key, PREVIOUS_PROMPT_VERSION)
+        if result is not None:
+            result.classification_source = {"version": PREVIOUS_PROMPT_VERSION, "cache_key": previous_key}
+            result.observation_source = dict(result.classification_source)
+        else:
             observation_action = {"action": "terminate"} if action.get("action") == "terminate" else action
             prompt = f"""同时完成两项工作。
 
 第一，判断 Action 执行前的 Before 页面是否为会造成轨迹树偶发分叉的临时中间态。中间态包括广告、加载、升级/权限/隐私弹窗、临时错误和系统遮罩；正常业务页面和完成任务所需的业务弹窗不是中间态。
+
+分类只返回一个 category，不返回 is_intermediate；是否中间态由程序根据 category 推导。
+category 必须是以下七个字符串之一：none、advertisement、loading、update_popup、permission_privacy_popup、transient_error、system_overlay。
+正常业务页面和完成任务必需的业务弹窗必须使用 none；临时中间态选择一个最符合的具体类别，不返回多个类别、null 或空字符串。
+confidence 表示对此类别判断的置信度，取 0 到 1；看不清或证据不足时降低 confidence，并在 reason 中如实说明。
 
 第二，你是 GUI Agent 轨迹的 Post-action Observation 生成器。根据 Task、Action、Before Screenshot、After Screenshot，用一句中文描述：Action 执行后，两张截图之间与 Task 相关的可见环境状态变化。
 
@@ -180,8 +264,11 @@ Observation action：{json.dumps(observation_action, ensure_ascii=False)}
 上一摘要：{previous_summary or '无'}
 下一摘要：{next_summary or '无'}
 
-只输出严格 JSON，不输出分析、Markdown 或额外解释：
-{{"is_intermediate":true|false,"category":"advertisement|loading|update_popup|permission_privacy_popup|transient_error|system_overlay|none","confidence":0.0,"reason":"简短中文理由","observation":"一句中文 Observation"}}"""
+只输出包含 category、confidence、reason、observation 的严格 JSON，不输出分析、Markdown 或额外解释。
+正常页面示例（仅说明格式，内容必须根据当前截图填写）：
+{{"category":"none","confidence":0.96,"reason":"动作前是正常商品列表页","observation":"点击后页面从商品列表切换为商品详情。"}}
+临时页面示例（仅说明格式，内容必须根据当前截图填写）：
+{{"category":"advertisement","confidence":0.94,"reason":"动作前有遮挡业务页面的偶发广告","observation":"点击后广告弹窗消失，露出商品列表。"}}"""
             content = [{"type": "text", "text": prompt}, {"type": "text", "text": "Before Screenshot："},
                        {"type": "image_url", "image_url": {"url": _image_data_url(current_image_path)}},
                        {"type": "text", "text": "After Screenshot："},
@@ -192,25 +279,11 @@ Observation action：{json.dumps(observation_action, ensure_ascii=False)}
                 extra_body={"enable_thinking": False, "chat_template_kwargs": {"enable_thinking": False}},
                 **({"response_format": {"type": "json_object"}} if self.model.strip().lower() == "qwen3.8-max" else {}))
             raw = response_text(response)
-            parse_classification_response(raw, require_observation=True)
-            with self._cache_lock:
-                existing_item = self.cache.get(cache_key)
-                existing_raw = str(existing_item.get("raw_response", "")) if isinstance(existing_item, dict) else str(existing_item)
-                if existing_item is not None:
-                    try:
-                        parse_classification_response(existing_raw, require_observation=True)
-                        cached = True
-                        raw = existing_raw
-                    except ModelOutputError:
-                        pass
-                if not cached:
-                    if invalid_legacy and self.cache.get(legacy_key) == legacy:
-                        self.cache.pop(legacy_key, None)
-                    self.cache[cache_key] = {"version": PROMPT_VERSION, "raw_response": raw}
-                    self._save_cache_unlocked()
-        result = parse_classification_response(raw, require_observation=True)
+            result = parse_classification_response(raw, require_observation=True)
+            result.classification_source = {"version": PROMPT_VERSION, "cache_key": cache_key}
+            result.observation_source = dict(result.classification_source)
         if legacy_result:
             result.classification_changed = (result.is_intermediate, result.category, result.confidence) != (legacy_result.is_intermediate, legacy_result.category, legacy_result.confidence)
             result.is_intermediate, result.category, result.confidence, result.reason = legacy_result.is_intermediate, legacy_result.category, legacy_result.confidence, legacy_result.reason
-        result.cached = cached
-        return result
+            result.classification_source = {"version": LEGACY_PROMPT_VERSION, "cache_key": legacy_key}
+        return self._store_result(cache_key, result)

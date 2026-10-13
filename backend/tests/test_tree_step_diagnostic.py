@@ -33,6 +33,7 @@ class TreeStepDiagnosticTests(unittest.TestCase):
             diagnostic.local_storage_probe(self.root, self.root / "system" / "app.sqlite", self.cache, "qwen3-vl-plus")
         self.assertIn("当前部署有 length 截断检查： True", output.getvalue())
         self.assertIn("当前模型输出 token 上限： 700", output.getvalue())
+        self.assertIn("当前部署的新响应先校验再缓存： True", output.getvalue())
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -57,7 +58,8 @@ class TreeStepDiagnosticTests(unittest.TestCase):
             "job_id": "job-diagnostic", "batch_id": "test-batch", "status": "failed",
             "raw_root": str(self.raw), "annotation_version": "revision-1",
             "failure": {"trajectory_id": "tr-fixture", "step": 15},
-            "build_config": {"model": "qwen3-vl-plus", "model_url": "https://model.invalid/v1"},
+            "build_config": {"model": "qwen3-vl-plus", "model_url": "https://model.invalid/v1",
+                             "prompt_version": classifier_module.PREVIOUS_PROMPT_VERSION},
         }
         self.inputs = {
             "trajectory": "tr-fixture", "step_index": 15,
@@ -100,7 +102,7 @@ class TreeStepDiagnosticTests(unittest.TestCase):
 
     def response(self, content=None, *, finish="stop", choices=True):
         if content is None:
-            content = json.dumps({"is_intermediate": False, "category": "none", "confidence": 0.9,
+            content = json.dumps({"category": "none", "confidence": 0.9,
                                   "reason": self.BODY, "observation": self.BODY})
         return {"id": "chatcmpl-fixture", "object": "chat.completion", "created": 0,
                 "model": self.job["build_config"]["model"],
@@ -155,6 +157,112 @@ class TreeStepDiagnosticTests(unittest.TestCase):
         self.assertIn('"choices_count": 1', output)
         self.assertIn('"completion_tokens": 7', output)
         self.assertIn("req-safe-fixture", output)
+        self.assertIn(classifier_module.PROMPT_VERSION, output)
+        self.assertIn("不是旧模型请求的原样复现", output)
+        self.assertIn("不复现旧缓存分类组合", output)
+
+    def test_current_job_does_not_claim_old_prompt_replay(self):
+        self.job["build_config"]["prompt_version"] = classifier_module.PROMPT_VERSION
+        code, output = self.run_probe(self.response())
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.requests), 1)
+        self.assertNotIn("不是旧模型请求的原样复现", output)
+
+    def test_unknown_job_protocol_is_sanitized_and_declares_new_prompt(self):
+        self.job["build_config"]["prompt_version"] = self.KEY
+        code, output = self.run_probe(self.response())
+        self.assertEqual(code, 0)
+        self.assertIn("原作业分类协议： 未记录或未知", output)
+        self.assertIn("不是旧模型请求的原样复现", output)
+
+    def cache_keys(self):
+        common = {
+            "model": self.job["build_config"]["model"],
+            "trajectory": self.inputs["trajectory"], "step_index": self.inputs["step_index"],
+            "current_image_digest": classifier_module._image_digest(self.current),
+            "next_image_digest": classifier_module._image_digest(self.following),
+            "action": self.inputs["action"], "summary": self.inputs["summary"],
+            "previous_summary": self.inputs["previous_summary"], "next_summary": self.inputs["next_summary"],
+        }
+        keys = {classifier_module.LEGACY_PROMPT_VERSION: classifier_module.QwenIntermediateStateClassifier._key(
+            {"version": classifier_module.LEGACY_PROMPT_VERSION, **common})}
+        for version in (classifier_module.PREVIOUS_PROMPT_VERSION, classifier_module.PROMPT_VERSION):
+            keys[version] = classifier_module.QwenIntermediateStateClassifier._key({
+                "version": version, **common, "task": self.GOAL,
+                "after_image_digest": classifier_module._image_digest(self.after)})
+        return keys
+
+    def test_offline_probe_uses_all_three_cache_contracts_and_normalized_sources(self):
+        keys = self.cache_keys()
+        v2, v4, v5 = (classifier_module.LEGACY_PROMPT_VERSION,
+                      classifier_module.PREVIOUS_PROMPT_VERSION, classifier_module.PROMPT_VERSION)
+        legacy = {"is_intermediate": True, "category": "loading", "confidence": 0.9, "reason": self.BODY}
+        previous = {"is_intermediate": False, "category": "none", "confidence": 0.9,
+                    "reason": self.BODY, "observation": self.SUMMARY}
+        current = {
+            "version": v5, "normalized_result": {"category": "loading", "confidence": 0.9,
+                                                  "reason": self.BODY, "observation": self.SUMMARY},
+            "raw_response": json.dumps(previous),
+            "classification_source": {"version": v2, "cache_key": keys[v2]},
+            "observation_source": {"version": v4, "cache_key": keys[v4]},
+            "classification_changed": True,
+        }
+        self.cache.write_text(json.dumps({keys[v2]: json.dumps(legacy),
+                                         keys[v4]: {"version": v4, "raw_response": json.dumps(previous)},
+                                         keys[v5]: current}), encoding="utf-8")
+        before = self.cache.read_bytes()
+        output = io.StringIO()
+        with patch.object(diagnostic, "parse_cached_classification", wraps=classifier_module.parse_cached_classification) as parser, \
+             patch.object(diagnostic, "model_probe", side_effect=AssertionError("offline model forbidden")), \
+             contextlib.redirect_stdout(output):
+            code = diagnostic.probe(self.root, self.job["job_id"], env_path=self.env)
+        text = output.getvalue()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.cache.read_bytes(), before)
+        self.assertEqual([call.kwargs["version"] for call in parser.call_args_list], [v2, v4, v5])
+        for label in ("v2 旧缓存", "v4 旧缓存", "v5 当前缓存"):
+            self.assertIn(label + "：解析通过", text)
+        self.assertIn('v5 当前缓存 分类来源： {"version": "' + v2 + '"', text)
+        self.assertIn('v5 当前缓存 Observation 来源： {"version": "' + v4 + '"', text)
+        for value in keys.values():
+            self.assertIn(value, text)
+        for private in (self.KEY, self.BODY, self.GOAL, self.SUMMARY):
+            self.assertNotIn(private, text)
+
+    def test_old_cache_conflicts_are_rejected_without_exposing_content(self):
+        for version in (classifier_module.LEGACY_PROMPT_VERSION, classifier_module.PREVIOUS_PROMPT_VERSION):
+            with self.subTest(version=version):
+                raw = json.dumps({"is_intermediate": False, "category": "loading", "confidence": 0.9,
+                                  "reason": self.BODY, "observation": self.SUMMARY})
+                item = raw if version == classifier_module.LEGACY_PROMPT_VERSION else {"version": version, "raw_response": raw}
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    diagnostic.parse_probe("旧缓存", item, version)
+                self.assertIn("分类字段冲突", output.getvalue())
+                self.assertNotIn(self.BODY, output.getvalue())
+                self.assertNotIn(self.SUMMARY, output.getvalue())
+
+    def test_untrusted_cache_source_is_not_printed(self):
+        v5 = classifier_module.PROMPT_VERSION
+        item = {"version": v5, "raw_response": self.BODY,
+                "normalized_result": {"category": "none", "confidence": 0.9,
+                                      "reason": self.BODY, "observation": self.SUMMARY},
+                "classification_source": {"version": v5, "cache_key": self.KEY},
+                "observation_source": {"version": v5, "cache_key": "a" * 64}}
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            diagnostic.parse_probe("v5 当前缓存", item, v5)
+        self.assertIn("解析失败", output.getvalue())
+        for private in (self.KEY, self.BODY, self.SUMMARY):
+            self.assertNotIn(private, output.getvalue())
+
+    def test_extra_boolean_does_not_break_current_single_category_probe(self):
+        content = json.dumps({"is_intermediate": False, "category": "loading", "confidence": 0.9,
+                              "reason": self.BODY, "observation": self.SUMMARY})
+        code, output = self.run_probe(self.response(content=content))
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.requests), 1)
+        self.assertIn("模型调用及内容校验：通过", output)
 
     def test_length_stops_after_one_request(self):
         code, output = self.run_probe(self.response(finish="length"))
