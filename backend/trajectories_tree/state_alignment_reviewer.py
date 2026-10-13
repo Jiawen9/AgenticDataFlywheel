@@ -7,6 +7,8 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from backend.file_io import io_path
+from backend.pipeline_retry_errors import ModelOutputError
+from backend.trajectories_tree.model_response import response_text
 
 from typing import Any
 
@@ -45,31 +47,35 @@ class StateAlignmentResult:
 
 
 def parse_alignment_response(raw: str) -> StateAlignmentResult:
+    if not isinstance(raw, str):
+        raise ModelOutputError("invalid_content")
     text = raw.strip()
     object_start = text.find("{")
     if object_start < 0:
-        raise ValueError(f"Qwen response does not contain JSON: {raw[:300]!r}")
+        raise ModelOutputError("invalid_json")
     try:
         value, _ = json.JSONDecoder().raw_decode(text[object_start:])
     except json.JSONDecodeError as exc:
-        raise ValueError(f"Qwen response contains invalid JSON: {raw[:300]!r}") from exc
+        raise ModelOutputError("invalid_json") from exc
     if not isinstance(value, dict):
-        raise ValueError("Qwen alignment review must be a JSON object")
+        raise ModelOutputError("invalid_schema")
 
     same_task_state = value.get("same_task_state")
     if not isinstance(same_task_state, bool):
-        raise ValueError(
-            f"same_task_state must be boolean, got {same_task_state!r}"
-        )
+        raise ModelOutputError("invalid_schema")
+    confidence_value = value.get("confidence")
+    if isinstance(confidence_value, bool):
+        raise ModelOutputError("invalid_schema")
     try:
-        confidence = float(value.get("confidence"))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("confidence must be numeric") from exc
+        confidence = float(confidence_value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ModelOutputError("invalid_schema") from exc
     if not 0.0 <= confidence <= 1.0:
-        raise ValueError(f"confidence must be between 0 and 1, got {confidence!r}")
-    reason = str(value.get("reason", "")).strip()
-    if not reason:
-        raise ValueError("alignment reason must not be empty")
+        raise ModelOutputError("invalid_schema")
+    reason = value.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ModelOutputError("invalid_schema")
+    reason = reason.strip()
     return StateAlignmentResult(
         same_task_state=same_task_state,
         confidence=confidence,
@@ -148,7 +154,11 @@ class QwenStateAlignmentReviewer:
         cached = cache_key in self.cache
         if cached:
             raw = self.cache[cache_key]
-        else:
+            try:
+                parse_alignment_response(raw)
+            except ModelOutputError:
+                cached = False
+        if not cached:
             prompt = (
                 "你正在复核移动端 GUI 轨迹的短暂跳步对齐。action 和 bbox 已经连续匹配，"
                 "现在只判断每组候选截图与已有轨迹截图是否处于相同的任务状态。\n"
@@ -200,12 +210,7 @@ class QwenStateAlignmentReviewer:
                 },
                 **({"response_format": {"type": "json_object"}} if self.model.strip().lower() == "qwen3.8-max" else {}),
             )
-            choice = response.choices[0]
-            if getattr(choice, "finish_reason", None) == "length":
-                raise ValueError("Qwen state-alignment response was truncated (finish_reason=length); result was not cached")
-            raw = (choice.message.content or "").strip()
-            if not raw:
-                raise ValueError("Qwen returned an empty state-alignment review")
+            raw = response_text(response)
             parse_alignment_response(raw)
             self.cache[cache_key] = raw
             self._save_cache()
