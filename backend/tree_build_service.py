@@ -34,6 +34,7 @@ from .trajectory_data import (
 from .trajectories_tree.intermediate_state_classifier import (
     QwenIntermediateStateClassifier,
 )
+from .trajectories_tree import intermediate_state_classifier
 from .trajectories_tree.state_alignment_reviewer import QwenStateAlignmentReviewer
 from .trajectories_tree.tree_builder import (
     DEFAULT_ALIGNMENT_CACHE,
@@ -59,7 +60,7 @@ def tree_build_config(env_path: Path = DEFAULT_ENV, *, confidence_threshold: flo
     values = read_env_file(env_path) if io_path(env_path).is_file() else {}
     return {"model": values.get("MODEL_NAME", ""), "model_url": values.get("MODEL_URL", ""),
             "confidence_threshold": confidence_threshold, "max_incidental_skip": max_incidental_skip,
-            "prompt_version": "trajectory-intermediate-observation-v4",
+            "prompt_version": intermediate_state_classifier.PROMPT_VERSION,
             "tree_pipeline_version": 2}
 
 
@@ -366,7 +367,7 @@ def build_tree_run(
                             "source_task_fingerprints": annotation_task_fingerprints(source_payload),
                             "task_fingerprints": tree_task_fingerprints(source_payload, config),
                             "tree_hashes": {task: digest(value) for task, value in tree_payloads.items()},
-                            "build_config": config, "quality_input_prompt_version": "trajectory-intermediate-observation-v4"}
+                            "build_config": config, "quality_input_prompt_version": intermediate_state_classifier.PROMPT_VERSION}
                 incoming["tree_hashes"] = tree_result_hashes(tree_payloads, incoming["quality_input"], incoming["task_fingerprints"])
                 manifest = merge_tree_results(batch_id, incoming, observation, observation_rows, data_root)
                 shutil.rmtree(io_path(temporary_dir))
@@ -399,7 +400,7 @@ def build_tree_run(
                 "artifacts": [observation_artifact, tree_artifact],
                 "quality_input_file": quality_workbook.name,
                 "quality_input_json": quality_workbook.with_suffix(".json").name,
-                "quality_input_prompt_version": "trajectory-intermediate-observation-v4",
+                "quality_input_prompt_version": intermediate_state_classifier.PROMPT_VERSION,
                 "quality_task_count": quality_task_count,
                 "quality_observation_count": quality_step_count,
                 "quality_final_answer_count": quality_trajectory_count,

@@ -185,7 +185,8 @@ class ResponseParsingTests(unittest.TestCase):
         with self.assertRaises(ValueError) as conflict:
             parse_classification_response(
                 '{"is_intermediate":false,"category":"advertisement",'
-                '"confidence":0.9,"reason":"bad"}'
+                '"confidence":0.9,"reason":"bad"}',
+                protocol_version="trajectory-intermediate-observation-v4",
             )
         self.assertEqual(conflict.exception.code, "inconsistent_fields")
 

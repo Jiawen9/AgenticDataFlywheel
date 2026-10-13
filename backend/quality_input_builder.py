@@ -16,6 +16,7 @@ from .DevelopRubrics.trajectory_tools.gui_trajectory_excel import (
 from .data_store import DATA_ROOT
 from .stage_artifacts import write_sidecar
 from .model_http import model_http_options
+from .trajectories_tree import intermediate_state_classifier
 
 FINAL_ANSWER_CACHE = DATA_ROOT / "cache" / "rubric_outputs" / "qwen_tree_final_answers.json"
 
@@ -116,7 +117,7 @@ def _build_quality_workbook(*, grouped: dict[str, list[tuple[str, list[Any]]]],
             raise RuntimeError(f"missing trajectory summary: {trajectory_id}")
         trajectories.append(TrajectoryRecord(trajectory_id, task_id, source_directory, final_answer,
             {"source_directory": source_directory, "observation_model": model,
-             "observation_prompt_version": "trajectory-intermediate-observation-v4",
+             "observation_prompt_version": intermediate_state_classifier.PROMPT_VERSION,
              "source_identity": records[0].action_input.get("source_identity", {})}, records))
     write_workbook(output, tasks, trajectories)
     write_sidecar(output, _quality_payload(tasks, trajectories))

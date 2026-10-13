@@ -1,4 +1,4 @@
-"""Read-only tree diagnostic; model requests require explicit --probe-model."""
+"""Read-only tree diagnostic for the v5 backend; networking requires --probe-model."""
 import argparse
 import hashlib
 import inspect
@@ -20,13 +20,15 @@ if (repo / "backend").is_dir():
 from backend.file_io import io_path, resolve_path
 try:
     from backend.pipeline_retry_errors import ModelOutputError
-except ImportError:  # The standalone diagnostic also supports older deployed backends.
+except ImportError:  # Retain safe labels for exceptions without the typed wrapper.
     ModelOutputError = None
 from backend.trajectories_tree.tree_builder import parse_action
 from backend.trajectories_tree.intermediate_state_classifier import (
-    LEGACY_PROMPT_VERSION, PROMPT_VERSION, QwenIntermediateStateClassifier,
-    _image_data_url, _image_digest, parse_classification_response,
+    LEGACY_PROMPT_VERSION, PREVIOUS_PROMPT_VERSION, PROMPT_VERSION, QwenIntermediateStateClassifier,
+    _image_data_url, _image_digest, parse_cached_classification,
 )
+
+KNOWN_PROTOCOLS = {LEGACY_PROMPT_VERSION, PREVIOUS_PROMPT_VERSION, PROMPT_VERSION}
 
 
 def read(path):
@@ -64,10 +66,22 @@ def parse_failure_reason(exc):
                 "字段类型或其他本地校验错误")
 
 
-def parse_probe(label, raw, observation):
+def parse_probe(label, item, version):
+    if item is None:
+        print(label + "：未命中")
+        return
     try:
-        parse_classification_response(raw, require_observation=observation)
+        result = parse_cached_classification(item, version=version)
         print(label + "：解析通过")
+        for name, source in (("分类来源", result.classification_source),
+                             ("Observation 来源", result.observation_source)):
+            # Persisted metadata is untrusted; print only a known version and digest.
+            if (isinstance(source, dict) and isinstance(source.get("version"), str)
+                    and source["version"] in KNOWN_PROTOCOLS
+                    and isinstance(source.get("cache_key"), str)
+                    and re.fullmatch(r"[a-f0-9]{64}", source["cache_key"])):
+                print(label + " " + name + "：", json.dumps(
+                    {"version": source["version"], "cache_key": source["cache_key"]}, ensure_ascii=False))
     except Exception as exc:
         print(label + "：解析失败；" + parse_failure_reason(exc) + "；异常类型 " + type(exc).__name__)
 
@@ -87,6 +101,11 @@ def model_probe(job, cache_path, env_path, inputs):
 
     current_config = tree_build_config(env_path)
     frozen = job.get("build_config") or {}
+    frozen_version = frozen.get("prompt_version")
+    print("原作业分类协议：", frozen_version if isinstance(frozen_version, str) and frozen_version in KNOWN_PROTOCOLS else "未记录或未知")
+    print("当前探测分类协议：", PROMPT_VERSION)
+    if frozen_version != PROMPT_VERSION:
+        print("诊断边界：使用当前分类协议和提示词探测旧作业输入，不是旧模型请求的原样复现")
     if any(current_config.get(k) != frozen.get(k) for k in ("model", "model_url")):
         print("模型或服务地址已变化，停止联网探测")
         return 1
@@ -107,6 +126,7 @@ def model_probe(job, cache_path, env_path, inputs):
             return 1
         classifier.cache = {}  # Request this step afresh, without touching existing cache.
         classifier._save_cache_unlocked = lambda: None
+        print("探测使用空内存缓存，仅检查当前协议新回答，不复现旧缓存分类组合")
         classifier.client = classifier.client.with_options(max_retries=0)
         original = classifier.client.chat.completions.create
 
@@ -203,6 +223,8 @@ def local_storage_probe(root, database, cache_path, model):
         source = inspect.getsource(QwenIntermediateStateClassifier.classify)
         validation = source.find("parse_classification_response(raw, require_observation=True)")
         storage = source.find("self.cache[cache_key] =")
+        if storage < 0:
+            storage = source.find("self._store_result(cache_key, result)")
         if validation >= 0 and storage >= 0:
             print("当前部署的新响应先校验再缓存：", validation < storage)
         response_parser = QwenIntermediateStateClassifier.classify.__globals__.get("response_text")
@@ -319,12 +341,8 @@ def probe(root, job_id, *, probe_model=False, env_path=None):
     else:
         cache = read(cache_path)
     old_key = QwenIntermediateStateClassifier._key({"version": LEGACY_PROMPT_VERSION, **common})
-    old = cache.get(old_key)
-    print("旧缓存键：", old_key)
-    if isinstance(old, str):
-        parse_probe("旧缓存", old, False)
-    else:
-        print("旧缓存：无可用字符串条目")
+    print("v2 旧缓存键：", old_key)
+    parse_probe("v2 旧缓存", cache.get(old_key), LEGACY_PROMPT_VERSION)
     goals = {}
     for task in read(stage / "00_collection" / "result.json").get("snapshot", {}).get("tasks", []):
         for identifier in (task.get("task_id"), task.get("collection_case_id")):
@@ -334,16 +352,11 @@ def probe(root, job_id, *, probe_model=False, env_path=None):
     if not task:
         print("来源快照缺少明确任务目标，无法精确计算当前缓存键")
         return 1
-    current_key = QwenIntermediateStateClassifier._key({
-        "version": PROMPT_VERSION, **common, "task": task, "after_image_digest": _image_digest(after),
-    })
-    item = cache.get(current_key)
-    print("当前缓存键：", current_key)
-    if item is None:
-        print("当前缓存：未命中")
-    else:
-        raw = str(item.get("raw_response", "")) if isinstance(item, dict) else str(item)
-        parse_probe("当前缓存", raw, True)
+    observation_inputs = {**common, "task": task, "after_image_digest": _image_digest(after)}
+    for label, version in (("v4 旧缓存", PREVIOUS_PROMPT_VERSION), ("v5 当前缓存", PROMPT_VERSION)):
+        key = QwenIntermediateStateClassifier._key({"version": version, **observation_inputs})
+        print(label + "键：", key)
+        parse_probe(label, cache.get(key), version)
     if probe_model:
         inputs = {
             "trajectory": trajectory, "step_index": step, "current_image_path": current,
