@@ -10,7 +10,6 @@ import os
 from pathlib import Path
 import shutil
 from typing import BinaryIO
-import uuid
 
 from ..batch_lifecycle import published_entry
 from ..data_store import RecordStore
@@ -18,6 +17,7 @@ from ..data_store.artifacts import _filename, _identifier, _json_bytes, _sha256,
 from ..data_store.locking import batch_lock
 from ..data_store.paths import contained_path
 from ..data_store.registry import utc_now
+from ..identifiers import BATCH_IDENTITIES, allocate_id, is_short_id
 
 IMPORTS = "dataset_release_imports"
 REQUESTS = "dataset_import_requests"
@@ -60,7 +60,7 @@ class ExternalReleaseImporter:
 
     def _directory(self, import_id: str) -> Path:
         _identifier(import_id, "import ID")
-        if not import_id.startswith("imp_"):
+        if not (import_id.startswith("imp_") or is_short_id(import_id, "i")):
             raise ImportFailure("导入编号无效")
         return contained_path(self.temporary_root, import_id)
 
@@ -75,7 +75,7 @@ class ExternalReleaseImporter:
 
     def _release_paths(self, record: dict) -> tuple[Path, Path]:
         release_id = _identifier(record["target_release_id"], "release ID")
-        if not release_id.startswith("rel_"):
+        if not (release_id.startswith("rel_") or is_short_id(release_id, "rel")):
             raise ImportFailure("发布恢复编号无效", status=409)
         return (contained_path(self.release_root, "." + release_id + ".importing"),
                 contained_path(self.release_root, release_id))
@@ -113,7 +113,7 @@ class ExternalReleaseImporter:
             if self.temporary_root.exists():
                 deadline = datetime.now(timezone.utc).timestamp() - TTL_HOURS * 3600
                 for path in self.temporary_root.iterdir():
-                    if (path.name.startswith("imp_") and path.name not in registered
+                    if ((path.name.startswith("imp_") or is_short_id(path.name, "i")) and path.name not in registered
                             and path.is_dir() and path.stat().st_mtime <= deadline):
                         self._remove(path, self.temporary_root)
 
@@ -155,7 +155,7 @@ class ExternalReleaseImporter:
         if suffix not in {".xlsx", ".xlsm"}:
             raise ImportFailure("仅支持 .xlsx 或 .xlsm 完整数据表")
         self.recover()
-        import_id = "imp_" + uuid.uuid4().hex
+        import_id = allocate_id("i", self.root)
         directory = self._directory(import_id)
         directory.mkdir(parents=True, exist_ok=False)
         source = directory / ("source" + suffix)
@@ -286,8 +286,8 @@ class ExternalReleaseImporter:
                                     release_id=duplicate["release_id"])
             if duplicate:
                 return self._reuse(record, duplicate, request_id, fingerprint)
-            release_id = record.get("target_release_id") or "rel_" + uuid.uuid4().hex[:16]
-            batch_id = record.get("target_batch_id") or "external_" + uuid.uuid4().hex
+            release_id = record.get("target_release_id") or allocate_id("rel", self.root, key=["external-release", import_id])
+            batch_id = record.get("target_batch_id") or allocate_id("b", self.root, key=["external-batch", import_id])
             record = self.records.update(IMPORTS, import_id, lambda item: item.update(
                 status="publishing", target_release_id=release_id, target_batch_id=batch_id, publish_name=name))
             staging, final = self._release_paths(record)
@@ -295,6 +295,10 @@ class ExternalReleaseImporter:
                 try:
                     release = self._prepare(record, source, canonical, staging, final)
                     payload = dict(record, status="published", release_id=release_id)
+                    batch_identity = self.records.get(BATCH_IDENTITIES, batch_id)
+                    identity_entries = [{"namespace": BATCH_IDENTITIES, "key": batch_id,
+                        "payload": {**batch_identity, "source_kind": "external_manual"},
+                        "expected_revision": batch_identity["storage_revision"]}] if batch_identity else []
                     self.records.put_many([
                         {"namespace": "dataset_releases", "key": release_id, "payload": release, "expected_revision": 0},
                         published_entry(batch_id, release_id, release["created_at"], self.root),
@@ -302,6 +306,7 @@ class ExternalReleaseImporter:
                          "expected_revision": record["storage_revision"]},
                         self._request_entry(request_id, fingerprint, release_id),
                         *self._index_entries(record, release_id),
+                        *identity_entries,
                     ])
                 except Exception:
                     # An uncertain commit must never delete registered release files.

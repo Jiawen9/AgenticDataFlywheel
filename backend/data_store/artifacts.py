@@ -207,8 +207,8 @@ class ArtifactStore:
             self._recover(batch_id)
             from ..batch_lifecycle import ensure_batch_active
             ensure_batch_active(batch_id, self.root)
-            op_id = uuid.uuid4().hex
-            transaction = contained_path(self.root, "tmp", "artifact_transactions", batch_id, op_id)
+            from ..identifiers import allocate_id
+            op_id, transaction = None, None
             manifests, changes, writes = [], [], []
             try:
                 for entry in entries:
@@ -253,6 +253,9 @@ class ArtifactStore:
                         continue
                     revision = int((current or {}).get("revision", 0)) + 1
                     final = contained_path(self.root, "batches", batch_id, stage)
+                    if transaction is None:
+                        op_id = allocate_id("o", self.root)
+                        transaction = contained_path(self.root, "tmp", "artifact_transactions", batch_id, op_id)
                     prepared = transaction / "prepared" / stage
                     io_path(prepared).mkdir(parents=True, exist_ok=False)
                     _write_bytes(prepared / "result.json", payload_bytes)
@@ -302,6 +305,8 @@ class ArtifactStore:
                 self._remove(transaction)
                 return manifests
             except BaseException:
+                if transaction is None:
+                    raise
                 if io_path(transaction / "commit.json").exists():
                     self._recover(batch_id)
                 else:

@@ -1,0 +1,125 @@
+手机工厂采集模块短编号融合提示词
+================================
+
+请在已经合入公共短编号工具的当前平台代码上，完成你维护的手机工厂采集模块适配。
+不要用旧版业务模块覆盖当前平台。先阅读实际实现和本文件，再按入口增量修改。
+
+一、分工边界
+你负责：平台手机工厂采集页面及任务上传、采集批次登记、生产/评估运行下发、结果回传的后端。
+重点检查 backend/manual_collection.py、collection_runs.py、collection_transfer.py、
+phone_factory.py、phone_factory_runtime.py、phonefactory_client.py、
+task_generation/collection_batches.py，以及当前采集/评估前端入口。
+路径只是定位提示，先沿路由确认，不另建一套入口。
+
+已由我们实现：公共编号/路径工具、任务生成与扩增、Rollout手动导入、预处理至发布/汇总、诊断日志及相关前端。
+不要重写这些模块；不要改独立9011服务、采集执行模板、历史业务数据或发布文件。
+现有采集模块仍能使用新生成的短批次/任务编号，旧回传目录继续可读。你合入后再联合验收手机工厂完整短路径链路。
+
+二、必须保留的功能
+手机/App行定制运行、局部VLA/采样/temperature/top_p/经验库参数、全局配置隔离；
+同物理手机跨App及生产/评估互斥、空闲另一台手机可下发同批次；
+监控截图/日志及轮询取消保护、评估报告/下载及generate/modeliter隔离；
+重复点击、响应丢失恢复、远端状态与回传状态分离；
+发布关闭、Pipeline可信上下文、迟到回写阻断、部分成功轨迹+错误清单。
+不按PID消失/手机空闲宣告成功，不自动重新执行手机任务。
+
+三、公共发号工具（唯一来源）
+from backend.identifiers import allocate_id, batch_uses_short_ids, ID_SCHEME
+
+allocate_id(prefix, root, *, key=None, request_fingerprint=None, now=None) -> str
+root必须是当前平台同一个ADF_DATA_ROOT。不要另建SQLite或计数器，不从目录数量/当前时间自行拼号。
+key是可JSON序列化的稳定业务身份；同key跨日、重启、并发始终返回同号。
+request_fingerprint用于同幂等请求参数冲突检测；冲突转换为现有409响应。
+发号使用SQLite事务，失败可以耗号，禁止删除占用后回收。不要在已有SQLite写事务/put_many回调内再次发号。
+
+类型：b批次，t任务，r运行(生产/评估/导入共用序列)，tr平台轨迹，p Pipeline，
+j阶段/上传作业，s修正会话，e导出，rel发布，i导入，c缓存目录，o内部事务，x执行，q/h模型诊断请求，w日志写入身份。
+格式如b261015-003，日期为北京时间创建日期，序号至少3位，超过999自然扩展。
+ID是不透明字符串；不能要求UUID/固定长度/旧前缀，不能截取日期前缀作为唯一文件名。
+SHA256、输入指纹、客户端request_id、服务端请求编号、授权凭证、外部用例号/设备号/原轨迹号保持原义。
+首次allocate_id('b')会登记batch_identities/id_scheme=dated-v1。它只是身份方案，不是业务批次或运行完成记录。
+历史批次缺此标记就走旧身份规则，即使名称碰巧长得像短号。不要给历史记录补标记或重编号。
+
+四、各入口接入方式
+1. 平台生成/扩增：已保证job_id==batch_id，任务task_uuid/result引用由生成侧提供。采集侧原样使用，不重新发b/t号。
+2. 手动上传：先以原有request_id及文件/参数指纹查已有记录，包括旧manual_+payload_digest(request_id)路径。
+   命中旧请求就原样返回并保留原参数冲突规则。没有旧记录才分配：
+   batch_id = allocate_id('b', root, key=['manual-collection', request_id], request_fingerprint=request_hash)
+   task_id = allocate_id('t', root, key=['collection-case', batch_id, collection_case_id])
+   无request_id时沿原接口语义创建新请求，不把所有空值请求映射到同批次。
+   冻结上传原件、完整SHA256、外部用例号到task_id映射；重复表头/重复用例/非法路径继续拒绝。
+   保留17列原值，场景缺失保留未分类，任务身份不依赖Excel行序。
+3. 生产运行：先查旧cr_+payload_digest([batch_id, dispatch_key])及现有运行记录；
+   新请求分配allocate_id('r', root, key=['collection-run', batch_id, dispatch_key], request_fingerprint=完整请求摘要)。
+   参数摘要仍包括VLA、采样、设备/App、run_mode、工作簿摘要等实际参数。
+4. 评估运行：先查旧eval_+payload_digest(request_id)，新请求用['modeliter-run', request_id]分配r。
+   保留独立model_iter_runs与报告路径。相同request_id不同mode不能混淆，不创建训练发布批次。
+5. 任务上传/登记入口只接受/展示平台实际编号；前端幂等request_id仍原样生成和透传。
+   不根据manual_/external_/cr_前缀判断来源，使用已有kind/source_kind/run_mode字段。
+
+五、回传：原协议与本地短目录分别验证
+from backend.short_paths import map_collection_manifest, validate_local_manifest, short_temporary_file, STORAGE_LAYOUT
+
+mapped = map_collection_manifest(root, run, source_manifest)
+返回：
+  mapped['manifest']       本地规范化清单(批次、运行、轨迹、错误)
+  mapped['storage_layout'] 'short-v1'或'legacy'
+  mapped['mapping']['files']  {远端源相对路径: 本地相对路径}
+  short-v1下另有mapping.key/source_sha256/source_manifest及持久记录collection_path_mappings。
+  mapping.original_manifest/original_sha256单独保留未经规范化的原始JSON清单和其完整摘要。
+
+先验证现有远端协议：批次/运行/mode、完整文件清单、用例归属、路径边界、链接、大小写冲突、文件大小和完整SHA256。
+公共工具会再次执行原清单结构/身份校验，但不会下载文件，也不代替HTTP归档的字节验证。
+在复制/解包前保存映射和现有回传恢复日志；后续直接按映射解包到短暂存目录，不能先解包成长目录再改名。
+同运行重试使用同一源清单摘要及冻结映射；若已完成结果不同，拒绝覆盖。
+本地目标：raw/collection_batches/<batch_id>/runs/<run_id>/<task_id>/<trajectory_id>/<原步骤文件名>。
+文件内容和步骤文件名不变，原用例号、原轨迹号、phone_id、源相对路径、原清单、完整校验值继续保留。
+轨迹映射键包含批次、运行、任务、手机和源相对目录，多手机同名轨迹不会覆盖。
+
+暂存副本验证：validate_local_manifest(root, run, mapped, root_override=staging)
+移动到最终run_root后再次validate_local_manifest(root, run, mapped)，通过后才沿原锁/事务登记完成。
+保存run.storage_layout、run.path_mapping=mapped['mapping']、run.source_manifest，及原远端manifest快照。
+批次id_scheme与run.storage_layout必须独立；新短批次允许legacy运行，不凭编号外形猜路径。
+
+特别注意现有CollectionRunStore.complete会调用旧_normalize：它要求目录首层是外部collection_case_id。
+不能把本地task_id/tr目录重新当远端清单交给旧_normalize，也不能删除其校验以求通过。
+在你负责的完成入口明确分支：远端清单保持旧_normalize；冻结映射后的本地清单走validate_local_manifest。
+保留现有批次活动检查、Pipeline写入授权、完成幂等、批次锁和事务。
+manifest_sha256仍只对本地四个字段计算payload_digest：batch_id、collection_run_id、trajectories、errors。
+布局/映射元数据放运行外层，不擅自改变ready_input的清单摘要协议。
+原始远端文件整体归档可保留为冻结归档，不能删除其中未登记文件来绕过完整性检查。
+
+普通原子文件写入可使用with short_temporary_file(target) as tmp，随后写tmp再replace(target)。
+tmp已通过O_EXCL创建，写入用wb/write_text，不能再用xb；不要追加目标全名+UUID。
+保留file_io.io_path长路径与UNC支持、contained_path/链接检查。
+不要修改预处理配置哈希涉及的旧转换/标框处理文件。后续身份适配层已由我们实现。
+
+六、可执行模拟样例（不需要任何手机/模型/API KEY）
+在仓库根目录Git Bash：
+  .venv/Scripts/python.exe -B scripts/verify_short_id_contract.py
+或指定一个尚不存在的目录：
+  .venv/Scripts/python.exe -B scripts/verify_short_id_contract.py --output D:/temp/short-id-demo
+
+工具只在新隔离目录生成模拟数据库、两台手机同名轨迹、真实文件SHA256以及：
+  dispatch.json：具名下发参数示例；是平台适配层逻辑结构，不意味着新增公共HTTP接口。
+  run.json：冻结任务映射。
+  remote-manifest.json：当前旧格式源完成清单。
+  local-layout.json：公共工具返回的本地清单/路径映射。
+  result.json：校验结果。
+此脚本不注册真实完成运行，不调用服务，不读写实际ADF_DATA_ROOT。
+请用实际现有HTTP/CLI封装发送这些字段，不发明不兼容的路由。
+
+七、验收及交付
+在隔离临时ADF_DATA_ROOT，用模拟服务执行：
+  并发/跨日/重启同请求不换号；超过999；旧manual/cr/eval请求重放；参数变化409。
+  生成/扩增/手动上传 -> 注册 -> 多手机 -> 回传 -> 完成 -> 预处理。
+  两手机同名轨迹、中文和超长用例名、260/261字符源路径、完整SHA256不变。
+  解包损坏、目录越界/链接/大小写冲突、源清单变更、提交中断、重复同步不得误登记或覆盖。
+  新短批次接旧布局、历史旧批次继续原身份；已完成转换/人工编辑/COT/发布文件不改。
+  手机定制运行参数、同手机互斥、响应丢失按原run_id查询；发布后下发/迟到回写被拒绝。
+  评估仍只入评估链，监控/报告不回退；同事合入后执行联合模拟浏览器验收。
+
+我们已有基础测试：backend.tests.test_short_ids、test_short_processing_ids、test_rollout_imports、
+test_rollout_pipeline_integration、test_short_release_ids。采集侧补充现有collection_runs/transfer/phone_factory测试。
+部署前等待作业结束并备份数据库，更新前后端，不迁移历史目录。不同平台数据库编号空间独立。
+完成后报告改动文件、模拟测试结果、前后端构建、旧数据SHA256核对；不要调用真实设备/模型/S3。

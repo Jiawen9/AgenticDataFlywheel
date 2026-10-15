@@ -8,12 +8,12 @@ import os
 from pathlib import Path
 import threading
 import time
-import uuid
 from typing import Any, Callable, Optional
 
 from ..trajectory_correction.draft_store import utc_now
 from .constants import BACKEND_DIR, UPLOAD_JOBS_DIR
 from ..data_store import RecordStore
+from ..identifiers import allocate_id, is_short_id
 from .service import DatasetReleaseRegistry
 from . import internal_uploader
 from .internal_jobs import InternalUploadJobsMixin
@@ -64,7 +64,8 @@ class DatasetUploadJobManager(InternalUploadJobsMixin):
         self.mark_interrupted_jobs()
 
     def _path(self, job_id: str) -> Path:
-        if not job_id or any(char not in "0123456789abcdef" for char in job_id) or len(job_id) != 32:
+        legacy = bool(job_id) and len(job_id) == 32 and all(char in "0123456789abcdef" for char in job_id)
+        if not (legacy or is_short_id(job_id, "j")):
             return self.jobs_dir / ".invalid-job-id"
         return self.jobs_dir / f"{job_id}.json"
 
@@ -168,7 +169,7 @@ class DatasetUploadJobManager(InternalUploadJobsMixin):
             raise FileNotFoundError("数据集发布记录不存在")
         if release.get("upload_status") in {"queued", "uploading"}:
             raise ValueError("该数据集正在上传")
-        job_id = uuid.uuid4().hex
+        job_id = allocate_id("j", self.registry.data_root)
         payload: dict[str, Any] = {
             "job_id": job_id,
             "release_id": release_id,

@@ -82,7 +82,7 @@ class ExternalDatasetImportTests(unittest.TestCase):
         self.assertEqual((release["trajectory_count"], release["step_count"]), (1, 2))
         self.assertEqual(release["trajectory_paths"], [])
         batch_id, = release["batch_ids"]
-        self.assertTrue(batch_id.startswith("external_"))
+        self.assertRegex(batch_id, r"^b[0-9]{6}-[0-9]{3,}$")
         self.assertEqual(lifecycle(batch_id, self.data)["release_id"], release["release_id"])
         with self.assertRaises(BatchPublishedError):
             ensure_batch_active(batch_id, self.data)

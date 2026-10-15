@@ -9,7 +9,6 @@ import re
 import sys
 import threading
 import time
-import uuid
 import zlib
 from contextvars import ContextVar
 from pathlib import Path
@@ -64,7 +63,7 @@ def _quality_context():
 
 class _Call:
     def __init__(self, operation, metadata):
-        self.id, self.start = "req_" + uuid.uuid4().hex, time.monotonic()
+        self.id, self.start = trace.diagnostic_id("q"), time.monotonic()
         context = {k: v for k, v in (trace.current_context() or {}).items() if k != "root"}
         self.data = {**context, "request_id": self.id, "operation": operation,
                      "started_at": trace.utc_now(), "status": "running", **metadata}
@@ -102,7 +101,7 @@ class _Call:
 
 class _Attempt:
     def __init__(self, call, request, settings):
-        self.call, self.id = call, "http_" + uuid.uuid4().hex
+        self.call, self.id = call, trace.diagnostic_id("h")
         self.path = f"requests/{call.id}/attempts/{self.id}"
         self.start, self.buffer, self.last_save = time.monotonic(), bytearray(), 0.0
         context = {k: v for k, v in (trace.current_context() or {}).items() if k != "root"}

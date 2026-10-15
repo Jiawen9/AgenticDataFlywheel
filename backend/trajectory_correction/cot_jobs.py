@@ -10,7 +10,6 @@ import hashlib
 import json
 import re
 import threading
-import uuid
 from concurrent.futures import Executor, ThreadPoolExecutor
 from contextlib import suppress
 from datetime import datetime
@@ -22,6 +21,7 @@ from zoneinfo import ZoneInfo
 
 from .constants import CORRECTION_BBOX_CACHE_DIR, CORRECTION_COT_JOBS_DIR, PROJECT_ROOT
 from ..data_store import RecordStore, DATA_ROOT, rebase_data_path
+from ..identifiers import allocate_id
 from .cot_generator import QwenCotGenerator, read_env, SYSTEM_PROMPT
 from ..bounding_box.build_annotations import resolve_action_box
 from ..bounding_box.qwen_reviewer import QwenBoxReviewer
@@ -86,7 +86,8 @@ def _xml_text(image: Path, row: dict[str, Any]) -> str:
 class CotJobManager:
     def __init__(self, jobs_dir: Path = CORRECTION_COT_JOBS_DIR, generator_factory: Callable[[], QwenCotGenerator] = QwenCotGenerator, executor: Executor | None = None) -> None:
         self.jobs_dir = jobs_dir
-        self._records = RecordStore(DATA_ROOT if jobs_dir == CORRECTION_COT_JOBS_DIR else jobs_dir.parent)
+        self.data_root = DATA_ROOT if jobs_dir == CORRECTION_COT_JOBS_DIR else jobs_dir.parent
+        self._records = RecordStore(self.data_root)
         self.generator_factory = generator_factory
         self._lock = threading.RLock()
         self._owns_executor = executor is None
@@ -95,7 +96,7 @@ class CotJobManager:
         self.mark_interrupted_jobs()
 
     def _path(self, job_id: str) -> Path:
-        if not re.fullmatch(r"[a-f0-9]{32}", job_id):
+        if not re.fullmatch(r"(?:[a-f0-9]{32}|j[0-9]{6}-[0-9]{3,})", job_id):
             return self.jobs_dir / ".invalid-job-id"
         return self.jobs_dir / f"{job_id}.json"
 
@@ -231,7 +232,7 @@ class CotJobManager:
                 return previous
         publish_stage_snapshot(session, _snapshot(session), "06_correction")
         payload = {
-            "job_id": uuid.uuid4().hex,
+            "job_id": allocate_id("j", self.data_root),
             "request_fingerprint": request_fingerprint,
             "configuration_fingerprint": configuration_fingerprint,
             "session_id": session_id,

@@ -31,6 +31,7 @@ _IDENTIFIER = re.compile(r"^[A-Za-z0-9_.:/-]{1,160}$")
 _SAFE_PATH_PART = re.compile(r"^(?:v[0-9]+(?:\.[0-9]+)?|api|openai|chat|completions|inference)$")
 _context: ContextVar[dict[str, str | None]] = ContextVar("quality_request_context", default={})
 _observer: ContextVar[Callable[[dict[str, Any]], None] | None] = ContextVar("quality_request_observer", default=None)
+_id_factory: ContextVar[Callable[[], str] | None] = ContextVar("quality_request_id_factory", default=None)
 _completed_timeouts: ContextVar[dict[tuple, tuple[dict[str, Any], float]]] = ContextVar(
     "quality_completed_timeouts", default={})
 T = TypeVar("T")
@@ -116,12 +117,27 @@ def request_context(operation: str, task_id: str | None = None,
 
 
 @contextmanager
-def observe_requests(callback: Callable[[dict[str, Any]], None]) -> Iterator[None]:
+def observe_requests(callback: Callable[[dict[str, Any]], None], *,
+                     id_factory: Callable[[], str] | None = None) -> Iterator[None]:
     token = _observer.set(callback)
+    id_token = _id_factory.set(id_factory)
     try:
         yield
     finally:
+        _id_factory.reset(id_token)
         _observer.reset(token)
+
+
+def _request_id() -> str:
+    factory = _id_factory.get()
+    if factory is not None:
+        try:
+            identifier = factory()
+            if isinstance(identifier, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,96}", identifier):
+                return identifier
+        except Exception:
+            logger.warning("Quality diagnostic ID allocation failed; using a local fallback")
+    return uuid.uuid4().hex
 
 
 def _emit(metadata: dict[str, Any], event: str, started: float) -> None:
@@ -154,7 +170,7 @@ async def controlled_request(factory: Callable[[], Awaitable[T]], *, timeout_sec
         remaining.pop(owner_key, None)
         _completed_timeouts.set(remaining)
     metadata = {
-        "local_request_id": uuid.uuid4().hex,
+        "local_request_id": _request_id(),
         "operation": context.get("operation", "model_request"),
         "task_id": context.get("task_id"),
         "trajectory_id": context.get("trajectory_id"),

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import re
 import threading
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from backend.file_io import io_path
@@ -13,9 +12,10 @@ from typing import Any, Callable
 from ..data_store import ArtifactStore, RecordStore
 from ..batch_lifecycle import ensure_batch_active, session_batch_id as lifecycle_session_batch_id
 from ..data_store.paths import DATA_ROOT
+from ..identifiers import allocate_id
 from .constants import CORRECTION_SESSIONS_DIR
 
-SESSION_ID_RE = re.compile(r"^[a-f0-9]{12,32}$")
+SESSION_ID_RE = re.compile(r"^(?:[a-f0-9]{12,32}|s[0-9]{6}-[0-9]{3,})$")
 _STORE_LOCK = threading.RLock()
 _DEFAULT_SESSIONS_DIR = CORRECTION_SESSIONS_DIR
 NAMESPACE = "correction_sessions"
@@ -26,7 +26,7 @@ def utc_now() -> str:
 
 
 def new_session_id() -> str:
-    return uuid.uuid4().hex[:16]
+    return allocate_id("s", storage_root())
 
 
 def ensure_correction_dirs() -> None:

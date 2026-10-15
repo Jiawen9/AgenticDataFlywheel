@@ -8,7 +8,6 @@ from .pipeline_diagnostic_http import install_box_reviewer_logging
 import copy
 import json
 import threading
-import uuid
 from concurrent.futures import Executor, ThreadPoolExecutor
 from pathlib import Path
 
@@ -19,6 +18,8 @@ from .collection_runs import CollectionRunStore
 from .data_store import ArtifactStore, DATA_ROOT, RecordStore
 from .data_store.paths import contained_path
 from .data_store.registry import utc_now
+from .identifiers import allocate_id
+from .short_paths import adapt_conversion_identity, short_cache_directory
 from .file_io import io_path, resolve_path
 from .preprocessing_service import (COLUMNS, SHEET, PreprocessingError, annotate_input,
                                     convert_input, digest, processing_config, verify_input)
@@ -102,7 +103,7 @@ class PreprocessingJobManager:
 
     def _new_job(self, batch_id, snapshot, config, *, resumed_from=None, artifacts=None,
                  base_annotation_version=None):
-        job_id = uuid.uuid4().hex
+        job_id = allocate_id("j", root=self.root)
         directory = contained_path(self.root, "system", "preprocessing", batch_id, job_id)
         io_path(directory).mkdir(parents=True, exist_ok=False)
         path = directory / "input.json"
@@ -226,6 +227,7 @@ class PreprocessingJobManager:
                 pending_conversion = None
                 if conversion is None:
                     payload, counts = convert_input(snapshot, lambda event: self._update(job_id, **event), data_root=self.root)
+                    payload = adapt_conversion_identity(payload, snapshot, self.root)
                     verify_input(snapshot, self.root)
                     self._update(job_id, stage="publishing", warnings=counts["warnings"])
                     output = work / "trajectories_to_excel.xlsx"
@@ -257,8 +259,11 @@ class PreprocessingJobManager:
                 if annotation is None:
                     self._update(job_id, stage="annotating", completed_steps=0, total_steps=len(payload["sheets"][SHEET]))
                     output = work / "annotated_trajectories.xlsx"
-                    cache = contained_path(self.root, "cache", "bounding_box", job["batch_id"],
-                                           digest(job["config"]), "qwen_review_cache.json")
+                    # The helper checks original components for links before
+                    # resolving them, so do not pre-resolve this parent.
+                    cache_parent = self.root / "cache" / "bounding_box" / job["batch_id"]
+                    cache = short_cache_directory(self.root, job["batch_id"], "bounding_box",
+                                                  digest(job["config"]), cache_parent) / "qwen_review_cache.json"
                     reviewer_factory = self.reviewer_factory
                     one_shot_reviewers = []
                     if reviewer_factory is None and retry_enabled_for_pipeline(job.get("pipeline_id"), self.root):

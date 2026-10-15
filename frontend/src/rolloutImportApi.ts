@@ -9,7 +9,7 @@ export interface RolloutTaskOverride {
 }
 export interface RolloutImportInput {
   source_path: string
-  batch_id: string
+  batch_id?: string
   name?: string
   app?: string
   scene?: string
@@ -26,6 +26,7 @@ export interface RolloutImportTask extends Omit<RolloutTaskOverride, 'app' | 'sc
 }
 export interface RolloutImportPreview {
   import_id: string
+  collection_run_id?: string
   batch_id: string
   source_path: string
   valid: boolean

@@ -29,9 +29,12 @@ describe('rollout import draft and request lifecycle', () => {
     const { flow, client } = setup()
     await flow.open()
     expect(flow.draft.source_path).toBe('D:\\raw\\rollout')
-    expect(flow.draft.batch_id).toMatch(/^rollout-\d{8}-[a-f0-9]{8}$/)
+    expect(flow.draft.batch_id).toBe('')
     expect(flow.canCommit.value).toBe(false)
     await flow.validate()
+    expect(client.preview.mock.calls[0]![0]).not.toHaveProperty('batch_id')
+    expect(flow.draft.batch_id).toBe('new-batch')
+    expect(flow.previewing.value).toBe(false)
     expect(flow.canCommit.value).toBe(true)
     flow.draft.app = '地图'
     expect(flow.canCommit.value).toBe(false)
@@ -39,6 +42,7 @@ describe('rollout import draft and request lifecycle', () => {
     await flow.commit()
     expect(client.commit).not.toHaveBeenCalled()
     await flow.validate()
+    expect(client.preview.mock.lastCall![0].batch_id).toBe('new-batch')
     flow.taskEdits['001'] = '搜索附近餐厅'
     expect(flow.canCommit.value).toBe(false)
     await flow.validate()

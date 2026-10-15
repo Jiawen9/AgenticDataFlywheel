@@ -37,6 +37,7 @@ def checksums(directory):
 
 
 class RolloutPipelineIntegrationTests(unittest.TestCase):
+    requested_batch_id = "rollout-offline"
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -111,7 +112,7 @@ class RolloutPipelineIntegrationTests(unittest.TestCase):
         self.manager = PipelineManager(self.runtime, self.root)
 
     def import_batch(self):
-        preview = self.imports.preview({"source_path": str(self.source), "batch_id": "rollout-offline",
+        preview = self.imports.preview({"source_path": str(self.source), "batch_id": self.requested_batch_id,
             "name": "导入验证", "app": "离线 App", "scene": "购物", "capability": "搜索"})
         self.assertFalse(preview["errors"], preview)
         result = self.imports.commit(preview["import_id"], "import-once")
@@ -224,6 +225,19 @@ class RolloutPipelineIntegrationTests(unittest.TestCase):
         self.assertEqual(checksums(self.source), self.original)
         self.reviewer.assert_not_called()
         self.dispatch.assert_not_called()
+
+
+class ShortRolloutPipelineIntegrationTests(RolloutPipelineIntegrationTests):
+    requested_batch_id = None
+
+    def assert_completed(self, batch, current):
+        super().assert_completed(batch, current)
+        self.assertRegex(batch, r"^b\d{6}-\d{3,}$")
+        rows = self.store.read_payload(self.store.get(batch, "02_annotation"))["sheets"]["VLA trajectories"]
+        for row in rows:
+            self.assertRegex(row["task_id"], r"^t\d{6}-\d{3,}$")
+            self.assertRegex(row["trajectory_id"], r"^tr\d{6}-\d{3,}$")
+            self.assertRegex(row["image"].replace("\\", "/"), r"^runs/r\d{6}-\d{3,}/t\d{6}-\d{3,}/tr\d{6}-\d{3,}/")
 
 
 if __name__ == "__main__":

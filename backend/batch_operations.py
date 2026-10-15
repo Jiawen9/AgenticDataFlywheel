@@ -83,7 +83,8 @@ def batch_operation(batch_id: str | None, kind: str, root: Path | None = None):
         yield None
         return
     records = RecordStore(root or DATA_ROOT)
-    operation_id = uuid.uuid4().hex
+    from .identifiers import allocate_id
+    operation_id = allocate_id("o", root or DATA_ROOT)
     with active_batch_lock(batch_id, root):
         from .pipeline_access import ensure_pipeline_write
         ensure_pipeline_write(batch_id, root)

@@ -5,7 +5,6 @@ import shutil
 import sqlite3
 import tempfile
 import threading
-import uuid
 from concurrent.futures import Executor, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +18,10 @@ from ..batch_operations import active_batch_lock, batch_operation
 from ..batch_lifecycle import is_batch_active
 from ..data_store.paths import DATA_ROOT
 from ..data_store.registry import RecordStore
+from ..identifiers import allocate_id, batch_uses_short_ids
+from .. import pipeline_diagnostics as diagnostics
+from ..short_paths import short_temporary_file
+from ..file_io import io_path
 from ..data_store.artifacts import ArtifactStore
 from .collection_input import CollectionInputError, build_collection_input
 from .constants import (
@@ -171,9 +174,9 @@ class TaskGenerationJobManager:
     @staticmethod
     def _write_mirror(path: Path, value: Any) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(path)
+        with short_temporary_file(path) as temporary:
+            io_path(temporary).write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+            io_path(temporary).replace(io_path(path))
 
     def _write_job(self, payload: dict[str, Any]) -> None:
         self._write_json(self._job_path(payload["job_id"]), payload)
@@ -182,6 +185,16 @@ class TaskGenerationJobManager:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         with (self.logs_dir / f"{job_id}.log").open("a", encoding="utf-8") as stream:
             stream.write(f"{_now()} {message}\n")
+
+    def _runner_options(self, runner, default, job_id, *, tasks=False):
+        # Inject the platform root explicitly; standalone services and custom
+        # runners keep their existing contracts and never discover DATA_ROOT.
+        if runner is not default:
+            return {}
+        options = {"diagnostic_id_factory": lambda: diagnostics.diagnostic_id("q", root=self.data_root)}
+        if tasks and batch_uses_short_ids(job_id, self.data_root):
+            options["id_factory"] = lambda: allocate_id("t", root=self.data_root)
+        return options
 
     def get(self, job_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -243,7 +256,7 @@ class TaskGenerationJobManager:
 
     def _new_job(self, kind: str, *, total_items: int, generate_n: int, input_filename: str | None = None,
                  kb_source: Path | None = None, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
-        job_id = uuid.uuid4().hex
+        job_id = allocate_id("b", root=self.data_root)
         self._run_dir(job_id).mkdir(parents=True, exist_ok=True)
         snapshot = snapshot_knowledge_base(self._run_dir(job_id) / "KnowledgeBase", root=kb_source or self.knowledge_base_dir)
         payload = {
@@ -316,7 +329,7 @@ class TaskGenerationJobManager:
             shutil.copy2(input_path, target)
             self._executor.submit(self._run_augmentation, payload["job_id"], target, generate_n)
             return payload
-        seeds = prepare_augmentation_seeds(input_path)
+        seeds = prepare_augmentation_seeds(input_path, id_factory=lambda: allocate_id("t", root=self.data_root))
         payload = self._new_job("augmentation", total_items=len(seeds) * 2, generate_n=generate_n, input_filename=original_filename,
                                 parameters={"auto_start": auto_start, "augmentation_preview_version": 1,
                                             "classification_completed": False, "augmentation_generation_started": False,
@@ -418,6 +431,7 @@ class TaskGenerationJobManager:
                     self._read_seeds(job_id), kb_root=self._source_file(job_id, "KnowledgeBase"),
                     progress=lambda value: self._progress(job_id, value),
                     on_seed=lambda seed, rows: self._checkpoint_seed(job_id, seed, rows),
+                    **self._runner_options(self.classification_runner, run_augmentation_classification, job_id),
                 )
                 seeds = outcome["seeds"]
                 if not seeds or any(seed.get("classification_status") not in {"classified", "failed"} for seed in seeds):
@@ -456,6 +470,7 @@ class TaskGenerationJobManager:
                     self._read_seeds(job_id), job["generate_n"], kb_root=self._execution_library(job_id),
                     progress=lambda value: self._progress(job_id, value),
                     on_seed=lambda seed, rows: self._checkpoint_seed(job_id, seed, rows),
+                    **self._runner_options(self.generation_runner, run_augmentation_generation, job_id, tasks=True),
                 )
                 outcome["errors"] = list(job.get("errors", [])) + outcome.get("errors", [])
                 outcome["warnings"] = list(job.get("warnings", [])) + outcome.get("warnings", [])
@@ -503,7 +518,9 @@ class TaskGenerationJobManager:
         self._log(job_id, f"开始任务生成，节点数={len(node_ids)}，每节点={generate_n}")
         try:
             with batch_operation(job_id, "initial", self.data_root):
-                outcome = self.initial_runner(node_ids, generate_n, kb_root=self._run_dir(job_id) / "KnowledgeBase", progress=lambda value: self._progress(job_id, value))
+                outcome = self.initial_runner(node_ids, generate_n, kb_root=self._run_dir(job_id) / "KnowledgeBase",
+                    progress=lambda value: self._progress(job_id, value),
+                    **self._runner_options(self.initial_runner, run_initial_generation, job_id, tasks=True))
                 self._log(job_id, f"任务生成结束，结果数={len(outcome.get('results', []))}，错误数={len(outcome.get('errors', []))}")
                 self._finish(job_id, outcome)
         except Exception as exc:
@@ -515,7 +532,9 @@ class TaskGenerationJobManager:
         self._log(job_id, f"开始任务扩增，输入={input_path.name}，每种子={generate_n}")
         try:
             with batch_operation(job_id, "augmentation", self.data_root):
-                outcome = self.augmentation_runner(input_path, generate_n, kb_root=self._run_dir(job_id) / "KnowledgeBase", progress=lambda value: self._progress(job_id, value))
+                outcome = self.augmentation_runner(input_path, generate_n, kb_root=self._run_dir(job_id) / "KnowledgeBase",
+                    progress=lambda value: self._progress(job_id, value),
+                    **self._runner_options(self.augmentation_runner, run_augmentation, job_id, tasks=True))
                 self._log(job_id, f"任务扩增结束，结果数={len(outcome.get('results', []))}，错误数={len(outcome.get('errors', []))}")
                 self._finish(job_id, outcome)
         except Exception as exc:

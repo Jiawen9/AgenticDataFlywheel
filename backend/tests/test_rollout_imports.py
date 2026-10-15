@@ -17,6 +17,7 @@ from backend.batch_lifecycle import BatchPublishedError
 from backend.collection_runs import CollectionRunError, CollectionRunStore
 from backend.data_store import ArtifactStore, RecordStore
 from backend.file_io import io_path, logical_path, rglob
+from backend.identifiers import ID_SCHEME
 from backend.rollout_imports import RolloutImportError, RolloutImportStore
 from backend.rollout_import_router import router, configure_rollout_import_store
 from backend.task_generation.collection_batches import workbook_digest
@@ -75,6 +76,61 @@ class RolloutImportTests(unittest.TestCase):
                                   for p in Path(run["output_dir"]).rglob("*") if p.is_file()})
         with self.assertRaisesRegex(RolloutImportError, "不能下发"):
             self.store.get_batch(result["batch_id"], require_workbook=True)
+
+    def test_server_allocates_short_ids_and_maps_files_without_changing_bytes(self):
+        fixture(self.source, case="TASK-B", trajectory="same-name", goal="Second goal")
+        before = self.hashes()
+        value = self.preview(batch_id=None)
+        self.assertRegex(value["batch_id"], r"^b\d{6}-\d{3,}$")
+        self.assertRegex(value["import_id"], r"^i\d{6}-\d{3,}$")
+        self.assertRegex(value["collection_run_id"], r"^r\d{6}-\d{3,}$")
+        tasks = [task["task_id"] for task in value["tasks"]]
+        for task in tasks:
+            self.assertRegex(task, r"^t\d{6}-\d{3,}$")
+        checked_again = self.preview(batch_id=value["batch_id"], name="Updated preview")
+        self.assertEqual(tasks, [task["task_id"] for task in checked_again["tasks"]])
+        result = self.store.commit(checked_again["import_id"], "short-import")
+        run = self.store.runs.get(result["collection_run_id"])
+        self.assertEqual(run["identity_scheme"], ID_SCHEME)
+        self.assertEqual(run["storage_layout"], "short-v1")
+        self.assertEqual(self.store.get_batch(result["batch_id"])["identity_scheme"], ID_SCHEME)
+        self.assertEqual(len({item["trajectory_id"] for item in run["trajectories"]}), 2)
+        for item in run["trajectories"]:
+            self.assertRegex(item["relative_dir"], r"^t\d{6}-\d{3,}/tr\d{6}-\d{3,}$")
+            self.assertEqual(item["source_relative_dir"], item["collection_case_id"] + "/same-name")
+        for original, local in run["path_mapping"]["files"].items():
+            self.assertEqual(workbook_digest(Path(run["output_dir"]) / local), before[str(Path(original))])
+        self.assertEqual(before, self.hashes())
+        self.assertEqual(len(self.store.runs.ready_input(result["batch_id"])["trajectories"]), 2)
+        self.assertTrue(RolloutImportStore(self.root).commit(checked_again["import_id"], "short-import")["reused"])
+
+    def test_short_mapping_is_persisted_before_copy_and_reused_after_interrupt(self):
+        value = self.preview(batch_id=None)
+        with patch("backend.rollout_imports.shutil.copyfileobj", side_effect=OSError("copy interrupted")):
+            with self.assertRaisesRegex(OSError, "copy interrupted"):
+                self.store.commit(value["import_id"], "short-restart")
+        mappings = self.store.records.list("collection_path_mappings")
+        self.assertEqual(len(mappings), 1)
+        frozen = mappings[0]["value"]
+        self.assertFalse(self.store.records.list("collection_runs"))
+        result = RolloutImportStore(self.root).commit(value["import_id"], "short-restart")
+        run = self.store.runs.get(result["collection_run_id"])
+        self.assertEqual(run["trajectories"], frozen["manifest"]["trajectories"])
+        self.assertEqual(len(self.store.records.list("collection_path_mappings")), 1)
+
+    def test_legacy_pending_preview_replays_original_run_id(self):
+        value = self.preview()
+        saved = self.store.records.get("rollout_import_previews", value["import_id"])
+        legacy_id = "a" * 32
+        saved.update(import_id=legacy_id)
+        saved.pop("collection_run_id")
+        saved["data"].pop("_collection_run_id")
+        saved["result"].update(import_id=legacy_id)
+        saved["result"].pop("collection_run_id")
+        self.store.records.put("rollout_import_previews", legacy_id, saved)
+        result = self.store.commit(legacy_id, "legacy-preview")
+        self.assertEqual(result["collection_run_id"], "ri_" + legacy_id)
+        self.assertEqual(self.store.runs.get(result["collection_run_id"])["storage_layout"], "legacy")
 
     def test_missing_goal_remains_editable_and_override_is_frozen(self):
         (self.directory / "turn001_orch_model_request.json").unlink()
@@ -302,7 +358,7 @@ class RolloutImportTests(unittest.TestCase):
         self.store.records.put("rollout_import_previews", value["import_id"], preview)
         self.assertEqual(self.store.recover()["removed"], 1)
         self.assertEqual(before, self.hashes())
-        self.assertFalse(self.store.runs.run_root("rollout-test", "ri_" + value["import_id"]).exists())
+        self.assertFalse(self.store.runs.run_root("rollout-test", value["collection_run_id"]).exists())
         self.assertTrue(self.preview()["valid"])
         with self.assertRaises(RolloutImportError):
             self.store.commit(value["import_id"], "expire")
@@ -373,6 +429,22 @@ class RolloutImportTests(unittest.TestCase):
             self.assertEqual(client.get("/api/rollout-imports/batches/rollout-test").status_code, 409)
             self.assertEqual(client.post("/api/rollout-imports", json={"import_id": preview.json()["import_id"], "request_id": "http"}).status_code, 409)
 
+    def test_router_preview_without_batch_id_assigns_short_id(self):
+        app = FastAPI()
+        app.include_router(router)
+        configure_rollout_import_store(self.store)
+        self.addCleanup(lambda: configure_rollout_import_store(None))
+        with TestClient(app) as client:
+            data = {key: value for key, value in self.data.items() if key != "batch_id"}
+            response = client.post("/api/rollout-imports/preview", json=data)
+            self.assertEqual(response.status_code, 200, response.text)
+            preview = response.json()
+            self.assertRegex(preview["batch_id"], r"^b\d{6}-\d{3,}$")
+            again = client.post("/api/rollout-imports/preview", json={**data, "batch_id": preview["batch_id"], "name": "Rechecked"})
+            self.assertEqual(again.status_code, 200, again.text)
+            self.assertEqual(again.json()["batch_id"], preview["batch_id"])
+            self.assertEqual(again.json()["tasks"][0]["task_id"], preview["tasks"][0]["task_id"])
+
     def test_final_long_paths_include_nested_prefetch_files_without_prefixes_in_records(self):
         final_root = self.store.runs.run_root(self.data["batch_id"], "ri_" + "a" * 32)
         relative_directory = self.directory.relative_to(self.source)
@@ -402,7 +474,7 @@ class RolloutImportTests(unittest.TestCase):
 
     def test_final_validation_failure_never_registers_and_retries_owned_copy(self):
         preview = self.preview()
-        final = self.store.runs.run_root(self.data["batch_id"], "ri_" + preview["import_id"])
+        final = self.store.runs.run_root(self.data["batch_id"], preview["collection_run_id"])
         validate = self.store.runs._validate_source_files
         def unavailable(run, manifest, *, root_override=None):
             if root_override == final:

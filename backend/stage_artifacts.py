@@ -86,12 +86,10 @@ def write_sidecar(path: Path, payload: dict[str, Any], *, source_ref: dict[str, 
     value = {**payload, "workbook_sha256": fingerprint(path)}
     if source_ref:
         value["source_ref"] = source_ref
-    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
-    try:
+    from .short_paths import short_temporary_file
+    with short_temporary_file(target) as temporary:
         io_path(temporary).write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
         io_path(temporary).replace(io_path(target))
-    finally:
-        io_path(temporary).unlink(missing_ok=True)
 
 
 def read_workbook_payload(path: Path, *, allow_excel_import: bool = False, data_root: Path | None = None) -> dict[str, Any]:

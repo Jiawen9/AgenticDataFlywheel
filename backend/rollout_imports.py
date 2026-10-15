@@ -10,7 +10,6 @@ import json
 import logging
 import os
 import shutil
-import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -24,6 +23,9 @@ from .export_vla_trajectories import collect_rows, STEP_RESPONSE_RE
 from .file_io import io_path, iterdir, logical_path, resolve_path, is_link_or_junction
 from .task_generation.collection_batches import payload_digest, workbook_digest
 from .trajectory_data import extract_original_goal_payload
+from .identifiers import (ID_SCHEME, allocate_id, batch_uses_short_ids,
+                          COUNTERS, RESERVATIONS, MAPPINGS, BATCH_IDENTITIES)
+from .short_paths import map_collection_manifest, validate_local_manifest
 
 LOG = logging.getLogger(__name__)
 
@@ -149,7 +151,9 @@ class RolloutImportStore:
             seen_cases.add(case.casefold())
             override, goals, source_fields = overrides.get(case, {}), set(), {key: set() for key in ("app", "scene", "capability")}
             task = {"collection_case_id": case, "case_id": case,
-                    "task_id": "rollout_task_" + payload_digest([batch_id, case]),
+                    "task_id": (allocate_id("t", self.root, key=["rollout_task", batch_id, case])
+                                if batch_uses_short_ids(batch_id, self.root)
+                                else "rollout_task_" + payload_digest([batch_id, case])),
                     "source_result_id": None, "source_row_id": case, "source_kind": "rollout_import",
                     "task": "", "app": None, "scene": None, "capability": None,
                     "trajectory_count": 0, "step_count": 0}
@@ -181,7 +185,7 @@ class RolloutImportStore:
                     # candidates may be files, but must never become extra trajectories.
                     entry = {"collection_case_id": case, "source_trajectory_id": directory.name,
                              "relative_dir": relative, "collected_at": created_at, "files": files}
-                    test_run = {"batch_id": batch_id, "collection_run_id": "ri_" + import_id,
+                    test_run = {"batch_id": batch_id, "collection_run_id": data.get("_collection_run_id") or "ri_" + import_id,
                                 "batch_tasks": {case: task}}
                     self.runs._normalize(test_run, {"batch_id": batch_id,
                         "trajectories": [entry], "errors": []}, created_at)
@@ -254,7 +258,8 @@ class RolloutImportStore:
             with self.records._connection() as connection:
                 if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='records'").fetchone():
                     for namespace, key, serialized in connection.execute("SELECT namespace, record_key, payload FROM records"):
-                        if namespace in {"rollout_import_previews", "rollout_import_intents", "rollout_import_requests", "rollout_import_request_intents"}:
+                        if namespace in {"rollout_import_previews", "rollout_import_intents", "rollout_import_requests", "rollout_import_request_intents",
+                                         COUNTERS, RESERVATIONS, MAPPINGS, BATCH_IDENTITIES, "collection_path_mappings"}:
                             continue
                         record = json.loads(serialized)
                         if (key == batch_id or record.get("batch_id") == batch_id or record.get("storage_batch_id") == batch_id
@@ -265,21 +270,27 @@ class RolloutImportStore:
             intent = self.records.get("rollout_import_intents", import_id) if import_id else None
             if not intent or intent.get("batch_id") != batch_id:
                 raise RolloutImportError("该批次已有原始数据目录，请使用新的批次编号")
-            run_root = self.runs.run_root(batch_id, "ri_" + import_id)
+            preview = self.records.get("rollout_import_previews", import_id) or {}
+            run_root = self.runs.run_root(batch_id, intent.get("collection_run_id") or preview.get("collection_run_id") or "ri_" + import_id)
             if any(path != raw / "runs" for path in iterdir(raw)) or io_path(raw / "runs").is_dir() and any(path != run_root for path in iterdir(raw / "runs")):
                 raise RolloutImportError("该批次原始数据目录存在其他运行，不能覆盖")
 
     def preview(self, data: dict) -> dict:
-        batch_id = _identifier(data.get("batch_id"), "新批次编号")
+        # Allocation belongs to the backend. Explicit legacy IDs keep their
+        # existing identity/layout algorithm; no ID is inferred from its shape.
+        batch_id = (_identifier(data["batch_id"], "新批次编号") if data.get("batch_id") is not None
+                    else allocate_id("b", self.root))
         with self.artifacts.batch_lock(batch_id):
             self._ensure_new_batch(batch_id)
-        import_id, created = uuid.uuid4().hex, utc_now()
+        import_id, created = allocate_id("i", self.root), utc_now()
+        run_id = allocate_id("r", self.root, key=["rollout_import", import_id])
+        data = {**data, "batch_id": batch_id, "_collection_run_id": run_id}
         scanned = self._scan(data, import_id, created)
         expires = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
         result = {key: value for key, value in scanned.items() if key != "trajectories"}
-        result.update(import_id=import_id, valid=not scanned["errors"], expires_at=expires)
+        result.update(import_id=import_id, collection_run_id=run_id, valid=not scanned["errors"], expires_at=expires)
         self.records.put("rollout_import_previews", import_id,
-            {"import_id": import_id, "batch_id": batch_id, "created_at": created, "expires_at": expires,
+            {"import_id": import_id, "batch_id": batch_id, "collection_run_id": run_id, "created_at": created, "expires_at": expires,
              "data": data, "scan": scanned, "scan_digest": payload_digest(scanned), "result": result}, expected_revision=0)
         return result
 
@@ -308,6 +319,12 @@ class RolloutImportStore:
             raise RolloutImportError("拒绝清理导入暂存目录之外的路径")
         if io_path(target).exists():
             shutil.rmtree(io_path(target))
+
+    def _validate_local(self, run: dict, mapped: dict, directory: Path):
+        if mapped["storage_layout"] == "legacy":
+            self.runs._validate_source_files(run, mapped["manifest"], root_override=directory)
+        else:
+            validate_local_manifest(self.root, run, mapped, root_override=directory)
 
     def commit(self, import_id: str, request_id: str) -> dict:
         from .batch_lifecycle import ensure_batch_active
@@ -345,13 +362,13 @@ class RolloutImportStore:
                 current = self._scan(preview["data"], import_id, preview["created_at"])
                 if payload_digest(current) != preview["scan_digest"]:
                     raise RolloutImportError("源目录内容或分类已变化，请重新校验后导入")
-                run_id, created = "ri_" + import_id, preview["created_at"]
+                run_id, created = preview.get("collection_run_id") or "ri_" + import_id, preview["created_at"]
                 final = self.runs.run_root(batch_id, run_id)
                 staging_parent = self.root / "tmp" / "rollout_imports"
                 staging = staging_parent / import_id
                 intent = self.records.get("rollout_import_intents", import_id)
                 intent_writes = []
-                intent_payload = {"import_id": import_id, "batch_id": batch_id, "request_id": request_id,
+                intent_payload = {"import_id": import_id, "batch_id": batch_id, "request_id": request_id, "collection_run_id": run_id,
                                   "created_at": created, "expires_at": preview["expires_at"]}
                 if intent is None:
                     intent_writes.append({"namespace": "rollout_import_intents", "key": import_id,
@@ -367,8 +384,16 @@ class RolloutImportStore:
                        "created_at": created, "completed_at": created, "output_dir": str(final),
                        "batch_tasks": {task["collection_case_id"]: task for task in current["tasks"]},
                        "trajectories": [], "errors": [], "dispatch_error": None}
-                manifest = self.runs._normalize(run, {"batch_id": batch_id,
+                source_manifest = self.runs._normalize(run, {"batch_id": batch_id,
                     "trajectories": current["trajectories"], "errors": []}, created)
+                # Persist source-to-local paths before copying, independently
+                # from the source protocol validation and completion transaction.
+                mapped = map_collection_manifest(self.root, run, source_manifest)
+                manifest = mapped["manifest"]
+                run.update(storage_layout=mapped["storage_layout"], path_mapping=mapped["mapping"],
+                           source_manifest=source_manifest)
+                identity = {"identity_scheme": ID_SCHEME} if batch_uses_short_ids(batch_id, self.root) else {}
+                run.update(identity)
                 source = self._source(current["source_path"])
                 try:
                     counts = [sum(len(t["files"]) for t in manifest["trajectories"]),
@@ -376,18 +401,17 @@ class RolloutImportStore:
                     if not io_path(final).exists():
                         with _phase("copy", import_id, counts=counts):
                             io_path(staging).mkdir(parents=True, exist_ok=False)
-                            for trajectory in manifest["trajectories"]:
-                                for item in trajectory["files"]:
-                                    self._no_links(source / item["path"])
-                                    incoming = contained_path(source, item["path"])
-                                    destination = contained_path(staging, item["path"])
-                                    io_path(destination.parent).mkdir(parents=True, exist_ok=True)
-                                    with io_path(incoming).open("rb") as reader, io_path(destination).open("xb") as writer:
-                                        shutil.copyfileobj(reader, writer)
-                                        writer.flush()
-                                        os.fsync(writer.fileno())
+                            for source_path, local_path in mapped["mapping"]["files"].items():
+                                self._no_links(source / source_path)
+                                incoming = contained_path(source, source_path)
+                                destination = contained_path(staging, local_path)
+                                io_path(destination.parent).mkdir(parents=True, exist_ok=True)
+                                with io_path(incoming).open("rb") as reader, io_path(destination).open("xb") as writer:
+                                    shutil.copyfileobj(reader, writer)
+                                    writer.flush()
+                                    os.fsync(writer.fileno())
                         with _phase("validate_copy", import_id, counts=counts):
-                            self.runs._validate_source_files(run, manifest, root_override=staging)
+                            self._validate_local(run, mapped, staging)
                         with _phase("validate_source_after_copy", import_id, counts=counts):
                             if payload_digest(self._scan(preview["data"], import_id, created)) != preview["scan_digest"]:
                                 raise RolloutImportError("复制期间源目录发生变化，请重新校验后导入")
@@ -396,14 +420,14 @@ class RolloutImportStore:
                     with _phase("validate_final", import_id, counts=counts):
                         # Final paths can exceed Windows' old 260-character
                         # limit even when the shorter staging paths did not.
-                        self.runs._validate_source_files(run, manifest, root_override=final)
+                        self._validate_local(run, mapped, final)
                     # Freeze classification and task identity without fabricating a
                     # generated task workbook or any downstream process artifact.
-                    snapshot = {"schema_version": 1, "batch_id": batch_id, "job_id": None,
+                    snapshot = {"schema_version": 1, **identity, "batch_id": batch_id, "job_id": None,
                                 "source_job_id": None, "kind": "rollout_import",
                                 "task_count": current["task_count"], "tasks": current["tasks"],
                                 "errors": [], "warnings": current["warnings"]}
-                    payload = {"schema_version": 1, "batch_id": batch_id, "source_job_id": None,
+                    payload = {"schema_version": 1, **identity, "batch_id": batch_id, "source_job_id": None,
                                "kind": "rollout_import", "source_kind": "rollout_import", "created_at": created,
                                "name": _text(preview["data"].get("name")) or batch_id,
                                "description": _text(preview["data"].get("name")), "filename": None,
@@ -454,7 +478,7 @@ class RolloutImportStore:
                     continue
                 intent = self.records.get("rollout_import_intents", import_id)
                 if intent and intent.get("batch_id") == batch_id:
-                    run_id = "ri_" + import_id
+                    run_id = intent.get("collection_run_id") or preview.get("collection_run_id") or "ri_" + import_id
                     if not self.records.get("collection_runs", run_id):
                         self._remove_owned(self.runs.run_root(batch_id, run_id), self.runs.raw_root(batch_id))
                     self._remove_owned(self.root / "tmp" / "rollout_imports" / import_id, self.root / "tmp" / "rollout_imports")

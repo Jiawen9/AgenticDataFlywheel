@@ -8,6 +8,7 @@ import hashlib
 import json
 from pathlib import Path
 from backend.file_io import io_path
+from backend.short_paths import short_temporary_file
 
 from typing import Any
 
@@ -172,7 +173,7 @@ def export_session_workbook(
 
         io_path(output_dir).mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{workbook_path.stem}_精修与筛查_{timestamp}_{export_id[:6]}.xlsx"
+        filename = f"{workbook_path.stem}_精修与筛查_{timestamp}_{export_id}.xlsx"
         output_path = output_dir / filename
         exported = Workbook()
         default = exported.active
@@ -181,9 +182,9 @@ def export_session_workbook(
         for name, rows in routed.items():
             if rows:
                 counts[name] = _append_sheet(exported, name, headers, rows)
-        temporary = output_path.with_name(f".{output_path.name}.tmp")
-        exported.save(io_path(temporary))
-        io_path(temporary).replace(io_path(output_path))
+        with short_temporary_file(output_path) as temporary:
+            exported.save(io_path(temporary))
+            io_path(temporary).replace(io_path(output_path))
         return {
             "filename": filename,
             "sheets": counts,
@@ -307,11 +308,11 @@ def export_full_dataset_workbook(
         io_path(output_dir).mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         suffix = workbook_path.suffix.lower()
-        filename = f"{workbook_path.stem}_专家纠偏完整数据集_{timestamp}_{export_id[:6]}{suffix}"
+        filename = f"{workbook_path.stem}_专家纠偏完整数据集_{timestamp}_{export_id}{suffix}"
         output_path = output_dir / filename
-        temporary = output_path.with_name(f".{output_path.name}.tmp")
-        workbook.save(io_path(temporary))
-        io_path(temporary).replace(io_path(output_path))
+        with short_temporary_file(output_path) as temporary:
+            workbook.save(io_path(temporary))
+            io_path(temporary).replace(io_path(output_path))
         return {
             "filename": filename,
             "sheets": {sheet.title: max(0, sheet.max_row - 1)},

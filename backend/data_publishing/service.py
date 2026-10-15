@@ -7,7 +7,6 @@ from contextlib import ExitStack
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
-import secrets
 import threading
 import shutil
 from typing import Any, Callable, Optional
@@ -16,6 +15,7 @@ from ..trajectory_correction.constants import CORRECTION_EXPORTS_DIR, FIXED_TRAJ
 from ..trajectory_correction.draft_store import list_sessions, load_session, save_session, storage_root, utc_now
 from .constants import PROJECT_ROOT, RELEASES_FILE, ensure_release_dirs
 from ..data_store import RecordStore, ArtifactStore, DATA_ROOT, rebase_data_path
+from ..identifiers import allocate_id
 from ..data_store.release_provenance import freeze_release_provenance
 from ..trajectory_correction.session_state import session_fingerprint
 from ..batch_lifecycle import (is_batch_active, session_batch_id, ensure_publishable, published_entry,
@@ -295,7 +295,7 @@ class DatasetReleaseRegistry:
             batch_ids = [session_batch_id(item, self.data_root) for item in sessions]
             if len(set(batch_ids)) != len(batch_ids):
                 raise ValueError("同一业务批次只能选择一次")
-            release_id = f"rel_{secrets.token_hex(8)}"
+            release_id = allocate_id("rel", self.data_root)
             created_at = utc_now()
             release: dict[str, Any] = {
                 "release_id": release_id,
