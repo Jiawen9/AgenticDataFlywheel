@@ -9,6 +9,9 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import uuid
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -30,6 +33,68 @@ from backend.batch_results import (current_tree_payload, current_tree_batch, mer
 from backend.trajectory_data import resolve_tree_run_dir
 from backend.quality_data import quality_manifest
 from backend.pipeline_retry_errors import failure_from_exception
+from backend import pipeline_diagnostics as diagnostics
+from backend.quality_execution import (
+    execution_context, execution_write_guard, check_execution, commit_record_entry,
+    committed_result, QualityExecutionRevoked,
+)
+from adarubric.llm.request_control import observe_requests, RequestConfigurationError
+
+_OUTPUT_LOCK = threading.Lock()
+
+
+def _frame(kind: str, payload: dict) -> None:
+    with _OUTPUT_LOCK:
+        # One write, with its own line boundary: ordinary legacy print() calls
+        # can otherwise insert a heartbeat between their text and final newline.
+        sys.stdout.write("\n" + kind + " " + json.dumps(payload, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
+
+def _accept_launch(job_id: str, token: str) -> None:
+    """No worker can run before its PID is durably registered by the parent."""
+    if sys.stdin.readline() != "QUALITY_GO\n":
+        raise QualityExecutionRevoked("质检执行未获得启动许可")
+    lease = check_execution(DATA_ROOT, job_id, token)
+    process = lease.get("process") or {}
+    if (process.get("launch_gate") is not True or process.get("launch_released") is not True
+            or process.get("pid") != os.getpid()):
+        raise QualityExecutionRevoked("质检执行启动登记不完整")
+
+
+@contextmanager
+def worker_telemetry(job_id: str, token: str | None):
+    """A thread keeps liveness distinct from an individual model's deadline."""
+    stop = threading.Event()
+
+    def heartbeat():
+        while not stop.is_set():
+            if token:
+                try:
+                    check_execution(DATA_ROOT, job_id, token, allow_committed=True)
+                except QualityExecutionRevoked:
+                    # The supervisor owns final classification. No orphan may keep
+                    # calling a model or write after its parent has disappeared.
+                    os._exit(2)
+            _frame("HEARTBEAT", {"at": _now()})
+            stop.wait(10)
+
+    def request(event: dict):
+        # A new request may never start with a revoked execution lease.
+        if event.get("event") == "started":
+            with execution_write_guard():
+                _frame("REQUEST", event)
+        else:
+            _frame("REQUEST", event)
+
+    thread = threading.Thread(target=heartbeat, name="quality-heartbeat", daemon=True)
+    thread.start()
+    try:
+        with observe_requests(request):
+            yield
+    finally:
+        stop.set()
+        thread.join(timeout=1)
 
 WORKSPACE = DATA_ROOT / "system"
 TREE_RUNS = WORKSPACE / "trajectory_tree_runs"
@@ -54,7 +119,9 @@ EVAL = _load_script("evaluate_jiawen_rubrics", HERE / "examples" / "evaluate-jia
 
 
 def progress(**changes: Any) -> None:
-    print("PROGRESS " + json.dumps(changes, ensure_ascii=False), flush=True)
+    with execution_write_guard():
+        _frame("PROGRESS", changes)
+    diagnostics.log_event("quality_progress", **changes)
 
 
 def _now() -> str:
@@ -110,12 +177,14 @@ async def _generate_rubric(task: Any, trajectories: list[Any], config: dict[str,
     )
     dimensions = GEN._int_setting(task_config, "num_dimensions", "ADARUBRIC_NUM_DIMENSIONS", default=5)
     messages = GEN.build_messages(task, trajectories, config=task_config, num_dimensions=dimensions)
-    io_path(evidence_path.parent).mkdir(parents=True, exist_ok=True)
-    io_path(evidence_path).write_text(GEN._evidence_from_messages(messages, workbook, task_config, trajectories), encoding="utf-8")
+    with execution_write_guard():
+        io_path(evidence_path.parent).mkdir(parents=True, exist_ok=True)
+        io_path(evidence_path).write_text(GEN._evidence_from_messages(messages, workbook, task_config, trajectories), encoding="utf-8")
     rubric = await GEN.generate_rubric(task=task, trajectories=trajectories, messages=messages, config=task_config, num_dimensions=dimensions)
     temporary = rubric_path.with_suffix(".json.tmp")
-    io_path(temporary).write_text(GEN._rubric_text(rubric) + "\n", encoding="utf-8")
-    os.replace(io_path(temporary), io_path(rubric_path))
+    with execution_write_guard():
+        io_path(temporary).write_text(GEN._rubric_text(rubric) + "\n", encoding="utf-8")
+        os.replace(io_path(temporary), io_path(rubric_path))
     return rubric_path
 
 
@@ -157,8 +226,9 @@ async def run(run_id: str, task_ids: list[str], job_id: str) -> dict[str, Any]:
             with tempfile.TemporaryDirectory(prefix=f"{job_id}-", dir=io_path(parent)) as directory:
                 work = logical_path(directory)
                 quality_path = work / "rubric_trajectories.xlsx"
-                write_payload_workbook(quality_path, current["quality_input"])
-                write_sidecar(quality_path, current["quality_input"])
+                with execution_write_guard():
+                    write_payload_workbook(quality_path, current["quality_input"])
+                    write_sidecar(quality_path, current["quality_input"])
                 return await _run_frozen(run_id, task_ids, job_id, current, work)
         if (RecordStore(DATA_ROOT).get("quality_jobs", job_id) or {}).get("batch_id"):
             raise StaleTaskInput("当前批次轨迹树已失效，请重新建树")
@@ -214,7 +284,10 @@ async def _run_frozen(run_id: str, task_ids: list[str], job_id: str,
         rubric_path = _matching_rubric(task_id)
         if rubric_path is None:
             progress(stage="generating_rubric", current_task=task_id, task_index=task_index, percent=max(5, round(15 * completed / max(total, 1))))
-            rubric_path = await _generate_rubric(task, trajectories, config, workbook)
+            with diagnostics.trace_context(task_id=task_id, concurrency=1):
+                rubric_path = await _generate_rubric(task, trajectories, config, workbook)
+        else:
+            diagnostics.log_event("rubric_reused", task_id=task_id, source_path=str(rubric_path))
         rubric = EVAL._load_rubric(rubric_path, task)
         async with EVAL.evaluation_pipeline(config) as pipeline:
             checkpoint_key = quality_task_fingerprints(current).get(task_id) if current is not None else None
@@ -236,6 +309,8 @@ async def _run_frozen(run_id: str, task_ids: list[str], job_id: str,
                     cached_count += 1
             completed += cached_count
             if cached_count:
+                diagnostics.log_event("quality_checkpoint_reused", task_id=task_id, source_path=str(checkpoint),
+                                      reused_trajectory_count=cached_count)
                 progress(
                     stage="evaluating", current_task=task_id, task_index=task_index,
                     completed_trajectories=completed, total_trajectories=total,
@@ -252,23 +327,27 @@ async def _run_frozen(run_id: str, task_ids: list[str], job_id: str,
                     percent=20 + round(75 * completed / max(total, 1)),
                 )
 
-            result = await EVAL.evaluate_run_incrementally(
-                pipeline=pipeline,
-                task=task,
-                trajectories=trajectories,
-                rubric=rubric,
-                rubric_path=rubric_path,
-                run_number=1,
-                temperature=float(config.get("evaluation_temperature", 0.0)),
-                eval_max_tokens=int(config.get("evaluation_max_tokens", 8192)),
-                max_concurrent=EVAL._int_setting(
-                    config, "evaluation_max_concurrent", "ADARUBRIC_EVAL_MAX_CONCURRENT", default=2
-                ),
-                evaluations_path=checkpoint,
-                config=config,
-                existing_evaluations=existing,
-                on_trajectory_complete=on_trajectory_complete,
+            temperature = float(config.get("evaluation_temperature", 0.0))
+            eval_max_tokens = int(config.get("evaluation_max_tokens", 8192))
+            max_concurrent = EVAL._int_setting(
+                config, "evaluation_max_concurrent", "ADARUBRIC_EVAL_MAX_CONCURRENT", default=2
             )
+            with diagnostics.trace_context(task_id=task_id, concurrency=max_concurrent):
+                result = await EVAL.evaluate_run_incrementally(
+                    pipeline=pipeline,
+                    task=task,
+                    trajectories=trajectories,
+                    rubric=rubric,
+                    rubric_path=rubric_path,
+                    run_number=1,
+                    temperature=temperature,
+                    eval_max_tokens=eval_max_tokens,
+                    max_concurrent=max_concurrent,
+                    evaluations_path=checkpoint,
+                    config=config,
+                    existing_evaluations=existing,
+                    on_trajectory_complete=on_trajectory_complete,
+                )
         evaluations = result.all_evaluations
         serialized = {}
         for evaluation in evaluations:
@@ -293,27 +372,40 @@ async def _run_frozen(run_id: str, task_ids: list[str], job_id: str,
         return merge_quality_results(run_id, task_results,
             {task: current["tree_hashes"][task] for task in task_ids},
             {task: fingerprints[task] for task in task_ids}, job_id=job_id, completed_at=_now(), root=DATA_ROOT)
-    artifact = ArtifactStore(DATA_ROOT).publish(str(manifest.get("batch_id") or run_id), "05_quality",
-        {"schema_version": 1, "run_id": run_id, "job_id": job_id, "tasks": task_results},
-        tables=quality_tables(task_results),
-        source_refs=[item for item in manifest.get("artifacts", []) if item.get("stage") == "04_tree"]
-            or [{"kind": "tree_run", "run_id": run_id}],
-        metadata={"run_id": run_id, "job_id": job_id, "task_ids": task_ids})
-    records = RecordStore(DATA_ROOT)
-    entries = []
-    for task_result in task_results:
-        task_result["artifact"] = artifact
-        entries.append({"namespace": "quality_results", "key": f"{run_id}:{task_result['task_id']}", "payload": task_result})
-    previous_manifest = quality_manifest(run_id)
-    previous = {str(item["task_id"]): item for item in previous_manifest.get("tasks", [])}
-    for summary in summaries:
-        previous[summary["task_id"]] = summary
-    payload = {"run_id": run_id, "updated_at": _now(), "artifact": artifact, "tasks": sorted(previous.values(), key=lambda item: item["task_id"])}
-    entries.append({"namespace": "quality_manifests", "key": run_id, "payload": payload,
-                    "expected_revision": previous_manifest.get("storage_revision", 0)})
-    saved = records.put_many(entries)
-    payload = saved[-1]
-    return payload
+    return _publish_legacy_quality(run_id, job_id, task_ids, manifest, task_results, summaries)
+
+
+def _publish_legacy_quality(run_id: str, job_id: str, task_ids: list[str], manifest: dict,
+                            task_results: list[dict], summaries: list[dict]) -> dict:
+    """Legacy indexes and the execution commit share the artifact transaction."""
+    store = ArtifactStore(DATA_ROOT)
+    batch_id = str(manifest.get("batch_id") or run_id)
+    with store.batch_lock(batch_id), execution_write_guard(DATA_ROOT, job_id):
+        previous_manifest = RecordStore(DATA_ROOT).get("quality_manifests", run_id) or {}
+        previous = {str(item["task_id"]): item for item in previous_manifest.get("tasks", [])}
+        previous.update({item["task_id"]: item for item in summaries})
+        payload = {"run_id": run_id, "updated_at": _now(),
+                   "tasks": sorted(previous.values(), key=lambda item: item["task_id"])}
+
+        def indexes(artifacts: list[dict]) -> list[dict]:
+            payload["artifact"] = artifacts[0]
+            entries = [{"namespace": "quality_results", "key": f"{run_id}:{item['task_id']}",
+                        "payload": {**item, "artifact": artifacts[0]}} for item in task_results]
+            entries.append({"namespace": "quality_manifests", "key": run_id, "payload": payload,
+                            "expected_revision": previous_manifest.get("storage_revision", 0)})
+            committed = commit_record_entry(DATA_ROOT, job_id, batch_id, payload)
+            if committed is not None:
+                entries.append(committed)
+            return entries
+
+        store.publish_many(batch_id, [{"stage": "05_quality",
+            "payload": {"schema_version": 1, "run_id": run_id, "job_id": job_id, "tasks": task_results},
+            "tables": quality_tables(task_results),
+            "source_refs": [item for item in manifest.get("artifacts", []) if item.get("stage") == "04_tree"]
+                or [{"kind": "tree_run", "run_id": run_id}],
+            "metadata": {"run_id": run_id, "job_id": job_id, "task_ids": task_ids}}],
+            record_entries=indexes)
+        return RecordStore(DATA_ROOT).get("quality_manifests", run_id)
 
 
 def main() -> int:
@@ -321,20 +413,49 @@ def main() -> int:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--task-id", action="append", required=True)
     parser.add_argument("--job-id", required=True)
+    parser.add_argument("--diagnostic-execution-id")
     args = parser.parse_args()
+    job = {}
+    diagnostic_execution_id = args.diagnostic_execution_id or uuid.uuid4().hex
     try:
         from backend.pipeline_access import retry_enabled_for_pipeline
-        job_owner = (RecordStore(DATA_ROOT).get("quality_jobs", args.job_id) or {}).get("pipeline_id")
+        job = RecordStore(DATA_ROOT).get("quality_jobs", args.job_id) or {}
+        job_owner = job.get("pipeline_id")
         if retry_enabled_for_pipeline(job_owner, DATA_ROOT):
             os.environ["PIPELINE_MODEL_SINGLE_ATTEMPT"] = "1"
         else:
             os.environ["PIPELINE_MODEL_SINGLE_ATTEMPT"] = "0"
-        result = asyncio.run(run(args.run_id, args.task_id, args.job_id))
+        token = os.environ.get("ADF_QUALITY_EXECUTION_TOKEN")
+        diagnostics.register_secrets(token)
+        if token:
+            _accept_launch(args.job_id, token)
+        with diagnostics.trace_context(root=DATA_ROOT, pipeline_id=job_owner,
+                batch_id=job.get("batch_id") or args.run_id, step_id="quality", job_id=args.job_id,
+                execution_id=diagnostic_execution_id), \
+                execution_context(DATA_ROOT, args.job_id, token), worker_telemetry(args.job_id, token):
+            diagnostics.log_event("quality_worker_started")
+            try:
+                result = asyncio.run(run(args.run_id, args.task_id, args.job_id))
+            except RequestConfigurationError as exc:
+                from backend.pipeline_retry_errors import ModelConfigurationError
+                raise ModelConfigurationError("质检模型请求超时配置无效") from exc
+            diagnostics.log_event("quality_worker_completed", result=result)
     except Exception as exc:
+        with diagnostics.trace_context(root=DATA_ROOT, pipeline_id=job.get("pipeline_id"),
+                batch_id=job.get("batch_id") or args.run_id, step_id="quality", job_id=args.job_id,
+                execution_id=diagnostic_execution_id):
+            diagnostics.log_event("quality_worker_exception", error=diagnostics.format_exception(exc))
+            if diagnostics.current_context():
+                diagnostics.write_json(f"jobs/{args.job_id}/{diagnostic_execution_id}/worker-exception.json",
+                                       diagnostics.format_exception(exc))
+        recovered = committed_result(DATA_ROOT, args.job_id, os.environ.get("ADF_QUALITY_EXECUTION_TOKEN"))
+        if recovered is not None:
+            _frame("RESULT", recovered)
+            return 0
         failure = failure_from_exception(exc)
-        print("ERROR " + json.dumps(failure, ensure_ascii=False), flush=True)
+        _frame("ERROR", failure)
         return 2 if failure["category"] == "stale" else 1
-    print("RESULT " + json.dumps(result, ensure_ascii=False), flush=True)
+    _frame("RESULT", result)
     return 0
 
 

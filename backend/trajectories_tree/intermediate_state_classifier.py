@@ -12,6 +12,7 @@ from backend.trajectories_tree.model_response import response_text
 
 from typing import Any
 import httpx
+from backend.pipeline_diagnostic_http import instrument_http_client, model_operation
 from openai import OpenAI
 from PIL import Image
 
@@ -146,6 +147,8 @@ class QwenIntermediateStateClassifier:
     def __init__(self, model: str, cache_path: Path) -> None:
         settings = qwen_settings()
         http_client = httpx.Client(proxy=settings["proxy"] or None, verify=settings["verify"], timeout=settings["timeout"], trust_env=settings["trust_env"])
+        instrument_http_client(http_client, api_key=settings["api_key"], settings={
+            "proxy": settings["proxy"], "trust_env": settings["trust_env"], "sdk_retries": 0})
         self.client = OpenAI(api_key=settings["api_key"], base_url=settings["base_url"], timeout=settings["timeout"], max_retries=0, http_client=http_client)
         self.model, self.cache_path = model, cache_path
         self.cache: dict[str, Any] = json.loads(io_path(cache_path).read_text(encoding="utf-8")) if io_path(cache_path).exists() else {}
@@ -206,6 +209,7 @@ class QwenIntermediateStateClassifier:
                 raise
         return result
 
+    @model_operation("intermediate_classify")
     def classify(self, *, trajectory: str, step_index: int, current_image_path: Path,
                  next_image_path: Path | None, action: dict[str, Any], summary: str,
                  previous_summary: str, next_summary: str, after_image_path: Path | None = None,

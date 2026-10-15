@@ -8,6 +8,7 @@ worker boundary or enter persistent job records.
 from __future__ import annotations
 
 import re
+import sys
 import unicodedata
 from typing import Any
 
@@ -189,6 +190,15 @@ def safe_error_message(category: str, http_status: int | None = None,
         "model_output": _MODEL_OUTPUT_FAILURES.get(code, ("", "模型返回内容无效"))[1],
         "unknown": "处理失败，原因未判定",
     }.get(category, "处理失败，原因未判定")
+    local_quality_messages = {
+        ("timeout", "quality_request_deadline"): "质检模型请求超过等待上限",
+        ("unknown", "quality_worker_unresponsive"): "质检子进程无响应，尚未确认是模型故障，请检查诊断日志",
+        ("unknown", "quality_worker_cleanup_failed"): "质检子进程退出未确认，已阻止新的质检执行，请检查诊断日志",
+        ("unknown", "quality_client_cleanup_timeout"): "质检模型连接清理超时，请检查诊断日志",
+        ("stale", "quality_execution_revoked"): "本次质检执行已停止，拒绝旧进程回写",
+    }
+    if http_status is None:
+        description = local_quality_messages.get((category, code), description)
     details = []
     if http_status is not None:
         details.append(f"HTTP {http_status}")
@@ -287,6 +297,12 @@ def failure_from_exception(exc: BaseException) -> dict[str, Any]:
 
     if any(isinstance(cause, ModelConfigurationError) for cause in chain):
         return classified("config")
+    from .quality_execution import QualityExecutionBlocked, QualityExecutionRevoked
+    for cause in chain:
+        if isinstance(cause, QualityExecutionBlocked):
+            return classified("unknown", code="quality_worker_cleanup_failed")
+        if isinstance(cause, QualityExecutionRevoked):
+            return classified("stale", code="quality_execution_revoked")
     if type(exc).__name__ == "StaleTaskInput":
         return classified("stale")
     if type(exc).__name__ == "BatchPublishedError":
@@ -329,6 +345,12 @@ def failure_from_exception(exc: BaseException) -> dict[str, Any]:
     for cause in chain:
         if isinstance(cause, ModelOutputError):
             return classified("model_output", code=cause.code)
+    # AdaRubric is also used standalone. Inspect its already-loaded local type
+    # without adding its directory or optional SDK dependencies to platform imports.
+    request_control = sys.modules.get("adarubric.llm.request_control")
+    cleanup_type = getattr(request_control, "QualityClientCleanupTimeout", None)
+    if isinstance(cleanup_type, type) and any(isinstance(cause, cleanup_type) for cause in chain):
+        return classified("unknown", code="quality_client_cleanup_timeout")
     if isinstance(exc, (ValueError, TypeError, FileNotFoundError)):
         return classified("input")
     return classified("unknown")

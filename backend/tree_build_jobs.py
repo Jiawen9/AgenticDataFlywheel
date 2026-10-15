@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .pipeline_access import submit_with_context, execution_pipeline_id, retry_enabled_for_pipeline
+from . import pipeline_diagnostics as diagnostics
 
 import json
 import threading
@@ -54,6 +55,7 @@ class TreeBuildJobManager:
         if execution_pipeline_id():
             payload.setdefault("pipeline_id", execution_pipeline_id())
         payload.update(self.records.put("tree_jobs", payload["job_id"], payload))
+        diagnostics.record_job_snapshot(payload, "tree", self.data_root)
 
     def get(self, job_id: str) -> dict[str, Any] | None:
         # Polling and worker changes share the manager lock; SQLite owns state.
@@ -187,6 +189,14 @@ class TreeBuildJobManager:
             self._write(payload)
 
     def _run(self, job_id: str, task_ids: list[str]) -> None:
+        try:
+            job = self.get(job_id) or {}
+        except Exception:
+            job = {}
+        with diagnostics.job_context(job, "tree", self.data_root):
+            return self._run_with_diagnostics(job_id, task_ids)
+
+    def _run_with_diagnostics(self, job_id: str, task_ids: list[str]) -> None:
         with self._lock:
             payload = self.get(job_id)
             if payload is None:
@@ -211,6 +221,7 @@ class TreeBuildJobManager:
                     **context_options,
                 )
         except Exception as exc:
+            diagnostics.log_event("job_exception", error=diagnostics.format_exception(exc))
             with self._lock:
                 payload = self.get(job_id) or {"job_id": job_id}
                 payload.update(

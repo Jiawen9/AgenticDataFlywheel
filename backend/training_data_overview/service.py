@@ -1,5 +1,7 @@
 """Durable, rebuildable summaries; publication files are never modified."""
 from __future__ import annotations
+from .. import pipeline_diagnostics as diagnostics
+from ..pipeline_access import submit_with_context
 
 from collections import Counter, defaultdict
 from concurrent.futures import Executor, ThreadPoolExecutor
@@ -189,9 +191,10 @@ class TrainingOverviewManager:
             queued = {"release_id": release_id, "name": release["name"], "status": "queued", "error": None,
                       "failure": None, "warnings": [], "updated_at": utc_now(), "converter_version": 1}
             saved = self.records.put(CONVERSIONS, release_id, queued, expected_revision=current.get("storage_revision", 0) if current else 0)
+            diagnostics.record_job_snapshot({**saved, "pipeline_id": release.get("pipeline_id")}, "overview", self.root)
             if self._started:
                 try:
-                    self._futures[release_id] = self._executor.submit(self._run, release_id)
+                    self._futures[release_id] = submit_with_context(self._executor, self._run, release_id)
                 except Exception as exc:
                     saved = self.records.update(CONVERSIONS, release_id, lambda c: c.update(
                         status="failed", error=f"汇总任务排队失败：{exc}",
@@ -216,16 +219,31 @@ class TrainingOverviewManager:
             future.result(timeout=timeout)
 
     def _run(self, release_id: str) -> None:
+        release, state = {}, {"release_id": release_id}
+        try:
+            release = self.registry.get(release_id) or {}
+            state = self.records.get(CONVERSIONS, release_id) or state
+        except Exception:
+            pass
+        with diagnostics.trace_context(_reset=True, root=self.root, pipeline_id=release.get("pipeline_id")), \
+                diagnostics.job_context({**state, "pipeline_id": release.get("pipeline_id"),
+                "batch_id": next(iter(release.get("batch_ids") or []), None)}, "overview", self.root):
+            return self._run_with_diagnostics(release_id)
+
+    def _run_with_diagnostics(self, release_id: str) -> None:
         with self._conversion_lock:
             try:
-                self.records.update(CONVERSIONS, release_id, lambda c: c.update(status="running", updated_at=utc_now()))
+                state = self.records.update(CONVERSIONS, release_id, lambda c: c.update(status="running", updated_at=utc_now()))
+                diagnostics.record_job_snapshot(state, "overview", self.root)
                 release = self.registry.get(release_id)
                 converted = self.converter(self.registry, release)
                 self._publish(release_id, converted)
             except Exception as exc:
+                diagnostics.log_event("conversion_exception", error=diagnostics.format_exception(exc))
                 log.exception("Training overview conversion failed for %s", release_id)
-                self.records.update(CONVERSIONS, release_id, lambda c: c.update(
+                state = self.records.update(CONVERSIONS, release_id, lambda c: c.update(
                     status="failed", error=str(exc), failure=failure_from_exception(exc), updated_at=utc_now()))
+                diagnostics.record_job_snapshot(state, "overview", self.root)
 
     def _publish(self, release_id: str, converted: dict) -> None:
         # A single worker assembles immutable files, then atomically exposes one catalog.
@@ -251,6 +269,9 @@ class TrainingOverviewManager:
                  "payload": {"schema_version": 1, "version": version, "updated_at": utc_now(), "rows": rows, "files": files}},
                 {"namespace": CONVERSIONS, "key": release_id, "expected_revision": state["storage_revision"], "payload": state},
             ])
+            diagnostics.record_job_snapshot(state, "overview", self.root)
+            diagnostics.log_event("conversion_committed", release_id=release_id, files=files,
+                                  trajectory_count=len(converted["rows"]))
         except BaseException:
             for candidate in (temporary, final):
                 if candidate.is_dir() and candidate.resolve().is_relative_to(base.resolve()):

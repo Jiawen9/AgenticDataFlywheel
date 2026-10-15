@@ -203,7 +203,8 @@ def merge_quality_results(batch_id: str, task_results: list[dict], expected_tree
                           fingerprints: dict[str, str], *, job_id: str, completed_at: str,
                           root: Path | None = None) -> dict:
     store = ArtifactStore(_root(root))
-    with active_batch_lock(batch_id, store.root):
+    from .quality_execution import execution_write_guard, commit_record_entry
+    with active_batch_lock(batch_id, store.root), execution_write_guard(store.root, job_id):
         tree_ref, trees = _current_tree_locked(store, batch_id)
         current = trees.get("tree_hashes", {})
         if any(current.get(task) != value for task, value in expected_tree_hashes.items()):
@@ -221,10 +222,14 @@ def merge_quality_results(batch_id: str, task_results: list[dict], expected_tree
                                           if task in valid_ids}, **fingerprints}}
         changed = {item["task_id"] for item in task_results
                    if previous.get("task_fingerprints", {}).get(item["task_id"]) != fingerprints.get(item["task_id"])}
+        entries = [invalidation_record_entry(store, batch_id, "quality", changed)]
+        committed = commit_record_entry(store.root, job_id, batch_id, {**value, "updated_at": completed_at})
+        if committed is not None:
+            entries.append(committed)
         ref = store.publish_many(batch_id, [{"stage": "05_quality", "payload": value,
             "tables": quality_tables(value["tasks"]), "source_refs": [tree_ref] if tree_ref else [],
             "metadata": {"run_id": batch_id, "task_ids": sorted(tasks)}}],
-            record_entries=[invalidation_record_entry(store, batch_id, "quality", changed)])[0]
+            record_entries=entries)[0]
         drain_batch_invalidations(batch_id, root)
         return {**value, "artifact": ref, "updated_at": completed_at}
 

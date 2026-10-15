@@ -19,6 +19,7 @@ from .data_store.paths import contained_path
 from .data_store.registry import utc_now
 from .file_io import io_path, iterdir, rglob, resolve_path, is_link_or_junction
 from .task_generation.collection_batches import payload_digest, workbook_digest
+from . import pipeline_diagnostics as diagnostics
 
 LOG = logging.getLogger(__name__)
 TERMINAL = {"completed", "succeeded", "partial", "failed", "interrupted", "cancelled"}
@@ -83,8 +84,11 @@ class CollectionTransferManager:
         return results
 
     def _update(self, run_id, **changes):
-        return self.records.update("collection_runs", run_id, lambda value: value.update(
+        saved = self.records.update("collection_runs", run_id, lambda value: value.update(
             **changes, transfer_updated_at=utc_now()))
+        diagnostics.record_job_snapshot(saved, "collection", self.root)
+        diagnostics.log_event("collection_transfer_progress", collection_run_id=run_id, **changes)
+        return saved
 
     def _temporary(self, run_id):
         return contained_path(self.root, "tmp", "collection_transfers", _identifier(run_id, "采集运行编号"))
@@ -225,6 +229,7 @@ class CollectionTransferManager:
             io_path(final.parent).mkdir(parents=True, exist_ok=True)
             io_path(staging).rename(io_path(final))
         self._validate_tree(final, descriptors)
+        diagnostics.log_event("collection_files_verified", file_count=len(descriptors), archive_directory=str(final))
         completed, _ = self.runs.complete(run["collection_run_id"], manifest)
         # If the process stops between complete and this update, the manifest is
         # already authoritative and the next sync only finalizes this journal.
@@ -235,6 +240,20 @@ class CollectionTransferManager:
         return completed
 
     def sync(self, run_id):
+        run, owner = {}, None
+        try:
+            run = self.runs.get(run_id) or {}
+            if run.get("dispatch_key"):
+                candidate = self.records.get("pipelines", run["dispatch_key"])
+                if candidate and candidate.get("batch_id") == run.get("batch_id"):
+                    owner = candidate["pipeline_id"]
+        except Exception:
+            pass
+        with diagnostics.trace_context(_reset=True, root=self.root, pipeline_id=owner), \
+                diagnostics.job_context({**run, "pipeline_id": owner}, "collection", self.root):
+            return self._sync_with_diagnostics(run_id)
+
+    def _sync_with_diagnostics(self, run_id):
         run = self.runs.get(run_id)
         if run is None:
             raise CollectionRunError("采集运行不存在", 404)
@@ -287,11 +306,14 @@ class CollectionTransferManager:
                 self._update(run_id, transfer_status="downloading", transfer_error=None)
                 archive = temp / "archive.zip"
                 self.remote.download_archive(run_id, io_path(archive))
+                diagnostics.log_event("collection_archive_downloaded", collection_run_id=run_id, archive_path=str(archive))
                 if not io_path(archive).is_file() or io_path(archive).stat().st_size != size or workbook_digest(archive) != checksum:
                     raise CollectionRunError("远端归档的大小或 SHA256 不匹配", file_failure={
                         "code": "source_hash_mismatch", "paths": ["archive.zip"]})
                 self._extract(archive, temp / "files", descriptors)
                 self.runs._validate_source_files(run, normalized, root_override=temp / "files")
+                diagnostics.log_event("collection_archive_verified", collection_run_id=run_id,
+                                      file_count=len(descriptors), size_bytes=size, sha256=checksum)
                 # The same missing collected_at must stay stable across retries.
                 manifest = {**manifest, "trajectories": [{**original, "collected_at": value["collected_at"]}
                     for original in manifest["trajectories"] for value in normalized["trajectories"]

@@ -143,8 +143,11 @@ class QualityHTTPClientTests(unittest.IsolatedAsyncioTestCase):
                     transport = client._client._client
                     self.assertIsInstance(transport, DefaultAsyncHttpxClient)
                     self.assertFalse(transport.trust_env)
-                    self.assertEqual(transport.timeout, DEFAULT_TIMEOUT)
-                    self.assertEqual(transport.timeout.read, 600)
+                    if class_name == "OpenAIClient":
+                        self.assertEqual(transport.timeout, httpx.Timeout(300, connect=10))
+                    else:
+                        self.assertEqual(transport.timeout, DEFAULT_TIMEOUT)
+                        self.assertEqual(transport.timeout.read, 600)
                     self.assertTrue(transport.follow_redirects)
                     self.assertEqual(transport._transport._pool._max_connections, DEFAULT_CONNECTION_LIMITS.max_connections)
                     self.assertEqual(transport._transport._pool._max_keepalive_connections, DEFAULT_CONNECTION_LIMITS.max_keepalive_connections)
@@ -165,7 +168,10 @@ class QualityHTTPClientTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(module, "AsyncOpenAI") as sdk:
                 client = getattr(module, class_name)(model="test", api_key="test", base_url="https://model.invalid/v1",
                     max_retries=7, http_proxy_url="http://explicit.invalid:81", http_trust_env=True)
-                factory.assert_called_once_with(proxy="http://explicit.invalid:81", trust_env=True)
+                expected = {"proxy": "http://explicit.invalid:81", "trust_env": True}
+                if class_name == "OpenAIClient":
+                    expected["timeout"] = httpx.Timeout(300, connect=10)
+                factory.assert_called_once_with(**expected)
                 self.assertEqual(client._max_retries, 1)
                 self.assertEqual(sdk.call_args.kwargs["max_retries"], 0)
                 self.assertIs(sdk.call_args.kwargs["http_client"], transport)

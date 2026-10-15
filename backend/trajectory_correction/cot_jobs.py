@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from ..pipeline_access import submit_with_context, execution_pipeline_id, retry_enabled_for_pipeline
+from .. import pipeline_diagnostics as diagnostics
+from ..pipeline_diagnostic_http import install_box_reviewer_logging
 
 import hashlib
 import json
@@ -102,6 +104,7 @@ class CotJobManager:
             payload.setdefault("pipeline_id", execution_pipeline_id())
         saved = self._records.put("correction_cot_jobs", str(payload["job_id"]), payload)
         payload["storage_revision"] = saved["storage_revision"]
+        diagnostics.record_job_snapshot(payload, "cot", storage_root())
 
     def get(self, job_id: str) -> dict[str, Any] | None:
         if self._path(job_id).name == ".invalid-job-id":
@@ -267,6 +270,16 @@ class CotJobManager:
             self._write(payload)
 
     def _run(self, job_id: str) -> None:
+        try:
+            job = self.get(job_id) or {}
+        except Exception:
+            job = {}
+        with diagnostics.job_context(job, "cot", storage_root()):
+            if diagnostics.current_context() and job.get("generate_bbox"):
+                install_box_reviewer_logging()
+            return self._run_with_diagnostics(job_id)
+
+    def _run_with_diagnostics(self, job_id: str) -> None:
         payload = self.get(job_id)
         if payload is None:
             return
@@ -299,14 +312,16 @@ class CotJobManager:
                 action = dict(target["action"])
                 if reviewer is not None and str(action.get("action", "")).lower() in {"click", "long_press", "swipe"}:
                     stable = _stable_image(image)
-                    resolution = resolve_action_box(
-                        image_path=stable,
-                        xml_text=_xml_text(stable, target),
-                        action=action,
-                        action_summary=str(target.get("summary") or ""),
-                        reviewer=reviewer,
-                        max_review_rounds=4,
-                    )
+                    with diagnostics.trace_context(task_id=target.get("task_id"), trajectory_id=target["trajectory_id"],
+                                                   step=target["step"], step_key=target.get("step_key")):
+                        resolution = resolve_action_box(
+                            image_path=stable,
+                            xml_text=_xml_text(stable, target),
+                            action=action,
+                            action_summary=str(target.get("summary") or ""),
+                            reviewer=reviewer,
+                            max_review_rounds=4,
+                        )
                     box = _format_manual_actions_box(action, resolution.result.bbox)
                     def save_bbox(current):
                         self._validate_target(current, target)
@@ -323,7 +338,9 @@ class CotJobManager:
                     self._progress(job_id, {"stage": "generating_bbox", "completed_bbox": completed_bbox})
                 with active_session_lock(str(payload["session_id"])):
                     pass
-                result = generator.generate(task=target["task"], trajectory_id=target["trajectory_id"], step=int(target["step"]), history=target["history"], action=target["action"], image=image, reference_answer=str(target.get("reference_answer") or ""))
+                with diagnostics.trace_context(task_id=target.get("task_id"), trajectory_id=target["trajectory_id"],
+                                               step=target["step"], step_key=target.get("step_key")):
+                    result = generator.generate(task=target["task"], trajectory_id=target["trajectory_id"], step=int(target["step"]), history=target["history"], action=target["action"], image=image, reference_answer=str(target.get("reference_answer") or ""))
                 def save_cot(current):
                     self._validate_target(current, target)
                     edit = current.setdefault("row_edits", {}).setdefault(str(target["excel_row"]), {})
@@ -349,10 +366,12 @@ class CotJobManager:
                 completed_cot += 1
                 self._progress(job_id, {"stage": "generating_cot", "completed_steps": completed, "completed_cot": completed_cot, "percent": round(completed / len(payload["targets"]) * 100), "error": None})
         except BatchPublishedError as exc:
+            diagnostics.log_event("job_exception", error=diagnostics.format_exception(exc))
             self._progress(job_id, {"status": "failed", "stage": "batch_published", "completed_at": _now(),
                                    "error": str(exc), "error_code": "batch_published", "detail": exc.detail})
             return
         except Exception as exc:
+            diagnostics.log_event("job_exception", error=diagnostics.format_exception(exc))
             failure = failure_from_exception(exc)
             self._progress(job_id, {"status": "failed", "stage": "failed", "completed_at": _now(),
                                     "error": (failure["message"] if retry_enabled_for_pipeline(payload.get("pipeline_id"), storage_root())
@@ -370,10 +389,12 @@ class CotJobManager:
             artifact = publish_cot_snapshot(str(payload["session_id"]))
             self._progress(job_id, {"artifact": artifact})
         except BatchPublishedError as exc:
+            diagnostics.log_event("job_exception", error=diagnostics.format_exception(exc))
             self._progress(job_id, {"status": "failed", "stage": "batch_published", "completed_at": _now(),
                                    "error": str(exc), "error_code": "batch_published", "detail": exc.detail})
             return
         except Exception as exc:
+            diagnostics.log_event("job_exception", error=diagnostics.format_exception(exc))
             self._progress(job_id, {"status": "failed", "stage": "export_failed", "completed_at": _now(), "error": f"COT 已保存，过程表导出失败；可重新导出，无需重新生成：{exc}"})
             return
         self._progress(job_id, {"status": "succeeded", "stage": "succeeded", "completed_at": _now(), "percent": 100, "error": None})

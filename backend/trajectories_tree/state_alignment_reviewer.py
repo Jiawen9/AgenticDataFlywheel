@@ -13,6 +13,7 @@ from backend.trajectories_tree.model_response import response_text
 from typing import Any
 
 import httpx
+from backend.pipeline_diagnostic_http import instrument_http_client, model_operation
 from openai import OpenAI
 
 try:
@@ -95,6 +96,8 @@ class QwenStateAlignmentReviewer:
             timeout=settings["timeout"],
             trust_env=settings["trust_env"],
         )
+        instrument_http_client(http_client, api_key=settings["api_key"], settings={
+            "proxy": settings["proxy"], "trust_env": settings["trust_env"], "sdk_retries": 0})
         self.client = OpenAI(
             api_key=settings["api_key"],
             base_url=settings["base_url"],
@@ -119,6 +122,7 @@ class QwenStateAlignmentReviewer:
         )
         io_path(temporary_path).replace(io_path(self.cache_path))
 
+    @model_operation("state_alignment_review")
     def review(
         self,
         *,

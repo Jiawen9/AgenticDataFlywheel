@@ -153,6 +153,7 @@ async def lifespan(app: FastAPI):
         with suppress(asyncio.CancelledError):
             await cleanup
         pipeline_manager.close()
+        await asyncio.to_thread(quality_job_manager.shutdown)
         close_phone_factory()
         manager.close()
 
