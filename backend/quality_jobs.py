@@ -14,7 +14,6 @@ import subprocess
 import sys
 import threading
 import time
-import uuid
 from concurrent.futures import Executor, ThreadPoolExecutor
 from contextvars import copy_context
 from datetime import datetime
@@ -28,6 +27,7 @@ from .data_store import RecordStore, DATA_ROOT, ArtifactStore
 from .batch_results import (current_tree_payload, current_quality_payload, quality_task_fingerprints, StaleTaskInput)
 from .stage_artifacts import store_root
 from .pipeline_retry_errors import failure_from_exception, failure_from_payload
+from .identifiers import allocate_id
 from .file_io import io_path
 from . import quality_execution
 from .quality_process import process_metadata, stop_owned_process, stop_recorded_process
@@ -168,7 +168,7 @@ def run_quality_subprocess(run_id: str, task_ids: list[str], *, job_id: str, pro
     owner = job.get("pipeline_id") or (context.get("pipeline_id") if context.get("job_id") == job_id else None)
     with diagnostics.trace_context(_reset=True, root=root, pipeline_id=owner,
             batch_id=job.get("batch_id") or run_id, step_id="quality", job_id=job_id,
-            execution_id=context.get("execution_id") or uuid.uuid4().hex):
+            execution_id=context.get("execution_id") or diagnostics.diagnostic_id("x", root=root)):
         return _run_quality_subprocess(run_id, task_ids, job_id=job_id, progress=progress,
             data_root=data_root, execution_token=execution_token, stop_event=stop_event)
 
@@ -479,7 +479,7 @@ class QualityJobManager:
         if self._closed:
             raise RuntimeError("质检服务正在关闭")
         payload = {
-            "job_id": uuid.uuid4().hex, "run_id": run_id, "task_ids": task_ids,
+            "job_id": allocate_id("j", root=self.data_root), "run_id": run_id, "task_ids": task_ids,
             "status": "queued", "stage": "queued", "created_at": _now(),
             "started_at": None, "completed_at": None, "current_task": None,
             "current_trajectory": None, "task_index": 0, "total_tasks": len(task_ids),

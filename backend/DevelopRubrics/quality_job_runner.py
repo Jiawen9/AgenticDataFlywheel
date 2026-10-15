@@ -10,7 +10,6 @@ import os
 import sys
 import tempfile
 import threading
-import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +26,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from backend.batch_operations import batch_operation
 from backend.file_io import io_path, logical_path, resolve_path
 from backend.data_store import DATA_ROOT, ArtifactStore, RecordStore
+from backend.short_paths import short_cache_directory
 from backend.stage_artifacts import load_quality_objects, quality_tables, write_payload_workbook, write_sidecar
 from backend.batch_results import (current_tree_payload, current_tree_batch, merge_quality_results,
                                    quality_task_fingerprints, StaleTaskInput)
@@ -90,7 +90,7 @@ def worker_telemetry(job_id: str, token: str | None):
     thread = threading.Thread(target=heartbeat, name="quality-heartbeat", daemon=True)
     thread.start()
     try:
-        with observe_requests(request):
+        with observe_requests(request, id_factory=lambda: diagnostics.diagnostic_id("q", root=DATA_ROOT)):
             yield
     finally:
         stop.set()
@@ -291,7 +291,8 @@ async def _run_frozen(run_id: str, task_ids: list[str], job_id: str,
         rubric = EVAL._load_rubric(rubric_path, task)
         async with EVAL.evaluation_pipeline(config) as pipeline:
             checkpoint_key = quality_task_fingerprints(current).get(task_id) if current is not None else None
-            checkpoint = (CHECKPOINT_ROOT / run_id / checkpoint_key / f"{task_id}.jsonl" if checkpoint_key
+            checkpoint = (short_cache_directory(DATA_ROOT, run_id, "quality_checkpoint", checkpoint_key,
+                                               CHECKPOINT_ROOT / run_id) / f"{task_id}.jsonl" if checkpoint_key
                           else CHECKPOINT_ROOT / run_id / f"{task_id}.jsonl")
             EVAL.initialize_evaluations_jsonl(checkpoint, resume=True)
             existing = EVAL.load_existing_evaluations_jsonl(checkpoint)
@@ -416,7 +417,7 @@ def main() -> int:
     parser.add_argument("--diagnostic-execution-id")
     args = parser.parse_args()
     job = {}
-    diagnostic_execution_id = args.diagnostic_execution_id or uuid.uuid4().hex
+    diagnostic_execution_id = args.diagnostic_execution_id or diagnostics.diagnostic_id("x", root=DATA_ROOT)
     try:
         from backend.pipeline_access import retry_enabled_for_pipeline
         job = RecordStore(DATA_ROOT).get("quality_jobs", args.job_id) or {}

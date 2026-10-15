@@ -40,7 +40,7 @@ class TaskOverride(BaseModel):
 class PreviewRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     source_path: str = Field(max_length=4096)
-    batch_id: str = Field(max_length=128)
+    batch_id: str | None = Field(default=None, max_length=128)
     name: str | None = Field(default=None, max_length=200)
     app: str | None = None
     scene: str | None = None

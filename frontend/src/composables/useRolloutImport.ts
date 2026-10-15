@@ -8,27 +8,27 @@ export function useRolloutImport(client = rolloutImportApi, imported: (result: R
   const draft = reactive({ source_path: '', batch_id: '', name: '', app: '', scene: '', capability: '' })
   const taskEdits = reactive<Record<string, string>>({})
   const input = computed<RolloutImportInput>(() => ({
-    source_path: draft.source_path.trim(), batch_id: draft.batch_id.trim(), name: draft.name.trim(),
+    source_path: draft.source_path.trim(), ...(draft.batch_id ? { batch_id: draft.batch_id } : {}), name: draft.name.trim(),
     app: draft.app.trim(), scene: draft.scene.trim(), capability: draft.capability.trim(),
     task_overrides: Object.entries(taskEdits).sort(([a], [b]) => a.localeCompare(b)).map(([collection_case_id, task]) => ({ collection_case_id, task: task.trim() })),
   }))
   const fingerprint = computed(() => JSON.stringify(input.value))
   const reviewedFingerprint = ref('')
   const stale = computed(() => Boolean(preview.value && fingerprint.value !== reviewedFingerprint.value))
-  const canPreview = computed(() => Boolean(draft.source_path.trim() && draft.batch_id.trim() && !loading.value && !committing.value))
+  const canPreview = computed(() => Boolean(draft.source_path.trim() && !loading.value && !committing.value))
   const canCommit = computed(() => Boolean(preview.value?.valid && !preview.value.errors.length && !stale.value && !previewing.value && !committing.value))
   let epoch = 0, disposed = false, optionsController: AbortController | undefined, previewController: AbortController | undefined, commitController: AbortController | undefined
   const requestIds = new Map<string, string>()
+  let applyingBatchId = false
   const clearEdits = () => { Object.keys(taskEdits).forEach(key => delete taskEdits[key]) }
   const current = (token: number) => !disposed && visible.value && token === epoch
   // Synchronous invalidation prevents a just-finished older response from re-enabling import.
-  const stopWatch = watch(fingerprint, () => { epoch++; previewController?.abort(); previewing.value = false; error.value = '' }, { flush: 'sync' })
+  const stopWatch = watch(fingerprint, () => { if (applyingBatchId) return; epoch++; previewController?.abort(); previewing.value = false; error.value = '' }, { flush: 'sync' })
   const stopPathWatch = watch(() => draft.source_path, clearEdits, { flush: 'sync' })
   async function open() {
     epoch++; optionsController?.abort(); previewController?.abort()
     visible.value = true; preview.value = null; reviewedFingerprint.value = ''; clearEdits(); error.value = ''
-    const today = new Date(), date = `${today.getFullYear()}${String(today.getMonth() + 1).padStart(2, '0')}${String(today.getDate()).padStart(2, '0')}`
-    Object.assign(draft, { source_path: '', batch_id: `rollout-${date}-${newRunRequestId().slice(0, 8)}`, name: '', app: '', scene: '', capability: '' })
+    Object.assign(draft, { source_path: '', batch_id: '', name: '', app: '', scene: '', capability: '' })
     allowedRoots.value = []; loading.value = true; previewing.value = false
     optionsController = new AbortController()
     const controller = optionsController
@@ -53,7 +53,12 @@ export function useRolloutImport(client = rolloutImportApi, imported: (result: R
     try {
       const result = await client.preview(input.value, previewController.signal)
       if (!current(token) || key !== fingerprint.value) return
-      preview.value = result; reviewedFingerprint.value = key
+      // A server assignment is part of the reviewed response, not a user edit.
+      // Further validations keep this reservation; edits still invalidate results.
+      applyingBatchId = true
+      draft.batch_id = result.batch_id
+      applyingBatchId = false
+      preview.value = result; reviewedFingerprint.value = fingerprint.value
     } catch (cause) { if (current(token) && (cause as Error).name !== 'AbortError') error.value = (cause as Error).message }
     finally { if (current(token)) previewing.value = false }
   }

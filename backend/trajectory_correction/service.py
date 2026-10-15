@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import hashlib
-import uuid
 import shutil
 from copy import deepcopy
 from contextlib import contextmanager
@@ -21,6 +20,7 @@ from .assets import resolve_asset
 from .constants import CORRECTION_EXPORTS_DIR, CORRECTION_INPUTS_DIR, FIXED_SOURCE_ID, PROJECT_ROOT, ensure_correction_dirs
 from .draft_store import list_sessions, load_session, new_session_id, save_session, update_session, storage_root, utc_now, session_batch_id
 from ..data_store import ArtifactStore, RecordStore, RevisionConflict
+from ..identifiers import allocate_id
 from ..batch_lifecycle import ensure_batch_active, is_batch_active
 from .session_state import identified, row_index, reconcile, reviews_for_group, session_fingerprint, fingerprint
 from .exporter import export_full_dataset_workbook, export_session_workbook
@@ -812,7 +812,7 @@ def publish_cot_snapshot(session_id: str, expected_revision: int | None = None) 
     output_dir = CORRECTION_EXPORTS_DIR / session_id
     io_path(output_dir).mkdir(parents=True, exist_ok=True)
     result = export_full_dataset_workbook(workbook_path=workbook_path, snapshot=snapshot, session=session,
-                                          output_dir=output_dir, export_id=uuid.uuid4().hex[:16])
+                                          output_dir=output_dir, export_id=allocate_id("e", storage_root()))
     generated = output_dir / result["filename"]
     try:
         return publish_stage_snapshot(session, snapshot, "07_cot", workbook=generated)
@@ -829,7 +829,7 @@ def export_session(session_id: str, expected_revision: int | None = None) -> dic
         return existing
     session, snapshot = _export_view(session, _snapshot(session))
     workbook_path, _ = _source_for_session(session, for_export=True)
-    export_id = uuid.uuid4().hex[:16]
+    export_id = allocate_id("e", storage_root())
     output_dir = CORRECTION_EXPORTS_DIR / session_id
     io_path(output_dir).mkdir(parents=True, exist_ok=True)
     result = export_session_workbook(
@@ -866,7 +866,7 @@ def export_dataset_session(session_id: str, expected_revision: int | None = None
         return existing
     session, snapshot = _export_view(session, _snapshot(session))
     workbook_path, _ = _source_for_session(session, for_export=True)
-    export_id = uuid.uuid4().hex[:16]
+    export_id = allocate_id("e", storage_root())
     output_dir = CORRECTION_EXPORTS_DIR / session_id
     io_path(output_dir).mkdir(parents=True, exist_ok=True)
     result = export_full_dataset_workbook(

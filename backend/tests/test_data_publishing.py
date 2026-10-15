@@ -99,7 +99,7 @@ class DatasetPublishingTests(unittest.TestCase):
 
         release = registry.create("GUI 数据集", [session["session_id"]])
 
-        self.assertRegex(release["release_id"], r"^rel_[a-f0-9]{16}$")
+        self.assertRegex(release["release_id"], r"^rel[0-9]{6}-[0-9]{3,}$")
         self.assertEqual(release["excel_paths"][0]["filename"], "latest.xlsx")
         self.assertTrue(release["excel_paths"][0]["path"].startswith("AgenticDataFlywheel/"))
         self.assertEqual(

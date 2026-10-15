@@ -14,11 +14,11 @@ import hashlib
 import json
 import math
 import shutil
-import uuid
 
 from .batch_lifecycle import ensure_publishable, published_entry, session_batch_id
 from .batch_results import current_tree_payload, current_quality_payload
 from .data_store import ArtifactStore, DATA_ROOT, RecordStore, RevisionConflict
+from .identifiers import ID_SCHEME, allocate_id
 from .data_store.release_provenance import freeze_release_provenance
 from .data_publishing.service import DatasetReleaseRegistry
 from .stage_artifacts import write_payload_workbook
@@ -142,7 +142,7 @@ def prepare_manual(batch_id, selection, *, root=None):
         ensure_publishable(batch_id, existing, root)
         if len(existing) > 1:
             raise ValueError("同一批次存在多个活动修正会话")
-        session = existing[0] if existing else {"session_id": uuid.uuid4().hex[:16], "source_id": FIXED_SOURCE_ID,
+        session = existing[0] if existing else {"session_id": allocate_id("s", root), "source_id": FIXED_SOURCE_ID,
             "source_kind": "annotated_workbook", "created_at": utc_now(), "row_edits": {}, "cot": {},
             "group_exports": {}, "exports": []}
         key = fingerprint({"selection": selection, "table": table})
@@ -317,9 +317,20 @@ def _remove_release_directory(path, release_root):
     shutil.rmtree(resolved)
 
 
+def _pipeline_release_id(pipeline, root):
+    """Resolve the durable intent first, including pre-upgrade publication IDs."""
+    pipeline_id = str(pipeline["pipeline_id"])
+    intent = RecordStore(root).get("release_intents", "pipeline:" + pipeline_id)
+    if intent:
+        return intent["release_id"]
+    if pipeline.get("id_scheme") == ID_SCHEME:
+        return allocate_id("rel", root, key=["pipeline-release", pipeline_id])
+    return "rel_" + hashlib.sha256(("pipeline:" + pipeline_id).encode()).hexdigest()[:24]
+
+
 def publish_pipeline(pipeline, *, root=None, registry=None):
     root = _root(root)
-    release_id = "rel_" + hashlib.sha256(("pipeline:" + str(pipeline["pipeline_id"])).encode()).hexdigest()[:24]
+    release_id = _pipeline_release_id(pipeline, root)
     context = {"pipeline_id": pipeline["pipeline_id"], "batch_id": pipeline["batch_id"],
                "release_id": release_id, "status": "preparing"}
     with diagnostics.job_context(context, "publication", root):
@@ -334,9 +345,9 @@ def _publish_pipeline_with_diagnostics(pipeline, *, root=None, registry=None):
     root = _root(root)
     records, store = RecordStore(root), ArtifactStore(root)
     pipeline_id, batch_id = str(pipeline["pipeline_id"]), str(pipeline["batch_id"])
-    release_id = "rel_" + hashlib.sha256(("pipeline:" + pipeline_id).encode()).hexdigest()[:24]
     registry = registry or DatasetReleaseRegistry(data_root=root, releases_file=root / "system" / "dataset_releases.json")
     with store.batch_lock(batch_id):
+        release_id = _pipeline_release_id(pipeline, root)
         existing = records.get("dataset_releases", release_id)
         if existing:
             if existing.get("pipeline_id") != pipeline_id or existing.get("batch_ids") != [batch_id]:

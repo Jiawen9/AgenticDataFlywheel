@@ -7,7 +7,6 @@ import json
 import logging
 import math
 import threading
-import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -16,6 +15,7 @@ from .data_store import DATA_ROOT, ArtifactStore, RecordStore, RevisionConflict
 from .data_store.artifacts import _identifier
 from .data_store.registry import utc_now
 from .file_io import io_path
+from .identifiers import ID_SCHEME, allocate_id
 from .pipeline_access import TERMINAL, active_pipeline, internal_pipeline
 from . import pipeline_diagnostics as diagnostics
 
@@ -304,8 +304,8 @@ class PipelineManager:
                 raise PipelineError("该批次已有执行中作业，请完成后再启动 Pipeline")
             snapshot = self.runtime.snapshot(batch)
             options = self.runtime.collection_options(data.get("collection_config") or {}) if start == "collect" else None
-            now, identifier = utc_now(), "pl_" + uuid.uuid4().hex
-            pipeline = {"pipeline_id": identifier, "batch_id": batch, "name": name, "mode": mode,
+            now, identifier = utc_now(), allocate_id("p", self.root, key=["pipeline", request_id], request_fingerprint=request_digest)
+            pipeline = {"pipeline_id": identifier, "id_scheme": ID_SCHEME, "batch_id": batch, "name": name, "mode": mode,
                 "start_mode": start, "threshold": threshold if mode == "automatic" else None,
                 "task_ids": snapshot["task_ids"], "batch_snapshot": snapshot, "collection_config": options,
                 "config_fingerprints": self.runtime.configurations(), "retry_policy": dict(RETRY_POLICY),

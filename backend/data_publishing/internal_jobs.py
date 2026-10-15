@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 from typing import Any
 from urllib.parse import urlsplit
-import uuid
+from ..identifiers import allocate_id
 
 from ..trajectory_correction.draft_store import utc_now
 from .internal_uploader import UploadContext, UploadError, UploadResult
@@ -94,7 +94,7 @@ class InternalUploadJobsMixin:
                     "url": prior.get("url") if prior else None, "error": None,
                 })
             payload = {
-                "job_id": uuid.uuid4().hex, "release_id": release_id, "dataset_name": release["name"],
+                "job_id": allocate_id("j", self.registry.data_root), "release_id": release_id, "dataset_name": release["name"],
                 "attempt": int((previous or summary).get("attempt", 0)) + 1,
                 "mode": "internal", "status": "queued", "stage": "queued",
                 "created_at": utc_now(), "started_at": None, "completed_at": None,

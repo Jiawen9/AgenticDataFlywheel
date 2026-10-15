@@ -24,6 +24,7 @@ from .prompts import dependency_prompt, flywheel_prompt, scene_classification_pr
 
 Progress = Callable[[dict[str, Any]], None]
 SeedProgress = Callable[[dict[str, Any], list[dict[str, Any]] | None], None]
+IdFactory = Callable[[], str]
 
 
 def _now() -> str:
@@ -36,8 +37,10 @@ def _text(value: Any, default: str = "") -> str:
     return str(value).strip()
 
 
-def _model(model: TaskGenerationModel | None, kb_root: Path) -> TaskGenerationModel:
-    return model or TaskGenerationModel(diagnostics_dir=kb_root.parent / "model_calls")
+def _model(model: TaskGenerationModel | None, kb_root: Path,
+           diagnostic_id_factory: IdFactory | None = None) -> TaskGenerationModel:
+    return model or TaskGenerationModel(diagnostics_dir=kb_root.parent / "model_calls",
+                                        diagnostic_id_factory=diagnostic_id_factory)
 
 
 class PartialGenerationError(ValueError):
@@ -121,9 +124,9 @@ def classify_pre_task_scene(task: str, app: str, *, kb_root: Path, model: TaskGe
     return _checked_json(scene_classification_prompt(scene_tree_text(kb_root), task, app), validate, model=model, stage="classifying", item_id=item_id)
 
 
-def _dependency_tasks(item: dict[str, Any], *, kb_root: Path, model: TaskGenerationModel) -> list[dict[str, Any]]:
+def _dependency_tasks(item: dict[str, Any], *, kb_root: Path, model: TaskGenerationModel, id_factory: IdFactory | None = None) -> list[dict[str, Any]]:
     main = dict(item)
-    main_uuid = str(uuid.uuid4())
+    main_uuid = id_factory() if id_factory else str(uuid.uuid4())
     main["task_uuid"] = main_uuid
     main["pre_task_uuid"] = None
     app = _text(item.get("app") or item.get("target_app"), "未知应用")
@@ -146,7 +149,7 @@ def _dependency_tasks(item: dict[str, Any], *, kb_root: Path, model: TaskGenerat
     relationship = dependency["dependency_relationships"]
     if relationship == "weak":
         pre_text = dependency["pre_task"]
-        pre_uuid = str(uuid.uuid4())
+        pre_uuid = id_factory() if id_factory else str(uuid.uuid4())
         scene = classify_pre_task_scene(pre_text, app, kb_root=kb_root, model=model, item_id=unit)
         pre = dict(item)
         pre.update({
@@ -164,7 +167,7 @@ def _dependency_tasks(item: dict[str, Any], *, kb_root: Path, model: TaskGenerat
     return [main]
 
 
-def _initial_node(row: dict[str, Any], *, generate_n: int, kb_root: Path, model: TaskGenerationModel) -> list[dict[str, Any]]:
+def _initial_node(row: dict[str, Any], *, generate_n: int, kb_root: Path, model: TaskGenerationModel, id_factory: IdFactory | None = None) -> list[dict[str, Any]]:
     prompt = system_prompt(
         row["scene"], row["capability"], row["sub_capability"], row["sub_capability_desc"],
         row["target_app"], row["resource_prior"], row.get("reference_example", ""), generate_n,
@@ -189,7 +192,7 @@ def _initial_node(row: dict[str, Any], *, generate_n: int, kb_root: Path, model:
             "created_at": _now(),
         })
         try:
-            results.extend(_dependency_tasks(normalized, kb_root=kb_root, model=model))
+            results.extend(_dependency_tasks(normalized, kb_root=kb_root, model=model, id_factory=id_factory))
         except Exception as exc:
             errors.append({"stage": "dependency", "task_index": task_index + 1, "error": f"第 {task_index + 1} 条任务依赖检查失败，未纳入结果：{exc}"})
     if errors:
@@ -197,7 +200,7 @@ def _initial_node(row: dict[str, Any], *, generate_n: int, kb_root: Path, model:
     return results
 
 
-def _run_initial_generation(node_ids: list[str], generate_n: int, *, kb_root: Path, progress: Progress, model: TaskGenerationModel) -> dict[str, Any]:
+def _run_initial_generation(node_ids: list[str], generate_n: int, *, kb_root: Path, progress: Progress, model: TaskGenerationModel, id_factory: IdFactory | None = None) -> dict[str, Any]:
     rows = merged_nodes(kb_root, sample_num=generate_n)
     selected = [row for row in rows if row["node_id"] in set(node_ids)]
     by_id = {row["node_id"]: row for row in selected}
@@ -207,7 +210,7 @@ def _run_initial_generation(node_ids: list[str], generate_n: int, *, kb_root: Pa
     errors: list[dict[str, Any]] = []
     workers = _model_config(model).max_concurrent
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="task-generation-node") as executor:
-        futures = {executor.submit(_initial_node, by_id[node_id_value], generate_n=generate_n, kb_root=kb_root, model=model): node_id_value for node_id_value in node_ids if node_id_value in by_id}
+        futures = {executor.submit(_initial_node, by_id[node_id_value], generate_n=generate_n, kb_root=kb_root, model=model, id_factory=id_factory): node_id_value for node_id_value in node_ids if node_id_value in by_id}
         for completed, future in enumerate(as_completed(futures), start=1):
             current_id = futures[future]
             try:
@@ -273,7 +276,7 @@ def _seed_classify(seed: dict[str, Any], *, kb_root: Path, model: TaskGeneration
     return {**seed, **classified}
 
 
-def _variant_records(seed: dict[str, Any], *, generate_n: int, kb_root: Path, model: TaskGenerationModel) -> list[dict[str, Any]]:
+def _variant_records(seed: dict[str, Any], *, generate_n: int, kb_root: Path, model: TaskGenerationModel, id_factory: IdFactory | None = None) -> list[dict[str, Any]]:
     nodes = merged_nodes(kb_root, sample_num=generate_n)
     node = next((item for item in nodes if item["node_id"] == node_id(seed["app"], seed["scene"], seed["capability"], seed["sub_capability"])), None)
     context = dict(seed)
@@ -290,7 +293,7 @@ def _variant_records(seed: dict[str, Any], *, generate_n: int, kb_root: Path, mo
         if not task:
             continue
         records.append({
-            "result_id": uuid.uuid4().hex,
+            "result_id": id_factory() if id_factory else uuid.uuid4().hex,
             "seed_id": seed.get("seed_id"),
             "source_row": seed.get("source_row"),
             "source_task": seed["task"],
@@ -305,11 +308,11 @@ def _variant_records(seed: dict[str, Any], *, generate_n: int, kb_root: Path, mo
     return records
 
 
-def prepare_augmentation_seeds(path: Path) -> list[dict[str, Any]]:
+def prepare_augmentation_seeds(path: Path, *, id_factory: IdFactory | None = None) -> list[dict[str, Any]]:
     """Keep every usable input row, including duplicate tasks, as its own seed."""
     return [{
         **seed,
-        "seed_id": uuid.uuid4().hex,
+        "seed_id": id_factory() if id_factory else uuid.uuid4().hex,
         "classification_source": "excel" if all(seed.get(key) for key in ("scene", "capability", "sub_capability")) else "model",
         "classification_status": "pending",
         "mapping_status": "pending",
@@ -370,7 +373,8 @@ def _run_augmentation_classification(seeds: list[dict[str, Any]], *, kb_root: Pa
 
 
 def _run_augmentation_generation(seeds: list[dict[str, Any]], generate_n: int, *, kb_root: Path, progress: Progress,
-                                model: TaskGenerationModel, on_seed: SeedProgress | None = None) -> dict[str, Any]:
+                                model: TaskGenerationModel, on_seed: SeedProgress | None = None,
+                                id_factory: IdFactory | None = None) -> dict[str, Any]:
     total = len(seeds)
     valid_seeds = [seed for seed in seeds if seed.get("classification_status") == "classified"]
     records: list[dict[str, Any]] = []
@@ -381,7 +385,7 @@ def _run_augmentation_generation(seeds: list[dict[str, Any]], generate_n: int, *
         if on_seed:
             on_seed(current, None)
         try:
-            rows = _variant_records(current, generate_n=generate_n, kb_root=kb_root, model=model)
+            rows = _variant_records(current, generate_n=generate_n, kb_root=kb_root, model=model, id_factory=id_factory)
             issues = []
         except PartialGenerationError as exc:
             rows, issues = exc.results, exc.errors
@@ -409,8 +413,9 @@ def _run_augmentation_generation(seeds: list[dict[str, Any]], generate_n: int, *
 
 
 def run_augmentation_classification(seeds: list[dict[str, Any]], *, kb_root: Path, progress: Progress,
-                                   on_seed: SeedProgress | None = None, model: TaskGenerationModel | None = None) -> dict[str, Any]:
-    active = _model(model, kb_root)
+                                   on_seed: SeedProgress | None = None, model: TaskGenerationModel | None = None,
+                                   diagnostic_id_factory: IdFactory | None = None) -> dict[str, Any]:
+    active = _model(model, kb_root, diagnostic_id_factory)
     try:
         return _run_augmentation_classification(seeds, kb_root=kb_root, progress=progress, model=active, on_seed=on_seed)
     finally:
@@ -419,36 +424,38 @@ def run_augmentation_classification(seeds: list[dict[str, Any]], *, kb_root: Pat
 
 
 def run_augmentation_generation(seeds: list[dict[str, Any]], generate_n: int, *, kb_root: Path, progress: Progress,
-                               on_seed: SeedProgress | None = None, model: TaskGenerationModel | None = None) -> dict[str, Any]:
-    active = _model(model, kb_root)
+                               on_seed: SeedProgress | None = None, model: TaskGenerationModel | None = None,
+                               id_factory: IdFactory | None = None,
+                               diagnostic_id_factory: IdFactory | None = None) -> dict[str, Any]:
+    active = _model(model, kb_root, diagnostic_id_factory)
     try:
-        return _run_augmentation_generation(seeds, generate_n, kb_root=kb_root, progress=progress, model=active, on_seed=on_seed)
+        return _run_augmentation_generation(seeds, generate_n, kb_root=kb_root, progress=progress, model=active, on_seed=on_seed, id_factory=id_factory)
     finally:
         if model is None:
             active.close()
 
 
-def _run_augmentation(path: Path, generate_n: int, *, kb_root: Path, progress: Progress, model: TaskGenerationModel) -> dict[str, Any]:
+def _run_augmentation(path: Path, generate_n: int, *, kb_root: Path, progress: Progress, model: TaskGenerationModel, id_factory: IdFactory | None = None) -> dict[str, Any]:
     """Compatibility entry point for callers that still want one automatic run."""
-    classified = _run_augmentation_classification(prepare_augmentation_seeds(path), kb_root=kb_root, progress=progress, model=model)
-    outcome = _run_augmentation_generation(classified["seeds"], generate_n, kb_root=kb_root, progress=progress, model=model)
+    classified = _run_augmentation_classification(prepare_augmentation_seeds(path, id_factory=id_factory), kb_root=kb_root, progress=progress, model=model)
+    outcome = _run_augmentation_generation(classified["seeds"], generate_n, kb_root=kb_root, progress=progress, model=model, id_factory=id_factory)
     outcome["errors"] = classified["errors"] + outcome["errors"]
     return outcome
 
 
-def run_initial_generation(node_ids: list[str], generate_n: int, *, kb_root: Path, progress: Progress, model: TaskGenerationModel | None = None) -> dict[str, Any]:
-    active = _model(model, kb_root)
+def run_initial_generation(node_ids: list[str], generate_n: int, *, kb_root: Path, progress: Progress, model: TaskGenerationModel | None = None, id_factory: IdFactory | None = None, diagnostic_id_factory: IdFactory | None = None) -> dict[str, Any]:
+    active = _model(model, kb_root, diagnostic_id_factory)
     try:
-        return _run_initial_generation(node_ids, generate_n, kb_root=kb_root, progress=progress, model=active)
+        return _run_initial_generation(node_ids, generate_n, kb_root=kb_root, progress=progress, model=active, id_factory=id_factory)
     finally:
         if model is None:
             active.close()
 
 
-def run_augmentation(path: Path, generate_n: int, *, kb_root: Path, progress: Progress, model: TaskGenerationModel | None = None) -> dict[str, Any]:
-    active = _model(model, kb_root)
+def run_augmentation(path: Path, generate_n: int, *, kb_root: Path, progress: Progress, model: TaskGenerationModel | None = None, id_factory: IdFactory | None = None, diagnostic_id_factory: IdFactory | None = None) -> dict[str, Any]:
+    active = _model(model, kb_root, diagnostic_id_factory)
     try:
-        return _run_augmentation(path, generate_n, kb_root=kb_root, progress=progress, model=active)
+        return _run_augmentation(path, generate_n, kb_root=kb_root, progress=progress, model=active, id_factory=id_factory)
     finally:
         if model is None:
             active.close()

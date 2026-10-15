@@ -47,7 +47,11 @@ const lifecycle = useBatchLifecycle({ currentBatch: () => '', onPublished, refre
 const { notice: publishedNotice } = lifecycle
 function onPublished(event: PublishedBatchEvent) {
   // External releases have no active editing workspace to retire on this page.
-  if (event.batch_ids.length && event.batch_ids.every(id => id.startsWith('external_'))) return
+  const sourceKind = event.source_kind || releases.value.find(item => item.release_id === event.release_id)?.source_kind
+  if (sourceKind === 'external_manual') return
+  // Older tabs may omit origin metadata. An unrelated published batch has no
+  // candidate or editing state to clear here, regardless of its ID spelling.
+  if (!candidates.value.some(item => event.batch_ids.includes(item.batch_id || ''))) return
   candidates.value = candidates.value.filter(item => !event.batch_ids.includes(item.batch_id || ''))
   const remaining = new Set(candidates.value.map(item => item.session_id))
   selectedSessionIds.value = selectedSessionIds.value.filter(id => remaining.has(id))
@@ -142,7 +146,7 @@ async function createRelease() {
   creating.value = true
   try {
     const release = await api.createDatasetRelease(name, selectedSessionIds.value)
-    notifyBatchesPublished({ batch_ids: release.batch_ids, release_id: release.release_id, published_at: release.created_at })
+    notifyBatchesPublished({ batch_ids: release.batch_ids, release_id: release.release_id, published_at: release.created_at, source_kind: release.source_kind })
     if (disposed) return
     datasetName.value = ''
     selectedSessionIds.value = []
@@ -159,8 +163,10 @@ async function createRelease() {
 
 async function externalReleased(release: DatasetRelease) {
   const history = ++historyEpoch
-  const externalBatchIds = release.batch_ids.filter(id => id.startsWith('external_'))
-  if (externalBatchIds.length) notifyBatchesPublished({ batch_ids: externalBatchIds, release_id: release.release_id, published_at: release.created_at })
+  if (release.source_kind === 'external_manual' && release.batch_ids.length) {
+    notifyBatchesPublished({ batch_ids: release.batch_ids, release_id: release.release_id,
+      published_at: release.created_at, source_kind: release.source_kind })
+  }
   if (disposed) return
   releases.value = [release, ...releases.value.filter(item => item.release_id !== release.release_id)]
   ++detailEpoch

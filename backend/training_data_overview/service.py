@@ -12,7 +12,6 @@ import math
 from pathlib import Path
 import shutil
 import threading
-import uuid
 
 from ..data_store import RecordStore
 from ..data_store.artifacts import _write_bytes, _write_tables, _json_bytes, _sha256
@@ -250,7 +249,8 @@ class TrainingOverviewManager:
         catalog = self.records.get(CATALOG, "current") or {}
         rows = [r for r in catalog.get("rows", []) if r["release_id"] != release_id] + converted["rows"]
         rows.sort(key=lambda r: (r["时间"], r["轨迹"], r["子任务轨迹"]))
-        version = uuid.uuid4().hex
+        from ..identifiers import allocate_id
+        version = allocate_id("o", self.root)
         base = contained_path(self.root, "system", "training_data_overview", "exports")
         temporary, final = base / ("." + version + ".tmp"), base / version
         temporary.mkdir(parents=True, exist_ok=False)

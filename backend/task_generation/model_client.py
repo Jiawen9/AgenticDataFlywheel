@@ -62,10 +62,12 @@ class ModelText(str):
 
 
 class TaskGenerationModel:
-    def __init__(self, config: TaskGenerationConfig | None = None, call: Callable[[str], str] | None = None, *, diagnostics_dir: Path | None = None) -> None:
+    def __init__(self, config: TaskGenerationConfig | None = None, call: Callable[[str], str] | None = None, *,
+                 diagnostics_dir: Path | None = None, diagnostic_id_factory: Callable[[], str] | None = None) -> None:
         self.config = config or load_model_config()
         self._call_override = call
         self.diagnostics_dir = diagnostics_dir or LOGS_DIR / "model_calls"
+        self._diagnostic_id_factory = diagnostic_id_factory
         if call is None:
             try:
                 import httpx
@@ -80,6 +82,17 @@ class TaskGenerationModel:
                 http_client=httpx.Client(proxy=self.config.proxy or None, verify=self.config.verify,
                                          timeout=self.config.timeout, trust_env=self.config.trust_env),
             )
+
+    def _trace_id(self) -> str:
+        if self._diagnostic_id_factory is not None:
+            try:
+                identifier = self._diagnostic_id_factory()
+                if isinstance(identifier, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,96}", identifier):
+                    return identifier
+            except Exception:
+                # Diagnostics must never change model-call success or retry decisions.
+                logging.warning("无法分配任务生成诊断编号，使用本地备用编号")
+        return uuid.uuid4().hex
 
     def _trace(self, record: dict[str, Any]) -> str | None:
         if not self.config.trace_enabled:
@@ -116,7 +129,7 @@ class TaskGenerationModel:
         last_trace: str | None = None
         for attempt in range(self.config.max_retries + 1):
             record: dict[str, Any] = {
-                "trace_id": uuid.uuid4().hex, "created_at": datetime.now(timezone.utc).isoformat(),
+                "trace_id": self._trace_id(), "created_at": datetime.now(timezone.utc).isoformat(),
                 "stage": stage, "item_id": item_id, "attempt": attempt + 1,
                 "endpoint": f"{endpoint.scheme}://{endpoint.netloc.rsplit('@', 1)[-1]}{endpoint.path}", "request": request,
             }

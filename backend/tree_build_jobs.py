@@ -7,7 +7,6 @@ from . import pipeline_diagnostics as diagnostics
 
 import json
 import threading
-import uuid
 from concurrent.futures import Executor, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +18,7 @@ from .pipeline_retry_errors import failure_from_exception, failure_from_payload
 from .trajectory_data import TREE_JOBS_DIR
 from .tree_build_service import build_tree_run, tree_build_config
 from .data_store import RecordStore, ArtifactStore
+from .identifiers import allocate_id
 from .file_io import io_path
 from .batch_results import (annotation_task_fingerprints, tree_task_fingerprints,
                             current_tree_payload, assert_task_inputs, StaleTaskInput)
@@ -137,7 +137,7 @@ class TreeBuildJobManager:
         return self._submit_job(pending, extra)
 
     def _submit_job(self, task_ids, extra=None):
-        job_id = uuid.uuid4().hex
+        job_id = allocate_id("j", root=self.data_root)
         payload: dict[str, Any] = {
             "job_id": job_id,
             "status": "queued",

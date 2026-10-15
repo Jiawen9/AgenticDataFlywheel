@@ -6,6 +6,7 @@ export interface PublishedBatchEvent {
   release_id: string | null
   published_at?: string | null
   source_path?: string
+  source_kind?: string
 }
 const listeners = new Set<(event: PublishedBatchEvent) => void>()
 const published = new Map<string, PublishedBatchEvent>()

@@ -4,6 +4,15 @@ import { activeBatchItems, eventMatchesRoute, notifyBatchesPublished, publishedB
 
 afterEach(() => vi.unstubAllGlobals())
 describe('published batch lifecycle', () => {
+  it('preserves explicit external origin for short batch IDs without affecting another workspace', () => {
+    const listener = vi.fn(), stop = subscribeBatchLifecycle(listener)
+    try {
+      notifyBatchesPublished({ batch_ids: ['b261015-841'], release_id: 'rel261015-321', source_kind: 'external_manual' })
+      expect(listener).toHaveBeenCalledWith(expect.objectContaining({ batch_ids: ['b261015-841'], source_kind: 'external_manual' }))
+      expect(publishedBatch('b261015-841')?.source_kind).toBe('external_manual')
+      expect(activeBatchItems([{ batch_id: 'b261015-842' }])).toEqual([{ batch_id: 'b261015-842' }])
+    } finally { stop() }
+  })
   it('notifies locally, broadcasts, deduplicates incoming events and closes the channel', () => {
     const channels: Array<{ onmessage: ((event: { data: unknown }) => void) | null; postMessage: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> }> = []
     vi.stubGlobal('window', {})

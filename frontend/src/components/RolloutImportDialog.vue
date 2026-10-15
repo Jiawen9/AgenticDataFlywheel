@@ -21,7 +21,7 @@ onBeforeUnmount(flow.dispose)
         <p class="field-hint">此处读取后端本地目录，不上传浏览器所在电脑的文件。{{ allowedRoots.length ? '允许的目录：' + allowedRoots.join('；') : '' }}</p>
       </el-form-item>
       <div class="rollout-import-grid">
-        <el-form-item label="新业务批次编号" required><el-input v-model="draft.batch_id" data-testid="rollout-import-batch-id" /></el-form-item>
+        <el-form-item label="新业务批次编号"><el-input :model-value="draft.batch_id" readonly placeholder="校验预览后由后端分配" data-testid="rollout-import-batch-id" /></el-form-item>
         <el-form-item label="批次名称（可选）"><el-input v-model="draft.name" maxlength="100" data-testid="rollout-import-name" placeholder="用于识别这次导入" /></el-form-item>
         <el-form-item label="App（补缺）"><el-input v-model="draft.app" data-testid="rollout-import-app" placeholder="源文件已有信息优先" /></el-form-item>
         <el-form-item label="一级场景（补缺）"><el-input v-model="draft.scene" data-testid="rollout-import-scene" placeholder="未填写保留为未分类" /></el-form-item>

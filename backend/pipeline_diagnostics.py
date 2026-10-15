@@ -16,7 +16,6 @@ import re
 import sys
 import threading
 import traceback
-import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -31,7 +30,8 @@ _context = ContextVar("pipeline_diagnostic_context", default=None)
 _lock = threading.RLock()
 _secrets: set[str] = set()
 _writer_pid = os.getpid()
-_writer_id = uuid.uuid4().hex
+_writer_id = None
+_writer_root = None
 _sequence = 0
 _warned: set[str] = set()
 _LOG = logging.getLogger(__name__)
@@ -345,14 +345,28 @@ def _warning(exc):
 
 def _atomic(path: Path, raw: bytes) -> None:
     io_path(path.parent).mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".part")
-    try:
-        with io_path(temporary).open("xb") as handle:
+    from .short_paths import short_temporary_file
+    with short_temporary_file(path) as temporary:
+        with io_path(temporary).open("wb") as handle:
             handle.write(raw)
             handle.flush()
         io_path(temporary).replace(io_path(path))
-    finally:
-        io_path(temporary).unlink(missing_ok=True)
+
+
+def diagnostic_id(prefix: str, root=None) -> str:
+    """Logging allocations are best effort, just like logging itself."""
+    try:
+        context = current_context() or {}
+        data_root = root or context.get("root")
+        if data_root is not None and io_path(Path(data_root) / "system" / "app.sqlite").is_file():
+            from .identifiers import allocate_id
+            return allocate_id(prefix, Path(data_root))
+    except Exception as exc:
+        _warning(exc)
+    # Never let database/log disk failure prevent a model request or job.
+    # This fallback is diagnostic-only, with 96 random bits and no business use.
+    import secrets
+    return prefix + "_" + secrets.token_hex(12)
 
 
 def write_json(relative_path, value) -> bool:
@@ -402,14 +416,15 @@ def _append_bytes(relative_path, raw: bytes) -> None:
 
 
 def log_event(event: str, **fields) -> None:
-    global _writer_id, _writer_pid, _sequence
+    global _writer_id, _writer_pid, _writer_root, _sequence
     context = current_context()
     if context is None:
         return
     try:
         with _lock:
-            if os.getpid() != _writer_pid:
-                _writer_pid, _writer_id, _sequence = os.getpid(), uuid.uuid4().hex, 0
+            if os.getpid() != _writer_pid or _writer_id is None or _writer_root != str(context["root"]):
+                _writer_pid, _writer_id, _sequence = os.getpid(), diagnostic_id("w"), 0
+                _writer_root = str(context["root"])
             _sequence += 1
             payload = {**{k: v for k, v in context.items() if k != "root"}, **fields,
                        "schema_version": SCHEMA_VERSION, "event": event, "at": utc_now(),
@@ -543,7 +558,7 @@ def job_context(payload: dict, stage: str, root: Path):
     if not pipeline_id or not job_id:
         yield None
         return
-    execution_id = uuid.uuid4().hex
+    execution_id = diagnostic_id("x", root)
     with trace_context(_reset=True, root=root, pipeline_id=pipeline_id,
                        batch_id=payload.get("batch_id") or inherited.get("batch_id") or payload.get("run_id"),
                        step_id=stage, job_id=job_id, execution_id=execution_id):
