@@ -62,6 +62,7 @@ from adarubric.generator.prompts import (
 from adarubric.generator.validation import OpenAIEmbeddingProvider, RubricValidator
 from adarubric.llm.json_extract import extract_json_substring, strip_thinking
 from adarubric.llm.openai_client import OpenAIClient, parse_extra_body
+from adarubric.llm.request_control import request_context
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_ROOT = PROJECT_ROOT.parents[1]
@@ -69,6 +70,7 @@ DEFAULT_CONFIG_PATH = PROJECT_ROOT / "examples" / "jiawen_rubric_config.json"
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 from backend.file_io import io_path
+from backend.quality_execution import execution_write_guard
 from backend.data_store import DATA_ROOT
 from backend.stage_artifacts import load_quality_objects, structured_input_exists
 DEFAULT_WORKBOOK = DATA_ROOT / "system" / "rubric_trajectories.xlsx"
@@ -638,8 +640,9 @@ def _evidence_from_messages(
 
 
 def _write_raw_response(path: Path, *, stage: str, raw: str) -> None:
-    io_path(path.parent).mkdir(parents=True, exist_ok=True)
-    io_path(path).write_text(f"## {stage}\n\n{strip_thinking(raw).rstrip()}\n", encoding="utf-8")
+    with execution_write_guard():
+        io_path(path.parent).mkdir(parents=True, exist_ok=True)
+        io_path(path).write_text(f"## {stage}\n\n{strip_thinking(raw).rstrip()}\n", encoding="utf-8")
 
 
 def _rubric_text(rubric: DynamicRubric) -> str:
@@ -686,11 +689,10 @@ async def _repair_rubric_json(
             ),
         },
     ]
-    repaired = await client.generate_text(
-        repair_messages,
-        temperature=0.0,
-        max_tokens=max_tokens,
-    )
+    with request_context("rubric_repair", task_id=task.task_id):
+        repaired = await client.generate_text(
+            repair_messages, temperature=0.0, max_tokens=max_tokens,
+        )
     _write_raw_response(raw_response_path, stage="json_repair_raw_response", raw=repaired)
     return _parse_rubric_json(repaired)
 
@@ -706,11 +708,10 @@ async def _generate_rubric_json(
     max_tokens: int,
     raw_response_path: Path,
 ) -> DynamicRubric:
-    raw = await client.generate_text(
-        messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
+    with request_context("rubric_generate", task_id=task.task_id):
+        raw = await client.generate_text(
+            messages, temperature=temperature, max_tokens=max_tokens,
+        )
     _write_raw_response(raw_response_path, stage="rubric_raw_response", raw=raw)
 
     try:

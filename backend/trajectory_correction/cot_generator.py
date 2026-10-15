@@ -1,6 +1,7 @@
 """Generate replacement GUI-agent thought/summary for corrected actions."""
 
 from __future__ import annotations
+from backend.pipeline_diagnostic_http import instrument_http_client, model_operation
 
 import base64
 import hashlib
@@ -107,7 +108,10 @@ class QwenCotGenerator:
         values = read_env(env_file)
         self.endpoint = values["MODEL_URL"]
         self.model = values.get("COT_MODEL_NAME") or "qwen3-vl-32b-instruct"
-        http_client = model_http_client(model_http_options(values, prefix="COT"))
+        http_options = model_http_options(values, prefix="COT")
+        http_client = model_http_client(http_options)
+        instrument_http_client(http_client, api_key=values["YUNAI_API_KEY"], settings={
+            **http_options, "sdk_retries": 2})
         try:
             self.client = OpenAI(api_key=values["YUNAI_API_KEY"], base_url=values["MODEL_URL"], max_retries=2, http_client=http_client)
         except Exception:
@@ -125,6 +129,7 @@ class QwenCotGenerator:
         payload = {"version": "cot-v9-current-batch", "model": model, "endpoint": endpoint, "prompt": SYSTEM_PROMPT, "task": task, "trajectory_id": trajectory_id, "step": step, "history": history, "action": action, "image": digest}
         return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
+    @model_operation("cot_generate")
     def generate(self, *, task: str, trajectory_id: str, step: int, history: str, action: dict[str, Any], image: Path, reference_answer: str = "") -> dict[str, str | bool]:
         key = self._key(task=task, trajectory_id=trajectory_id, step=step, history=history, action=action, reference_answer=reference_answer, image=image, model=self.model, endpoint=getattr(self, "endpoint", ""))
         path = self.cache_dir / f"{key}.json"

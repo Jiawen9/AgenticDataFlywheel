@@ -10,7 +10,7 @@ import shutil
 import uuid
 from itertools import chain
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .paths import DATA_ROOT, contained_path
 from .registry import RecordStore, utc_now, RevisionConflict
@@ -182,7 +182,8 @@ class ArtifactStore:
         return result
 
     def publish_many(self, batch_id: str, entries: list[dict], *,
-                     replace_legacy: bool = False, record_entries: list[dict] | None = None) -> list[dict]:
+                     replace_legacy: bool = False,
+                     record_entries: list[dict] | Callable[[list[dict]], list[dict]] | None = None) -> list[dict]:
         """Commit whole stages together; version is a CAS token, never a folder.
 
         source_stages references earlier entries in this publication.
@@ -279,9 +280,12 @@ class ArtifactStore:
                     writes.append({"namespace": "artifacts", "key": self._key(batch_id, stage),
                                    "payload": manifest, "expected_revision": (current or {}).get("storage_revision", 0)})
                     manifests.append(manifest)
+                # Some indexes need the exact frozen reference. Build them only
+                # after preparation, before any replacement or SQLite commit.
+                extra_records = record_entries(manifests) if callable(record_entries) else record_entries
                 if not changes:
-                    if record_entries:
-                        self.records.put_many(record_entries)
+                    if extra_records:
+                        self.records.put_many(extra_records)
                     return manifests
                 io_path(transaction / "previous").mkdir(parents=True, exist_ok=True)
                 _write_bytes(transaction / "commit.json", _json_bytes({"batch_id": batch_id, "op_id": op_id, "changes": changes}))
@@ -291,7 +295,7 @@ class ArtifactStore:
                     if io_path(final).exists():
                         io_path(final).rename(io_path(transaction / "previous" / change["stage"]))
                     io_path(transaction / "prepared" / change["stage"]).rename(io_path(final))
-                writes.extend(record_entries or [])
+                writes.extend(extra_records or [])
                 writes.append({"namespace": "artifact_commits", "key": batch_id, "payload": {"op_id": op_id}})
                 deletes = [{"namespace": "artifacts", "key": key} for change in changes for key in change["legacy_keys"]]
                 self.records.put_many(writes, deletes=deletes)

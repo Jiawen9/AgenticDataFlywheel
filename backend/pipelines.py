@@ -17,6 +17,7 @@ from .data_store.artifacts import _identifier
 from .data_store.registry import utc_now
 from .file_io import io_path
 from .pipeline_access import TERMINAL, active_pipeline, internal_pipeline
+from . import pipeline_diagnostics as diagnostics
 
 LOG = logging.getLogger(__name__)
 STEPS = [("collection", "采集与回传"), ("preprocessing", "预处理与标框"), ("tree", "轨迹树构建"),
@@ -322,17 +323,27 @@ class PipelineManager:
                 {"namespace": "pipeline_owners", "key": batch, "payload": {"pipeline_id": identifier, "batch_id": batch},
                  "expected_revision": (owner or {}).get("storage_revision", 0)},
                 {"namespace": "pipeline_requests", "key": key, "payload": {"pipeline_id": identifier, "request_digest": request_digest}, "expected_revision": 0}])
-            return self.get(identifier)
+            created = self.get(identifier)
+            diagnostics.record_pipeline(created, self.root, event="pipeline_created")
+            return created
 
     def _save(self, pipeline):
         pipeline["updated_at"] = utc_now()
         pipeline["logs"] = pipeline.get("logs", [])[-200:]
-        return self.records.put("pipelines", pipeline["pipeline_id"], pipeline, expected_revision=pipeline["storage_revision"])
+        saved = self.records.put("pipelines", pipeline["pipeline_id"], pipeline, expected_revision=pipeline["storage_revision"])
+        diagnostics.record_pipeline(saved, self.root)
+        return saved
 
     def _log(self, p, message):
         p["logs"].append({"at": utc_now(), "message": message})
+        with diagnostics.trace_context(root=self.root, pipeline_id=p["pipeline_id"], batch_id=p["batch_id"], step_id=p["current_step"]):
+            diagnostics.log_event("pipeline_message", message=message, status=p["status"])
 
     def control(self, pipeline_id, action, revision, *, session_revision=None):
+        with diagnostics.trace_context(root=self.root, pipeline_id=pipeline_id):
+            return self._control_with_diagnostics(pipeline_id, action, revision, session_revision=session_revision)
+
+    def _control_with_diagnostics(self, pipeline_id, action, revision, *, session_revision=None):
         with self.artifacts.batch_lock("pipeline_" + pipeline_id):
             p = self.get(pipeline_id, public=False)
             if revision != p["storage_revision"]:
@@ -387,6 +398,7 @@ class PipelineManager:
     def _schedule_or_fail(self, pipeline, step, exc):
         from .pipeline_retry_errors import failure_from_exception, failure_from_payload
 
+        diagnostics.log_event("pipeline_stage_exception", step_id=step["id"], error=diagnostics.format_exception(exc))
         child_failure = getattr(exc, "failure", None)
         failure = failure_from_payload(child_failure) if child_failure else failure_from_exception(exc)
         message = (str(exc) if isinstance(exc, PipelineError) and not isinstance(exc, PipelineStepFailure)
@@ -461,6 +473,10 @@ class PipelineManager:
             step["retry_info"].update(last_error=None, next_retry_at=None)
 
     def _job_step(self, p, step):
+        with diagnostics.trace_context(root=self.root, pipeline_id=p["pipeline_id"], batch_id=p["batch_id"], step_id=step["id"]):
+            return self._job_step_with_diagnostics(p, step)
+
+    def _job_step_with_diagnostics(self, p, step):
         key = step["id"]
         jobs = {j["job_id"]: j for j in self.runtime.jobs(key, p)}
         known = [jobs.get(j) for j in step["job_ids"]]
@@ -491,6 +507,7 @@ class PipelineManager:
             raise PipelineError("处理配置已变化，请结束流程后重新创建")
         if key != "cot" and self.runtime.ready(key, p):
             self._done(step, "复用当前有效结果")
+            diagnostics.log_event("stage_reused", step_id=key, task_ids=p["task_ids"], source="current_valid_artifacts")
             return
         if step["status"] == "running" and not step["job_ids"]:
             previous = set(step.get("previous_job_ids", []))
@@ -513,6 +530,8 @@ class PipelineManager:
             return
         if job["job_id"] not in step["job_ids"]:
             step["job_ids"].append(job["job_id"])
+        diagnostics.record_job_snapshot(job, key, self.root)
+        diagnostics.log_event("job_bound", job_id=job["job_id"], status=job["status"], reused=job.get("reused", False))
         # Other sub-jobs of the same frozen task input may cover the remainder.
         for child in self.runtime.jobs(key, p):
             if child["status"] in ACTIVE_JOBS and child["job_id"] not in step["job_ids"]:
@@ -521,6 +540,10 @@ class PipelineManager:
             raise PipelineStepFailure(job.get("error") or "作业提交失败", job.get("failure"))
 
     def tick(self, pipeline_id):
+        with diagnostics.trace_context(root=self.root, pipeline_id=pipeline_id):
+            return self._tick_with_diagnostics(pipeline_id)
+
+    def _tick_with_diagnostics(self, pipeline_id):
         with self.artifacts.batch_lock("pipeline_" + pipeline_id), internal_pipeline(pipeline_id):
             p = self.get(pipeline_id, public=False)
             original = digest(p)
@@ -596,7 +619,11 @@ class PipelineManager:
                         step.update(status="running", started_at=step["started_at"] or utc_now(), message="下发采集")
                         saved = self._save(p)
                         p["storage_revision"] = saved["storage_revision"]
-                        run = self.runtime.dispatch_collection(p)
+                        with diagnostics.trace_context(batch_id=p["batch_id"], step_id="collection"):
+                            diagnostics.log_event("collection_dispatch_started", collection_config=p["collection_config"])
+                            run = self.runtime.dispatch_collection(p)
+                            diagnostics.record_job_snapshot(run, "collection", self.root)
+                            diagnostics.log_event("collection_dispatched", collection_run_id=run["collection_run_id"])
                         p["collection_run_ids"] = [run["collection_run_id"]]
                     if p["start_mode"] == "existing":
                         p["collection_run_ids"] = [r["collection_run_id"] for r in self.runtime.collection_runs(p["batch_id"]) if r["status"] == "completed"]

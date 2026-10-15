@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from .pipeline_access import submit_with_context, execution_pipeline_id, retry_enabled_for_pipeline
+from . import pipeline_diagnostics as diagnostics
+from .pipeline_diagnostic_http import install_box_reviewer_logging
 
 import copy
 import json
@@ -66,7 +68,9 @@ class PreprocessingJobManager:
                     total = job.get("total_steps") or 0
                     job["percent"] = min(99, round(100 * job.get("completed_steps", 0) / total)) if total else 0
                 return job
-            return self.records.update("preprocessing_jobs", job_id, update)
+            saved = self.records.update("preprocessing_jobs", job_id, update)
+            diagnostics.record_job_snapshot(saved, "preprocessing", self.root)
+            return saved
 
     def list_jobs(self, batch_id=None):
         with self._lock:
@@ -122,6 +126,7 @@ class PreprocessingJobManager:
         if execution_pipeline_id():
             job["pipeline_id"] = execution_pipeline_id()
         self.records.put("preprocessing_jobs", job_id, job, expected_revision=0)
+        diagnostics.record_job_snapshot(job, "preprocessing", self.root)
         try:
             submit_with_context(self._executor, self._run, job_id)
         except Exception as exc:
@@ -196,6 +201,16 @@ class PreprocessingJobManager:
                                  base_annotation_version=previous.get("base_annotation_version"))
 
     def _run(self, job_id):
+        try:
+            job = self._get(job_id) or {}
+        except Exception:
+            job = {}
+        with diagnostics.job_context(job, "preprocessing", self.root):
+            if diagnostics.current_context():
+                install_box_reviewer_logging()
+            return self._run_with_diagnostics(job_id)
+
+    def _run_with_diagnostics(self, job_id):
         self._update(job_id, status="running", stage="scanning", started_at=utc_now())
         try:
             job = self._get(job_id)
@@ -303,6 +318,7 @@ class PreprocessingJobManager:
                 for name in ("trajectories_to_excel.xlsx", "trajectories_to_excel.json", "annotated_trajectories.xlsx", "annotated_trajectories.json"):
                     io_path(work / name).unlink(missing_ok=True)
         except Exception as exc:
+            diagnostics.log_event("job_exception", error=diagnostics.format_exception(exc))
             failure = failure_from_exception(exc)
             self._update(job_id, status="failed", stage="failed", completed_at=utc_now(),
                          error=(failure["message"] if retry_enabled_for_pipeline(job.get("pipeline_id"), self.root)

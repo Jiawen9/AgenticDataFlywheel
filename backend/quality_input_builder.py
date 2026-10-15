@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from contextlib import suppress
+from contextvars import copy_context
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from backend.file_io import io_path
@@ -16,6 +17,7 @@ from .DevelopRubrics.trajectory_tools.gui_trajectory_excel import (
 from .data_store import DATA_ROOT
 from .stage_artifacts import write_sidecar
 from .model_http import model_http_options
+from .pipeline_diagnostics import trace_context
 from .trajectories_tree import intermediate_state_classifier
 
 FINAL_ANSWER_CACHE = DATA_ROOT / "cache" / "rubric_outputs" / "qwen_tree_final_answers.json"
@@ -82,8 +84,10 @@ def _build_quality_workbook(*, grouped: dict[str, list[tuple[str, list[Any]]]],
     final_answers: list[str | None] = [None] * total
 
     def _summarize(item: tuple[str, str, str, str, list[StepRecord]]) -> str:
-        _, task_text, trajectory_id, _, records = item
-        return summarizer.summarize_trajectory(task_text, trajectory_id, records)
+        task_id, task_text, trajectory_id, _, records = item
+        with trace_context(task_id=task_id, trajectory_id=trajectory_id,
+                           operation="trajectory_summary", concurrency=max(1, int(max_concurrent))):
+            return summarizer.summarize_trajectory(task_text, trajectory_id, records)
 
     worker_count = max(1, int(max_concurrent))
     completed = 0
@@ -100,7 +104,7 @@ def _build_quality_workbook(*, grouped: dict[str, list[tuple[str, list[Any]]]],
             thread_name_prefix="tree-summary",
         ) as executor:
             pending = {
-                executor.submit(_summarize, item): index
+                executor.submit(copy_context().run, _summarize, item): index
                 for index, item in enumerate(prepared)
             }
             for future in as_completed(pending):

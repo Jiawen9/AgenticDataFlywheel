@@ -24,7 +24,8 @@ except ModuleNotFoundError:  # Legacy examples import trajectory_tools directly.
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
-from backend.model_http import model_http_client
+from backend.model_http import model_http_client, model_http_options
+from backend.pipeline_diagnostic_http import instrument_http_client, model_operation
 
 
 DOMAIN = "Mobile GUI Agent"
@@ -252,7 +253,9 @@ class QwenSummarizer:
         self.cache_path = cache_path
         self.cache = json.loads(io_path(cache_path).read_text(encoding="utf-8")) if io_path(cache_path).is_file() else {}
         self._cache_lock = threading.RLock()
-        http_client = model_http_client(http_options)
+        resolved_http_options = http_options if http_options is not None else model_http_options()
+        http_client = model_http_client(resolved_http_options)
+        instrument_http_client(http_client, api_key=api_key, settings={**resolved_http_options, "sdk_retries": 2})
         try:
             self.client = OpenAI(api_key=api_key, base_url=base_url, max_retries=2, http_client=http_client)
         except Exception:
@@ -280,6 +283,7 @@ class QwenSummarizer:
         with self._cache_lock:
             self._save_unlocked()
 
+    @model_operation("trajectory_summary")
     def _complete(self, key: str, messages: list[dict[str, Any]], max_tokens: int) -> str:
         with self._cache_lock:
             cached = self.cache.get(key)

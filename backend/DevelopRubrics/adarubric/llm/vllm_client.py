@@ -21,6 +21,14 @@ from adarubric.llm.base import LLMClient
 from adarubric.llm.http_options import close_failed_http_client, resolve_http_options
 from adarubric.llm.json_extract import extract_json_substring
 
+try:  # Optional when AdaRubric is installed without the platform.
+    from backend.pipeline_diagnostic_http import instrument_http_client, model_operation
+except ImportError:
+    def instrument_http_client(client, **kwargs):
+        return client
+    def model_operation(operation):
+        return lambda function: function
+
 try:
     from openai import (
         APIConnectionError,
@@ -81,11 +89,12 @@ class VLLMClient(LLMClient):
         single_attempt = os.environ.get("PIPELINE_MODEL_SINGLE_ATTEMPT") == "1"
         self._max_retries = 1 if single_attempt else max(1, max_retries)
 
-        http_client = DefaultAsyncHttpxClient(
-            **resolve_http_options(
-                http_proxy_url=http_proxy_url, http_trust_env=http_trust_env,
-            )
-        )
+        http_options = resolve_http_options(http_proxy_url=http_proxy_url, http_trust_env=http_trust_env)
+        http_client = DefaultAsyncHttpxClient(**http_options)
+        instrument_http_client(http_client, api_key=api_key, settings={
+            **http_options,
+            "sdk_retries": 0 if single_attempt else "SDK default",
+        })
         try:
             self._client = AsyncOpenAI(
                 api_key=api_key, base_url=base_url, http_client=http_client,
@@ -140,6 +149,7 @@ class VLLMClient(LLMClient):
         assert last_exc is not None
         raise last_exc
 
+    @model_operation("structured_generate")
     async def generate_structured(
         self,
         messages: list[dict[str, str]],
@@ -195,6 +205,7 @@ class VLLMClient(LLMClient):
                 context={"raw_response": raw[:500]},
             ) from exc
 
+    @model_operation("text_generate")
     async def generate_text(
         self,
         messages: list[dict[str, str]],

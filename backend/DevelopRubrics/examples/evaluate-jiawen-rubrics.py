@@ -55,12 +55,14 @@ from adarubric.filter.threshold import (
 )
 from adarubric.generator.llm_generator import LLMRubricGenerator
 from adarubric.llm.openai_client import OpenAIClient
+from adarubric.llm.request_control import request_context
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_ROOT = PROJECT_ROOT.parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 from backend.file_io import io_path
+from backend.quality_execution import execution_write_guard
 from backend.data_store import DATA_ROOT
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "examples" / "jiawen_rubric_config.json"
 DEFAULT_REPORT_PATH = DATA_ROOT / "system" / "rubric_outputs" / "evaluations" / "jiawen_gui_eval.md"
@@ -513,10 +515,11 @@ def save_evaluations_jsonl(bundles: list[TaskEvaluationBundle], path: Path) -> N
 
 
 def initialize_evaluations_jsonl(path: Path, *, resume: bool) -> None:
-    io_path(path.parent).mkdir(parents=True, exist_ok=True)
-    if resume and io_path(path).exists():
-        return
-    io_path(path).write_text("", encoding="utf-8")
+    with execution_write_guard():
+        io_path(path.parent).mkdir(parents=True, exist_ok=True)
+        if resume and io_path(path).exists():
+            return
+        io_path(path).write_text("", encoding="utf-8")
 
 
 def _evaluation_settings(config: Config) -> dict[str, Any]:
@@ -661,8 +664,11 @@ def append_evaluation_jsonl(
         "evaluation_settings_signature": _settings_signature(evaluation_settings),
         "evaluation": json.loads(evaluation.model_dump_json()),
     }
-    with io_path(path).open("a", encoding="utf-8") as file:
-        file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    with execution_write_guard():
+        with io_path(path).open("a", encoding="utf-8") as file:
+            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+            file.flush()
+            os.fsync(file.fileno())
 
 
 def _trajectory_chunks(
@@ -926,15 +932,17 @@ async def evaluate_run_incrementally(
         trajectory: Trajectory,
     ) -> tuple[int, TrajectoryEvaluation]:
         async with sem:
-            evaluation = await evaluate_trajectory(
-                pipeline=pipeline,
-                task=task,
-                trajectory=trajectory,
-                rubric=rubric,
-                config=config,
-                temperature=temperature,
-                eval_max_tokens=eval_max_tokens,
-            )
+            with request_context("trajectory_score", task_id=task.task_id,
+                                 trajectory_id=trajectory.trajectory_id):
+                evaluation = await evaluate_trajectory(
+                    pipeline=pipeline,
+                    task=task,
+                    trajectory=trajectory,
+                    rubric=rubric,
+                    config=config,
+                    temperature=temperature,
+                    eval_max_tokens=eval_max_tokens,
+                )
             return index, evaluation
 
     if not pending:

@@ -10,7 +10,11 @@ import asyncio
 import json
 import logging
 import os
+import sys
 from typing import Any, TypeVar, cast
+from urllib.request import getproxies
+
+import httpx
 
 from pydantic import BaseModel, ValidationError
 
@@ -18,6 +22,18 @@ from adarubric.core.exceptions import LLMClientError
 from adarubric.llm.base import LLMClient
 from adarubric.llm.http_options import close_failed_http_client, resolve_http_options
 from adarubric.llm.json_extract import extract_json_candidates
+from adarubric.llm.request_control import (
+    QualityClientCleanupTimeout, QualityRequestTimeout, controlled_request,
+    request_context, request_timeout_seconds,
+)
+
+try:  # AdaRubric is also usable independently of the platform package.
+    from backend.pipeline_diagnostic_http import instrument_http_client, model_operation
+except ImportError:
+    def instrument_http_client(client, **kwargs):
+        return client
+    def model_operation(operation):
+        return lambda function: function
 
 try:
     from openai import (
@@ -38,10 +54,11 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
-_RETRYABLE = (APIConnectionError, APITimeoutError, RateLimitError)
+_RETRYABLE = (APIConnectionError, APITimeoutError, RateLimitError, QualityRequestTimeout)
 # 5xx status codes are transient server-side errors and should be retried.
 _RETRYABLE_STATUS = frozenset({500, 502, 503, 504})
 _EXTRA_BODY_ENV = "ADARUBRIC_EXTRA_BODY_JSON"
+_CLIENT_CLEANUP_TIMEOUT_SECONDS = 15.0
 
 
 def parse_extra_body(value: Any, *, source: str = "extra_body") -> dict[str, Any] | None:
@@ -106,16 +123,27 @@ class OpenAIClient(LLMClient):
         single_attempt = os.environ.get("PIPELINE_MODEL_SINGLE_ATTEMPT") == "1"
         self._max_retries = 1 if single_attempt else max(1, max_retries)
         self._extra_body = extra_body if extra_body is not None else _extra_body_from_env()
-        http_client = DefaultAsyncHttpxClient(
-            **resolve_http_options(
-                http_proxy_url=http_proxy_url, http_trust_env=http_trust_env,
-            )
+        self._request_timeout = request_timeout_seconds()
+        http_options = resolve_http_options(
+            http_proxy_url=http_proxy_url, http_trust_env=http_trust_env,
         )
+        self._http_trust_env = http_options["trust_env"]
+        self._http_proxy_enabled = bool(http_options["proxy"]) or (
+            self._http_trust_env and any(getproxies().get(scheme) for scheme in ("http", "https", "all"))
+        )
+        http_client = DefaultAsyncHttpxClient(
+            **http_options, timeout=httpx.Timeout(self._request_timeout, connect=10.0),
+        )
+        instrument_http_client(http_client, api_key=api_key or os.environ.get("OPENAI_API_KEY"),
+                               settings={**http_options, "sdk_retries": 0 if single_attempt else "SDK default",
+                                         "request_timeout_seconds": self._request_timeout})
         try:
             self._client = AsyncOpenAI(
                 api_key=api_key, base_url=base_url, http_client=http_client,
                 **({"max_retries": 0} if single_attempt else {}),
             )
+            self._service_url = str(getattr(self._client, "base_url", None) or base_url
+                                    or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1")
         except BaseException:
             close_failed_http_client(http_client)
             raise
@@ -144,7 +172,13 @@ class OpenAIClient(LLMClient):
         last_exc: Exception | None = None
         for attempt in range(self._max_retries):
             try:
-                response = await self._client.chat.completions.create(**kwargs)
+                response = await controlled_request(
+                    lambda: self._client.chat.completions.create(**kwargs),
+                    timeout_seconds=self._request_timeout, messages=messages,
+                    max_tokens=max_tokens, model=self.model, base_url=self._service_url,
+                    http_proxy_enabled=self._http_proxy_enabled, http_trust_env=self._http_trust_env,
+                    request_owner=self,
+                )
                 content = response.choices[0].message.content
                 if content is None:
                     raise LLMClientError("LLM returned empty content")
@@ -174,6 +208,7 @@ class OpenAIClient(LLMClient):
         assert last_exc is not None
         raise last_exc
 
+    @model_operation("structured_generate")
     async def generate_structured(
         self,
         messages: list[dict[str, str]],
@@ -230,6 +265,7 @@ class OpenAIClient(LLMClient):
             },
         )
 
+    @model_operation("text_generate")
     async def generate_text(
         self,
         messages: list[dict[str, str]],
@@ -250,4 +286,16 @@ class OpenAIClient(LLMClient):
             ) from exc
 
     async def close(self) -> None:
-        await self._client.close()
+        original_error = sys.exc_info()[1]
+        try:
+            with request_context("client_cleanup"):
+                await controlled_request(
+                    self._client.close, timeout_seconds=_CLIENT_CLEANUP_TIMEOUT_SECONDS,
+                    messages=[], max_tokens=0, model=self.model, base_url=self._service_url,
+                    http_proxy_enabled=self._http_proxy_enabled, http_trust_env=self._http_trust_env,
+                    request_owner=self, deadline_error_factory=QualityClientCleanupTimeout,
+                )
+        except QualityClientCleanupTimeout as exc:
+            if original_error is not None:
+                raise exc from original_error
+            raise

@@ -54,4 +54,9 @@ def configure_model_environment(path: Path = DEFAULT_ENV_FILE) -> dict[str, str]
             "ADARUBRIC_EVAL_MAX_CONCURRENT",
             values["ADARUBRIC_EVAL_MAX_CONCURRENT"],
         )
+    if "ADARUBRIC_REQUEST_TIMEOUT_SECONDS" in values:
+        os.environ.setdefault(
+            "ADARUBRIC_REQUEST_TIMEOUT_SECONDS",
+            values["ADARUBRIC_REQUEST_TIMEOUT_SECONDS"],
+        )
     return {"model": values["MODEL_NAME"], "base_url": values["MODEL_URL"]}

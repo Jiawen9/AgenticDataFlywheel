@@ -14,6 +14,7 @@ import re
 import sys
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,6 +33,7 @@ if str(Path(__file__).resolve().parents[2]) not in sys.path:
 from backend.data_store import DATA_ROOT
 from backend.stage_artifacts import read_workbook_payload, structured_input_exists
 from backend.trajectory_context import row_task_id, row_trajectory_id
+from backend.pipeline_diagnostics import trace_context
 
 try:
     from ..trajectories_preprocessing import configure_reviewer_environment
@@ -495,18 +497,20 @@ def classify_trajectories(
     def _classify(item: tuple[str, Step, Path, Path | None, Path | None, str, str, str]) -> IntermediateStateResult:
         trajectory, step, current_path, next_path, done_path, previous_summary, next_summary, task_text = item
         try:
-            return classifier.classify(
-                trajectory=trajectory,
-                step_index=step.step_index,
-                current_image_path=current_path,
-                next_image_path=next_path,
-                action=step.action,
-                summary=step.summary,
-                previous_summary=previous_summary,
-                next_summary=next_summary,
-                after_image_path=done_path,
-                task=task_text,
-            )
+            with trace_context(task_id=step.task_id, trajectory_id=trajectory, step=step.step_index,
+                               concurrency=max(1, int(max_concurrent))):
+                return classifier.classify(
+                    trajectory=trajectory,
+                    step_index=step.step_index,
+                    current_image_path=current_path,
+                    next_image_path=next_path,
+                    action=step.action,
+                    summary=step.summary,
+                    previous_summary=previous_summary,
+                    next_summary=next_summary,
+                    after_image_path=done_path,
+                    task=task_text,
+                )
         except Exception as exc:
             raise RuntimeError(
                 f"中间状态分类失败: trajectory={trajectory}, "
@@ -524,7 +528,7 @@ def classify_trajectories(
             thread_name_prefix="tree-classify",
         ) as executor:
             pending = {
-                executor.submit(_classify, item): index
+                executor.submit(copy_context().run, _classify, item): index
                 for index, item in enumerate(work_items)
             }
             for future in as_completed(pending):

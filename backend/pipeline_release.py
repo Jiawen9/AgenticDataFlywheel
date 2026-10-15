@@ -5,6 +5,7 @@ artifacts are frozen unchanged; no correction session is invented in automatic
 mode. All public helpers accept an isolated data root for offline validation.
 """
 from __future__ import annotations
+from . import pipeline_diagnostics as diagnostics
 
 from copy import deepcopy
 from pathlib import Path
@@ -318,6 +319,19 @@ def _remove_release_directory(path, release_root):
 
 def publish_pipeline(pipeline, *, root=None, registry=None):
     root = _root(root)
+    release_id = "rel_" + hashlib.sha256(("pipeline:" + str(pipeline["pipeline_id"])).encode()).hexdigest()[:24]
+    context = {"pipeline_id": pipeline["pipeline_id"], "batch_id": pipeline["batch_id"],
+               "release_id": release_id, "status": "preparing"}
+    with diagnostics.job_context(context, "publication", root):
+        release = _publish_pipeline_with_diagnostics(pipeline, root=root, registry=registry)
+        diagnostics.record_job_snapshot({**release, "status": "published"}, "publication", root)
+        diagnostics.log_event("publication_committed", release_id=release["release_id"],
+                              source_refs=release.get("source_refs"), files=release.get("excel_paths"))
+        return release
+
+
+def _publish_pipeline_with_diagnostics(pipeline, *, root=None, registry=None):
+    root = _root(root)
     records, store = RecordStore(root), ArtifactStore(root)
     pipeline_id, batch_id = str(pipeline["pipeline_id"]), str(pipeline["batch_id"])
     release_id = "rel_" + hashlib.sha256(("pipeline:" + pipeline_id).encode()).hexdigest()[:24]
@@ -327,6 +341,7 @@ def publish_pipeline(pipeline, *, root=None, registry=None):
         if existing:
             if existing.get("pipeline_id") != pipeline_id or existing.get("batch_ids") != [batch_id]:
                 raise ValueError("Pipeline 发布幂等编号冲突")
+            diagnostics.log_event("publication_reused", release_id=release_id)
             return registry.get(release_id)
         from .pipeline_access import ensure_pipeline_write
         ensure_pipeline_write(batch_id, root, action="publish")
