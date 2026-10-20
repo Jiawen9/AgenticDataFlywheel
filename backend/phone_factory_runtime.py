@@ -30,6 +30,8 @@ class FactoryRuntime:
         self._transfer = None
         self._stop = threading.Event()
         self._thread = None
+        self._protocol_cache = None
+        self._protocol_lock = threading.Lock()
 
     @property
     def transfer(self):
@@ -64,6 +66,9 @@ class FactoryRuntime:
                 if self._stop.is_set():
                     return
                 if run["status"] in TERMINAL and not (run["status"] == "failed" and run.get("dispatch_error")):
+                    continue
+                request = run.get("request", {})
+                if (request.get("result_transport") or request.get("metadata", {}).get("result_transport")) == "legacy":
                     continue
                 try:
                     self.sync_evaluation(run["run_id"])
@@ -154,12 +159,22 @@ class FactoryRuntime:
             raise PhoneFactoryError("请选择已关联 App 的手机")
         return {"run_mode": mode, "result_transport": "http", "vla": vla, "config": config, "phone_id": phone, "app": app, "phone_apps": associations, "phone_ids": sorted({row["phone_id"] for row in associations})}
 
-    def _capabilities(self):
+    def _protocol(self) -> str:
+        """http: 批次结果回传协议；legacy: 旧 Flask（无 /capabilities）；
+        unsupported: 有接口但未声明批次回传能力。连接故障不缓存，让调用方如实报错。"""
+        if self._protocol_cache is not None:
+            return self._protocol_cache
         try:
             value = self.store._remote_result(["capabilities"])
-        except PhoneFactoryError as exc:
-            raise PhoneFactoryError("采集服务无法确认回传协议，请检查连接并升级为支持批次结果回传的服务", 502) from exc
-        if value.get("protocol_version") != 1 or value.get("batch_results") is not True:
+        except PhoneFactoryError:
+            return "legacy"
+        self._protocol_cache = "http" if (isinstance(value, dict)
+            and value.get("protocol_version") == 1 and value.get("batch_results") is True) else "unsupported"
+        return self._protocol_cache
+
+    def _capabilities(self):
+        protocol = self._protocol()
+        if protocol == "unsupported":
             raise PhoneFactoryError("采集服务不支持批次结果回传，请升级采集服务后再运行", 409)
 
     def remote_start(self, data, mode):
@@ -169,6 +184,9 @@ class FactoryRuntime:
         _identifier(request_id, "request_id")
         digest = hashlib.sha256(content).hexdigest()
         metadata = {**options, "filename": task["filename"]}
+        protocol = self._protocol()
+        if protocol == "legacy":
+            metadata["result_transport"] = "legacy"
         if mode == "generate":
             run, created = self.store.collection_runs.create(task["source_batch_id"], dispatch_key=request_id, metadata=metadata, workbook_sha256=digest)
             run_id = run["collection_run_id"]
@@ -224,9 +242,11 @@ class FactoryRuntime:
                     apps_path, manifest_path = directory / "apps.json", directory / "tasks.json"
                     apps_path.write_text(json.dumps(options["phone_apps"], ensure_ascii=False), encoding="utf-8")
                     manifest_path.write_text(json.dumps({"tasks": tasks}, ensure_ascii=False), encoding="utf-8")
-                    args = ["start-run", str(path), str(apps_path), options["phone_id"], options["app"], "--vla", options["vla"], "--runmode", mode, "--collection-run-id", run_id, "--task-manifest", str(manifest_path), "--temperature", str(options["config"]["temperature"]), "--top-p", str(options["config"]["top_p"])]
-                    if mode == "generate":
-                        args += ["--batch-id", current["batch_id"], "--output-dir", current["output_dir"]]
+                    args = ["start-run", str(path), str(apps_path), options["phone_id"], options["app"], "--vla", options["vla"], "--runmode", mode, "--temperature", str(options["config"]["temperature"]), "--top-p", str(options["config"]["top_p"])]
+                    if protocol == "http":
+                        args += ["--collection-run-id", run_id, "--task-manifest", str(manifest_path)]
+                        if mode == "generate":
+                            args += ["--batch-id", current["batch_id"], "--output-dir", current["output_dir"]]
                     if options["config"]["sampling_enabled"]:
                         args.append("--sampling")
                     if options["config"]["use_experience_lib"]:
@@ -271,13 +291,32 @@ class FactoryRuntime:
         runs = self.run_views(mode)
         for task in state["tasks"]:
             matching = [run for run in runs if run.get("filename") == task["filename"]]
-            if matching:
-                # A task can run on several phones; one phone finishing must not
-                # hide another phone's active run, regardless of dispatch order.
-                active = [run for run in matching if run["status"] in {"dispatching", "queued", "running"}]
-                live = [run for run in active if not run.get("transfer_error")]
-                latest = (live or active or matching)[-1]
-                task["status"] = "回传失败" if latest.get("transfer_error") else statuses.get(latest["status"], latest["status"])
+            if not matching:
+                continue
+            # A task can run on several phones; one phone finishing must not
+            # hide another phone's active run, regardless of dispatch order.
+            active = [run for run in matching if run["status"] in {"dispatching", "queued", "running"}]
+            if active:
+                latest = active[-1]
+                # Legacy collectors own results in the phone workspace and never
+                # report batch transfers; only http transfers can surface here.
+                transport = latest.get("request", {}).get("metadata", {}).get("result_transport")
+                if latest.get("transfer_error") and transport == "http":
+                    task["status"] = "回传失败"
+                else:
+                    task["status"] = statuses.get(latest["status"], latest["status"])
+                continue
+            done = [run for run in matching if run["status"] in {"completed", "succeeded", "partial"}]
+            if done:
+                task["status"] = statuses.get(done[-1]["status"], done[-1]["status"])
+                continue
+            failed = [run for run in matching if run["status"] == "failed"]
+            if failed:
+                task["status"] = "失败"
+                continue
+            # Interrupted/historical runs must not override a task that was
+            # added but never started, e.g. stale transfer errors.
+            task["status"] = task.get("status") or "未运行"
         return state
 
     def batches(self):

@@ -568,7 +568,7 @@ class PipelineManager:
                         p["paused_from"] = "running"
                     elif p["status"] not in {"paused", "terminating"}:
                         p.update(status="running", error=None)
-                elif p["status"] not in {"retry_waiting", "paused"}:
+                elif p["status"] not in {"retry_waiting", "paused", "published_summary_failed"}:
                     p.update(status="running", error=None)
                 p["current_step"] = "overview"
             elif p["status"] == "terminating":
@@ -669,7 +669,13 @@ class PipelineManager:
                     if step["status"] == "pending":
                         self._start_attempt(p, step)
                     conversion = self.runtime.conversion(p["release_id"], retry=bool(step.pop("retry", False)))
-                    step.update(status="running", message="累计到最终汇总表和看板")
+                    if p["status"] == "published_summary_failed" and conversion["status"] == "failed":
+                        # Observe retries from release details, but do not consume the
+                        # same terminal failure again. Re-logging it on every poll
+                        # would invalidate the revision needed for a manual retry.
+                        return
+                    p.update(status="running", error=None)
+                    step.update(status="running", error=None, message="累计到最终汇总表和看板")
                     if conversion["status"] == "succeeded":
                         self._done(step)
                         p.update(status="succeeded", error=None)

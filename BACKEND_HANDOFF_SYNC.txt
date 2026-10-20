@@ -1,0 +1,109 @@
+后端交接版同步记录（2026-10-20）
+
+本地仓库：D:\03_work\Code\AgenticDataFlywheel
+交接来源：D:\03_work\Code\李庚工作交接\backend\backend
+分支：codex/merge-phone-factory
+基准提交：894ae92（编号简洁缩短）
+本次未切换分支、未暂存、未提交、未推送。
+
+一、同步清单
+
+交接版为主体，以下文件按内容同步（与交接版忽略换行后完全相同）：
+1. backend/api.py
+   保留 CORS_ORIGINS 配置（未配置默认 *）；保留交接版移除质检 shutdown 调用的选择。
+2. backend/collection_transfer.py
+   legacy 生产运行跳过自动结果回传查询。
+3. backend/phone_factory_runtime.py
+   合入 http/legacy 协议兼容、生产/评估下发参数分支、评估后台轮询及任务状态显示规则。
+4. backend/DevelopRubrics/examples/jiawen_rubric_config.json
+   enable_thinking=false，保留内网关闭质检思考的适配。
+5. backend/phone_factory_dispatch.py（新增）
+   原样纳入任务分发表脚本，未接入或执行。
+6. backend/cleandebugruns.py（新增）
+   原样纳入调试清理脚本，未执行。该脚本会删除运行记录及轨迹目录，没有业务级回滚保护。
+
+保留本地已存在的未提交改动，文件 SHA256 与同步前一致：
+7. backend/pipelines.py
+   汇总失败的相同终态不在每次轮询时重复写回，保证修订号稳定，允许前端携带原修订号重试。
+   重试转换沿用同一 release_id，不再次发布；发布详情发起的转换重试可被 Pipeline 核对。
+8. backend/tests/test_pipelines.py
+   保留三个回归测试：结构化汇总失败及 HTTP 重试、三次耗尽后稳定、发布详情外部重试核对。
+
+本次新增验证：
+9. backend/tests/test_handoff_legacy_compat.py
+   4 个模拟测试，覆盖 legacy/http × generate/modeliter、实际运行参数、重复请求、
+   legacy 生产/评估跳过后台同步、独立报告列表及下载、下载失败清理与生产/评估隔离。
+
+296 个已跟踪后端文件对比：72 个原字节相同，218 个仅换行不同，6 个实质差异。
+其中 4 个同步、2 个保留本地补丁；没有整目录覆盖。
+前端、公共路由及请求/响应定义未修改。报告列表、轮次查询、下载和远端评估执行器实现未变。
+
+二、测试结果
+
+合计 196 项：194 通过，2 项已确认的交接版既有失败；没有跳过或放宽断言。
+
+采集/评估：83 项，81 通过，2 项失败。
+  test_phone_factory / test_phone_factory_runtime / test_phone_factory_integration
+  test_collection_transfer / test_collection_runs / test_manual_collection / test_collector_service
+
+Pipeline/发布/汇总/诊断：109 项，全部通过。
+  test_pipelines / test_pipeline_runtime_integration / test_pipeline_release
+  test_training_overview_service / test_training_overview_converter
+  test_training_overview_dev_parity / test_pipeline_diagnostic_integration
+
+新增兼容测试：test_handoff_legacy_compat，4 项全部通过。
+
+保留的两个失败（backend/tests/test_phone_factory_runtime.py）：
+- test_failed_transfer_does_not_hide_other_live_run_and_remains_actionable
+  同一任务仍有其他活动运行时，显示“回传失败”，预期为“运行中”。
+- test_old_service_rejected_and_same_run_recovers_after_lost_response
+  同实例缓存 unsupported 后，不识别服务能力升级；测试预期进入下发响应丢失恢复，实际仍拒绝运行。
+
+所有服务均为模拟替身，业务数据使用临时 ADF_DATA_ROOT。
+主回归禁止外部 socket 连接，仅放行 Windows asyncio 所需本机回环连接。
+最初测试保护误拦截了 Windows asyncio 的本机 socketpair；修正测试运行器后完整重跑，
+以上统计来自重跑结果，不将测试运行器引入的失败计为业务失败。
+没有启动真实手机、调用真实模型或上传服务；未执行新增分发和清理脚本。
+仅后端变动，本轮没有前端构建。
+
+三、已知限制（按本轮范围保留）
+
+1. legacy 跳过的是运行状态/结果回传自动同步，报告仍能独立查询下载。
+   legacy 运行可能持续显示运行中，不代表已经具备采集完成到预处理的自动闭环。
+2. 能力缓存没有刷新机制；能力查询报 PhoneFactoryError 时会回退 legacy。
+   旧协议响应丢失重试的远端幂等保障也取决于旧服务，不能当成新版运行协议保证。
+3. 任务状态汇总保留交接版规则，含上述两个已知失败，不在此次同步中修复。
+4. 保留移除 quality_job_manager.shutdown 的改动，服务关闭不再走该主动清理入口。
+5. 分发脚本仍未接入；不能仅凭纳入此文件宣称任务已自动按手机分发。
+6. 关闭思考的 JSON 参与质检内容配置指纹；旧 Pipeline 冻结值若不同，仍按原规则报配置变化，
+   本次不会改写旧 Pipeline 冻结配置或绕过校验。
+
+四、环境配置与部署差异（不复制 .env）
+
+本地 backend/.env 原字节保留，交接 .env 没有拷贝或加入 Git。
+代码同步不等于复制内网部署环境；内网部署应继续保留本机 .env。
+
+已核对的非密钥差异：
+- MODEL_NAME：本地 qwen3-vl-plus，交接 Qwen3.8-27B。
+- COT_MODEL_NAME：本地未显式设置，交接 Qwen3.8-27B。
+- TREE_CLASSIFICATION_MAX_CONCURRENT：本地 8，交接 4。
+- TREE_SUMMARY_MAX_CONCURRENT：本地 8，交接 2。
+- ADARUBRIC_EVAL_MAX_CONCURRENT：本地 8，交接 1。
+- TASK_GENERATION_MAX_CONCURRENT：本地 1，交接 4。
+- ADARUBRIC_REQUEST_TIMEOUT_SECONDS：交接显式为 300。
+- HTTP_TRUST_ENV：交接显式为 false。
+- DATASET_UPLOAD_MODE：交接显式为 mock。
+
+MODEL_URL、YUNAI_API_KEY、ADARUBRIC_PYTHON 也存在部署差异，此处不记录其值。
+本地还有任务生成专用 MODEL_NAME / MODEL_URL / API_KEY / HTTP_TIMEOUT / MAX_RETRIES 覆盖；
+交接未配置这些专用覆盖。S3 桶/前缀同样仅保留各部署原环境配置。
+
+五、保护与待提交范围
+
+- backend/.env、本地 Pipeline 修复及三个测试的 SHA256 与同步前一致。
+- 核对本地现有数据库及发布文件共 42 个，SHA256 全部不变。
+- 其他已跟踪文件未发生改动，两个原有手机工厂失败断言保持原样。
+- SHORT_ID_VALIDATION.txt、任务生成草稿/、黄区平台前后端/ 等原有未跟踪内容未纳入、未改动。
+- 不包含交接数据库、轨迹、发布文件、缓存、依赖目录或压缩包。
+- 待提交为第一节 9 个文件和本说明 BACKEND_HANDOFF_SYNC.txt；请按清单选择文件，
+  避免把工作区其他未跟踪资料一起暂存。所有代码仍留在当前工作树供审核。

@@ -71,6 +71,10 @@ class CollectionTransferManager:
             metadata = run.get("request", {}).get("metadata", {})
             if metadata.get("run_mode", "generate") != "generate":
                 continue
+            # Legacy collectors own their results in the phone workspace and
+            # expose no /runs/{id}; never poll them for batch-result transfer.
+            if metadata.get("result_transport") == "legacy":
+                continue
             # Legacy local collectors do not advertise this transfer protocol.
             if not (metadata.get("result_transport") == "http" or run.get("transfer_status")
                     or run.get("dispatch_response", {}).get("result_transport") == "http"):
