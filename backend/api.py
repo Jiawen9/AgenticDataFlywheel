@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -153,7 +154,6 @@ async def lifespan(app: FastAPI):
         with suppress(asyncio.CancelledError):
             await cleanup
         pipeline_manager.close()
-        await asyncio.to_thread(quality_job_manager.shutdown)
         close_phone_factory()
         manager.close()
 
@@ -169,7 +169,7 @@ async def pipeline_managed_handler(_request, exc):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[origin.strip() for origin in os.environ.get("CORS_ORIGINS", "*").split(",") if origin.strip()],
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],

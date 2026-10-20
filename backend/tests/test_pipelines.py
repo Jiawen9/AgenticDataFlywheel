@@ -673,6 +673,78 @@ class PipelineTests(unittest.TestCase):
         revision = p["storage_revision"]
         self.assertEqual(self.tick(p, 3)["storage_revision"], revision)
 
+    def test_structured_summary_failure_stays_stable_and_http_retry_uses_same_release(self):
+        p = self.tick(self.ready(), 8)
+        release = self.runtime.records.get("dataset_releases", p["release_id"])
+        closed_batch = lifecycle(p["batch_id"], self.root)
+        self.runtime.records.put("training_overview_conversions", p["release_id"], {
+            "status": "failed", "error": "invalid source", "failure": {"category": "input"}})
+        p = self.tick(p)
+        self.assertEqual(p["status"], "published_summary_failed")
+        failed = self.manager.get(p["pipeline_id"], public=False)
+        app = FastAPI()
+        app.state.pipelines = self.manager
+        app.include_router(router)
+        with TestClient(app) as client:
+            url = "/api/pipelines/" + p["pipeline_id"]
+            revision = client.get(url).json()["pipeline"]["storage_revision"]
+            # Reconciliation can run between the browser read and its retry POST,
+            # including after a backend restart; neither should rewrite this failure.
+            restarted = PipelineManager(self.runtime, self.root)
+            for _ in range(3):
+                restarted.tick(p["pipeline_id"])
+            self.assertEqual(restarted.get(p["pipeline_id"], public=False), failed)
+            result = client.post(url + "/retry", json={"expected_revision": revision})
+            self.assertEqual(result.status_code, 200, result.text)
+            self.assertEqual(result.json()["pipeline"]["status"], "running")
+            # Real conflicting controls must still be rejected, not silently replayed.
+            self.assertEqual(client.post(url + "/retry", json={"expected_revision": revision}).status_code, 409)
+        self.runtime.records.put("training_overview_conversions", p["release_id"], {"status": "succeeded"})
+        self.assertEqual(self.tick(p)["status"], "succeeded")
+        self.assertEqual(self.runtime.publish_count, 1)
+        self.assertEqual(self.runtime.records.get("dataset_releases", p["release_id"]), release)
+        self.assertEqual(lifecycle(p["batch_id"], self.root), closed_batch)
+
+    def test_exhausted_summary_retries_do_not_reprocess_the_same_failure(self):
+        p = self.tick(self.ready(), 8)
+        for attempt in range(1, 4):
+            self.runtime.records.put("training_overview_conversions", p["release_id"], {
+                "status": "failed", "failure": {"category": "timeout"}})
+            p = self.tick(p)
+            self.assertEqual(p["steps"][-1]["retry_info"]["attempts"], attempt)
+            if attempt < 3:
+                self.assertEqual(p["status"], "retry_waiting")
+                with patch("backend.pipelines._retry_due", return_value=True):
+                    p = self.tick(p)
+        self.assertEqual(p["status"], "published_summary_failed")
+        failed = self.manager.get(p["pipeline_id"], public=False)
+        self.tick(p, 3)
+        self.assertEqual(self.manager.get(p["pipeline_id"], public=False), failed)
+        p = self.manager.control(p["pipeline_id"], "retry", p["storage_revision"])
+        self.assertEqual(p["steps"][-1]["retry_info"]["attempts"], 1)
+        self.assertEqual(self.runtime.publish_count, 1)
+
+    def test_external_summary_retry_clears_failure_and_reconciles_new_result(self):
+        p = self.tick(self.ready(), 8)
+        self.runtime.records.put("training_overview_conversions", p["release_id"], {
+            "status": "failed", "failure": {"category": "input"}})
+        p = self.tick(p)
+        self.assertEqual(p["status"], "published_summary_failed")
+        self.runtime.conversion(p["release_id"], retry=True)
+        p = self.tick(p)
+        self.assertEqual(p["status"], "running")
+        self.assertIsNone(p["error"])
+        self.assertIsNone(p["steps"][-1]["error"])
+        self.assertEqual(self.tick(p, 3)["storage_revision"], p["storage_revision"])
+        self.runtime.records.put("training_overview_conversions", p["release_id"], {
+            "status": "failed", "failure": {"category": "unknown"}})
+        p = self.tick(p)
+        self.assertEqual(p["status"], "published_summary_failed")
+        self.assertEqual(self.tick(p, 3)["storage_revision"], p["storage_revision"])
+        self.runtime.records.put("training_overview_conversions", p["release_id"], {"status": "succeeded"})
+        self.assertEqual(self.tick(p)["status"], "succeeded")
+        self.assertEqual(self.runtime.publish_count, 1)
+
     def test_missing_bound_collection_cannot_be_replaced_with_old_annotation(self):
         from types import SimpleNamespace
         from unittest.mock import Mock

@@ -1,0 +1,86 @@
+短编号与短路径交付/验证记录（2026-10-15）
+=======================================
+
+实施范围
+公共SQLite发号器和归档映射；任务生成/扩增；Rollout手动导入；预处理、建树、质检、修正、COT；
+Pipeline及发布恢复、外部发布、上传作业、汇总版本；诊断编号/短临时文件；Rollout及发布前端。
+手机工厂页面及任务上传/批次登记/下发/回传、独立9011和执行模板未修改。
+手机工厂全链路短目录需同事按COLLECTOR_SHORT_ID_HANDOFF.txt接入后联合验收。
+
+兼容约定
+- 新批次身份方案dated-v1记录在batch_identities；每次运行布局单独为short-v1或legacy。
+- 同库SQLite事务计数、占用和稳定映射；类型+北京日期+至少三位序号，不回收。
+- 旧编号、旧目录、旧请求、旧Pipeline发布号继续兼容；没有标记的批次使用旧身份规则。
+- 原始内容、步骤文件名、外部用例/设备身份、SHA256、缓存完整指纹不截断。
+- 六个预处理代码指纹覆盖文件保持原样，旧Pipeline不会仅因本次身份适配失效。
+- 幂等复用过程件不会为不存在的更新分配新事务号或改写数据库。
+- 缓存完整指纹存在identity.json；中断的身份临时文件可恢复，未标识的真实缓存拒绝复用。
+- 缓存父目录/祖先、目标目录和标记文件的链接或junction被拒绝，仍保留原路径边界校验。
+
+路径长度对照
+统一以本机数据根 D:\work\Code\AgenticDataFlywheel\backend_workspace（50字符）计算。
+历史文件未移动；下表新长度是新编号布局在同一根目录的等价路径，不是迁移结果。
+
+对象                              旧长度    新长度
+已发现的最长checkpoint             279       137
+现有最长原始文件(保留全部尾部目录)   267       210
+诊断响应原子临时文件(构造对照)       240       137
+普通新步骤截图                     —         149
+
+checkpoint新路径：
+cache/rubric_outputs/evaluations/checkpoints/b261015-003/c261015-001/t261015-008.jsonl
+
+原始文件新路径（保留_prefetch_staging原内容，不靠忽略文件缩短）：
+raw/collection_batches/b261015-003/runs/r261015-002/t261015-008/tr261015-012/
+_prefetch_staging/step002_continue_t1_debe2510670b/step002_vla_input_stability.jpg
+（上两行是同一个路径，文档仅为阅读换行。）
+
+普通截图：
+raw/collection_batches/b261015-003/runs/r261015-002/t261015-008/tr261015-012/step015_vla_input.jpg
+
+诊断临时文件：
+logs/pipelines/p261015-001/requests/q261015-001/attempts/h261015-001/.123456789abc.tmp
+构造旧对照使用pl_/q_/h_各32位身份、response.json加32位随机后缀；现有本机诊断目录样本不足，不将此项称作实测历史最长值。
+短编号不是路径长度硬上限；原文件深层子目录、长期序号增长、很长数据根仍依赖已有Windows长路径工具。
+
+测试与安全边界
+- 新增test_short_ids：并发线程/进程、跨日稳定映射、参数冲突、旧编号占用、超过999、
+  原始清单保留、短归档完整SHA256、复制损坏、路径伪造、缓存指纹/中断恢复、junction拒绝。
+- 新增test_short_processing_ids：生成/扩增依赖引用、新批次接旧采集布局、转换恢复、
+  短轨迹进入建树/质检、诊断发号失败继续业务。
+- 新增test_short_release_ids：新旧Pipeline发布intent、发布中断、旧导入恢复、跨日重试、
+  新旧会话编号、同日多次导出文件名、外部来源字段。
+- Rollout集成覆盖新旧两种批次完整自动/人工Pipeline至发布及汇总，原始文件未改变。
+- 现有长路径回归覆盖中文、UNC拼写、已有前缀、260/261/420字符和边界检查。
+- 本轮最后受影响的公共路径/成对过程件/Rollout集成回归：67项，66通过，1项因Windows符号链接权限跳过。
+- 汇总服务/DEV统计/转换回归：36项通过。
+- 最终后端兼容回归：931项，929通过、2项环境跳过；仅排除下述已在HEAD独立复现的23项旧诊断测试。
+- 最后缓存父路径调用及诊断导入清理后补跑32项通过；真实Windows junction复测拒绝链接且目标目录未写入。
+- 前端全量44个文件339项通过，vue-tsc及Vite生产构建通过（保留既有bundle大小提示）。
+- Mock浏览器5个场景：预览编号/补分类、参数变化重校验、确认响应丢失重试、迟到预览失效、导入后Pipeline与预处理可见。
+- scripts/verify_short_id_contract.py离线样例：两台手机同用例同名轨迹，2条轨迹12个文件，完整SHA256和重复映射验证通过。
+
+已发现的既有测试问题
+首次全量执行949项，发现本轮事务号幂等写入问题（已修复并回归），另有23项旧建树单步诊断测试失败。
+这些旧失败均在未修改的scripts/diagnose_tree_step.py与test_tree_step_diagnostic.py之间：
+测试要求model_probe/local_storage_probe/parse_cached_classification及probe_model参数，当前脚本没有这些接口；
+旧缓存冲突文案也不一致。已在隔离目录从HEAD原版完整backend/scripts重跑，独立复现21错误+2断言失败。
+未在本轮扩大修改这组既有诊断接口。最后兼容回归只单独排除此模块，其余931项结果为OK（2项环境跳过）。
+
+数据保护核对
+改造前后对9,231个基线文件逐个计算SHA256，变化0、缺失0（9,104个原始文件、80个阶段文件、41个发布文件及六个处理代码文件）。
+实际backend_workspace数据库未新增short_id_*、batch_identities、collection_path_mappings记录；测试均使用临时隔离数据根。
+未调用真实模型、手机、采集服务或S3。浏览器对所有API进行mock并阻断外网请求。
+
+复现命令（Git Bash，在仓库根目录）
+  .venv/Scripts/python.exe -B -m unittest backend.tests.test_short_ids backend.tests.test_short_processing_ids backend.tests.test_short_release_ids
+  .venv/Scripts/python.exe -B scripts/verify_short_id_contract.py
+前端在frontend目录执行npm test和npm run build。
+全量backend.tests.test_tree_step_diagnostic的既有失败需独立修复，不能把全量命令描述为全部通过。
+
+部署
+等待正在执行的作业结束；停止后端后备份整个ADF_DATA_ROOT/system/app.sqlite，保留现有文件备份策略。
+更新我们负责的平台前后端并重启；新记录自动使用共享发号器，不运行历史数据迁移或重编号脚本。
+同事在同一版本基础上增量适配采集模块，使用同一数据库；不同平台数据库不合并编号空间。
+旧批次继续原样查看/续处理。新Rollout批次可独立使用短路径，手机工厂旧回传布局继续兼容。
+代码已在本地修改，尚未替用户提交、推送或部署。
