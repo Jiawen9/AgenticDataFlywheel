@@ -39,7 +39,20 @@ describe('phone factory transport contracts', () => {
     await phoneFactoryApi.adbDevices(controller.signal)
     expect(fetcher.mock.calls[0]?.[1]?.signal).toBe(controller.signal)
     await modelIterationApi.reportDownload({ index: 1, dir_name: 'old-folder', run_id: 'eval-1', files: [] }, { name: 'report.xlsx', file_id: 'file-1', size: 1 })
-    expect(fetcher.mock.calls.at(-1)?.[0]).toBe('/api/model-iter/report-download?run_id=eval-1&file_id=file-1')
+    expect(fetcher.mock.calls.at(-1)?.[0]).toBe('/api/model-iter/report-download?run_id=eval-1&file_id=file-1&name=report.xlsx')
+  })
+  it('isolates evaluator settings and preserves case result identities and cancellation', async () => {
+    const fetcher = vi.fn(async () => new Response('{"ok":true}'))
+    vi.stubGlobal('fetch', fetcher)
+    const config = { text: { base_url: 'http://text/v1/', model: 'text', api_key_env: 'TEXT_KEY' }, vision: { base_url: 'http://vision/v1/', model: 'vision', api_key_env: 'VISION_KEY' } }
+    await modelIterationApi.saveEvaluationConfig(config)
+    const controller = new AbortController()
+    await modelIterationApi.evaluations('eval/a', controller.signal)
+    await modelIterationApi.evaluationCapabilities()
+    expect(fetcher.mock.calls.map(call => call[0])).toEqual(['/api/model-iter/evaluation-config', '/api/model-iter/runs/eval%2Fa/evaluations', '/api/model-iter/evaluation-capabilities'])
+    expect(fetcher.mock.calls[0]?.[1]?.method).toBe('PUT')
+    expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual(config)
+    expect(fetcher.mock.calls[1]?.[1]?.signal).toBe(controller.signal)
   })
   it('queries the unified batch source and reports remote deletion failure', async () => {
     const fetcher = vi.fn(async () => new Response('{"batches":[]}'))

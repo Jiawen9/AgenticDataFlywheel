@@ -365,7 +365,7 @@ def create_router(store: PhoneFactoryStore | None = None, *, prefix="/api/phone-
     service = store if store is not None else PhoneFactoryStore()
     result = APIRouter(prefix=prefix, tags=["phone-factory"])
 
-    @result.api_route("/{action:path}", methods=["GET", "POST", "DELETE"])
+    @result.api_route("/{action:path}", methods=["GET", "POST", "PUT", "DELETE"])
     def dispatch(action: str, request: Request, data: dict | None = Body(default=None)):
         try:
             body = dict(request.query_params) if request.method == "GET" else data or {}

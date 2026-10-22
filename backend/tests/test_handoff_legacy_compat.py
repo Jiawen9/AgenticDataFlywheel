@@ -12,7 +12,9 @@ from unittest.mock import Mock, patch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from backend.phone_factory import PhoneFactoryStore, create_router
+from backend.phone_factory import PhoneFactoryStore, PhoneFactoryError, create_router
+from backend.model_iteration import save_config
+from backend.tests.test_model_iteration import evaluator_config, results
 from backend.tests.test_phone_factory_runtime import workbook_bytes
 
 
@@ -33,7 +35,7 @@ class HandoffLegacyCompatibilityTests(unittest.TestCase):
         if args[0] == "capabilities":
             if self.protocol == "legacy":
                 return {"ok": False, "output": "404: legacy collector has no capabilities endpoint"}
-            value.update(protocol_version=1, batch_results=True)
+            value.update(protocol_version=1, batch_results=True, model_iteration_evaluation=1)
         elif args[0] == "start-run":
             captured = {"args": list(args), "apps": json.loads(Path(args[2]).read_text(encoding="utf-8"))}
             if "--task-manifest" in args:
@@ -46,6 +48,8 @@ class HandoffLegacyCompatibilityTests(unittest.TestCase):
                 self.remote_runs[run_id] = {**value, "status": "succeeded", "errors": []}
         elif args[0] == "run":
             value = self.remote_runs[args[1]]
+        elif args[0] == "run-evaluations":
+            value = results(args[1])
         elif args[0] == "reports":
             value["reports"] = [{"folder": "round-one", "name": "report.xlsx"}]
         elif args[0] == "report-download":
@@ -61,8 +65,16 @@ class HandoffLegacyCompatibilityTests(unittest.TestCase):
         store.initialize_settings({"phones": ["phone-1"], "apps": ["App"],
             "phoneApps": [{"phone_id": "phone-1", "app": "App"}],
             "vla": ["http://mock.invalid/vla"]})
+        save_config(store, evaluator_config())
         self.addCleanup(store.runtime.close)
         return store
+
+    @staticmethod
+    def historical_evaluation(store, suffix):
+        run_id = "eval_" + suffix
+        return store.records.put("model_iter_runs", run_id, {"run_id": run_id, "collection_run_id": run_id,
+            "status": "running", "created_at": "2026-10-20T00:00:00Z", "filename": "tasks.xlsx",
+            "request": {"result_transport": "legacy"}, "errors": []})
 
     @staticmethod
     def upload(store, mode):
@@ -83,6 +95,12 @@ class HandoffLegacyCompatibilityTests(unittest.TestCase):
                     self.protocol = protocol
                     store = self.make_store(protocol + "-" + mode)
                     self.upload(store, mode)
+                    if protocol == "legacy" and mode == "modeliter":
+                        count = len(self.dispatched)
+                        with self.assertRaisesRegex(PhoneFactoryError, "能力检查失败"):
+                            store.remote_start(self.request(run_mode=mode), mode=mode)
+                        self.assertEqual(len(self.dispatched), count)
+                        continue
                     global_config = copy.deepcopy(store.config())
                     run = store.remote_start(self.request(run_mode=mode), mode=mode)
                     dispatch = self.dispatched[-1]
@@ -119,8 +137,8 @@ class HandoffLegacyCompatibilityTests(unittest.TestCase):
     def test_evaluation_background_sync_skips_both_legacy_metadata_shapes(self):
         store = self.make_store()
         self.upload(store, "modeliter")
-        legacy = store.remote_start(self.request("legacy"), mode="modeliter")
-        nested = store.remote_start(self.request("legacy-nested"), mode="modeliter")
+        legacy = self.historical_evaluation(store, "legacy")
+        nested = self.historical_evaluation(store, "legacy-nested")
         def nest_transport(item):
             item["request"]["metadata"] = {"result_transport": item["request"].pop("result_transport")}
         store.records.update("model_iter_runs", nested["run_id"], nest_transport)
@@ -158,7 +176,7 @@ class HandoffLegacyCompatibilityTests(unittest.TestCase):
     def test_legacy_reports_remain_available_and_download_failures_cleanup(self):
         store = self.make_store()
         self.upload(store, "modeliter")
-        evaluation = store.remote_start(self.request(), mode="modeliter")
+        evaluation = self.historical_evaluation(store, "historical")
         app = FastAPI()
         app.include_router(create_router(store))
         app.include_router(create_router(store, prefix="/api/model-iter", mode="modeliter"))

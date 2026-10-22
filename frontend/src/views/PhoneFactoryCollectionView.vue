@@ -10,6 +10,7 @@
         <p>{{ isEvaluation ? '选择设备、任务和 VLA 开始评估，查看独立评估轮次与报告。' : '管理采集手机与运行 APP，配置 VLA 接口，上传轨迹生产任务文件。' }}</p>
       </div>
     </header>
+    <ModelIterationPanel v-if="isEvaluation" :runs="runs" @ready="evaluationReady = $event" @config="evaluatorConfig = $event" />
 
     <div class="factory-layout">
       <!-- ============ 左列：新增手机（含手机列表） ============ -->
@@ -60,7 +61,7 @@
           </el-table-column>
           <el-table-column label="操作" width="170" align="center">
             <template #default="{ row }">
-              <el-button link type="primary" :disabled="taskBusy || saving || phoneIsBusy(row.phone_id)" @click="openCustomRun(row)">定制运行</el-button>
+              <el-button link type="primary" :disabled="taskBusy || saving || phoneIsBusy(row.phone_id) || evaluationBlocked" @click="openCustomRun(row)">定制运行</el-button>
               <el-button link type="danger" :loading="deletingKey === rowKey(row)" :disabled="taskBusy || saving" @click="handleRemovePhoneApp(row)">
                 删除手机
               </el-button>
@@ -172,7 +173,7 @@
                 link
                 type="primary"
                 :loading="startingTask === row.filename"
-                :disabled="taskBusy"
+                :disabled="taskBusy || evaluationBlocked"
                 @click="handleStartTask(row)"
               >
                 开始运行
@@ -226,7 +227,7 @@
           </div>
           <template #footer>
             <el-button :disabled="confirmingRun" @click="runDialogVisible = false">取消</el-button>
-            <el-button type="primary" :loading="confirmingRun" @click="confirmRun">确定</el-button>
+            <el-button type="primary" :loading="confirmingRun" :disabled="evaluationBlocked" @click="confirmRun">确定</el-button>
           </template>
         </el-dialog>
       </section>
@@ -246,7 +247,8 @@ import { eventMatchesRoute, publishedBatch, withoutBatchQuery, type PublishedBat
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { phoneFactoryApi, modelIterationApi, factoryBatchesApi, newRunRequestId, type FactoryConfig, type PhoneAppRow, type TaskRow, type FactoryBatchSummary, type FactoryState, type FactoryRun, type ReportFolder, type ReportFile, type AdbDevice, type CollectionWarning } from '@/phoneFactoryApi'
+import { phoneFactoryApi, modelIterationApi, factoryBatchesApi, newRunRequestId, type EvaluatorConfig, type FactoryConfig, type PhoneAppRow, type TaskRow, type FactoryBatchSummary, type FactoryState, type FactoryRun, type ReportFolder, type ReportFile, type AdbDevice, type CollectionWarning } from '@/phoneFactoryApi'
+import ModelIterationPanel from '@/components/ModelIterationPanel.vue'
 import { useFactoryPolling } from '@/composables/useFactoryPolling'
 import { runDisplayStatus, runMessage } from '@/utils/phoneFactoryRuns'
 import { usePhoneCollectionBatches } from '@/composables/usePhoneCollectionBatches'
@@ -254,6 +256,8 @@ import { usePhoneCollectionBatches } from '@/composables/usePhoneCollectionBatch
 const props = withDefaults(defineProps<{ mode?: 'generate' | 'modeliter' }>(), { mode: 'generate' })
 const isEvaluation = props.mode === 'modeliter'
 const factoryApi = isEvaluation ? modelIterationApi : phoneFactoryApi
+const evaluationReady = ref(false), evaluatorConfig = ref<EvaluatorConfig>()
+const evaluationBlocked = computed(() => isEvaluation && !evaluationReady.value)
 // ---------- 状态 ----------
 const apps = ref<string[]>([])
 const phoneApps = ref<PhoneAppRow[]>([])
@@ -550,7 +554,7 @@ function openCustomRun(row: PhoneAppRow) {
 // ---------- 3.3 开始运行：不弹窗，把任务文件与 手机ID/运行APP 关联文件 发送到 server 端，
 // 关联文件中的所有手机都执行 ----------
 async function handleStartTask(row: TaskRow) {
-  if (taskBusy.value) return
+  if (taskBusy.value || evaluationBlocked.value) return
   if (!newVla.value.trim()) return ElMessage.warning('请选择 VLA 接口')
   startingTask.value = row.filename; stateEpoch++
   try {
@@ -568,7 +572,7 @@ async function handleStartTask(row: TaskRow) {
 // ---------- 3.3 定制运行确认：把任务文件、关联文件 + 手机ID/运行APP 发送到 server 端，
 // 仅指定的 手机ID 执行 ----------
 async function confirmRun() {
-  if (taskBusy.value) return
+  if (taskBusy.value || evaluationBlocked.value) return
   if (!runTargetTask.value) return ElMessage.warning('请选择要运行的任务')
   if (!runDialogPhoneId.value) return ElMessage.warning('请选择手机ID')
   if (!runDialogApp.value) return ElMessage.warning('请选择运行APP')
@@ -589,7 +593,8 @@ async function confirmRun() {
 }
 
 async function dispatchTask(task: TaskRow, phoneId: string, app: string, vla: string, config: FactoryConfig) {
-  const parameters = { filename: task.filename, phone_id: phoneId, app, vla, config, run_mode: props.mode }
+  const parameters = { filename: task.filename, phone_id: phoneId, app, vla, config, run_mode: props.mode,
+    ...(isEvaluation ? { evaluator_config: evaluatorConfig.value, checklist_source: 'llm' as const, evaluation_mode: 'checklist' as const } : {}) }
   const key = JSON.stringify(parameters)
   const requestId = requestIds.get(key) || newRunRequestId()
   requestIds.set(key, requestId)

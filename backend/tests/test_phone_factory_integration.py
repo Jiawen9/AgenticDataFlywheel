@@ -10,7 +10,9 @@ from pathlib import Path
 from unittest.mock import patch
 from fastapi.testclient import TestClient
 from backend import phonefactory_client
-from backend.phone_factory import PhoneFactoryStore
+from backend.phone_factory import PhoneFactoryStore, PhoneFactoryError
+from backend.model_iteration import save_config
+from backend.tests.test_model_iteration import evaluator_config
 from backend.phonefactory_manager import create_app
 from backend.collector_service.core import CollectorConfig
 from backend.collector_service.logprobs import extract_logprob_sidecars
@@ -115,17 +117,12 @@ class CollectorHttpIntegrationTests(unittest.TestCase):
                 self.assertEqual(platform.runtime.transfer.sync(generated_run['run_id'])['status'], 'completed')
                 self.assertFalse(app.state.collector.get(generated_run['run_id'])['params']['capture_logprobs'])
                 count_before = len(platform.collection_runs.list_runs())
-                evaluation = platform.remote_start({**params, 'request_id': 'evaluation-run', 'run_mode': 'modeliter'}, mode='modeliter')
-                self.assertEqual(platform.runtime.sync_evaluation(evaluation['run_id'])['status'], 'succeeded')
+                save_config(platform, evaluator_config())
+                # This older collector intentionally does not advertise the new evaluator capability.
+                with self.assertRaisesRegex(PhoneFactoryError, '升级'):
+                    platform.remote_start({**params, 'request_id': 'evaluation-run', 'run_mode': 'modeliter'}, mode='modeliter')
                 self.assertEqual(len(platform.collection_runs.list_runs()), count_before)
-                reports = platform.dispatch('reports', 'GET', {}, mode='modeliter')
-                self.assertEqual(len(reports['folders']), 1)
-                self.assertEqual(reports['folders'][0]['run_id'], evaluation['run_id'])
-                file = reports['folders'][0]['files'][0]
-                response = platform.dispatch('report-download', 'GET', {'run_id': evaluation['run_id'], 'file_id': file['file_id']}, mode='modeliter')
-                self.assertEqual(Path(response.path).read_bytes(), b'report')
-                Path(response.path).unlink()
-                self.assertEqual(execution.calls, 3)
+                self.assertEqual(execution.calls, 2)
 
 if __name__ == '__main__':
     unittest.main()

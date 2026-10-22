@@ -7,6 +7,7 @@ import math
 import tempfile
 import threading
 import uuid
+import mimetypes
 from pathlib import Path
 from urllib.parse import urlsplit
 from fastapi.responses import FileResponse
@@ -18,6 +19,7 @@ from .data_store import RevisionConflict
 from .data_store.locking import batch_lock
 from .data_store.registry import utc_now
 from .manual_collection import ManualCollectionStore
+from . import model_iteration
 from .phone_factory import DEFAULT_CONFIG, PhoneFactoryError, _atomic_write, _filename, _text
 from .task_generation.collection_batches import payload_digest
 
@@ -65,7 +67,9 @@ class FactoryRuntime:
             for run in self.records.list("model_iter_runs"):
                 if self._stop.is_set():
                     return
-                if run["status"] in TERMINAL and not (run["status"] == "failed" and run.get("dispatch_error")):
+                needs_snapshot = (run.get("request", {}).get("evaluator_config")
+                                  and not (self.records.get("model_iter_results", run["run_id"]) or {}).get("final"))
+                if run["status"] in TERMINAL and not needs_snapshot and not (run["status"] == "failed" and run.get("dispatch_error")):
                     continue
                 request = run.get("request", {})
                 if (request.get("result_transport") or request.get("metadata", {}).get("result_transport")) == "legacy":
@@ -84,7 +88,13 @@ class FactoryRuntime:
             raise PhoneFactoryError("远端评估运行身份不匹配", 502)
         if remote.get("status") not in TERMINAL | {"queued", "running"}:
             raise PhoneFactoryError("远端评估运行状态无效", 502)
+        result = None
+        if run.get("request", {}).get("evaluator_config"):
+            result = model_iteration.capture_results(self, run, final=remote["status"] in TERMINAL,
+                                                     remote_status=remote["status"])
         def update(current):
+            if result is not None:
+                current["evaluation_summary"] = result["summary"]
             if current["status"] not in TERMINAL or (current["status"] == "failed" and current.get("dispatch_error")):
                 current.update(status=remote["status"], errors=remote.get("errors", []), remote_status=remote["status"], updated_at=utc_now(), dispatch_error=None)
         return self.records.update("model_iter_runs", run_id, update)
@@ -157,7 +167,14 @@ class FactoryRuntime:
         associations.sort(key=lambda row: (row["phone_id"], row["app"]))
         if not associations:
             raise PhoneFactoryError("请选择已关联 App 的手机")
-        return {"run_mode": mode, "result_transport": "http", "vla": vla, "config": config, "phone_id": phone, "app": app, "phone_apps": associations, "phone_ids": sorted({row["phone_id"] for row in associations})}
+        options = {"run_mode": mode, "result_transport": "http", "vla": vla, "config": config, "phone_id": phone, "app": app, "phone_apps": associations, "phone_ids": sorted({row["phone_id"] for row in associations})}
+        if mode == "modeliter":
+            if data.get("checklist_source", "llm") != "llm" or data.get("evaluation_mode", "checklist") != "checklist":
+                raise PhoneFactoryError("当前评测仅支持 LLM 生成 checklist")
+            options.update(evaluator_config=model_iteration.normalize_config(
+                data.get("evaluator_config", model_iteration.get_config(self.store)), required=True),
+                checklist_source="llm", evaluation_mode="checklist")
+        return options
 
     def _protocol(self) -> str:
         """http: 批次结果回传协议；legacy: 旧 Flask（无 /capabilities）；
@@ -184,7 +201,9 @@ class FactoryRuntime:
         _identifier(request_id, "request_id")
         digest = hashlib.sha256(content).hexdigest()
         metadata = {**options, "filename": task["filename"]}
-        protocol = self._protocol()
+        # Evaluation always uses the upgraded HTTP contract; its capability is
+        # checked afresh below so an in-place collector upgrade needs no platform restart.
+        protocol = "http" if mode == "modeliter" else self._protocol()
         if protocol == "legacy":
             metadata["result_transport"] = "legacy"
         if mode == "generate":
@@ -228,7 +247,12 @@ class FactoryRuntime:
                                     item.update(status=known["status"], errors=known.get("errors", []), dispatch_error=None, updated_at=utc_now())
                             saved = self.records.update("model_iter_runs", run_id, recovered)
                         return {**known, **saved, "ok": True, "reused": True}
-                self._capabilities()
+                if mode == "modeliter":
+                    capability = model_iteration.capabilities(self.store)
+                    if not capability["supported"]:
+                        raise PhoneFactoryError(capability["message"], 409)
+                else:
+                    self._capabilities()
                 if mode == "generate":
                     with active_batch_lock(task["source_batch_id"], self.root):
                         if current["status"] == "failed":
@@ -244,6 +268,9 @@ class FactoryRuntime:
                     apps_path.write_text(json.dumps(options["phone_apps"], ensure_ascii=False), encoding="utf-8")
                     manifest_path.write_text(json.dumps({"tasks": tasks}, ensure_ascii=False), encoding="utf-8")
                     args = ["start-run", str(path), str(apps_path), options["phone_id"], options["app"], "--vla", options["vla"], "--runmode", mode, "--temperature", str(options["config"]["temperature"]), "--top-p", str(options["config"]["top_p"])]
+                    if mode == "modeliter":
+                        args += ["--evaluator-config", json.dumps(options["evaluator_config"], ensure_ascii=False),
+                                 "--checklist-source", "llm", "--evaluation-mode", "checklist"]
                     if protocol == "http":
                         args += ["--collection-run-id", run_id, "--task-manifest", str(manifest_path)]
                         if mode == "generate":
@@ -362,6 +389,13 @@ class FactoryRuntime:
         return {**response, "state": self.store.state(mode)}
 
     def dispatch(self, action, method, data, mode):
+        if mode == "modeliter" and action == "evaluation-config":
+            if method == "GET":
+                return True, model_iteration.get_config(self.store)
+            if method == "PUT":
+                return True, model_iteration.save_config(self.store, data)
+        if mode == "modeliter" and action == "evaluation-capabilities" and method == "GET":
+            return True, model_iteration.capabilities(self.store)
         if method == "GET" and action in {"runs", "collection-runs"}:
             runs = self.run_views(mode)
             if mode == "generate" and not data.get("batch_id"):
@@ -375,6 +409,23 @@ class FactoryRuntime:
             parts = action.split("/")
             if method == "POST" and len(parts) == 3 and parts[2] == "sync":
                 return True, self.sync_evaluation(parts[1])
+            if method == "GET" and len(parts) == 3 and parts[2] == "evaluations":
+                run_id = _identifier(parts[1], "评估运行编号")
+                run = self.records.get("model_iter_runs", run_id)
+                if run is None:
+                    raise PhoneFactoryError("评估运行不存在", 404)
+                if not run.get("request", {}).get("evaluator_config"):
+                    raise PhoneFactoryError("历史运行不包含逐用例评测，请下载历史报告", 409)
+                snapshot = self.records.get("model_iter_results", run_id)
+                if snapshot and snapshot.get("final"):
+                    return True, snapshot["result"]
+                try:
+                    self.sync_evaluation(run_id)
+                    return True, self.records.get("model_iter_results", run_id)["result"]
+                except PhoneFactoryError as exc:
+                    if snapshot:
+                        return True, {**snapshot["result"], "stale": True, "sync_error": str(exc)}
+                    raise
         if action.startswith("collection-runs/") and mode == "modeliter":
             raise PhoneFactoryError("评估结果不进入生产采集链", 409)
         if action.startswith("collection-runs/") and method == "POST":
@@ -420,7 +471,14 @@ class FactoryRuntime:
                 raise PhoneFactoryError("请指定报告运行及文件编号")
             directory = self.root / "tmp" / "phone_factory_reports"
             directory.mkdir(parents=True, exist_ok=True)
-            destination = directory / (uuid.uuid4().hex + ".xlsx")
+            name = _filename(data.get("name") or "evaluation-report.xlsx")
+            if data.get("run_id") and data.get("file_id") and not data.get("name"):
+                folders = self.store._remote_result(["reports", "--runmode", mode]).get("folders", [])
+                matching = [file for folder in folders if folder.get("run_id") == data["run_id"]
+                            for file in folder.get("files", []) if file.get("file_id", file.get("id")) == data["file_id"]]
+                if matching:
+                    name = _filename(matching[0]["name"])
+            destination = directory / (uuid.uuid4().hex + Path(name).suffix)
             try:
                 result = self.store._remote_result(args + ["--out", str(destination)])
                 if result.get("ok") is False or not destination.is_file():
@@ -428,5 +486,5 @@ class FactoryRuntime:
             except BaseException:
                 destination.unlink(missing_ok=True)
                 raise
-            return True, FileResponse(destination, filename=_filename(data.get("name") or "evaluation-report.xlsx"), headers={"Cache-Control": "no-store"}, background=BackgroundTask(destination.unlink, missing_ok=True))
+            return True, FileResponse(destination, filename=name, media_type=mimetypes.guess_type(name)[0] or "application/octet-stream", headers={"Cache-Control": "no-store"}, background=BackgroundTask(destination.unlink, missing_ok=True))
         return False, None

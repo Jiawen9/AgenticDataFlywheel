@@ -31,13 +31,16 @@ class FactoryRuntimeTests(unittest.TestCase):
         self.calls, self.remote = [], {}
         self.store = PhoneFactoryStore(self.root, run_client_fn=self.client)
         self.store.initialize_settings({'phones': ['phone-1'], 'apps': ['App'], 'phoneApps': [{'phone_id': 'phone-1', 'app': 'App'}], 'vla': ['http://mock.invalid/vla']})
+        from backend.model_iteration import save_config
+        from backend.tests.test_model_iteration import evaluator_config
+        save_config(self.store, evaluator_config())
         self.upload = {'filename': 'tasks.xlsx', 'description': 'test', 'content_base64': base64.b64encode(workbook_bytes()).decode()}
 
     def client(self, args):
         self.calls.append(args)
         value = {'ok': True}
         if args[0] == 'capabilities':
-            value.update(protocol_version=1, batch_results=True)
+            value.update(protocol_version=1, batch_results=True, model_iteration_evaluation=1)
         if args[0] == 'start-run':
             run_id = args[args.index('--collection-run-id') + 1]
             mode = args[args.index('--runmode') + 1]
@@ -47,6 +50,9 @@ class FactoryRuntimeTests(unittest.TestCase):
             if args[1] not in self.remote:
                 return {'ok': False, 'output': 'not found'}
             value = self.remote[args[1]]
+        if args[0] == 'run-evaluations':
+            from backend.tests.test_model_iteration import results
+            value = results(args[1])
         if args[0] == 'report-download':
             Path(args[args.index('--out') + 1]).write_bytes(b'mock report')
         return {'ok': True, 'output': json.dumps(value)}
