@@ -15,7 +15,7 @@ from .stage_artifacts import fingerprint
 from .trajectories_preprocessing import DEFAULT_ENV_FILE, read_env_file
 
 SHEET = "VLA trajectories"
-COLUMNS = ["文件夹名", "image", "xml", "action", "summary"]
+COLUMNS = ["文件夹名", "image", "xml", "action", "summary", "logprobs_path"]
 
 
 class PreprocessingError(ValueError):
@@ -88,6 +88,7 @@ def convert_input(snapshot: dict, progress: Callable[[dict], None], *, data_root
         files = {Path(item["path"]).as_posix(): item for item in trajectory["files"]}
         directory = Path(trajectory["relative_dir"])
         image = (directory / f"step{step:03d}_vla_input.jpg").as_posix()
+        logprobs = (directory / f"step{step:03d}_logprobs.json").as_posix()
         xml = (directory / f"step{step:03d}_vla_input_ui.xml").as_posix()
         fallback = (directory / f"step{step-1:03d}_vla_done_ui.xml").as_posix()
         reason = None
@@ -116,6 +117,7 @@ def convert_input(snapshot: dict, progress: Callable[[dict], None], *, data_root
                          "image": (Path("runs") / run_id / image).as_posix(),
                          "xml": (Path("runs") / run_id / xml).as_posix(),
                          "action": action, "summary": summary,
+                         "logprobs_path": (Path("runs") / run_id / logprobs).as_posix() if logprobs in files else "",
                          "task_id": trajectory["task_id"], "trajectory_id": trajectory_id,
                          "source_trajectory_id": source_id, "collection_run_id": run_id,
                          "collected_at": trajectory.get("collected_at"),

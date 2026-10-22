@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from openpyxl import Workbook
 from backend.phone_factory import PhoneFactoryStore, PhoneFactoryError, create_router
 from backend.batch_lifecycle import BatchPublishedError
-from backend.task_generation.collection_batches import COLLECTION_COLUMNS
+from backend.task_generation.collection_batches import COLLECTION_COLUMNS, payload_digest
 
 
 def workbook_bytes():
@@ -75,10 +75,65 @@ class FactoryRuntimeTests(unittest.TestCase):
             runs = list(pool.map(lambda _: self.store.remote_start(self.request()), range(4)))
         self.assertEqual(len({run['collection_run_id'] for run in runs}), 1)
         self.assertEqual(len([args for args in self.calls if args[0] == 'start-run']), 1)
-        for change in ({'vla': 'http://other.invalid'}, {'config': {'temperature': 0.5}}, {'config': {'sampling_enabled': True}}):
+        for change in ({'vla': 'http://other.invalid'}, {'config': {'temperature': 0.5}}, {'config': {'sampling_enabled': True}}, {'config': {'capture_logprobs': True}}):
             with self.subTest(change=change):
                 with self.assertRaises(ValueError):
                     self.store.remote_start(self.request(**change))
+
+    def test_logprob_default_and_per_run_overrides_preserve_sampling_and_saved_settings(self):
+        for index, (saved_flag, override) in enumerate(((False, None), (True, None), (True, False), (False, True))):
+            with self.subTest(saved=saved_flag, override=override):
+                store = PhoneFactoryStore(self.root / f'capture-{index}', run_client_fn=self.client)
+                config = {'sampling_enabled': True, 'temperature': 0.35, 'top_p': 0.75,
+                          'use_experience_lib': False, 'capture_logprobs': saved_flag}
+                store.initialize_settings({'phones': ['phone-1'], 'apps': ['App'],
+                    'phoneApps': [{'phone_id': 'phone-1', 'app': 'App'}],
+                    'vla': ['http://mock.invalid/vla'], 'config': config})
+                store.add_task(self.upload)
+                extra = {} if override is None else {'config': {'capture_logprobs': override}}
+                result = store.remote_start(self.request(**extra))
+                expected = saved_flag if override is None else override
+                self.assertEqual(result['request']['metadata']['config'], {**config, 'capture_logprobs': expected})
+                args = [call for call in self.calls if call[0] == 'start-run'][-1]
+                self.assertEqual('--capture-logprobs' in args, expected)
+                self.assertIn('--sampling', args)
+                self.assertEqual(args[args.index('--temperature') + 1], '0.35')
+                self.assertEqual(args[args.index('--top-p') + 1], '0.75')
+                self.assertEqual(store.config(), config)
+
+    def test_invalid_logprob_override_is_rejected_before_dispatch(self):
+        self.store.add_task(self.upload)
+        for invalid in ('true', 'false', 0, 1, None, [], {}):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(PhoneFactoryError, 'capture_logprobs'):
+                    self.store.remote_start(self.request(config={'capture_logprobs': invalid}))
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.store.collection_runs.list_runs(), [])
+
+    def test_pre_logprob_generate_and_evaluation_requests_replay_false_but_reject_changes(self):
+        for mode, namespace in (('generate', 'collection_runs'), ('modeliter', 'model_iter_runs')):
+            with self.subTest(mode=mode):
+                task = self.store.add_task(self.upload, mode=mode)['imported_task']
+                request = self.request(filename=task['filename'], request_id='legacy-' + mode,
+                    config={'capture_logprobs': False})
+                initial = self.store.remote_start(request, mode=mode)
+                run_id = initial['collection_run_id']
+                def legacy(item):
+                    options = item['request']['metadata'] if mode == 'generate' else item['request']
+                    del options['config']['capture_logprobs']
+                    item['request_digest'] = payload_digest(item['request'])
+                original = self.store.records.update(namespace, run_id, legacy)
+                starts = len([args for args in self.calls if args[0] == 'start-run'])
+                replay = self.store.remote_start(request, mode=mode)
+                self.assertTrue(replay['reused'])
+                self.assertEqual(replay['collection_run_id'], run_id)
+                self.assertEqual(self.store.records.get(namespace, run_id), original)
+                for config in ({'capture_logprobs': True}, {'capture_logprobs': False, 'temperature': 0.2}):
+                    with self.subTest(config=config):
+                        with self.assertRaisesRegex(ValueError, 'request_id'):
+                            self.store.remote_start({**request, 'config': config}, mode=mode)
+                self.assertEqual(len([args for args in self.calls if args[0] == 'start-run']), starts)
+                self.assertEqual(self.store.records.get(namespace, run_id), original)
 
     def test_model_iteration_run_persistence_reports_and_no_production_artifacts(self):
         self.store.add_task(self.upload, mode='modeliter')
@@ -204,6 +259,22 @@ class FactoryRuntimeTests(unittest.TestCase):
                         self.assertEqual(rebuilt.state(mode)['tasks'][0]['status'], active_label)
                 self.store.records.update(namespace, first_id, lambda item: item.update(status=final))
                 self.assertEqual(self.store.state(mode)['tasks'][0]['status'], label)
+
+    def test_completed_partial_run_keeps_usable_status_and_surfaces_remote_warning(self):
+        self.store.add_task(self.upload)
+        run = self.store.remote_start(self.request())
+        run_id = run['collection_run_id']
+        self.store.records.update('collection_runs', run_id, lambda item: item.update(status='completed'))
+        warnings = [{'error': 'task-a step2: logprobs missing'}]
+        self.store.records.put('collection_transfers', run_id, {'remote_status': 'partial',
+            'transfer_status': 'completed', 'remote_errors': warnings})
+        before = self.store.collection_runs.get(run_id)
+        self.assertEqual(self.store.state()['tasks'][0]['status'], '部分完成')
+        public = self.store.runtime.run_views('generate')[0]
+        self.assertEqual(public['status'], 'completed')
+        self.assertEqual(public['remote_status'], 'partial')
+        self.assertEqual(public['remote_errors'], warnings)
+        self.assertEqual(self.store.collection_runs.get(run_id), before)
 
     def test_failed_transfer_does_not_hide_other_live_run_and_remains_actionable(self):
         self.store.add_task(self.upload)

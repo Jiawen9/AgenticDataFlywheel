@@ -33,7 +33,7 @@ describe('phone collection batch selection and dispatch', () => {
 
   it('reuses request identity after a lost response and passes per-run configuration', async () => {
     const { collection, factoryApi } = setup()
-    const config = { sampling_enabled: true, temperature: 0.5, top_p: 0.9, use_experience_lib: true }
+    const config = { sampling_enabled: true, temperature: 0.5, top_p: 0.9, use_experience_lib: true, capture_logprobs: true }
     factoryApi.remoteStartRun.mockRejectedValueOnce(new Error('network lost'))
     await expect(collection.runBatch('batch-a', 'phone-1', 'AppA', { vla: 'vla:8000', config })).rejects.toThrow('network lost')
     await collection.runBatch('batch-a', 'phone-1', 'AppA', { vla: 'vla:8000', config })

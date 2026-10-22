@@ -87,7 +87,7 @@
             allow-create
             default-first-option
             clearable
-            placeholder="ip:port"
+            placeholder="host:port 或 http(s)://host:port/v1"
             class="field-input vla-input"
             @keyup.enter="handleSaveVla"
           >
@@ -96,6 +96,10 @@
           <el-button :disabled="taskBusy" :loading="savingVla" @click="handleSaveVla">保存</el-button>
         </div>
 
+        <div class="row-form config-row">
+          <span class="field-label">采集 Logprobs</span>
+          <el-switch v-model="config.capture_logprobs" data-testid="capture-logprobs" :disabled="taskBusy || savingConfig" @change="handleConfigChange" />
+        </div>
         <!-- 3.1.1 是否打开采样 + 是否使用经验库 -->
         <div class="row-form config-row">
           <span class="field-label">是否打开采样</span>
@@ -182,7 +186,7 @@
         <el-alert v-if="runError" :title="runError" type="warning" :closable="false" />
         <el-table :data="runs" border data-testid="factory-runs">
           <el-table-column label="运行编号" min-width="160" show-overflow-tooltip><template #default="{ row }">{{ row.collection_run_id || row.run_id }}</template></el-table-column>
-          <el-table-column label="状态" width="110"><template #default="{ row }">{{ runStatus(row.status) }}</template></el-table-column>
+          <el-table-column label="状态" width="110"><template #default="{ row }">{{ runDisplayStatus(row) }}</template></el-table-column>
           <el-table-column label="结果" min-width="170"><template #default="{ row }">{{ runMessage(row) }}</template></el-table-column>
           <el-table-column v-if="!isEvaluation" label="操作" min-width="100"><template #default="{ row }"><el-button link :loading="syncingRun === (row.collection_run_id || row.run_id)" :disabled="pipelineContext.isPipelineRoute.value || managedBatchIds.includes(row.batch_id)" @click="syncRun(row)">重试回传</el-button></template></el-table-column>
         </el-table>
@@ -213,7 +217,8 @@
             <span data-testid="custom-run-app">{{ runDialogApp }}</span>
           </div>
           <div class="custom-config">
-            <label>VLA 接口<el-select v-model="runDialogVla" data-testid="custom-run-vla" filterable allow-create :disabled="confirmingRun" placeholder="选择 VLA 接口"><el-option v-for="item in vla" :key="item" :value="item" :label="item" /></el-select></label>
+            <label>VLA 接口<el-select v-model="runDialogVla" data-testid="custom-run-vla" filterable allow-create :disabled="confirmingRun" placeholder="host:port 或 http(s)://host:port/v1"><el-option v-for="item in vla" :key="item" :value="item" :label="item" /></el-select></label>
+            <label>采集 Logprobs<el-switch v-model="runDialogConfig.capture_logprobs" data-testid="custom-run-capture-logprobs" :disabled="confirmingRun" /></label>
             <label>打开采样<el-switch v-model="runDialogConfig.sampling_enabled" :disabled="confirmingRun" /></label>
             <template v-if="runDialogConfig.sampling_enabled"><label>temperature<el-input-number v-model="runDialogConfig.temperature" :min="0" :max="2" :step="0.05" :disabled="confirmingRun" /></label><label>top_p<el-input-number v-model="runDialogConfig.top_p" :min="0" :max="1" :step="0.05" :disabled="confirmingRun" /></label></template>
             <label>使用经验库<el-switch v-model="runDialogConfig.use_experience_lib" :disabled="confirmingRun" /></label>
@@ -243,6 +248,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { phoneFactoryApi, modelIterationApi, factoryBatchesApi, newRunRequestId, type FactoryConfig, type PhoneAppRow, type TaskRow, type FactoryBatchSummary, type FactoryState, type FactoryRun, type ReportFolder, type ReportFile, type AdbDevice, type CollectionWarning } from '@/phoneFactoryApi'
 import { useFactoryPolling } from '@/composables/useFactoryPolling'
+import { runDisplayStatus, runMessage } from '@/utils/phoneFactoryRuns'
 import { usePhoneCollectionBatches } from '@/composables/usePhoneCollectionBatches'
 
 const props = withDefaults(defineProps<{ mode?: 'generate' | 'modeliter' }>(), { mode: 'generate' })
@@ -260,6 +266,7 @@ const config = reactive<FactoryConfig>({
   temperature: 0.7,
   top_p: 0.85,
   use_experience_lib: false,
+  capture_logprobs: false,
 })
 
 const newPhoneId = ref('')
@@ -641,8 +648,6 @@ const reportPoller = isEvaluation ? useFactoryPolling(async (signal, current) =>
   finally { if (current()) loadingReports.value = false }
 }) : { start() {} }
 const reportTime = (value?: number) => value != null && Number.isFinite(value) ? new Date(value * 1000).toLocaleString('zh-CN', { hour12: false }) : '—'
-const runStatus = (status: string) => ({ dispatching: '正在下发', queued: '排队中', running: '运行中', completed: '已完成', succeeded: '已完成', failed: '失败', cancelled: '已取消', interrupted: '已中断', partial: '部分完成', ready: '结果已就绪', waiting: '等待回传', syncing: '正在回传', pending: '等待中' } as Record<string, string>)[status] || status
-const runMessage = (run: FactoryRun) => run.transfer_error || run.dispatch_error || run.error || run.errors?.map(item => item.error || item.message).filter(Boolean).join('；') || (run.trajectory_count != null ? `${run.trajectory_count} 条轨迹` : runStatus(run.transfer_status || ''))
 async function syncRun(run: FactoryRun) {
   if (pipelineContext.isPipelineRoute.value || managedBatchIds.value.includes(run.batch_id || '')) return
   const id = run.collection_run_id || run.run_id

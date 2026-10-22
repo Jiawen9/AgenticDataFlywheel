@@ -64,8 +64,9 @@ class PreprocessingDownstreamIntegrationTests(unittest.TestCase):
 
     def test_real_annotation_payload_progress_and_current_downstream_tree(self):
         f = self.fixture
-        f.complete()
-        f.complete()
+        trace = {"status": "ok", "response_token_ids": [101], "behavior_logprobs": [-0.25]}
+        f.complete(traces={1: trace})
+        f.complete(traces={1: trace})
         events = []
         original_update = f.manager._update
         def track(job_id, **changes):
@@ -102,6 +103,9 @@ class PreprocessingDownstreamIntegrationTests(unittest.TestCase):
         tree_payload = f.store.read_payload(f.store.get("batch-one", "04_tree"))
         snapshot = tree_payload["source_annotation"]
         self.assertEqual(snapshot["sheets"]["VLA trajectories"], current.payload["sheets"]["VLA trajectories"])
+        self.assertIn("logprobs_path", snapshot["columns"]["VLA trajectories"])
+        self.assertEqual({row["logprobs_path"] for row in snapshot["sheets"]["VLA trajectories"]},
+                         {row["logprobs_path"] for row in rows})
         quality = tree_payload["quality_input"]
         self.assertEqual(len(quality["sheets"]["Trajectories"]), 2)
         for row in quality["sheets"]["Steps"]:

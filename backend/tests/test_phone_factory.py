@@ -71,6 +71,25 @@ class PhoneFactoryTests(unittest.TestCase):
         after = {file.relative_to(self.root): (file.read_bytes(), file.stat().st_mtime_ns) for file in self.root.rglob("*") if file.is_file()}
         self.assertEqual(before, after)
 
+    def test_legacy_settings_default_logprobs_off_without_rewriting_stored_config(self):
+        legacy = {key: value for key, value in DEFAULT_CONFIG.items() if key != "capture_logprobs"}
+        self.store._update(lambda state: state.update(config=legacy))
+        before = self.store.records.get("phone_factory", "state")
+        self.assertEqual(self.store.config(), DEFAULT_CONFIG)
+        self.assertEqual(self.store.records.get("phone_factory", "state"), before)
+
+    def test_config_saves_logprob_default_and_rejects_non_boolean_flags_without_writes(self):
+        saved = {**DEFAULT_CONFIG, "capture_logprobs": True, "temperature": 0.4}
+        self.assertEqual(self.store.dispatch("config", "POST", saved), saved)
+        self.assertEqual(self.new_store().config(), saved)
+        before = self.store.records.get("phone_factory", "state")
+        for key in ("capture_logprobs", "sampling_enabled", "use_experience_lib"):
+            for invalid in ("false", "true", 0, 1, None, [], {}):
+                with self.subTest(key=key, invalid=invalid):
+                    with self.assertRaisesRegex(PhoneFactoryError, key):
+                        self.store.dispatch("config", "POST", {**saved, key: invalid})
+                    self.assertEqual(self.store.records.get("phone_factory", "state"), before)
+
     def test_settings_initialization_is_explicit_excludes_history_and_does_not_overwrite(self):
         settings = {"phones": ["phone"], "apps": ["App"], "vla": ["http://mock.invalid/vla"],
                     "phoneApps": [{"phone_id": "phone", "app": "App", "status": "运行中"}],
@@ -92,7 +111,8 @@ class PhoneFactoryTests(unittest.TestCase):
 
     def test_settings_initialization_rejects_tasks_and_invalid_config_without_writes(self):
         for settings in ({"tasks": []}, {"phones": "phone"}, {"phoneApps": [{}]},
-                         {"config": {"top_p": float("nan")}}, {"config": {"sampling_enabled": "true"}}):
+                         {"config": {"top_p": float("nan")}}, {"config": {"sampling_enabled": "true"}},
+                         {"config": {"capture_logprobs": "false"}}, {"config": {"capture_logprobs": 1}}):
             with self.subTest(settings=settings):
                 with self.assertRaises(PhoneFactoryError):
                     self.store.initialize_settings(settings)
@@ -138,7 +158,7 @@ class PhoneFactoryTests(unittest.TestCase):
         request["filename"] = registered["tasks"][0]["filename"]
         self.store.dispatch("vla", "POST", {"value": "http://model.invalid"})
         self.store.dispatch("phone-apps", "POST", {"phone_id": "phone", "app": "App"})
-        self.store.dispatch("config", "POST", {"sampling_enabled": True, "temperature": 0.5, "top_p": 0.9, "use_experience_lib": True})
+        self.store.dispatch("config", "POST", {"sampling_enabled": True, "temperature": 0.5, "top_p": 0.9, "use_experience_lib": True, "capture_logprobs": True})
         result = self.store.remote_start({"filename": request["filename"], "phone_id": "phone", "app": "App"})
         self.assertTrue(result["ok"])
         call = self.calls[-1]
@@ -147,6 +167,7 @@ class PhoneFactoryTests(unittest.TestCase):
         self.assertEqual(call["args"][3:5], ["phone", "App"])
         self.assertIn("--sampling", call["args"])
         self.assertIn("--exp", call["args"])
+        self.assertIn("--capture-logprobs", call["args"])
         self.assertFalse(Path(call["args"][2]).exists())
         self.assertEqual(self.store.state()["tasks"][0]["status"], "运行中")
         self.store.dispatch("remote/add-phone", "POST", {"phone_id": "phone"})

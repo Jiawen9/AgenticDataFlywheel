@@ -39,6 +39,7 @@ class PipelineReleaseTests(unittest.TestCase):
                 for step in range(1, 4):
                     rows.append({"文件夹名": trajectory, "task_id": task, "trajectory_id": trajectory,
                         "collection_case_id": "case-" + task, "image": f"{task}/{trajectory}/step{step:03}.jpg",
+                        "logprobs_path": f"{task}/{trajectory}/step{step:03}_logprobs.json",
                         "action": '{"action":"wait"}', "summary": "baseline", "sop": "original SOP", "actions_box": "wait()"})
         table = {"schema_version": 1, "columns": {"VLA trajectories": list(rows[0])}, "sheets": {"VLA trajectories": rows}}
         collection = self.store.publish(self.batch, "00_collection", {"batch_id": self.batch, "snapshot": {"tasks": tasks}})
@@ -83,6 +84,8 @@ class PipelineReleaseTests(unittest.TestCase):
         self.assertEqual(book.active.max_row, 4)
         columns = [cell.value for cell in book.active[1]]
         self.assertEqual(book.active.cell(2, columns.index("sop") + 1).value, "original SOP")
+        self.assertEqual([book.active.cell(i, columns.index("logprobs_path") + 1).value for i in range(2, 5)],
+                         [f"A/a-first/step{step:03}_logprobs.json" for step in range(1, 4)])
         book.close()
         converted = convert_release(self.registry, release)
         self.assertEqual(len(converted["rows"]), 1)
@@ -138,6 +141,7 @@ class PipelineReleaseTests(unittest.TestCase):
         self.assertEqual(row["action"], final_action)
         self.assertEqual(row["thought"], "saved handwritten")
         self.assertEqual(row["summary"], "saved generated summary")
+        self.assertEqual(row["logprobs_path"], "A/a-first/step001_logprobs.json")
         payload = self.store.read_payload(self.store.get(self.batch, "07_cot"))
         self.assertEqual(set(payload["row_edits"]), {"2"})
         self.assertEqual(payload["cot"]["2"]["summary"], "saved generated summary")

@@ -99,11 +99,14 @@ def atomic_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(value, f, ensure_ascii=False, allow_nan=False)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(value, f, ensure_ascii=False, allow_nan=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -300,9 +303,15 @@ class Collector:
             raise CollectorError("采样参数无效") from exc
         if not math.isfinite(temperature) or not 0 <= temperature <= 2 or not math.isfinite(top_p) or not 0 <= top_p <= 1:
             raise CollectorError("temperature 应为 0–2，top_p 应为 0–1")
+        capture_logprobs = form.get("capture_logprobs", "false")
+        if isinstance(capture_logprobs, str) and capture_logprobs.lower() in {"true", "false"}:
+            capture_logprobs = capture_logprobs.lower() == "true"
+        if type(capture_logprobs) is not bool:
+            raise CollectorError("capture_logprobs 必须为布尔值 true 或 false")
         params = {"vla": vla, "runmode": mode, "phone_id": str(form.get("phone_id") or ""),
                   "app": str(form.get("app") or ""), "sampling_enabled": boolean("sampling_enabled"),
-                  "temperature": temperature, "top_p": top_p, "use_experience_lib": boolean("use_experience_lib")}
+                  "temperature": temperature, "top_p": top_p, "use_experience_lib": boolean("use_experience_lib"),
+                  "capture_logprobs": capture_logprobs}
         try:
             with zipfile.ZipFile(io.BytesIO(task_bytes)) as zipped:
                 if sum(entry.file_size for entry in zipped.infolist()) > 512 * 1024 * 1024:
@@ -365,13 +374,18 @@ class Collector:
         phone_tasks = {p: cases for p, cases in phone_tasks.items() if cases}
         if not phone_tasks:
             raise CollectorError("没有匹配的手机/APP 任务")
-        request_hash = digest({"task_sha256": hashlib.sha256(task_bytes).hexdigest(),
-                               "apps": apps, "tasks": tasks, "params": params, "batch_id": batch_id})
+        request_payload = {"task_sha256": hashlib.sha256(task_bytes).hexdigest(),
+                           "apps": apps, "tasks": tasks, "params": params, "batch_id": batch_id}
+        request_hash = digest(request_payload)
         with self.lock("mutations"):
             with self.db() as conn:
                 existing = self._get(conn, run_id)
             if existing:
-                if existing["request_digest"] != request_hash:
+                accepted_hashes = {request_hash}
+                if not capture_logprobs and "capture_logprobs" not in existing.get("params", {}):
+                    legacy_params = {key: value for key, value in params.items() if key != "capture_logprobs"}
+                    accepted_hashes.add(digest({**request_payload, "params": legacy_params}))
+                if existing["request_digest"] not in accepted_hashes:
                     raise CollectorError("相同运行编号对应不同的实际运行参数", 409)
                 return self.public(existing)
             self.execution.preflight(params)

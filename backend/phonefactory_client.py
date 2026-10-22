@@ -111,6 +111,7 @@ def cmd_start_run(args):
     fields = {"phone_id": args.phone or "", "app": args.app_name or "",
         "sampling_enabled": str(args.sampling).lower(), "temperature": str(args.temperature),
         "top_p": str(args.top_p), "use_experience_lib": str(args.exp).lower(),
+        "capture_logprobs": str(getattr(args, "capture_logprobs", False)).lower(),
         "vla": getattr(args, "vla", "") or "", "runmode": getattr(args, "runmode", "generate")}
     batch = getattr(args, "batch_id", None)
     run = getattr(args, "collection_run_id", None)
@@ -141,6 +142,7 @@ def build_parser():
     run.add_argument("phone", nargs="?", default="")
     run.add_argument("app_name", nargs="?", default="")
     run.add_argument("--sampling", action="store_true")
+    run.add_argument("--capture-logprobs", action="store_true")
     run.add_argument("--temperature", type=float, default=0.7)
     run.add_argument("--top-p", type=float, default=0.85)
     run.add_argument("--exp", action="store_true")

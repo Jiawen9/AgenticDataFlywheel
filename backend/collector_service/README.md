@@ -63,7 +63,7 @@ PHONE_FACTORY_ROOT/
 ## HTTP 协议
 
 - `GET /capabilities`：`protocol_version: 1`、`batch_results: true`。
-- `POST /start_run`：multipart `task_file`、`apps_file`、`vla`、`runmode`（`generate` / `modeliter`）、`sampling_enabled`、`temperature`、`top_p`、`use_experience_lib`、可选 `phone_id` / `app` 筛选，以及 `collection_run_id`、`batch_id`、JSON 字符串 `task_manifest`。
+- `POST /start_run`：multipart `task_file`、`apps_file`、`vla`、`runmode`（`generate` / `modeliter`）、`sampling_enabled`、`temperature`、`top_p`、`use_experience_lib`、`capture_logprobs`（可选，默认 false）、可选 `phone_id` / `app` 筛选，以及 `collection_run_id`、`batch_id`、JSON 字符串 `task_manifest`。
 - `task_manifest` 形状为 `{tasks: [{collection_case_id, task_id, task, app, ...来源分类字段}]}`。生成模式必须传批次；评估模式可不传批次。所有实际运行参数、文件摘要和任务清单参与幂等校验。
 - 相同运行编号和相同请求返回已有运行；参数冲突返回 409，不重复执行。服务先持久登记，随后异步执行。
 - `GET /runs/{id}`：返回 `run_id`、`collection_run_id`、`batch_id`、`run_mode`、`status`、`errors` 和可用时的 `manifest`。
@@ -83,6 +83,22 @@ PHONE_FACTORY_ROOT/
 - `GET /reports?runmode=modeliter`：返回 `folders`，每个文件附稳定 `run_id` / `file_id`。
 - `GET /report_download?runmode=modeliter&run_id=...&file_id=...`：校验冻结摘要后下载。
 - 兼容旧 `folder` / `name` 查询；同名报告不唯一时要求使用稳定 ID。生成与评估查询互不混入。评估不自动进入平台生产批次。
+
+## Logprobs 采集
+
+工厂页面的“采集 Logprobs”默认关闭，可保存为默认配置或按本次运行覆盖。平台将 `capture_logprobs` 经客户端的 `--capture-logprobs` 参数和 `/start_run` 表单传到采集服务器，运行参数会保存在 `request.json` 与 `worker-config.json` 中。worker 每次都为 Agent 子进程显式设置 `GUI_AGENT_VLA_CAPTURE_LOGPROBS=true/false`；评估子进程单独设置为 `false`，不会受服务器全局环境或上一次任务开关影响。
+
+此开关依赖服务器上的执行模板实现。模板的采集配置必须加载 `GUI_AGENT_VLA_CAPTURE_LOGPROBS`，VLA 请求需支持选中 token 的 logprobs 和 token IDs，并在正式 `stepNNN_vla_model_response.json` 中保存 `behavior_trace`。参考 `new-guigent` 的 `agent_with_save_logprobs_cjw` 分支；该分支原始实现开启采集会覆盖 temperature 为 `1.0`，部署时必须同步合入“采集开关保留 adapter 原有 temperature/top_p”的修正。不要通过另加一个采集温度设置改变平台现有采样行为。
+
+worker 在采集输出快照内、冻结清单与 ZIP 生成之前，为正式轨迹目录中的每个模型响应提取 `behavior_trace`，写成同目录 `stepNNN_logprobs.json`。JSON 的主体就是原 trace 对象，原 response 保留不变；不会递归抽取预取候选或拒绝记录。开启采集但 trace 缺失、异常或文件无法写入时，保留有效轨迹并记录步骤错误，有可用轨迹的运行标记为 `partial`。关闭开关时不为缺失 trace 报错。
+
+平台“开始预处理”只新增 `logprobs_path` 一列，使用冻结文件清单中的同一步文件，路径与 `image/xml` 一样相对于批次 `raw_root`，例如 `runs/<run_id>/<trajectory>/step001_logprobs.json`。后续标框、人工修正和发布表保留该字段；旧轨迹没有独立 JSON 时留空，不写回已冻结的原始目录。概率始终属于原始模型输出，不代表人工修正后的文本。发布表包含路径不等于对外发布包已携带 JSON 附件，附件发布不在此改动范围内。
+
+升级顺序：
+
+1. 在空闲窗口更新采集服务器的 backend 代码，以及 `PHONE_FACTORY_TEMPLATE_DIR` 指向的 Agent 模板和实际 `config_trajectory.py`；核对模板保留现有工厂目录约定。
+2. 同步更新已有 `devices/<device_digest>` 下的执行代码副本，保留设备配置和未归档输出。仅更新模板目录不会自动替换已有副本；不要在任务运行中同步或删除目录。
+3. 重启采集服务，再更新平台 backend 与前端。依次做关闭、开启、再次关闭的短任务联调，检查任务参数、模型请求、trace、独立 JSON 与预处理路径；开启时确认温度和 top_p 未变化。
 
 ## 本地验收
 

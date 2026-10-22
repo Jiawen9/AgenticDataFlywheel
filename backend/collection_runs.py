@@ -32,6 +32,20 @@ class CollectionRunError(ValueError):
         self.status = status
 
 
+def matches_legacy_logprobs_request(existing: dict, request: dict, *, nested_metadata: bool = False) -> bool:
+    """Allow only the added false default when replaying a pre-logprob request."""
+    frozen = existing.get("request", {})
+    options = request.get("metadata", {}) if nested_metadata else request
+    frozen_options = frozen.get("metadata", {}) if nested_metadata else frozen
+    config, frozen_config = options.get("config"), frozen_options.get("config")
+    if (not isinstance(config, dict) or not isinstance(frozen_config, dict)
+            or config.get("capture_logprobs") is not False or "capture_logprobs" in frozen_config):
+        return False
+    legacy_options = {**options, "config": {key: value for key, value in config.items() if key != "capture_logprobs"}}
+    legacy_request = {**request, "metadata": legacy_options} if nested_metadata else legacy_options
+    return payload_digest(legacy_request) == existing.get("request_digest")
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -201,7 +215,8 @@ class CollectionRunStore:
                 return saved, True
             except RevisionConflict:
                 existing = self.get(run_id)
-                if existing["request_digest"] != payload["request_digest"]:
+                if (existing["request_digest"] != payload["request_digest"]
+                        and not matches_legacy_logprobs_request(existing, request, nested_metadata=True)):
                     raise CollectionRunError("相同 request_id 对应的运行参数不同")
                 return existing, False
 

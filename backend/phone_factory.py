@@ -30,7 +30,7 @@ from .collection_runs import CollectionRunError, CollectionRunStore
 
 DEFAULT_CONFIG = {
     "sampling_enabled": False, "temperature": 0.7,
-    "top_p": 0.85, "use_experience_lib": False,
+    "top_p": 0.85, "use_experience_lib": False, "capture_logprobs": False,
 }
 CLIENT_SCRIPT = Path(__file__).resolve().with_name("phonefactory_client.py")
 
@@ -134,7 +134,7 @@ class PhoneFactoryStore:
         if not isinstance(config, dict) or set(config) - set(DEFAULT_CONFIG):
             raise PhoneFactoryError("初始化采集配置格式无效", 409)
         config = {**DEFAULT_CONFIG, **config}
-        for key in ("sampling_enabled", "use_experience_lib"):
+        for key in ("sampling_enabled", "use_experience_lib", "capture_logprobs"):
             if not isinstance(config[key], bool):
                 raise PhoneFactoryError(f"初始化 {key} 必须为布尔值", 409)
         for key in ("temperature", "top_p"):
@@ -169,7 +169,7 @@ class PhoneFactoryStore:
         return self.runtime.public_state(self._public(self._current()), mode)
 
     def config(self) -> dict:
-        return self._current()["config"]
+        return {**DEFAULT_CONFIG, **self._current()["config"]}
 
     def _update(self, mutator: Callable[[dict], None]) -> dict:
         return self.records.update("phone_factory", "state", mutator, default=self._empty_state())
@@ -312,6 +312,11 @@ class PhoneFactoryStore:
             return self._remote_result(["add-phone", phone_id])
         if method == "POST" and action == "config":
             config = {}
+            for key in ("sampling_enabled", "use_experience_lib", "capture_logprobs"):
+                value = data.get(key, DEFAULT_CONFIG[key])
+                if not isinstance(value, bool):
+                    raise PhoneFactoryError(f"{key} 必须是布尔值")
+                config[key] = value
             for key in ("temperature", "top_p"):
                 try:
                     value = float(data[key])
@@ -320,7 +325,6 @@ class PhoneFactoryStore:
                 if not math.isfinite(value) and data.get("sampling_enabled"):
                     raise PhoneFactoryError("temperature 与 top_p 必须是数字")
                 config[key] = value if math.isfinite(value) else DEFAULT_CONFIG[key]
-            config.update(sampling_enabled=bool(data.get("sampling_enabled")), use_experience_lib=bool(data.get("use_experience_lib")))
             self._update(lambda state: state.update(config=config))
             return config
         if method == "POST" and action in {"phones", "apps", "vla"}:
