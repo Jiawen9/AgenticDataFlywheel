@@ -113,6 +113,10 @@ def cmd_start_run(args):
         "top_p": str(args.top_p), "use_experience_lib": str(args.exp).lower(),
         "capture_logprobs": str(getattr(args, "capture_logprobs", False)).lower(),
         "vla": getattr(args, "vla", "") or "", "runmode": getattr(args, "runmode", "generate")}
+    evaluator_config = getattr(args, "evaluator_config", None)
+    if fields["runmode"] == "modeliter" and evaluator_config:
+        fields.update(evaluator_config=evaluator_config, checklist_source=args.checklist_source,
+                      evaluation_mode=args.evaluation_mode)
     batch = getattr(args, "batch_id", None)
     run = getattr(args, "collection_run_id", None)
     output = getattr(args, "output_dir", None)
@@ -152,10 +156,14 @@ def build_parser():
     run.add_argument("--collection-run-id")
     run.add_argument("--output-dir")
     run.add_argument("--task-manifest")
+    run.add_argument("--evaluator-config")
+    run.add_argument("--checklist-source", choices=["llm"], default="llm")
+    run.add_argument("--evaluation-mode", choices=["checklist"], default="checklist")
     sub.add_parser("status").add_argument("phones")
     sub.add_parser("adb-devices")
     sub.add_parser("capabilities")
     sub.add_parser("run").add_argument("run_id")
+    sub.add_parser("run-evaluations").add_argument("run_id")
     archive = sub.add_parser("run-archive")
     archive.add_argument("run_id")
     archive.add_argument("--out", required=True)
@@ -191,6 +199,8 @@ def main():
         result = get_json("/capabilities")
     elif args.cmd == "run":
         result = get_json("/runs/" + urllib.parse.quote(args.run_id, safe=""))
+    elif args.cmd == "run-evaluations":
+        result = get_json("/runs/" + urllib.parse.quote(args.run_id, safe="") + "/evaluations")
     elif args.cmd == "run-archive":
         result = download_file("/runs/" + urllib.parse.quote(args.run_id, safe="") + "/archive", args.out)
     elif args.cmd == "reports":
