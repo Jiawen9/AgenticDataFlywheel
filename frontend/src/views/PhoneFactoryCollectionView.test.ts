@@ -48,14 +48,17 @@ async function render(mode: 'generate' | 'modeliter' = 'generate') {
   const passthrough = defineComponent({ setup: (_props, { slots }) => () => h('div', null, slots.default?.()) })
   app.component('el-input', empty)
   app.component('el-progress', empty)
-  app.component('el-switch', empty)
+  app.component('el-switch', defineComponent({
+    props: { modelValue: Boolean },
+    setup: props => () => h('input', { type: 'checkbox', checked: props.modelValue }),
+  }))
   app.component('el-button', passthrough)
   app.component('el-table', empty)
   app.component('el-table-column', empty)
   app.component('el-tag', passthrough)
   app.component('el-input-number', empty)
   app.component('el-alert', empty)
-  app.component('el-dialog', empty)
+  app.component('el-dialog', passthrough)
   app.component('el-select', defineComponent({
     props: { placeholder: String },
     setup: (props, { slots }) => () => h('section', { 'data-placeholder': props.placeholder }, slots.default?.()),
@@ -68,6 +71,16 @@ async function render(mode: 'generate' | 'modeliter' = 'generate') {
 }
 
 describe('phone collection batch picker', () => {
+  it('offers default-off logprob switches for saved settings and a custom run', async () => {
+    const html = await render()
+    expect(html).toContain('采集 Logprobs')
+    expect(html).toContain('data-placeholder="host:port 或 http(s)://host:port/v1"')
+    for (const id of ['capture-logprobs', 'custom-run-capture-logprobs']) {
+      const control = html.match(new RegExp(`<input[^>]*data-testid="${id}"[^>]*>`))?.[0]
+      expect(control).toBeDefined()
+      expect(control).not.toContain('checked')
+    }
+  })
   it('keeps evaluation runs outside production batch and preprocessing controls', async () => {
     const html = await render('modeliter')
     expect(html).toContain('模型迭代评估')

@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 from openpyxl import Workbook
 
-from backend.collector_service.core import Collector, CollectorConfig, CollectorError, atomic_json, sha
+from backend.collector_service.core import Collector, CollectorConfig, CollectorError, atomic_json, digest, sha
 from backend.collector_service.adapters import TemplateExecutor
 from backend.phonefactory_manager import create_app
 
@@ -142,10 +142,27 @@ class CollectorServiceTests(unittest.TestCase):
         first = self.submit()
         self.assertEqual(self.submit(), first)
         for field, value in {"vla": "http://other", "temperature": "1", "top_p": ".5", "sampling_enabled": "true",
-                             "use_experience_lib": "true", "runmode": "modeliter", "phone_id": "phone-a"}.items():
+                             "use_experience_lib": "true", "capture_logprobs": "true",
+                             "runmode": "modeliter", "phone_id": "phone-a"}.items():
             with self.subTest(field=field), self.assertRaises(CollectorError) as caught:
                 self.submit(**{field: value})
             self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(self.execution.calls, 1)
+
+    def test_legacy_request_without_capture_flag_replays_after_upgrade(self):
+        original = self.submit()
+        self.assertIs(self.collector.get("cr_1")["params"]["capture_logprobs"], False)
+        with self.collector.db() as conn:
+            old = self.collector._get(conn, "cr_1")
+            old["params"].pop("capture_logprobs")
+            old["request_digest"] = digest({"task_sha256": hashlib.sha256(self.task).hexdigest(),
+                "apps": json.loads(self.apps), "tasks": json.loads(self.form["task_manifest"])["tasks"],
+                "params": old["params"], "batch_id": old["batch_id"]})
+            self.collector._save(conn, old)
+        self.assertEqual(self.submit(), original)
+        self.assertEqual(self.submit(capture_logprobs="false"), original)
+        with self.assertRaises(CollectorError):
+            self.submit(capture_logprobs="true")
         self.assertEqual(self.execution.calls, 1)
 
     def test_same_batch_different_phones_run_concurrently_and_retry_reuses_run(self):
@@ -290,6 +307,8 @@ class CollectorServiceTests(unittest.TestCase):
 
     def test_invalid_parameters_and_manifest_fail_before_execution(self):
         for changes in ({"temperature": "nan"}, {"top_p": "-0.1"}, {"runmode": "bad"}, {"batch_id": ""},
+                        {"capture_logprobs": "yes"}, {"capture_logprobs": "1"}, {"capture_logprobs": ""},
+                        {"capture_logprobs": 1}, {"capture_logprobs": None},
                         {"collection_run_id": "../escape"}, {"task_manifest": '{"tasks":[]}'},
                         {"task_manifest": json.dumps({"tasks": [{"collection_case_id": "wrong", "task_id": "a"}]})}):
             with self.subTest(changes=changes), self.assertRaises(CollectorError):

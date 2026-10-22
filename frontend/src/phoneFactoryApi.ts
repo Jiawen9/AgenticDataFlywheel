@@ -5,12 +5,12 @@ export interface PhoneAppRow { phone_id: string; app: string; status: string }
 export interface CollectionWarning { sheet: string; row: number; field: string; message: string }
 export interface TaskRow { warnings?: CollectionWarning[]; original_filename?: string; description: string; filename: string; status: string; source_batch_id?: string }
 export interface FactoryState { imported_task?: Pick<TaskRow, 'filename' | 'source_batch_id' | 'warnings'>; phones: string[]; apps: string[]; phoneApps: PhoneAppRow[]; vla: string[]; tasks: TaskRow[] }
-export interface FactoryConfig { sampling_enabled: boolean; temperature: number; top_p: number; use_experience_lib: boolean }
+export interface FactoryConfig { sampling_enabled: boolean; temperature: number; top_p: number; use_experience_lib: boolean; capture_logprobs: boolean }
 export interface RunOptions { filename: string; phone_id?: string; app?: string; request_id: string; vla: string; run_mode?: 'generate' | 'modeliter'; config?: FactoryConfig }
 export interface RemoteResult { ok: boolean; message?: string; error?: string; run_id?: string; collection_run_id?: string; batch_id?: string }
 export interface AdbDevice { serial: string; model: string; battery: number | null }
 export interface PhoneMonitor { ok: boolean; screenshot: string | null; log: string; running: boolean; device_size?: { width: number; height: number } | null }
-export interface FactoryRun { run_id?: string; collection_run_id?: string; batch_id?: string; status: string; created_at?: string; filename?: string; vla?: string; error?: string; dispatch_error?: string; transfer_error?: string; transfer_status?: string; errors?: Array<{ error?: string; message?: string }>; trajectory_count?: number }
+export interface FactoryRun { run_id?: string; collection_run_id?: string; batch_id?: string; status: string; created_at?: string; filename?: string; vla?: string; error?: string; dispatch_error?: string; transfer_error?: string; transfer_status?: string; remote_status?: string; remote_errors?: Array<{ error?: string; message?: string }>; errors?: Array<{ error?: string; message?: string }>; trajectory_count?: number }
 export interface ReportFile { name: string; size: number; modified?: number; file_id?: string }
 export interface ReportFolder { index: number; dir_name: string; modified?: number; run_id?: string; files: ReportFile[] }
 export type FactoryBatchSummary = Omit<CollectionBatchSummary, 'kind' | 'source_job_id'> & { warnings?: CollectionWarning[]; kind: CollectionBatchSummary['kind'] | 'manual_collection'; source_job_id: string | null }

@@ -11,6 +11,7 @@ from pathlib import Path
 from openpyxl import load_workbook
 
 from .core import CollectorError, atomic_json, boundary, component, now
+from .logprobs import extract_logprob_sidecars
 
 
 def run(config):
@@ -48,14 +49,18 @@ def run(config):
         workbook.close()
     env = dict(os.environ)
     params = config["params"]
+    capture_logprobs = params.get("capture_logprobs", False) is True
     env.update(ADB_SERIAL=phone, ADB_PATH=config["adb_path"],
                GUI_AGENT_CORE_VLA_SAMPLING_ENABLED=str(params["sampling_enabled"]).lower(),
                GUI_AGENT_CORE_VLA_TEMPERATURE=str(params["temperature"]),
                GUI_AGENT_CORE_VLA_TOP_P=str(params["top_p"]),
                GUI_AGENT_CORE_VLA_ENABLE_SKILLS=str(params["use_experience_lib"]).lower(),
+               GUI_AGENT_VLA_CAPTURE_LOGPROBS=str(capture_logprobs).lower(),
                GUI_AGENT_VLA_API_BASE_URL=params["vla"])
-    def call(args, timeout):
-        return subprocess.run(args, cwd=workdir, env=env, check=True, timeout=timeout)
+    evaluation_env = {**env, "GUI_AGENT_VLA_CAPTURE_LOGPROBS": "false"}
+    def call(args, timeout, *, process_env=None):
+        return subprocess.run(args, cwd=workdir, env=env if process_env is None else process_env,
+                              check=True, timeout=timeout)
     try:
         check = subprocess.run([config["adb_path"], "-s", phone, "get-state"], capture_output=True,
                                text=True, timeout=config.get("adb_timeout", 10), env=env)
@@ -75,7 +80,8 @@ def run(config):
             result["errors"].append({"phone_id": phone, "error": f"轨迹执行失败：{exc}"})
         shutil.copyfile(workdir / "config_report.py", workdir / "config.py")
         try:
-            call([sys.executable, str(workdir / "run_evaluator_batch.py")], config["evaluator_timeout"])
+            call([sys.executable, str(workdir / "run_evaluator_batch.py")], config["evaluator_timeout"],
+                 process_env=evaluation_env)
         except (subprocess.SubprocessError, OSError) as exc:
             result["errors"].append({"phone_id": phone, "error": f"评估失败：{exc}"})
         # Freeze a copy before returning any successful entries; no "latest directory" guessing.
@@ -98,6 +104,9 @@ def run(config):
             except (ValueError, OSError) as exc:
                 result["errors"].append({"phone_id": phone, "collection_case_id": case, "error": f"轨迹JSON损坏：{exc}"})
                 continue
+            for error in extract_logprob_sidecars(trajectory, required=capture_logprobs):
+                result["errors"].append({"phone_id": phone, "collection_case_id": case,
+                                         "error": f"手机 {phone} / 轨迹 {source_id}: {error}"})
             result["trajectories"].append({"collection_case_id": case, "phone_id": phone,
                 "source_trajectory_id": source_id, "source_dir": str(trajectory), "collected_at": now()})
         report_root = output / "report-output"

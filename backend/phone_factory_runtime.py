@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 from .batch_lifecycle import BatchPublishedError, ensure_batch_active, is_batch_active
 from .batch_operations import active_batch_lock
-from .collection_runs import _identifier
+from .collection_runs import _identifier, matches_legacy_logprobs_request
 from .data_store import RevisionConflict
 from .data_store.locking import batch_lock
 from .data_store.registry import utc_now
@@ -138,7 +138,7 @@ class FactoryRuntime:
         if not isinstance(config, dict) or set(config) - set(DEFAULT_CONFIG):
             raise PhoneFactoryError("本次采样配置无效")
         config = {**DEFAULT_CONFIG, **state.get("config", {}), **config}
-        for key in ("sampling_enabled", "use_experience_lib"):
+        for key in ("sampling_enabled", "use_experience_lib", "capture_logprobs"):
             if not isinstance(config[key], bool):
                 raise PhoneFactoryError(f"{key} 必须是布尔值")
         for key, maximum in (("temperature", 2), ("top_p", 1)):
@@ -199,7 +199,8 @@ class FactoryRuntime:
                 created = True
             except RevisionConflict:
                 run = self.records.get("model_iter_runs", run_id)
-                if run["request_digest"] != payload["request_digest"]:
+                if (run["request_digest"] != payload["request_digest"]
+                        and not matches_legacy_logprobs_request(run, request)):
                     raise PhoneFactoryError("相同 request_id 对应的运行参数不同", 409)
                 created = False
         if not created and (run["status"] not in {"failed", "dispatching"} or (run["status"] == "failed" and not run.get("dispatch_error"))):
@@ -251,6 +252,8 @@ class FactoryRuntime:
                         args.append("--sampling")
                     if options["config"]["use_experience_lib"]:
                         args.append("--exp")
+                    if options["config"]["capture_logprobs"]:
+                        args.append("--capture-logprobs")
                     if mode == "generate":
                         with active_batch_lock(task["source_batch_id"], self.root):
                             self.records.update("collection_runs", run_id,
@@ -308,7 +311,9 @@ class FactoryRuntime:
                 continue
             done = [run for run in matching if run["status"] in {"completed", "succeeded", "partial"}]
             if done:
-                task["status"] = statuses.get(done[-1]["status"], done[-1]["status"])
+                latest = done[-1]
+                display_status = "partial" if latest["status"] == "completed" and latest.get("remote_status") == "partial" else latest["status"]
+                task["status"] = statuses.get(display_status, display_status)
                 continue
             failed = [run for run in matching if run["status"] == "failed"]
             if failed:

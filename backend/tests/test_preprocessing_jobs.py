@@ -64,14 +64,18 @@ class PreprocessingJobTests(unittest.TestCase):
         return PreprocessingJobManager(self.root, source_store=self.sources, executor=self.queue,
             config_loader=lambda: copy.deepcopy(self.config), reviewer_factory=self.factory, **kwargs)
 
-    def complete(self, batch_id="batch-one", case_id="task-one", name="original-run"):
+    def complete(self, batch_id="batch-one", case_id="task-one", name="original-run", *, traces=None, steps=(1,)):
         run, _ = self.sources.create(batch_id)
         directory = Path(run["output_dir"]) / case_id / name
         directory.mkdir(parents=True)
         action = {"action": "click", "coordinate": [50, 50]}
-        create_step(directory, 1, action)
+        for step in steps:
+            create_step(directory, step, action)
+        for step, trace in (traces or {}).items():
+            (directory / f"step{step:03d}_logprobs.json").write_text(
+                json.dumps(trace, ensure_ascii=False), encoding="utf-8")
         (directory / "_trajectory_for_evaluate.json").write_text(
-            json.dumps({"actions_flat": [{"global_step": 1, "action": action}]}), encoding="utf-8")
+            json.dumps({"actions_flat": [{"global_step": step, "action": action} for step in steps]}), encoding="utf-8")
         entry = {"collection_case_id": case_id, "source_trajectory_id": name,
                  "relative_dir": directory.relative_to(Path(run["output_dir"])).as_posix(),
                  "files": [{"path": file.relative_to(Path(run["output_dir"])).as_posix(),
@@ -99,6 +103,7 @@ class PreprocessingJobTests(unittest.TestCase):
             row = payload["sheets"][SHEET][0]
             self.assertEqual(row["task_id"], "task-one")
             self.assertEqual(row["source_trajectory_id"], "original-run")
+            self.assertEqual(row["logprobs_path"], "")
             self.assertEqual(len(row["trajectory_id"]), 67)
             path = self.store.resolve_file(artifact, next(f["name"] for f in artifact["files"] if f["kind"] == "excel"))
             workbook = load_workbook(path, read_only=True)
@@ -116,6 +121,45 @@ class PreprocessingJobTests(unittest.TestCase):
         self.assertEqual(self.manager.batches()[0]["annotation_version"], annotation["version"])
         self.manager.get(job["job_id"])
         self.assertEqual(before, {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in self.root.rglob("*") if p.is_file()})
+
+    def test_logprobs_paths_keep_run_and_step_identity_through_annotation(self):
+        trace = {"status": "ok", "response_token_ids": [101], "behavior_logprobs": [-0.25],
+                 "response_loss_mask": [1], "sampling": {"temperature": 0.7, "top_p": 0.85}}
+        first = self.complete(traces={1: trace, 3: {**trace, "status": "invalid"}}, steps=(3, 1))
+        second = self.complete(traces={1: {**trace, "response_token_ids": [202]}})
+        original = {p: p.read_bytes() for p in (self.root / "raw").rglob("*") if p.is_file()}
+        job = self.start()
+        self.assertEqual(job["status"], "succeeded", job.get("error"))
+        expected = ["文件夹名", "image", "xml", "action", "summary", "logprobs_path"]
+        by_stage = []
+        for artifact in job["artifacts"]:
+            payload = self.payload(artifact)
+            columns = expected + (["actions_box"] if artifact["stage"] == "02_annotation" else [])
+            self.assertEqual(payload["columns"][SHEET], columns)
+            rows = payload["sheets"][SHEET]
+            self.assertEqual(len(rows), 3)
+            self.assertEqual(len({r["logprobs_path"] for r in rows}), 3)
+            mapping = {}
+            for row in rows:
+                image = Path(row["image"])
+                reference = image.with_name(f"step{row['step']:03d}_logprobs.json").as_posix()
+                self.assertEqual(row["logprobs_path"], reference)
+                stored = json.loads((Path(payload["raw_root"]) / reference).read_text(encoding="utf-8"))
+                self.assertEqual(stored["response_token_ids"],
+                                 [202] if row["collection_run_id"] == second["collection_run_id"] else [101])
+                mapping[(row["collection_run_id"], row["step"])] = reference
+            by_stage.append(mapping)
+            workbook_path = self.store.resolve_file(artifact, next(f["name"] for f in artifact["files"] if f["kind"] == "excel"))
+            workbook = load_workbook(workbook_path, read_only=True)
+            try:
+                values = list(workbook.active.values)
+                self.assertEqual(list(values[0]), columns)
+                self.assertEqual({r[columns.index("logprobs_path")] for r in values[1:]}, set(mapping.values()))
+            finally:
+                workbook.close()
+        self.assertEqual(by_stage[0], by_stage[1])
+        self.assertIn((first["collection_run_id"], 3), by_stage[0])
+        self.assertEqual(original, {p: p.read_bytes() for p in (self.root / "raw").rglob("*") if p.is_file()})
 
     def test_failure_retains_conversion_and_retry_uses_frozen_input_despite_new_collection(self):
         self.complete()

@@ -119,6 +119,9 @@ class PipelineRuntime:
         self.factory.add_task({"filename": batch["filename"], "description": pipeline["name"],
             "source_batch_id": pipeline["batch_id"], "content_base64": base64.b64encode(io_path(path).read_bytes()).decode()})
         options = pipeline["collection_config"]
+        # Frozen pre-logprob pipelines keep their original default, regardless
+        # of the factory settings now in effect. Do not rewrite their snapshot.
+        options = {**options, "config": {"capture_logprobs": False, **options["config"]}}
         current = self.collection_options(options)
         if current != options:
             raise PipelineError("手机或 App 关联已变化，请结束流程后重新创建")

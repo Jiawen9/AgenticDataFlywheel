@@ -83,6 +83,26 @@ class CollectionRunTests(unittest.TestCase):
             self.store.create("batch-one", dispatch_key="request-one", metadata={"phone": "changed"})
         self.assertNotEqual(self.create()["collection_run_id"], self.create()["collection_run_id"])
 
+    def test_legacy_request_replay_only_allows_explicit_false_default(self):
+        metadata = {"config": {"temperature": 0.7}, "vla": "http://mock.invalid/vla"}
+        original, _ = self.store.create("batch-one", dispatch_key="legacy-request", metadata=metadata)
+        replay, created = self.store.create("batch-one", dispatch_key="legacy-request",
+            metadata={**metadata, "config": {**metadata["config"], "capture_logprobs": False}})
+        self.assertFalse(created)
+        self.assertEqual(replay, original)
+        self.assertEqual(self.store.get(original["collection_run_id"]), original)
+        for changed in (
+            {**metadata, "config": {**metadata["config"], "capture_logprobs": True}},
+            {**metadata, "config": {**metadata["config"], "capture_logprobs": "false"}},
+            {**metadata, "config": {**metadata["config"], "capture_logprobs": 0}},
+            {**metadata, "config": {"temperature": 0.5, "capture_logprobs": False}},
+            {**metadata, "vla": "http://other.invalid", "config": {**metadata["config"], "capture_logprobs": False}},
+        ):
+            with self.subTest(metadata=changed):
+                with self.assertRaisesRegex(CollectionRunError, "request_id"):
+                    self.store.create("batch-one", dispatch_key="legacy-request", metadata=changed)
+        self.assertEqual(self.store.get(original["collection_run_id"]), original)
+
     def test_complete_maps_case_identity_and_freezes_full_input_without_writes_on_reads(self):
         run = self.create()
         entry = raw_trajectory(run)

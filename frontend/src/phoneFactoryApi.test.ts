@@ -2,6 +2,17 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { factoryBatchesApi, modelIterationApi, phoneFactoryApi } from './phoneFactoryApi'
 afterEach(() => vi.unstubAllGlobals())
 describe('phone factory transport contracts', () => {
+  it('saves logprob defaults and sends an explicit per-run override without changing sampling', async () => {
+    const fetcher = vi.fn(async () => new Response('{"ok":true}'))
+    vi.stubGlobal('fetch', fetcher)
+    const config = { sampling_enabled: true, temperature: 0.4, top_p: 0.8, use_experience_lib: false, capture_logprobs: true }
+    await phoneFactoryApi.saveConfig(config)
+    await phoneFactoryApi.remoteStartRun({ filename: 'manual.xlsx', request_id: 'capture-override', vla: 'vla:8000', config: { ...config, capture_logprobs: false } })
+    expect(fetcher.mock.calls.map(call => call[0])).toEqual(['/api/phone-factory/config', '/api/phone-factory/remote/start-run'])
+    expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual(config)
+    expect(JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body)).config).toEqual({ ...config, capture_logprobs: false })
+    expect(config.capture_logprobs).toBe(true)
+  })
   it('passes an explicit manual upload request ID without changing generated batch import identity', async () => {
     const fetcher = vi.fn(async () => new Response('{"tasks":[]}'))
     vi.stubGlobal('fetch', fetcher)
@@ -14,7 +25,7 @@ describe('phone factory transport contracts', () => {
   it('keeps evaluation requests separate and passes run configuration with caller idempotency', async () => {
     const fetcher = vi.fn(async () => new Response(JSON.stringify({ ok: true, runs: [], folders: [] })))
     vi.stubGlobal('fetch', fetcher)
-    const options = { filename: 'manual.xlsx', phone_id: 'phone-1', app: 'App', request_id: 'same-request', vla: 'vla:8000', run_mode: 'modeliter' as const, config: { sampling_enabled: true, temperature: 0.4, top_p: 0.8, use_experience_lib: false } }
+    const options = { filename: 'manual.xlsx', phone_id: 'phone-1', app: 'App', request_id: 'same-request', vla: 'vla:8000', run_mode: 'modeliter' as const, config: { sampling_enabled: true, temperature: 0.4, top_p: 0.8, use_experience_lib: false, capture_logprobs: false } }
     await modelIterationApi.remoteStartRun(options); await modelIterationApi.runs(); await modelIterationApi.reports()
     expect(fetcher.mock.calls.map(call => call[0])).toEqual(['/api/model-iter/remote/start-run', '/api/model-iter/runs', '/api/model-iter/reports'])
     expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual(options)
