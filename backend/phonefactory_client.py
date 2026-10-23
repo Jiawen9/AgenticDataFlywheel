@@ -117,6 +117,9 @@ def cmd_start_run(args):
     if fields["runmode"] == "modeliter" and evaluator_config:
         fields.update(evaluator_config=evaluator_config, checklist_source=args.checklist_source,
                       evaluation_mode=args.evaluation_mode)
+        for key in ("evaluation_profile_id", "evaluation_profile_digest"):
+            if getattr(args, key, None):
+                fields[key] = getattr(args, key)
     batch = getattr(args, "batch_id", None)
     run = getattr(args, "collection_run_id", None)
     output = getattr(args, "output_dir", None)
@@ -157,13 +160,20 @@ def build_parser():
     run.add_argument("--output-dir")
     run.add_argument("--task-manifest")
     run.add_argument("--evaluator-config")
-    run.add_argument("--checklist-source", choices=["llm"], default="llm")
+    run.add_argument("--checklist-source", choices=["llm", "auto"], default="llm")
     run.add_argument("--evaluation-mode", choices=["checklist"], default="checklist")
+    run.add_argument("--evaluation-profile-id")
+    run.add_argument("--evaluation-profile-digest")
     sub.add_parser("status").add_argument("phones")
     sub.add_parser("adb-devices")
     sub.add_parser("capabilities")
+    sub.add_parser("evaluation-profiles")
+    sub.add_parser("evaluation-sources")
+    for command in ("evaluation-preview", "start-evaluation"):
+        sub.add_parser(command).add_argument("--payload", required=True)
     sub.add_parser("run").add_argument("run_id")
     sub.add_parser("run-evaluations").add_argument("run_id")
+    sub.add_parser("cancel-run").add_argument("run_id")
     archive = sub.add_parser("run-archive")
     archive.add_argument("run_id")
     archive.add_argument("--out", required=True)
@@ -197,10 +207,22 @@ def main():
         result = post_json("/adb_devices", {})
     elif args.cmd == "capabilities":
         result = get_json("/capabilities")
+    elif args.cmd in {"evaluation-profiles", "evaluation-sources"}:
+        result = get_json("/" + args.cmd.replace("-", "_"))
+    elif args.cmd in {"evaluation-preview", "start-evaluation"}:
+        try:
+            payload = json.loads(args.payload)
+        except (ValueError, TypeError):
+            sys.exit("错误：评测请求必须为 JSON 对象")
+        if not isinstance(payload, dict):
+            sys.exit("错误：评测请求必须为 JSON 对象")
+        result = post_json("/" + args.cmd.replace("-", "_"), payload)
     elif args.cmd == "run":
         result = get_json("/runs/" + urllib.parse.quote(args.run_id, safe=""))
     elif args.cmd == "run-evaluations":
         result = get_json("/runs/" + urllib.parse.quote(args.run_id, safe="") + "/evaluations")
+    elif args.cmd == "cancel-run":
+        result = post_json("/runs/" + urllib.parse.quote(args.run_id, safe="") + "/cancel", {})
     elif args.cmd == "run-archive":
         result = download_file("/runs/" + urllib.parse.quote(args.run_id, safe="") + "/archive", args.out)
     elif args.cmd == "reports":

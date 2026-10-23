@@ -86,6 +86,9 @@ class FactoryRuntime:
         remote = self.get_run(run_id)
         if remote.get("run_id", remote.get("collection_run_id")) != run_id or remote.get("run_mode") != "modeliter":
             raise PhoneFactoryError("远端评估运行身份不匹配", 502)
+        if (run.get("request", {}).get("execution_mode") == "evaluate_only"
+                and remote.get("execution_mode") != "evaluate_only"):
+            raise PhoneFactoryError("远端运行不是独立评测任务", 502)
         if remote.get("status") not in TERMINAL | {"queued", "running"}:
             raise PhoneFactoryError("远端评估运行状态无效", 502)
         result = None
@@ -169,11 +172,9 @@ class FactoryRuntime:
             raise PhoneFactoryError("请选择已关联 App 的手机")
         options = {"run_mode": mode, "result_transport": "http", "vla": vla, "config": config, "phone_id": phone, "app": app, "phone_apps": associations, "phone_ids": sorted({row["phone_id"] for row in associations})}
         if mode == "modeliter":
-            if data.get("checklist_source", "llm") != "llm" or data.get("evaluation_mode", "checklist") != "checklist":
-                raise PhoneFactoryError("当前评测仅支持 LLM 生成 checklist")
-            options.update(evaluator_config=model_iteration.normalize_config(
-                data.get("evaluator_config", model_iteration.get_config(self.store)), required=True),
-                checklist_source="llm", evaluation_mode="checklist")
+            options.update(model_iteration.evaluation_options(self.store, data))
+            if options["checklist_source"] == "auto":
+                options["execution_mode"] = "collect_and_evaluate"
         return options
 
     def _protocol(self) -> str:
@@ -248,9 +249,8 @@ class FactoryRuntime:
                             saved = self.records.update("model_iter_runs", run_id, recovered)
                         return {**known, **saved, "ok": True, "reused": True}
                 if mode == "modeliter":
-                    capability = model_iteration.capabilities(self.store)
-                    if not capability["supported"]:
-                        raise PhoneFactoryError(capability["message"], 409)
+                    model_iteration.require_capability(self.store, profiles=options["checklist_source"] == "auto")
+                    model_iteration.verify_profile(self.store, options)
                 else:
                     self._capabilities()
                 if mode == "generate":
@@ -270,7 +270,10 @@ class FactoryRuntime:
                     args = ["start-run", str(path), str(apps_path), options["phone_id"], options["app"], "--vla", options["vla"], "--runmode", mode, "--temperature", str(options["config"]["temperature"]), "--top-p", str(options["config"]["top_p"])]
                     if mode == "modeliter":
                         args += ["--evaluator-config", json.dumps(options["evaluator_config"], ensure_ascii=False),
-                                 "--checklist-source", "llm", "--evaluation-mode", "checklist"]
+                                 "--checklist-source", options["checklist_source"], "--evaluation-mode", "checklist"]
+                        if options["checklist_source"] == "auto":
+                            args += ["--evaluation-profile-id", options["evaluation_profile_id"],
+                                     "--evaluation-profile-digest", options["evaluation_profile_digest"]]
                     if protocol == "http":
                         args += ["--collection-run-id", run_id, "--task-manifest", str(manifest_path)]
                         if mode == "generate":
@@ -306,9 +309,80 @@ class FactoryRuntime:
                     self.records.update("model_iter_runs", run_id, failed)
                 raise
 
+    def remote_start_evaluation(self, data):
+        """Submit a manifest-bound evaluation without touching phone or production state."""
+        allowed = {"request_id", "evaluator_config", "evaluation_profile_id", "evaluation_profile_digest",
+                   "profile_id", "profile_digest", "preview_id", "checklist_source", "evaluation_mode"}
+        if set(data) - allowed:
+            raise PhoneFactoryError("独立评测不接受手机、App、VLA 或采集参数")
+        options = model_iteration.evaluation_options(self.store, data, offline=True)
+        preview_id = _identifier(data.get("preview_id"), "预览编号")
+        preview_record = self.records.get("model_iter_previews", preview_id)
+        if preview_record is None:
+            raise PhoneFactoryError("请先预览并确认要评测的轨迹集", 409)
+        preview = preview_record["preview"]
+        request_id = _identifier(data.get("request_id") or uuid.uuid4().hex, "request_id")
+        run_id = "eval_" + payload_digest(request_id)
+        request = {**options, "run_mode": "modeliter", "execution_mode": "evaluate_only", "result_transport": "http",
+                   "preview_id": preview_id, "source": preview["source"], "source_digest": preview["source_digest"],
+                   "source_cases": preview["cases"], "source_request": preview_record["request"]}
+        payload = {"run_id": run_id, "collection_run_id": run_id, "run_mode": "modeliter",
+                   "execution_mode": "evaluate_only", "source": preview["source"], "source_digest": preview["source_digest"],
+                   "evaluation_profile_id": options["evaluation_profile_id"],
+                   "evaluation_profile_digest": options["evaluation_profile_digest"],
+                   "status": "dispatching", "filename": "已有轨迹评测", "vla": "", "created_at": utc_now(),
+                   "request": request, "request_digest": payload_digest(request), "errors": [], "dispatch_error": None}
+        try:
+            run = self.records.put("model_iter_runs", run_id, payload, expected_revision=0)
+            created = True
+        except RevisionConflict:
+            run = self.records.get("model_iter_runs", run_id)
+            if run["request_digest"] != payload["request_digest"]:
+                raise PhoneFactoryError("相同 request_id 对应的运行参数不同", 409)
+            created = False
+        if not created and (run["status"] not in {"failed", "dispatching"}
+                            or run["status"] == "failed" and not run.get("dispatch_error")):
+            return {"ok": True, "reused": True, **run}
+        with batch_lock(self.root, "dispatch_" + run_id):
+            current = self.records.get("model_iter_runs", run_id)
+            if current["status"] not in {"failed", "dispatching"}:
+                return {"ok": True, "reused": True, **current}
+            try:
+                model_iteration.require_capability(self.store, offline=True)
+                if created:
+                    model_iteration.verify_profile(self.store, options)
+                # Re-submit exactly the frozen request after a lost acknowledgement.
+                # The remote atomically validates its request digest before reuse;
+                # a GET with only the same run id cannot establish that identity.
+                # Already accepted runs may outlive their selectable rule version.
+                remote_request = {**options, "collection_run_id": run_id, "preview_id": preview_id}
+                response = self.store._remote_result(["start-evaluation", "--payload", json.dumps(remote_request, ensure_ascii=False)])
+                if (response.get("ok") is False or response.get("run_id", response.get("collection_run_id")) != run_id
+                        or response.get("run_mode") != "modeliter" or response.get("execution_mode") != "evaluate_only"
+                        or response.get("status") not in TERMINAL | {"queued", "running"}):
+                    raise PhoneFactoryError("远端未接受独立评测，或返回的运行身份不匹配", 502)
+                def accepted(item):
+                    if item["status"] not in {"interrupted", "cancelled", "succeeded", "partial", "completed"}:
+                        item.update(status=response["status"], dispatch_response=response,
+                                    dispatch_error=None, updated_at=utc_now())
+                saved = self.records.update("model_iter_runs", run_id, accepted)
+                return {**response, **saved, "ok": True}
+            except Exception as exc:
+                def failed(item):
+                    if item["status"] not in {"interrupted", "cancelled", "succeeded", "partial", "completed"}:
+                        item.update(status="failed", dispatch_error=str(exc), updated_at=utc_now())
+                self.records.update("model_iter_runs", run_id, failed)
+                raise
+
     def run_views(self, mode):
         if mode == "modeliter":
-            return sorted(self.records.list("model_iter_runs"), key=lambda item: (item["created_at"], item["run_id"]))
+            runs = []
+            for run in self.records.list("model_iter_runs"):
+                request = run.get("request", {})
+                metadata = {key: request[key] for key in ("source", "source_digest", "evaluation_profile_id",
+                                                         "evaluation_profile_digest", "checklist_source") if key in request}
+                runs.append({**run, **metadata, "execution_mode": request.get("execution_mode", "collect_and_evaluate")})
+            return sorted(runs, key=lambda item: (item["created_at"], item["run_id"]))
         views = []
         for run in self.store.collection_runs.list_runs():
             transfer = self.records.get("collection_transfers", run["collection_run_id"]) or {}
@@ -396,6 +470,15 @@ class FactoryRuntime:
                 return True, model_iteration.save_config(self.store, data)
         if mode == "modeliter" and action == "evaluation-capabilities" and method == "GET":
             return True, model_iteration.capabilities(self.store)
+        if mode == "modeliter":
+            if action == "evaluation-profiles" and method == "GET":
+                return True, model_iteration.get_profiles(self.store)
+            if action == "evaluation-sources" and method == "GET":
+                return True, model_iteration.get_sources(self.store)
+            if action == "evaluation-preview" and method == "POST":
+                return True, model_iteration.preview_source(self.store, data)
+            if action == "remote/start-evaluation" and method == "POST":
+                return True, self.remote_start_evaluation(data)
         if method == "GET" and action in {"runs", "collection-runs"}:
             runs = self.run_views(mode)
             if mode == "generate" and not data.get("batch_id"):
@@ -409,6 +492,14 @@ class FactoryRuntime:
             parts = action.split("/")
             if method == "POST" and len(parts) == 3 and parts[2] == "sync":
                 return True, self.sync_evaluation(parts[1])
+            if method == "POST" and len(parts) == 3 and parts[2] == "cancel":
+                run_id = _identifier(parts[1], "评估运行编号")
+                if self.records.get("model_iter_runs", run_id) is None:
+                    raise PhoneFactoryError("评估运行不存在", 404)
+                result = self.store._remote_result(["cancel-run", run_id])
+                if result.get("ok") is False:
+                    raise PhoneFactoryError("远端取消评测失败", 502)
+                return True, self.sync_evaluation(run_id)
             if method == "GET" and len(parts) == 3 and parts[2] == "evaluations":
                 run_id = _identifier(parts[1], "评估运行编号")
                 run = self.records.get("model_iter_runs", run_id)

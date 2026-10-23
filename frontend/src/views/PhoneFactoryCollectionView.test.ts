@@ -53,6 +53,9 @@ async function render(mode: 'generate' | 'modeliter' = 'generate') {
     setup: props => () => h('input', { type: 'checkbox', checked: props.modelValue }),
   }))
   app.component('el-button', passthrough)
+  app.component('el-radio-group', passthrough)
+  app.component('el-radio-button', passthrough)
+  app.component('el-radio', passthrough)
   app.component('el-table', empty)
   app.component('el-table-column', empty)
   app.component('el-tag', passthrough)
@@ -88,6 +91,8 @@ describe('phone collection batch picker', () => {
     expect(html).toContain('评测模型配置')
     expect(html).toContain('用例评测进度')
     expect(html).toContain('密钥环境变量名')
+    expect(html).toContain('已有轨迹单独评测')
+    expect(html).toContain('评测规则版本')
     expect(html).not.toContain('采集任务批次')
     expect(html).not.toContain('前往预处理')
   })

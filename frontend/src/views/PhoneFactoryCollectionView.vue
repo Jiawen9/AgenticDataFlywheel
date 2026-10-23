@@ -7,14 +7,14 @@
       <div>
         <span class="eyebrow">{{ isEvaluation ? 'MODEL ITERATION EVALUATION' : 'PHONE FACTORY COLLECTION' }}</span>
         <h1>{{ isEvaluation ? '模型迭代评估' : '手机工厂采集' }}</h1>
-        <p>{{ isEvaluation ? '选择设备、任务和 VLA 开始评估，查看独立评估轮次与报告。' : '管理采集手机与运行 APP，配置 VLA 接口，上传轨迹生产任务文件。' }}</p>
+        <p>{{ isEvaluation ? '采集并即时评测，或用已有轨迹创建独立评测；选择规则版本，保留每轮结果。' : '管理采集手机与运行 APP，配置 VLA 接口，上传轨迹生产任务文件。' }}</p>
       </div>
     </header>
-    <ModelIterationPanel v-if="isEvaluation" :runs="runs" @ready="evaluationReady = $event" @config="evaluatorConfig = $event" />
+    <ModelIterationPanel v-if="isEvaluation" :runs="runs" @ready="evaluationReady = $event" @config="evaluatorConfig = $event" @mode="evaluationMode = $event" @profile="evaluationProfile = $event" @started="refreshEvaluationRuns" @changed="refreshEvaluationRuns" />
 
-    <div class="factory-layout">
+    <div class="factory-layout" :class="{ 'offline-layout': !showCollectionControls }">
       <!-- ============ 左列：新增手机（含手机列表） ============ -->
-      <section class="panel">
+      <section v-if="showCollectionControls" class="panel">
         <div class="panel-head">
           <h2>新增手机</h2>
           <span class="panel-tip">提示：规划的 APP 需要提前安装并且登录，避免功能受限</span>
@@ -73,6 +73,7 @@
 
       <!-- ============ 右列：轨迹生产（含任务列表） ============ -->
       <section class="panel traj-panel">
+        <template v-if="showCollectionControls">
         <div class="panel-head">
           <h2>{{ isEvaluation ? '模型评估' : '轨迹生产' }}</h2>
           <span class="panel-tip">上传文件由后端统一保存</span>
@@ -182,11 +183,14 @@
           </el-table-column>
         </el-table>
         <p v-if="!tasks.length" class="empty-hint">暂无任务，请在上方新增。</p>
+        </template>
 
         <h3 class="sub-title">{{ isEvaluation ? '评估运行与报告' : '采集运行与回传' }}</h3>
         <el-alert v-if="runError" :title="runError" type="warning" :closable="false" />
         <el-table :data="runs" border data-testid="factory-runs">
           <el-table-column label="运行编号" min-width="160" show-overflow-tooltip><template #default="{ row }">{{ row.collection_run_id || row.run_id }}</template></el-table-column>
+          <el-table-column v-if="isEvaluation" label="评测方式 / 规则" min-width="180"><template #default="{ row }">{{ evaluationModeLabel(row.execution_mode) }} · {{ row.evaluation_profile_id || '历史配置' }}</template></el-table-column>
+          <el-table-column v-if="isEvaluation" label="数据来源" min-width="170" show-overflow-tooltip><template #default="{ row }">{{ evaluationSourceLabel(row) }}</template></el-table-column>
           <el-table-column label="状态" width="110"><template #default="{ row }">{{ runDisplayStatus(row) }}</template></el-table-column>
           <el-table-column label="结果" min-width="170"><template #default="{ row }">{{ runMessage(row) }}</template></el-table-column>
           <el-table-column v-if="!isEvaluation" label="操作" min-width="100"><template #default="{ row }"><el-button link :loading="syncingRun === (row.collection_run_id || row.run_id)" :disabled="pipelineContext.isPipelineRoute.value || managedBatchIds.includes(row.batch_id)" @click="syncRun(row)">重试回传</el-button></template></el-table-column>
@@ -208,7 +212,7 @@
           </section>
         </section>
         <!-- 定制运行只覆盖此次运行的配置 -->
-        <el-dialog v-model="runDialogVisible" title="定制运行" width="480px" :close-on-click-modal="false" :close-on-press-escape="!confirmingRun" :show-close="!confirmingRun">
+        <el-dialog v-if="showCollectionControls" v-model="runDialogVisible" title="定制运行" width="480px" :close-on-click-modal="false" :close-on-press-escape="!confirmingRun" :show-close="!confirmingRun">
           <div class="row-form">
             <span class="field-label">手机ID</span>
             <span data-testid="custom-run-phone">{{ runDialogPhoneId }}</span>
@@ -247,17 +251,20 @@ import { eventMatchesRoute, publishedBatch, withoutBatchQuery, type PublishedBat
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { phoneFactoryApi, modelIterationApi, factoryBatchesApi, newRunRequestId, type EvaluatorConfig, type FactoryConfig, type PhoneAppRow, type TaskRow, type FactoryBatchSummary, type FactoryState, type FactoryRun, type ReportFolder, type ReportFile, type AdbDevice, type CollectionWarning } from '@/phoneFactoryApi'
+import { phoneFactoryApi, modelIterationApi, factoryBatchesApi, newRunRequestId, type EvaluatorConfig, type EvaluationExecutionMode, type EvaluationProfile, type FactoryConfig, type PhoneAppRow, type TaskRow, type FactoryBatchSummary, type FactoryState, type FactoryRun, type ReportFolder, type ReportFile, type AdbDevice, type CollectionWarning } from '@/phoneFactoryApi'
 import ModelIterationPanel from '@/components/ModelIterationPanel.vue'
 import { useFactoryPolling } from '@/composables/useFactoryPolling'
 import { runDisplayStatus, runMessage } from '@/utils/phoneFactoryRuns'
+import { evaluationModeLabel, evaluationSourceLabel } from '@/utils/modelIteration'
 import { usePhoneCollectionBatches } from '@/composables/usePhoneCollectionBatches'
 
 const props = withDefaults(defineProps<{ mode?: 'generate' | 'modeliter' }>(), { mode: 'generate' })
 const isEvaluation = props.mode === 'modeliter'
 const factoryApi = isEvaluation ? modelIterationApi : phoneFactoryApi
 const evaluationReady = ref(false), evaluatorConfig = ref<EvaluatorConfig>()
-const evaluationBlocked = computed(() => isEvaluation && !evaluationReady.value)
+const evaluationMode = ref<EvaluationExecutionMode>('collect_and_evaluate'), evaluationProfile = ref<EvaluationProfile>()
+const showCollectionControls = computed(() => !isEvaluation || evaluationMode.value === 'collect_and_evaluate')
+const evaluationBlocked = computed(() => isEvaluation && (!evaluationReady.value || !evaluationProfile.value || !showCollectionControls.value))
 // ---------- 状态 ----------
 const apps = ref<string[]>([])
 const phoneApps = ref<PhoneAppRow[]>([])
@@ -594,7 +601,7 @@ async function confirmRun() {
 
 async function dispatchTask(task: TaskRow, phoneId: string, app: string, vla: string, config: FactoryConfig) {
   const parameters = { filename: task.filename, phone_id: phoneId, app, vla, config, run_mode: props.mode,
-    ...(isEvaluation ? { evaluator_config: evaluatorConfig.value, checklist_source: 'llm' as const, evaluation_mode: 'checklist' as const } : {}) }
+    ...(isEvaluation ? { evaluator_config: evaluatorConfig.value, evaluation_profile_id: evaluationProfile.value?.id, evaluation_profile_digest: evaluationProfile.value?.digest, checklist_source: 'auto' as const, evaluation_mode: 'checklist' as const } : {}) }
   const key = JSON.stringify(parameters)
   const requestId = requestIds.get(key) || newRunRequestId()
   requestIds.set(key, requestId)
@@ -623,10 +630,14 @@ async function handleConfigChange() {
 function applyState(state: FactoryState) {
   apps.value = state.apps; phoneApps.value = state.phoneApps; vla.value = state.vla; tasks.value = activeFactoryTasks(state.tasks)
 }
+async function refreshEvaluationRuns() {
+  try { const result = await factoryApi.runs(); if (!disposed) { runs.value = result.runs; runError.value = '' } }
+  catch (error) { if (!disposed) runError.value = `运行状态暂不可用：${(error as Error).message}` }
+}
 useFactoryPolling(async (signal, current) => {
   if (pipelineContext.historyOnly.value || (pipelineContext.isPipelineRoute.value && !pipelineContext.resolved.value)) return
   const epoch = stateEpoch, pipelineId = pipelineContext.pipeline.value?.pipeline_id
-  try {
+  if (showCollectionControls.value) try {
     const state = await factoryApi.state(signal)
     if (!current()) return
     if (epoch === stateEpoch && !taskBusy.value && !saving.value && !deletingKey.value) applyState(state)
@@ -700,6 +711,7 @@ onBeforeUnmount(() => { document.body.classList.remove('factory-responsive'); di
 /* 左右双栏：左列=新增手机（含手机列表），右列=轨迹生产（含任务列表），两列互不交叉
    左列整体比右列窄 20 个英文字符（约 140px），手机ID/运行APP 两列合计减少 20 字符 */
 .factory-layout { display: grid; grid-template-columns: minmax(0, calc(50% - 70px)) minmax(0, calc(50% + 70px)); gap: 22px; align-items: start; }
+.factory-layout.offline-layout { grid-template-columns: 1fr; }
 
 .panel { min-width: 0; padding: 20px 22px; border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.88); box-shadow: 0 10px 30px rgba(15,23,42,.05); }
 .panel-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }

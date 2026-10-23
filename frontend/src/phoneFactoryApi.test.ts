@@ -54,6 +54,29 @@ describe('phone factory transport contracts', () => {
     expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual(config)
     expect(fetcher.mock.calls[1]?.[1]?.signal).toBe(controller.signal)
   })
+  it('previews a server source and starts an independent evaluation without a phone or VLA', async () => {
+    const fetcher = vi.fn(async () => new Response('{"ok":true}'))
+    vi.stubGlobal('fetch', fetcher)
+    const controller = new AbortController()
+    await modelIterationApi.evaluationProfiles(); await modelIterationApi.evaluationSources()
+    await modelIterationApi.evaluationPreview({ source_run_id: 'source-a' }, controller.signal)
+    await modelIterationApi.evaluationPreview({ source_path: 'D:/采集结果/batch-a' })
+    const options = { request_id: 'reeval-one', evaluator_config: { text: { base_url: 'https://text/v1/', model: 'text', api_key_env: 'TEXT_KEY' }, vision: { base_url: 'https://vision/v1/', model: 'vision', api_key_env: 'VISION_KEY' } }, evaluation_profile_id: 'rules-v2', evaluation_profile_digest: 'sha-rules', preview_id: 'preview-a', checklist_source: 'auto' as const }
+    await modelIterationApi.remoteStartEvaluation(options)
+    await modelIterationApi.cancelEvaluation('eval/a')
+    expect(fetcher.mock.calls.map(call => call[0])).toEqual(['/api/model-iter/evaluation-profiles', '/api/model-iter/evaluation-sources', '/api/model-iter/evaluation-preview', '/api/model-iter/evaluation-preview', '/api/model-iter/remote/start-evaluation', '/api/model-iter/runs/eval%2Fa/cancel'])
+    expect(fetcher.mock.calls[2]?.[1]?.signal).toBe(controller.signal)
+    expect(JSON.parse(String(fetcher.mock.calls[2]?.[1]?.body))).toEqual({ source_run_id: 'source-a' })
+    expect(JSON.parse(String(fetcher.mock.calls[3]?.[1]?.body))).toEqual({ source_path: 'D:/采集结果/batch-a' })
+    expect(JSON.parse(String(fetcher.mock.calls[4]?.[1]?.body))).toEqual(options)
+  })
+  it('passes the selected rule version on streaming evaluation starts without changing production parameters', async () => {
+    const fetcher = vi.fn(async () => new Response('{"ok":true}'))
+    vi.stubGlobal('fetch', fetcher)
+    const options = { filename: 'cases.xlsx', vla: 'vla:8000', request_id: 'online-one', run_mode: 'modeliter' as const, evaluation_profile_id: 'v1', evaluation_profile_digest: 'hash', checklist_source: 'auto' as const }
+    await modelIterationApi.remoteStartRun(options)
+    expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual(options)
+  })
   it('queries the unified batch source and reports remote deletion failure', async () => {
     const fetcher = vi.fn(async () => new Response('{"batches":[]}'))
     vi.stubGlobal('fetch', fetcher)
