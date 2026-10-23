@@ -61,6 +61,8 @@ class ModelIterationFlaskTests(unittest.TestCase):
         sys.modules[spec.name] = self.manager
         spec.loader.exec_module(self.manager)
         self.collector = self.base / 'collector'
+        self.inputs = self.base / 'offline_inputs'
+        self.inputs.mkdir()
         template = self.collector / 'new-guigent'
         template.mkdir(parents=True)
         shutil.copy2(self.source / 'new-guigent/logprobs_export.py', template / 'logprobs_export.py')
@@ -71,6 +73,8 @@ class ModelIterationFlaskTests(unittest.TestCase):
         self.stack.enter_context(patch.dict(os.environ, {
             'PHONE_FACTORY_EVALUATOR_DIR':str(self.source / 'evaluator_runtime'),
             'PHONE_FACTORY_EVALUATOR_PYTHON':sys.executable,
+            'PHONE_FACTORY_EVALUATOR_PROFILES_DIR': str(self.source / 'evaluator_runtime/profiles'),
+            'PHONE_FACTORY_EVALUATION_INPUT_ROOTS': json.dumps([str(self.inputs)]),
             'PHONE_FACTORY_EVALUATOR_TEXT_API_KEY':'offline-test-text',
             'PHONE_FACTORY_EVALUATOR_VISION_API_KEY':'offline-test-vision',
             'GUI_AGENT_VLA_CAPTURE_LOGPROBS':'true',
@@ -178,6 +182,10 @@ class ModelIterationFlaskTests(unittest.TestCase):
                 'items':[{'id':f'c{i}','description':f'check{i}','status':status,'evidence':'offline'} for i,status in enumerate(states)]}}
         if invalid:
             report['trajectory_sha256'] = 'wrong-trajectory'
+        if '--profile-snapshot' in job.command:
+            profile = json.loads(Path(job.argument('--profile-snapshot')).read_text(encoding='utf-8'))
+            report.update(checklist_policy='auto', checklist_source='llm',
+                          **{key: profile[key] for key in ('profile_id', 'profile_digest', 'runtime_digest')})
         path = folder / '_report_offline.json'
         path.write_text(json.dumps(report,ensure_ascii=False),encoding='utf-8')
         (folder / '_evaluation_result.json').write_text(json.dumps({'status':'complete','report_path':str(path)}),encoding='utf-8')
@@ -192,6 +200,139 @@ class ModelIterationFlaskTests(unittest.TestCase):
         with patch.object(self.manager,'_phone_process_stopped',return_value=True), \
                 patch.object(self.manager,'_phone_run_state',return_value={'status':'completed'}):
             return self.manager._finalize_http_run(record['collection_run_id'])
+
+    def profile(self):
+        value = self.factory.dispatch('evaluation-profiles', 'GET', {}, mode='modeliter')
+        self.assertEqual(value['errors'], [], value)
+        self.assertTrue(value['profiles'], value)
+        return value['profiles'][0]
+
+    def offline_input(self):
+        for folder_name in ('first', 'second'):
+            folder = self.inputs / folder_name
+            folder.mkdir()
+            create_step(folder, 1, {'action': 'wait', 'time': 1})
+            payload = {'task_id': 'same-original-id', 'task': '搜索商品', 'session_id': folder_name,
+                'actions_flat': [{'global_step': 1, 'action': {'action': 'wait', 'time': 1},
+                                  'screenshot_before': r'Z:\old-server\step001_vla_input.jpg'}]}
+            (folder / '_trajectory_for_evaluate.json').write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+        return self.factory.dispatch('evaluation-preview', 'POST', {'source_path': str(self.inputs)}, mode='modeliter')
+
+    def start_offline(self, profile, preview, request_id='offline'):
+        return self.factory.dispatch('remote/start-evaluation', 'POST', {
+            'request_id': request_id, 'evaluator_config': self.config,
+            'evaluation_profile_id': profile['id'], 'evaluation_profile_digest': profile['digest'],
+            'preview_id': preview['preview_id'], 'checklist_source': 'auto'}, mode='modeliter')
+
+    def test_offline_http_profile_preview_progress_cancel_without_phone_launch(self):
+        profile = self.profile()
+        sources = self.factory.dispatch('evaluation-sources', 'GET', {}, mode='modeliter')
+        self.assertEqual(sources['allowed_roots'], [str(self.inputs)])
+        preview = self.offline_input()
+        self.assertTrue(preview['valid'], preview)
+        self.assertEqual(preview['trajectory_count'], 2)
+        self.assertEqual(len({case['source_trajectory_id'] for case in preview['cases']}), 2)
+        self.assertEqual({case['case_id'] for case in preview['cases']}, {'same-original-id'})
+        # The independent entry must not depend on platform phone/VLA settings.
+        self.factory._update(lambda state: state.update(phones=[], phoneApps=[], vla=[]))
+        run = self.start_offline(profile, preview)
+        self.assertEqual(run['execution_mode'], 'evaluate_only')
+        self.assertEqual(self.launch.call_count, 0)
+        record = self.manager._load_http_run(run['run_id'])
+        self.assertEqual(record['phone_ids'], [])
+        self.assertEqual(record['evaluation_profile']['profile_digest'], profile['digest'])
+        for case in record['evaluation_cases']:
+            self.assertTrue(Path(case['trajectory_path']).is_file())
+            self.assertFalse(Path(case['trajectory_path']).is_relative_to(self.inputs))
+        self.dispatcher.tick()
+        self.assertEqual(len(self.jobs), 2)
+        self.assertTrue(all(job.argument('--checklist-source') == 'auto' for job in self.jobs))
+        self.assertTrue(all(job.options['env']['GUI_AGENT_VLA_CAPTURE_LOGPROBS'] == 'false' for job in self.jobs))
+        state = self.results(run['run_id'])
+        self.assertEqual(state['summary']['collection_completed'], 2)
+        self.assertEqual(state['summary']['evaluation_running'], 2)
+        self.assertEqual(state['source_digest'], preview['source_digest'])
+        self.assertEqual({row['source_trajectory_id'] for row in state['cases']},
+                         {row['source_trajectory_id'] for row in preview['cases']})
+        with patch.object(self.dispatcher, '_stop_pid'), patch.object(self.manager, 'kill_processes_in') as phone_kill:
+            cancelled = self.factory.dispatch(f"runs/{run['run_id']}/cancel", 'POST', {}, mode='modeliter')
+        self.assertEqual(cancelled['status'], 'cancelled')
+        phone_kill.assert_not_called()
+        self.assertEqual(self.results(run['run_id'])['summary']['evaluation_failed'], 2)
+        self.assertEqual(self.factory.records.list('collection_runs'), [])
+
+    def test_offline_http_final_reports_archive_and_re_evaluation_are_separate(self):
+        profile, preview = self.profile(), self.offline_input()
+        run = self.start_offline(profile, preview)
+        self.dispatcher.tick()
+        self.finish_job(self.jobs[0], 'success')
+        self.finish_job(self.jobs[1], 'partial_success')
+        self.dispatcher.tick()
+        # The scheduler finalizes independent runs only after their cases settle.
+        record = self.manager._load_http_run(run['run_id'])
+        if record['status'] not in self.manager.HTTP_TERMINAL:
+            record = self.manager._finalize_http_run(run['run_id'])
+        self.assertEqual(record['status'], 'completed', record.get('errors'))
+        state = self.results(run['run_id'])
+        self.assertEqual(state['summary']['success_rate'], 0.5)
+        self.assertEqual(state['summary']['partial_success'], 1)
+        self.assertEqual({row['checklist_source'] for row in state['cases']}, {'llm'})
+        reports = self.factory.dispatch('reports', 'GET', {}, mode='modeliter')['folders']
+        folder = next(item for item in reports if item.get('run_id') == run['run_id'])
+        self.assertTrue(any(item['name'].endswith('.xlsx') for item in folder['files']))
+        with zipfile.ZipFile(record['archive_path']) as archive:
+            names = archive.namelist()
+            self.assertTrue(any(name.startswith('evaluation_profile/') for name in names))
+            self.assertEqual(sum(name.endswith('_trajectory_for_evaluate.json') for name in names), 2)
+        sources = self.factory.dispatch('evaluation-sources', 'GET', {}, mode='modeliter')
+        self.assertTrue(any(source['run_id'] == run['run_id'] for source in sources['sources']))
+        archived_preview = self.factory.dispatch('evaluation-preview', 'POST', {'source_run_id': run['run_id']}, mode='modeliter')
+        self.assertTrue(archived_preview['valid'], archived_preview)
+        self.assertEqual(archived_preview['trajectory_count'], 2)
+        # Selecting a completed run creates new output/checkpoint directories.
+        second = self.start_offline(profile, archived_preview, request_id='offline-second')
+        self.assertNotEqual(run['run_id'], second['run_id'])
+        self.assertEqual(self.results(second['run_id'])['summary']['evaluation_completed'], 0)
+        self.assertEqual(self.results(run['run_id']), state)
+        self.assertEqual(self.launch.call_count, 0)
+
+    def test_online_auto_profile_is_frozen_and_forwarded_to_executor(self):
+        profile = self.profile()
+        run = self.factory.remote_start({'filename': 'evaluation.xlsx', 'request_id': 'online-auto',
+            'vla': 'target.invalid:8000', 'evaluator_config': self.config, 'checklist_source': 'auto',
+            'evaluation_profile_id': profile['id'], 'evaluation_profile_digest': profile['digest']}, mode='modeliter')
+        record = self.manager._load_http_run(run['run_id'])
+        self.assertEqual(record['params']['checklist_source'], 'auto')
+        self.assertEqual(record['params']['evaluation_profile_digest'], profile['digest'])
+        self.assertEqual(record['evaluation_profile']['profile_id'], profile['id'])
+        self.ready(record, 0)
+        self.dispatcher.tick()
+        self.assertEqual(len(self.jobs), 1)
+        self.assertEqual(self.jobs[0].argument('--checklist-source'), 'auto')
+        self.assertTrue(Path(self.jobs[0].argument('--profile-snapshot')).is_file())
+        self.assertEqual(self.launch.call_count, 1)
+
+    def test_online_auto_lost_ack_recovers_frozen_run_after_profile_catalog_changes(self):
+        profile = self.profile()
+        payload = {'filename': 'evaluation.xlsx', 'request_id': 'online-auto-lost-ack',
+            'vla': 'target.invalid:8000', 'evaluator_config': self.config, 'checklist_source': 'auto',
+            'evaluation_profile_id': profile['id'], 'evaluation_profile_digest': profile['digest']}
+        def lose_start_ack(args):
+            response = self.client(args)
+            return {'ok': False, 'output': 'lost acknowledgement'} if args[0] == 'start-run' else response
+        self.factory.run_client = lose_start_ack
+        with self.assertRaisesRegex(Exception, 'lost acknowledgement'):
+            self.factory.remote_start(payload, mode='modeliter')
+        def changed_catalog(args):
+            if args[0] == 'evaluation-profiles':
+                return {'ok': True, 'output': json.dumps({'profiles': [{**profile, 'digest': '0' * 64}], 'errors': []})}
+            return self.client(args)
+        self.factory.run_client = changed_catalog
+        run = self.factory.remote_start(payload, mode='modeliter')
+        self.assertTrue(run['reused'])
+        self.assertEqual(self.launch.call_count, 1)
+        record = self.manager._load_http_run(run['run_id'])
+        self.assertEqual(record['evaluation_profile']['profile_digest'], profile['digest'])
 
     def test_http_pipeline_overlaps_cases_and_freezes_complete_report_archive(self):
         run,record = self.start()

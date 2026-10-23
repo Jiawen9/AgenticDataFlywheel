@@ -8,14 +8,22 @@ export interface FactoryState { imported_task?: Pick<TaskRow, 'filename' | 'sour
 export interface FactoryConfig { sampling_enabled: boolean; temperature: number; top_p: number; use_experience_lib: boolean; capture_logprobs: boolean }
 export interface EvaluatorModel { base_url: string; model: string; api_key_env: string }
 export interface EvaluatorConfig { text: EvaluatorModel; vision: EvaluatorModel }
+export type EvaluationExecutionMode = 'collect_and_evaluate' | 'evaluate_only'
+export interface EvaluationProfile { id: string; name: string; digest: string }
+export type EvaluationIssue = string | { message?: string; error?: string; case_id?: string; path?: string }
+export interface EvaluationSource { run_id?: string; source_run_id?: string; path?: string; source_path?: string; run_mode?: string; status?: string; created_at?: string; trajectory_count?: number }
+export type EvaluationSourceInput = { source_run_id: string; source_path?: never } | { source_path: string; source_run_id?: never }
+export interface EvaluationPreview { preview_id: string; valid: boolean; trajectory_count: number; cases: Array<{ source_trajectory_id: string; case_id: string; task: string; phone_id?: string; key_elements?: string }>; errors: EvaluationIssue[]; source: EvaluationSource; source_digest: string }
+export interface EvaluationRunMetadata { execution_mode?: EvaluationExecutionMode; evaluation_profile_id?: string; evaluation_profile_name?: string; evaluation_profile_digest?: string; source?: EvaluationSource }
+export interface StartEvaluationOptions { request_id: string; evaluator_config: EvaluatorConfig; evaluation_profile_id: string; evaluation_profile_digest: string; preview_id: string; checklist_source: 'auto' }
 export interface EvaluationSummary { total: number; collection_completed: number; collection_failed: number; evaluation_completed: number; evaluation_failed: number; evaluation_running: number; evaluation_pending: number; success: number; partial_success: number; fail: number; success_rate: number | null }
-export interface EvaluationCase { case_key: string; phone_id: string; case_id: string; session_id?: string; collection_status: string; evaluation_status: string; verdict?: string | null; failure_reason?: string; attempt_count: number; report_file_id?: string | null; report_name?: string; errors: Array<{ error?: string; message?: string } | string> }
-export interface EvaluationResults { run_id: string; run_mode: 'modeliter'; summary: EvaluationSummary; cases: EvaluationCase[]; stale?: boolean; sync_error?: string }
-export interface RunOptions { evaluator_config?: EvaluatorConfig; checklist_source?: 'llm'; evaluation_mode?: 'checklist'; filename: string; phone_id?: string; app?: string; request_id: string; vla: string; run_mode?: 'generate' | 'modeliter'; config?: FactoryConfig }
+export interface EvaluationCase { case_key: string; phone_id: string; case_id: string; session_id?: string; source_trajectory_id?: string; checklist_source?: string; collection_status: string; evaluation_status: string; verdict?: string | null; failure_reason?: string; attempt_count: number; report_file_id?: string | null; report_name?: string; errors: Array<{ error?: string; message?: string } | string> }
+export interface EvaluationResults extends EvaluationRunMetadata { run_id: string; run_mode: 'modeliter'; summary: EvaluationSummary; cases: EvaluationCase[]; stale?: boolean; sync_error?: string }
+export interface RunOptions { evaluator_config?: EvaluatorConfig; evaluation_profile_id?: string; evaluation_profile_digest?: string; checklist_source?: 'llm' | 'auto'; evaluation_mode?: 'checklist'; filename: string; phone_id?: string; app?: string; request_id: string; vla: string; run_mode?: 'generate' | 'modeliter'; config?: FactoryConfig }
 export interface RemoteResult { ok: boolean; message?: string; error?: string; run_id?: string; collection_run_id?: string; batch_id?: string }
 export interface AdbDevice { serial: string; model: string; battery: number | null }
 export interface PhoneMonitor { ok: boolean; screenshot: string | null; log: string; running: boolean; device_size?: { width: number; height: number } | null }
-export interface FactoryRun { evaluation_summary?: EvaluationSummary; run_id?: string; collection_run_id?: string; batch_id?: string; status: string; created_at?: string; filename?: string; vla?: string; error?: string; dispatch_error?: string; transfer_error?: string; transfer_status?: string; remote_status?: string; remote_errors?: Array<{ error?: string; message?: string }>; errors?: Array<{ error?: string; message?: string }>; trajectory_count?: number }
+export interface FactoryRun extends EvaluationRunMetadata { evaluation_summary?: EvaluationSummary; run_id?: string; collection_run_id?: string; batch_id?: string; status: string; created_at?: string; filename?: string; vla?: string; error?: string; dispatch_error?: string; transfer_error?: string; transfer_status?: string; remote_status?: string; remote_errors?: Array<{ error?: string; message?: string }>; errors?: Array<{ error?: string; message?: string }>; trajectory_count?: number }
 export interface ReportFile { name: string; size: number; modified?: number; file_id?: string }
 export interface ReportFolder { index: number; dir_name: string; modified?: number; run_id?: string; files: ReportFile[] }
 export type FactoryBatchSummary = Omit<CollectionBatchSummary, 'kind' | 'source_job_id'> & { warnings?: CollectionWarning[]; kind: CollectionBatchSummary['kind'] | 'manual_collection'; source_job_id: string | null }
@@ -54,8 +62,13 @@ export function createFactoryApi(base: '/api/phone-factory' | '/api/model-iter')
   return {
     evaluationConfig: () => req<EvaluatorConfig>('/evaluation-config'),
     saveEvaluationConfig: (config: EvaluatorConfig) => req<EvaluatorConfig>('/evaluation-config', jsonInit('PUT', config)),
-    evaluationCapabilities: () => req<{ ok: boolean; supported: boolean; message: string }>('/evaluation-capabilities'),
+    evaluationCapabilities: () => req<{ ok: boolean; supported: boolean; offline_supported?: boolean; profiles_supported?: boolean; message: string }>('/evaluation-capabilities'),
+    evaluationProfiles: () => req<{ profiles: EvaluationProfile[]; errors: EvaluationIssue[] }>('/evaluation-profiles'),
+    evaluationSources: () => req<{ sources: EvaluationSource[]; allowed_roots: string[] }>('/evaluation-sources'),
+    evaluationPreview: (source: EvaluationSourceInput, signal?: AbortSignal) => req<EvaluationPreview>('/evaluation-preview', jsonInit('POST', source, signal)),
+    remoteStartEvaluation: (options: StartEvaluationOptions) => req<RemoteResult>('/remote/start-evaluation', jsonInit('POST', options)),
     evaluations: (runId: string, signal?: AbortSignal) => req<EvaluationResults>(`/runs/${encodeURIComponent(runId)}/evaluations`, { signal }),
+    cancelEvaluation: (runId: string) => req<FactoryRun>(`/runs/${encodeURIComponent(runId)}/cancel`, jsonInit('POST', {})),
     state: (signal?: AbortSignal) => req<FactoryState>('/state', { signal }),
     addPhone: (phoneId: string) => req<FactoryState>('/phones', jsonInit('POST', { phone_id: phoneId })),
     addApp: (app: string) => req<FactoryState>('/apps', jsonInit('POST', { app })),
