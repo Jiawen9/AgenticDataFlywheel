@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import DisplayId from '@/components/DisplayId.vue'
+import { useDisplayIdentifiers } from '@/composables/useDisplayIdentifiers'
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Cpu, EditPen, Refresh, Search, Setting, VideoPlay, View } from '@element-plus/icons-vue'
@@ -7,7 +9,10 @@ import type { DatasetRelease, ModelArtifact, TrainingMixtureJob } from '@/types'
 import { readModelPublishingState } from '@/utils/modelPublishingStore'
 import { createTrainingMixtureJob, readTrainingMixtureState, updateTrainingMixtureJob } from '@/utils/trainingMixtureStore'
 
+const { displayId, matches, searchText: identifierSearchText } = useDisplayIdentifiers()
 const datasets = ref<DatasetRelease[]>([])
+const datasetSearch = ref('')
+const visibleDatasets = computed(() => datasets.value.filter(item => matches(datasetSearch.value, 'release', item.release_id, '', item.name)))
 const models = ref<ModelArtifact[]>([])
 const jobs = ref<TrainingMixtureJob[]>([])
 const loading = ref(true)
@@ -47,7 +52,7 @@ const succeededCount = computed(() => jobs.value.filter(item => item.status === 
 const filteredJobs = computed(() => {
   const keyword = historySearch.value.trim().toLowerCase()
   return jobs.value.filter((job) => {
-    const matchesText = !keyword || [job.job_id, job.dataset_name, job.student_model_name, job.teacher_model_name, job.result_filename].some(value => value.toLowerCase().includes(keyword))
+    const matchesText = !keyword || [identifierSearchText('job', job.job_id), identifierSearchText('release', job.dataset_release_id), job.dataset_name, job.student_model_name, job.teacher_model_name, job.result_filename].some(value => value.toLowerCase().includes(keyword))
     return matchesText && (historyStatus.value === 'all' || job.status === historyStatus.value)
   })
 })
@@ -185,7 +190,8 @@ onBeforeUnmount(stopTimer)
       <el-form label-position="top" class="configuration-grid" @submit.prevent="startMixture">
         <div class="resource-column">
           <el-form-item label="选择数据集" required>
-            <el-select v-model="form.datasetReleaseId" filterable placeholder="选择发布的数据集"><el-option v-for="dataset in datasets" :key="dataset.release_id" :value="dataset.release_id" :label="`${dataset.name} · ${dataset.release_id}`"><div class="select-option"><b>{{ dataset.name }}</b><span>{{ dataset.release_id }} · {{ dataset.trajectory_count }} 轨迹</span></div></el-option></el-select>
+            <el-select v-model="form.datasetReleaseId" filterable :filter-method="(value: string) => datasetSearch = value" placeholder="选择发布的数据集"><el-option v-for="dataset in visibleDatasets" :key="dataset.release_id" :value="dataset.release_id" :label="`${dataset.name} · ${displayId('release', dataset.release_id)}`"><div class="select-option"><b>{{ dataset.name }}</b><span>{{ displayId('release', dataset.release_id) }} · {{ dataset.trajectory_count }} 轨迹</span></div></el-option></el-select>
+            <DisplayId v-if="form.datasetReleaseId" kind="release" :id="form.datasetReleaseId" />
           </el-form-item>
           <el-form-item label="Student 模型（已发布）" required>
             <el-select v-model="form.studentArtifactId" filterable placeholder="选择发布的模型"><el-option v-for="model in publishedModels" :key="model.artifact_id" :value="model.artifact_id" :label="`${model.model_version} · ${model.filename}`" /></el-select>
@@ -209,7 +215,7 @@ onBeforeUnmount(stopTimer)
     </section>
 
     <section v-if="activeJob" class="panel active-panel">
-      <div class="active-head"><div><span class="running-dot" /><b>{{ stageText(activeJob.stage) }}</b><code>{{ activeJob.job_id }}</code></div><strong>{{ activeJob.progress }}%</strong></div>
+      <div class="active-head"><div><span class="running-dot" /><b>{{ stageText(activeJob.stage) }}</b><DisplayId kind="job" :id="activeJob.job_id" /></div><strong>{{ activeJob.progress }}%</strong></div>
       <el-progress :percentage="activeJob.progress" />
       <p>{{ activeJob.dataset_name }} · Student {{ activeJob.student_model_name }} · Teacher {{ activeJob.teacher_model_name }} · Pass@{{ activeJob.pass_k }}</p>
     </section>
@@ -217,7 +223,7 @@ onBeforeUnmount(stopTimer)
     <section class="panel history-panel">
       <div class="section-heading history-heading"><div><h2>历史数据配比结果</h2><p>保留任务参数、执行过程、结果文件名和保存目录。</p></div><div class="filters"><el-input v-model="historySearch" :prefix-icon="Search" clearable placeholder="搜索任务、数据集或模型" /><el-select v-model="historyStatus"><el-option label="全部状态" value="all" /><el-option label="运行中" value="running" /><el-option label="已完成" value="succeeded" /><el-option label="失败" value="failed" /><el-option label="已中断" value="interrupted" /></el-select></div></div>
       <el-table v-if="filteredJobs.length" :data="filteredJobs" row-key="job_id">
-        <el-table-column label="数据集" min-width="210"><template #default="{ row }"><div class="primary-cell"><b>{{ row.dataset_name }}</b><code>{{ row.job_id }}</code></div></template></el-table-column>
+        <el-table-column label="数据集" min-width="210"><template #default="{ row }"><div class="primary-cell"><b>{{ row.dataset_name }}</b><DisplayId kind="job" :id="row.job_id" /></div></template></el-table-column>
         <el-table-column label="模型组合" min-width="220"><template #default="{ row }"><span>{{ row.teacher_model_name }} → {{ row.student_model_name }}</span></template></el-table-column>
         <el-table-column label="参数" width="150"><template #default="{ row }">workers {{ row.max_workers }} · Pass@{{ row.pass_k }}</template></el-table-column>
         <el-table-column label="当前阶段" min-width="170"><template #default="{ row }">{{ stageText(row.stage) }}</template></el-table-column>
@@ -235,8 +241,8 @@ onBeforeUnmount(stopTimer)
 
     <el-dialog v-model="detailVisible" title="数据配比任务详情" width="min(760px, 92vw)">
       <el-descriptions v-if="selectedJob" :column="2" border>
-        <el-descriptions-item label="任务 ID">{{ selectedJob.job_id }}</el-descriptions-item><el-descriptions-item label="状态"><el-tag :type="statusType(selectedJob.status)">{{ statusText(selectedJob.status) }}</el-tag></el-descriptions-item>
-        <el-descriptions-item label="数据集">{{ selectedJob.dataset_name }}</el-descriptions-item><el-descriptions-item label="发布 ID">{{ selectedJob.dataset_release_id }}</el-descriptions-item>
+        <el-descriptions-item label="任务 ID"><DisplayId kind="job" :id="selectedJob.job_id" /></el-descriptions-item><el-descriptions-item label="状态"><el-tag :type="statusType(selectedJob.status)">{{ statusText(selectedJob.status) }}</el-tag></el-descriptions-item>
+        <el-descriptions-item label="数据集">{{ selectedJob.dataset_name }}</el-descriptions-item><el-descriptions-item label="发布 ID"><DisplayId kind="release" :id="selectedJob.dataset_release_id" /></el-descriptions-item>
         <el-descriptions-item label="Student 模型">{{ selectedJob.student_model_name }}</el-descriptions-item><el-descriptions-item label="Teacher 模型">{{ selectedJob.teacher_model_name }}</el-descriptions-item>
         <el-descriptions-item label="Teacher 路径" :span="2">{{ selectedJob.teacher_model_path }}</el-descriptions-item><el-descriptions-item label="参数">max_workers={{ selectedJob.max_workers }}, Pass@{{ selectedJob.pass_k }}</el-descriptions-item><el-descriptions-item label="创建时间">{{ formatDate(selectedJob.created_at) }}</el-descriptions-item>
         <el-descriptions-item label="结果文件" :span="2">{{ selectedJob.result_filename }}</el-descriptions-item><el-descriptions-item label="结果路径" :span="2">{{ selectedJob.result_path }}</el-descriptions-item>

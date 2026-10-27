@@ -203,12 +203,21 @@ class Step:
     source_trajectory_id: str = ""
     collection_run_id: str = ""
     collected_at: str = ""
+    agent_type: str = ""
+    agent_version: str = ""
+    trajectory_format: str = ""
+    normalizer_version: str = ""
+    runtime_digest: str = ""
+    configuration_digest: str = ""
 
     def identity_dict(self) -> dict[str, Any]:
         return {key: value for key, value in {
             "task_id": self.task_id, "trajectory_id": self.trajectory,
             "source_trajectory_id": self.source_trajectory_id,
             "collection_run_id": self.collection_run_id, "collected_at": self.collected_at,
+            "agent_type": self.agent_type, "agent_version": self.agent_version,
+            "trajectory_format": self.trajectory_format, "normalizer_version": self.normalizer_version,
+            "runtime_digest": self.runtime_digest, "configuration_digest": self.configuration_digest,
         }.items() if value}
 
     def apply_classification(
@@ -410,6 +419,9 @@ def load_trajectories(path: Path, sheet_name: str | None, *, allow_excel_import:
             summary=str(values.get("summary") or ""), actions_box=str(values.get("actions_box") or ""),
             task_id=row_task_id(values), source_trajectory_id=str(values.get("source_trajectory_id") or ""),
             collection_run_id=str(values.get("collection_run_id") or ""), collected_at=str(values.get("collected_at") or ""),
+            agent_type=str(values.get("agent_type") or ""), agent_version=str(values.get("agent_version") or ""),
+            trajectory_format=str(values.get("trajectory_format") or ""), normalizer_version=str(values.get("normalizer_version") or ""),
+            runtime_digest=str(values.get("runtime_digest") or ""), configuration_digest=str(values.get("configuration_digest") or ""),
         ))
 
     for trajectory, steps in grouped.items():

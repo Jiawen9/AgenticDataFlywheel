@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs'
 import { compileScript, parse } from '@vue/compiler-sfc'
 import ts from 'typescript'
 import * as polling from '@/composables/useFactoryPolling'
+import * as collectionAgents from '@/utils/collectionAgents'
 import type { FactoryState, PhoneMonitor } from '@/phoneFactoryApi'
 
 const api = vi.hoisted(() => ({ state: vi.fn(), adbDevices: vi.fn(), remoteStatus: vi.fn(), monitor: vi.fn() }))
@@ -16,6 +17,7 @@ const compiled = ts.transpileModule(script.content, { compilerOptions: { target:
 const exports: { default?: any } = {}
 new Function('require', 'exports', compiled.outputText)((name: string) => {
   if (name === 'vue') return Vue
+  if (name === '@/utils/collectionAgents') return collectionAgents
   if (name === '@/phoneFactoryApi') return { phoneFactoryApi: api }
   if (name === '@/composables/useFactoryPolling') return polling
   throw new Error(`Unexpected import ${name}`)

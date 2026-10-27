@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import DisplayId from '@/components/DisplayId.vue'
+import { useDisplayIdentifiers } from '@/composables/useDisplayIdentifiers'
 import PipelineStatusBar from '@/components/PipelineStatusBar.vue'
 import { usePipelineContext } from '@/composables/usePipelineContext'
 import BatchPublishedNotice from '@/components/BatchPublishedNotice.vue'
@@ -16,6 +18,9 @@ import { resolveBatchSelection } from '@/utils/batchSelection'
 import { useCorrectionWorkspace, type ActionDecision } from '@/composables/useCorrectionWorkspace'
 
 const route = useRoute(), router = useRouter()
+const { displayId, matches } = useDisplayIdentifiers()
+const batchSearch = ref('')
+const visibleBatches = computed(() => batches.value.filter(batch => matches(batchSearch.value, 'batch', batch.batch_id)))
 const batches = ref<CorrectionBatch[]>([])
 const selectedBatchId = ref('')
 const pipelineContext = usePipelineContext({ batchId: selectedBatchId, stepId: 'correction' })
@@ -234,9 +239,10 @@ onBeforeUnmount(() => {
 
     <section class="toolbar">
       <label for="correction-batch">业务批次</label>
-      <el-select id="correction-batch" :model-value="selectedBatchId" :loading="loading" :disabled="pipelineContext.isPipelineRoute.value || loading || busy || !batches.length" placeholder="选择已质检批次" @change="changeBatch">
-        <el-option v-for="batch in batches" :key="batch.batch_id" :label="`${batch.batch_id} · 已质检 ${batch.reviewed_task_count}/${batch.total_task_count} 个任务`" :value="batch.batch_id" />
+      <el-select id="correction-batch" filterable :filter-method="(value: string) => batchSearch = value" :model-value="selectedBatchId" :loading="loading" :disabled="pipelineContext.isPipelineRoute.value || loading || busy || !batches.length" placeholder="选择已质检批次" @change="changeBatch">
+        <el-option v-for="batch in visibleBatches" :key="batch.batch_id" :label="`${displayId('batch', batch.batch_id)} · 已质检 ${batch.reviewed_task_count}/${batch.total_task_count} 个任务`" :value="batch.batch_id" />
       </el-select>
+      <DisplayId v-if="selectedBatchId" kind="batch" :id="selectedBatchId" />
       <el-button :disabled="busy || loading" @click="refreshBatch">刷新当前结果</el-button>
       <span class="save-status" role="status">{{ savingCount ? '正在保存…' : hasUnsaved ? '有未保存修改' : session ? '草稿已加载' : '' }}</span>
       <el-button v-if="!pipelineContext.managed.value && !pipelineContext.isPipelineRoute.value" type="success" :loading="savingCount > 0" :disabled="!session || busy || loading" @click="exportData">导出 SFT / RL / 原生数据（{{ exportCount }} 条）</el-button>
@@ -252,7 +258,7 @@ onBeforeUnmount(() => {
         <el-collapse-item v-for="task in tasks" :key="task.task_id" :name="task.task_id">
           <template #title>
             <div class="task-title">
-              <div class="task-title__id">{{ task.task_id }}</div>
+              <div class="task-title__id"><DisplayId kind="task" :id="task.task_id" :scope="selectedBatchId" /></div>
               <div class="task-title__goal" :title="task.goal">{{ task.goal }}</div>
               <el-tag type="success" round>已选轨迹</el-tag>
               <span class="task-title__stats">{{ task.trajectories.length }} 轨迹 · 已改 {{ task.edited_row_count }} 步 · 导出 {{ task.export_count }}/{{ task.trajectories.length }}</span>
@@ -264,7 +270,7 @@ onBeforeUnmount(() => {
                 <template #title>
                   <div class="trajectory-title">
                     <el-icon><Refresh /></el-icon>
-                    <b>{{ trajectory.trajectory_id }}</b>
+                    <b><DisplayId kind="trajectory" :id="trajectory.trajectory_id" :scope="selectedBatchId" /></b>
                     <span class="rank">Top-{{ trajectory.rank }}</span>
                     <span class="score">{{ trajectory.global_score.toFixed(4) }} 分</span>
                     <el-tag size="small" :type="trajectory.passed_threshold ? 'success' : 'warning'">{{ trajectory.passed_threshold ? '质检通过' : '质检未通过' }}</el-tag>
@@ -303,6 +309,7 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.task-title__id,.trajectory-title>b{min-width:0;max-width:100%}
 .review-panel{padding:16px;display:grid;gap:12px}.review-panel article{padding:12px;border:1px solid var(--line);border-radius:8px}.review-panel table{width:100%;table-layout:fixed;border-collapse:collapse;font-size:12px}.review-panel th,.review-panel td{padding:8px;text-align:left;white-space:pre-wrap;overflow-wrap:anywhere;vertical-align:top;border:1px solid var(--line)}
 .toolbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:20px 0 10px;padding:14px 16px;border:1px solid var(--line);border-radius:12px;background:white}.toolbar label{font-size:12px;font-weight:800;color:#64748b}.toolbar .el-select{width:330px;max-width:100%}.save-status{margin-left:auto;color:#64748b;font-size:12px}.export-history summary{cursor:pointer;font-weight:700;padding:8px 0}.task-list{min-height:180px;margin-top:16px}.task-title{display:grid;grid-template-columns:190px minmax(240px,1fr) auto minmax(220px,auto);align-items:center;gap:14px;width:calc(100% - 36px);padding-right:16px}.task-title__id{font-weight:900;letter-spacing:.02em}.task-title__goal{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#334155}.task-title__stats{color:var(--muted);font-size:12px;text-align:right;white-space:nowrap}.trajectory-list{padding:10px 14px 18px 46px;min-height:80px}.trajectory-title{display:flex;align-items:center;gap:9px;width:calc(100% - 36px);padding-right:16px}.trajectory-title b{overflow:hidden;color:#334155;font-size:12px;text-overflow:ellipsis;white-space:nowrap}.trajectory-title span{color:var(--muted);font-size:12px;font-weight:400;white-space:nowrap}.trajectory-title .rank{color:#0f766e;font-weight:800}.trajectory-title .score{font-variant-numeric:tabular-nums}.trajectory-export{margin-left:auto;flex-shrink:0}.trajectory-detail{min-height:160px}.inline-loading,.inline-error{padding:24px;color:#64748b;font-size:13px}.inline-error{display:grid;gap:12px}.inline-error .el-button{justify-self:start}.export-history{margin-top:16px;padding:8px 16px;border:1px solid var(--line);border-radius:12px;background:white;font-size:12px;color:#64748b}.export-history a{display:flex;justify-content:space-between;gap:12px;padding:12px 0;color:#0f766e;overflow-wrap:anywhere}.export-history small{color:#64748b}
 @media(max-width:1000px){.task-title{grid-template-columns:190px minmax(180px,1fr) auto}.task-title__stats{text-align:left}.trajectory-list{padding-left:0}.trajectory-title{flex-wrap:wrap;gap:8px}.trajectory-export{margin-left:0}}@media(max-width:650px){.save-status{margin-left:0}.toolbar .el-select{width:100%}.task-title{grid-template-columns:1fr auto;width:calc(100% - 36px)}.task-title__goal{grid-column:1 / -1}.task-title__stats{text-align:left;white-space:normal}.trajectory-title{width:calc(100% - 36px);padding-right:8px}.export-history a{flex-direction:column}}

@@ -71,7 +71,9 @@ def _iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
 
 
 def xml_for_step(directory: Path, step: int, action_record: dict[str, Any]) -> tuple[str, str]:
-    xml_path = directory / f"step{step:03d}_vla_input_ui.xml"
+    xml_path = directory / f"step{step:03d}_vla_input_stability_ui.xml"
+    if not io_path(xml_path).exists():
+        xml_path = directory / f"step{step:03d}_vla_input_ui.xml"
     if io_path(xml_path).exists():
         return io_path(xml_path).read_text(encoding="utf-8", errors="replace"), str(xml_path)
     raw = action_record.get("ui_tree_before_raw", "")

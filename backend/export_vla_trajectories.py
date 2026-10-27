@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 import uuid
@@ -36,7 +37,7 @@ def json_object_after_tool_call(content: str, start: int) -> tuple[Any, int]:
     return value, start + (len(content[start:]) - len(remainder)) + end
 
 
-def extract_response_fields(response_path: Path) -> tuple[str, str]:
+def _extract_raw_response_fields(response_path: Path) -> tuple[str, str]:
     """Return tool-call payloads and summary text from a VLA response."""
     with io_path(response_path).open("r", encoding="utf-8-sig") as file:
         response = json.load(file)
@@ -62,6 +63,56 @@ def extract_response_fields(response_path: Path) -> tuple[str, str]:
     summary_match = SUMMARY_RE.search(content)
     summary = summary_match.group(1).strip() if summary_match else ""
     return action_text, summary
+
+
+def pipeline_executed_action(response_path: Path, response: dict) -> dict:
+    """Read actual pixel actions and verify the finalized trajectory's same step."""
+    action = response.get("executed_action")
+    step = response.get("global_step")
+    match = STEP_RESPONSE_RE.fullmatch(response_path.name)
+    if (response.get("agent_type") != "pipelineagent"
+            or response.get("actual_action_coordinate_system") != "pixel"
+            or type(step) is not int or step < 1 or not match or int(match.group(1)) != step
+            or not isinstance(action, dict) or not isinstance(action.get("action"), str)
+            or not action["action"].strip()):
+        raise ValueError("pipeline response is missing a verified executed pixel action")
+    coordinate_keys = {"click": ("coordinate",), "long_press": ("coordinate",),
+                       "swipe": ("start_coordinate", "end_coordinate")}.get(action["action"], ())
+    for key in coordinate_keys:
+        point = action.get(key)
+        if (not isinstance(point, list) or len(point) != 2
+                or any(type(value) not in {int, float} or not math.isfinite(value) for value in point)):
+            raise ValueError("pipeline executed action has invalid pixel coordinates")
+    with io_path(response_path.parent / "_trajectory_for_evaluate.json").open("r", encoding="utf-8-sig") as file:
+        trajectory = json.load(file)
+    actions = trajectory.get("actions_flat")
+    if not isinstance(actions, list):
+        raise ValueError("pipeline trajectory is missing actions_flat")
+    matches = [item for item in actions if isinstance(item, dict) and type(item.get("global_step")) is int and item["global_step"] == step]
+    if len(matches) != 1 or matches[0].get("action") != action:
+        raise ValueError("pipeline executed action does not match actions_flat at global_step")
+    return action
+
+
+def extract_response_fields(response_path: Path) -> tuple[str, str]:
+    """Keep native parsing; PipelineAgent exports only verified executed actions."""
+    with io_path(response_path).open("r", encoding="utf-8-sig") as file:
+        response = json.load(file)
+    if response.get("agent_type") != "pipelineagent":
+        return _extract_raw_response_fields(response_path)
+    action = pipeline_executed_action(response_path, response)
+    try:
+        _, summary = _extract_raw_response_fields(response_path)
+    except ValueError as raw_error:
+        parsed = response.get("parsed_action")
+        status, repaired = response.get("parse_status"), response.get("repair_applied")
+        if (status not in {"parsed", "repaired"} or type(repaired) is not bool or repaired != (status == "repaired")
+                or not isinstance(parsed, dict) or not isinstance(parsed.get("action"), str)
+                or not parsed["action"].strip() or not isinstance(response.get("content"), str)
+                or not isinstance(response.get("parsed_summary", ""), str)):
+            raise raw_error
+        summary = response.get("parsed_summary", "")
+    return json.dumps(action, ensure_ascii=False, separators=(",", ":")), summary
 
 
 def discover_case_dirs(run_dir: Path) -> list[Path]:
@@ -101,7 +152,9 @@ def collect_rows(run_dir: Path) -> tuple[list[list[str]], list[str]]:
         for step_number, response_path in sorted(responses, key=lambda item: item[0]):
             prefix = f"step{step_number:03d}"
             image_path = case_dir / f"{prefix}_vla_input.jpg"
-            input_xml_path = case_dir / f"{prefix}_vla_input_ui.xml"
+            input_xml_path = case_dir / f"{prefix}_vla_input_stability_ui.xml"
+            if not io_path(input_xml_path).is_file():
+                input_xml_path = case_dir / f"{prefix}_vla_input_ui.xml"
             previous_prefix = f"step{step_number - 1:03d}"
             fallback_xml_path = case_dir / f"{previous_prefix}_vla_done_ui.xml"
             if io_path(input_xml_path).is_file():

@@ -23,7 +23,7 @@ LOG = logging.getLogger(__name__)
 STEPS = [("collection", "采集与回传"), ("preprocessing", "预处理与标框"), ("tree", "轨迹树构建"),
          ("quality", "轨迹质检"), ("correction", "人工修正"), ("cot", "COT 生成"),
          ("publication", "数据发布"), ("overview", "看板汇总")]
-ACTIVE_JOBS = {"queued", "running", "dispatching", "pending"}
+ACTIVE_JOBS = {"queued", "starting", "running", "dispatching", "pending"}
 FAILED_JOBS = {"failed", "interrupted", "cancelled", "stale"}
 RETRY_POLICY = {"version": 1, "max_attempts": 3, "delays_seconds": [30, 120]}
 RETRYABLE_STEPS = {"collection", "preprocessing", "tree", "quality", "cot", "publication", "overview"}
@@ -107,7 +107,7 @@ class PipelineRuntime:
 
     def collection_options(self, config):
         options = self.factory.runtime._options(config or {}, "generate")
-        return {key: options[key] for key in ("phone_id", "app", "vla", "config", "phone_apps", "phone_ids")}
+        return {key: options[key] for key in ("agent_type", "phone_id", "app", "vla", "config", "phone_apps", "phone_ids")}
 
     def collection_runs(self, batch_id):
         return self.factory.collection_runs.list_runs(batch_id)
@@ -121,7 +121,7 @@ class PipelineRuntime:
         options = pipeline["collection_config"]
         # Frozen pre-logprob pipelines keep their original default, regardless
         # of the factory settings now in effect. Do not rewrite their snapshot.
-        options = {**options, "config": {"capture_logprobs": False, **options["config"]}}
+        options = {"agent_type": "newagent", **options, "config": {"capture_logprobs": False, **options["config"]}}
         current = self.collection_options(options)
         if current != options:
             raise PipelineError("手机或 App 关联已变化，请结束流程后重新创建")

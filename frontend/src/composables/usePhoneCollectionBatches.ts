@@ -34,7 +34,7 @@ export function usePhoneCollectionBatches(batchApi: BatchApi, factoryApi: Factor
   setTasks: (tasks: TaskRow[]) => void
   isBlocked?: () => boolean
   downloadFile?: (blob: Blob, filename: string) => void
-  runOptions?: () => Pick<RunOptions, 'vla' | 'run_mode' | 'config'>
+  runOptions?: () => Pick<RunOptions, 'agent_type' | 'vla' | 'run_mode' | 'config'>
 }) {
   const retiredIds = new Set<string>()
   const batches = ref<FactoryBatchSummary[]>([])
@@ -90,7 +90,7 @@ export function usePhoneCollectionBatches(batchApi: BatchApi, factoryApi: Factor
     }
   }
 
-  async function runBatch(batchId: string, phoneId = '', app = '', overrides?: Pick<RunOptions, 'vla' | 'run_mode' | 'config'>) {
+  async function runBatch(batchId: string, phoneId = '', app = '', overrides?: Pick<RunOptions, 'agent_type' | 'vla' | 'run_mode' | 'config'>) {
     if (publishedBatch(batchId) || retiredIds.has(batchId)) throw new Error('该批次已发布，处理已结束')
     if (disposed || busy.value) throw new Error('正在处理采集任务，请稍候')
     busy.value = true

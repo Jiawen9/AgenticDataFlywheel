@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import DisplayId from '@/components/DisplayId.vue'
+import { useDisplayIdentifiers } from '@/composables/useDisplayIdentifiers'
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -7,18 +9,26 @@ import { api } from '@/api'
 import RolloutImportDialog from '@/components/RolloutImportDialog.vue'
 import type { RolloutImportResult } from '@/rolloutImportApi'
 import { PIPELINE_DIAGRAM_STAGES, diagramNodeState, diagramStageState, diagramStageTarget, type DiagramStage, type DiagramNodeState } from '@/utils/pipelineDiagram'
-import { factoryBatchesApi, newRunRequestId, phoneFactoryApi, type FactoryState } from '@/phoneFactoryApi'
+import CollectionAgentSelect from '@/components/CollectionAgentSelect.vue'
+import { agentBlockedReason } from '@/utils/collectionAgents'
+import { factoryBatchesApi, newRunRequestId, phoneFactoryApi, type AgentCapabilities, type AgentType, type FactoryState } from '@/phoneFactoryApi'
 import { usePipelineContext } from '@/composables/usePipelineContext'
 import { activeBatchItems, subscribeBatchLifecycle } from '@/utils/batchLifecycle'
 import { retryProgress } from '@/utils/pipelineRetry'
 import { PIPELINE_TERMINAL, pipelineStatusLabels, pipelineStepLabels, pipelineStepLocation, type CreatePipeline, type Pipeline, type PipelineAction, type PipelineStepId } from '@/types/pipeline'
 const route = useRoute(), router = useRouter(), context = usePipelineContext()
+const { displayId, matches } = useDisplayIdentifiers()
+const batchSearch = ref(''), historySearch = ref('')
+const filteredHistory = computed(() => history.value.filter(item => matches(historySearch.value, 'pipeline', item.pipeline_id, '', item.name) || matches(historySearch.value, 'batch', item.batch_id)))
+const visibleChoices = computed(() => choices.value.filter(item => matches(batchSearch.value, 'batch', item.batch_id, '', item.label)))
+function childJobKind(stepId: PipelineStepId) { return stepId === 'collection' ? 'run' : 'job' }
 const pipeline = context.pipeline, history = ref<Pipeline[]>([])
 const error = ref(''), createError = ref(''), loading = ref(false), submitting = ref(false), controlling = ref(false), dialogVisible = ref(false), choicesLoading = ref(false)
 const batches = ref<Array<{ batch_id: string; label: string; collectible: boolean; task_count: number }>>([])
 const factory = ref<FactoryState>({ phones: [], apps: [], phoneApps: [], vla: [], tasks: [] })
 const rolloutImportVisible = ref(false)
-const draft = reactive({ name: '', batch_id: '', start_mode: 'existing' as 'existing' | 'collect', mode: 'manual' as 'manual' | 'automatic', threshold: 3, phone_id: '', app: '', vla: '', sampling_enabled: false, temperature: 1, top_p: 1, use_experience_lib: false, capture_logprobs: false })
+const agentCapabilities = ref<AgentCapabilities | null>(null)
+const draft = reactive({ agent_type: 'newagent' as AgentType, name: '', batch_id: '', start_mode: 'existing' as 'existing' | 'collect', mode: 'manual' as 'manual' | 'automatic', threshold: 3, phone_id: '', app: '', vla: '', sampling_enabled: false, temperature: 1, top_p: 1, use_experience_lib: false, capture_logprobs: false })
 let disposed = false, listGeneration = 0, choicesGeneration = 0, listController: AbortController | undefined
 const requests = new Map<string, string>()
 const icons = { TrendCharts, DataAnalysis, Collection, Upload, Cpu, Promotion }
@@ -86,6 +96,9 @@ async function loadHistory() {
 async function loadChoices(hydrateConfig = true) {
   const generation = ++choicesGeneration; choicesLoading.value = true
   const [collection, prepared, state, config] = await Promise.allSettled([factoryBatchesApi.list(), api.preprocessingBatches(), phoneFactoryApi.state(), phoneFactoryApi.config()])
+  if (typeof phoneFactoryApi.agentCapabilities === 'function') {
+    try { const value = await phoneFactoryApi.agentCapabilities(); if (!disposed && generation === choicesGeneration) agentCapabilities.value = value.agent_types } catch { if (!disposed && generation === choicesGeneration) agentCapabilities.value = null }
+  }
   if (disposed || generation !== choicesGeneration) return
   const options = new Map<string, { batch_id: string; label: string; collectible: boolean; task_count: number }>()
   if (collection.status === 'fulfilled') for (const batch of collection.value) options.set(batch.batch_id, { batch_id: batch.batch_id, label: batch.batch_id, collectible: true, task_count: batch.task_count })
@@ -101,23 +114,25 @@ async function importedRollout(result: RolloutImportResult) {
   await loadChoices(false)
   if (disposed || !dialogVisible.value) return
   if (!choices.value.some(batch => batch.batch_id === result.batch_id)) {
-    createError.value = `批次 ${result.batch_id} 已登记，但未出现在当前活动列表；请重新打开创建窗口刷新确认。`
+    createError.value = `批次 ${displayId('batch', result.batch_id)} 已登记，但未出现在当前活动列表；请重新打开创建窗口刷新确认。`
     return
   }
   draft.batch_id = result.batch_id
   ElMessage.success('原始轨迹已登记。确认当前配置后，点击“创建并开始”接续处理。')
 }
 function openCreate() {
+  batchSearch.value = ''
   createError.value = ''; dialogVisible.value = true
   Object.assign(draft, { name: '', batch_id: '', start_mode: 'existing', mode: 'manual', threshold: 3, phone_id: '', app: '', vla: '' })
   void loadChoices()
 }
 async function create() {
   if (!canSubmit.value || submitting.value) return
+  if (draft.start_mode === 'collect' && agentBlockedReason(agentCapabilities.value, draft.agent_type, draft.capture_logprobs)) { createError.value = agentBlockedReason(agentCapabilities.value, draft.agent_type, draft.capture_logprobs); return }
   submitting.value = true; createError.value = ''
   const body: Omit<CreatePipeline, 'request_id'> = { name: draft.name.trim(), batch_id: draft.batch_id, start_mode: draft.start_mode, mode: draft.mode,
     ...(draft.mode === 'automatic' ? { threshold: draft.threshold } : {}),
-    ...(draft.start_mode === 'collect' ? { collection_config: { phone_id: draft.phone_id, app: draft.app, vla: draft.vla.trim(), config: { sampling_enabled: draft.sampling_enabled, temperature: draft.temperature, top_p: draft.top_p, use_experience_lib: draft.use_experience_lib, capture_logprobs: draft.capture_logprobs } } } : {}),
+    ...(draft.start_mode === 'collect' ? { collection_config: { agent_type: draft.agent_type, phone_id: draft.phone_id, app: draft.app, vla: draft.vla.trim(), config: { sampling_enabled: draft.sampling_enabled, temperature: draft.temperature, top_p: draft.top_p, use_experience_lib: draft.use_experience_lib, capture_logprobs: draft.capture_logprobs } } } : {}),
   }
   const key = JSON.stringify(body), requestId = requests.get(key) || newRunRequestId(); requests.set(key, requestId)
   try {
@@ -157,7 +172,7 @@ onBeforeUnmount(() => { disposed = true; stopRetryClock(); listGeneration++; cho
     <section class="circuit-shell">
       <header class="run-strip">
         <div class="run-signal" :class="'is-' + runSignal"><i></i><span>{{ pipeline ? pipelineStatusLabels[pipeline.status] : '等待创建或选择 Pipeline' }}</span></div>
-        <span v-if="pipeline" class="run-name">{{ pipeline.name }} · {{ pipeline.batch_id }}</span>
+        <span v-if="pipeline" class="run-name">{{ pipeline.name }} · <DisplayId kind="batch" :id="pipeline.batch_id" /></span>
         <span class="run-current">{{ pipeline ? currentStep?.label : '点击“新建 Pipeline”配置并启动一次迭代' }}</span>
         <div v-if="pipeline" class="run-controls">
           <el-button v-if="pipeline.status === 'running' || pipeline.status === 'retry_waiting' || pipeline.status === 'waiting_for_correction'" size="small" :loading="controlling" @click="control('pause')">暂停</el-button>
@@ -181,7 +196,7 @@ onBeforeUnmount(() => { disposed = true; stopRetryClock(); listGeneration++; cho
             <span v-if="retryInfo?.last_error">最近错误：{{ retryInfo.last_error }}</span>
           </div>
           <span v-if="currentStep.error && currentStep.error !== retryInfo?.last_error" class="run-error">{{ currentStep.error }}</span>
-          <span v-for="job in currentStep.job_ids" :key="job" class="job-id">{{ job }}</span>
+          <span v-for="job in currentStep.job_ids" :key="job" class="job-id"><DisplayId :kind="childJobKind(currentStep.id)" :id="job" /></span>
         </div>
         <div class="run-links">
           <div v-for="item in auxiliarySteps" :key="item.id" class="auxiliary-step">
@@ -217,9 +232,9 @@ onBeforeUnmount(() => { disposed = true; stopRetryClock(); listGeneration++; cho
       </div>
       <footer v-if="pipeline" class="run-footer">创建于 {{ date(pipeline.created_at) }}</footer>
     </section>
-    <section class="history-panel"><div class="history-heading"><h2>运行记录</h2><el-button size="small" :loading="loading" @click="loadHistory"><el-icon><Refresh /></el-icon>刷新</el-button></div>
-      <el-table :data="history" stripe empty-text="暂无 Pipeline，点击右上角新建" @row-click="(row: Pipeline) => selectPipeline(row.pipeline_id)">
-        <el-table-column prop="name" label="名称" min-width="150" /><el-table-column prop="batch_id" label="业务批次" min-width="200" />
+    <section class="history-panel"><div class="history-heading"><h2>运行记录</h2><el-input v-model="historySearch" clearable placeholder="搜索编号、批次或名称" style="max-width:280px" /><el-button size="small" :loading="loading" @click="loadHistory"><el-icon><Refresh /></el-icon>刷新</el-button></div>
+      <el-table :data="filteredHistory" stripe empty-text="暂无 Pipeline，点击右上角新建" @row-click="(row: Pipeline) => selectPipeline(row.pipeline_id)">
+        <el-table-column label="名称" min-width="180"><template #default="{ row }"><div>{{ row.name }}</div><DisplayId kind="pipeline" :id="row.pipeline_id" /></template></el-table-column><el-table-column label="业务批次" min-width="180"><template #default="{ row }"><DisplayId kind="batch" :id="row.batch_id" /></template></el-table-column>
         <el-table-column label="模式" width="120"><template #default="{ row }">{{ row.mode === 'manual' ? '人工修正' : '自动发布' }}</template></el-table-column>
         <el-table-column label="状态" min-width="160"><template #default="{ row }">{{ pipelineStatusLabels[row.status as Pipeline['status']] }}</template></el-table-column>
         <el-table-column label="创建时间" min-width="165"><template #default="{ row }">{{ date(row.created_at) }}</template></el-table-column>
@@ -231,23 +246,26 @@ onBeforeUnmount(() => { disposed = true; stopRetryClock(); listGeneration++; cho
       <el-form label-position="top" :disabled="submitting">
         <el-form-item label="名称" required><el-input v-model="draft.name" maxlength="100" placeholder="例如：手机采集批次验收" /></el-form-item>
         <el-form-item label="起点" required><el-radio-group v-model="draft.start_mode"><el-radio-button value="existing">接续已有结果</el-radio-button><el-radio-button value="collect">下发采集</el-radio-button></el-radio-group></el-form-item>
-        <el-form-item label="业务批次" required><el-select v-model="draft.batch_id" filterable :loading="choicesLoading" placeholder="选择未发布批次" style="width:100%"><el-option v-for="batch in choices" :key="batch.batch_id" :label="`${batch.batch_id}${batch.label && batch.label !== batch.batch_id ? ' · ' + batch.label : ''} · ${batch.task_count} 个任务`" :value="batch.batch_id" /></el-select></el-form-item>
+        <el-form-item label="业务批次" required><el-select v-model="draft.batch_id" filterable :filter-method="(value: string) => batchSearch = value" :loading="choicesLoading" placeholder="选择未发布批次" style="width:100%"><el-option v-for="batch in visibleChoices" :key="batch.batch_id" :label="`${displayId('batch', batch.batch_id)}${batch.label && batch.label !== batch.batch_id ? ' · ' + batch.label : ''} · ${batch.task_count} 个任务`" :value="batch.batch_id" /></el-select></el-form-item>
         <el-form-item v-if="draft.start_mode === 'existing'"><el-button :disabled="choicesLoading || submitting" data-testid="open-rollout-import" @click="rolloutImportVisible = true">导入已有 Rollout</el-button><span class="form-hint">已有本地轨迹尚未登记时，从这里添加新批次。</span></el-form-item>
         <el-form-item label="处理模式" required><el-radio-group v-model="draft.mode"><el-radio-button value="manual">人工修正</el-radio-button><el-radio-button value="automatic">自动发布</el-radio-button></el-radio-group></el-form-item>
         <p class="form-hint">{{ draft.mode === 'manual' ? '每任务选择一条 Top1，修正关卡等待人工确认；无需修改的轨迹也会导出。' : '每任务选择一条达标的最高分轨迹，未达标任务跳过；发布成功后整个批次结束处理。' }}</p>
         <el-form-item v-if="draft.mode === 'automatic'" label="质检总分阈值（0～5）" required><el-input-number v-model="draft.threshold" :min="0" :max="5" :step="0.1" /></el-form-item>
         <template v-if="draft.start_mode === 'collect'">
+          <el-form-item label="采集引擎"><CollectionAgentSelect v-model="draft.agent_type" :capabilities="agentCapabilities" /></el-form-item>
+          <el-alert v-if="agentBlockedReason(agentCapabilities, draft.agent_type, draft.capture_logprobs)" :title="agentBlockedReason(agentCapabilities, draft.agent_type, draft.capture_logprobs)" type="warning" :closable="false" />
           <div class="form-grid"><el-form-item label="手机"><el-select v-model="draft.phone_id" clearable placeholder="全部关联手机"><el-option v-for="phone in factory.phones" :key="phone" :label="phone" :value="phone" /></el-select></el-form-item><el-form-item label="App"><el-select v-model="draft.app" clearable placeholder="全部关联 App"><el-option v-for="app in apps" :key="app" :label="app" :value="app" /></el-select></el-form-item></div>
           <el-form-item label="VLA" required><el-select v-model="draft.vla" filterable allow-create default-first-option placeholder="host:port 或 http(s)://host:port/v1" style="width:100%"><el-option v-for="vla in factory.vla" :key="vla" :label="vla" :value="vla" /></el-select></el-form-item>
           <div class="form-grid"><el-form-item label="采集 Logprobs"><el-switch v-model="draft.capture_logprobs" /></el-form-item><el-form-item label="采样"><el-switch v-model="draft.sampling_enabled" /></el-form-item><el-form-item label="经验库"><el-switch v-model="draft.use_experience_lib" /></el-form-item><el-form-item label="temperature"><el-input-number v-model="draft.temperature" :min="0" :max="2" :step="0.1" /></el-form-item><el-form-item label="top_p"><el-input-number v-model="draft.top_p" :min="0" :max="1" :step="0.05" /></el-form-item></div>
         </template>
       </el-form>
-      <template #footer><el-button :disabled="submitting" @click="dialogVisible = false">取消</el-button><el-button type="primary" :disabled="!canSubmit || choicesLoading" :loading="submitting" @click="create">创建并开始</el-button></template>
+      <template #footer><el-button :disabled="submitting" @click="dialogVisible = false">取消</el-button><el-button type="primary" :disabled="!canSubmit || choicesLoading || (draft.start_mode === 'collect' && Boolean(agentBlockedReason(agentCapabilities, draft.agent_type, draft.capture_logprobs)))" :loading="submitting" @click="create">创建并开始</el-button></template>
     </el-dialog>
     <RolloutImportDialog v-model="rolloutImportVisible" @imported="importedRollout" />
   </div>
 </template>
 <style scoped>
+.run-name{min-width:0;max-width:42%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.history-heading{flex-wrap:wrap;gap:10px}
 /* Diagram baseline: 6f85f34; keep its complete effective geometry and palette. */
 .pipeline-page{min-height:100vh;padding:30px 34px;background:#f5f7fa}.page-head{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;max-width:1540px;margin:0 auto 20px}.page-head span{color:#0f766e;font-size:10px;letter-spacing:.17em}.page-head h1{margin:5px 0 2px;font-size:34px;font-weight:500;letter-spacing:-.035em}.page-head p{margin:0;color:#64748b;font-size:13px}
 .circuit-shell{max-width:1540px;margin:auto;overflow:hidden;border:1px solid #26364d;border-radius:18px;background:#09111f;box-shadow:0 24px 60px rgba(15,23,42,.2)}.run-strip{display:flex;align-items:center;gap:16px;height:50px;padding:0 18px;border-bottom:1px solid #26364d;background:rgba(15,27,45,.92);color:#dbe8f5}.run-signal{display:flex;align-items:center;gap:8px;color:#71849d;font-size:11px}.run-signal i{width:7px;height:7px;border-radius:50%;background:#54657a}.run-signal.is-running,.run-signal.is-paused{color:#67e8f9}.run-signal.is-running i{background:#22d3ee;box-shadow:0 0 10px #22d3ee;animation:signal 1.2s infinite}.run-signal.is-paused i{background:#fbbf24}.run-signal.is-completed{color:#6ee7b7}.run-signal.is-completed i{background:#34d399;box-shadow:0 0 9px #34d399}.run-signal.is-failed{color:#fca5a5}.run-signal.is-failed i{background:#ef4444}.run-name{padding-left:15px;border-left:1px solid #334155;color:#f1f5f9;font-size:12px}.run-current{flex:1;color:#7f93aa;font-size:11px}.run-controls{display:flex;gap:6px}

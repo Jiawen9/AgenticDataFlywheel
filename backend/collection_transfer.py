@@ -20,6 +20,7 @@ from .data_store.registry import utc_now
 from .file_io import io_path, iterdir, rglob, resolve_path, is_link_or_junction
 from .task_generation.collection_batches import payload_digest, workbook_digest
 from . import pipeline_diagnostics as diagnostics
+from .remote_sync import BoundedSyncPool, RemoteSyncPolicy, SyncDeferred
 
 LOG = logging.getLogger(__name__)
 TERMINAL = {"completed", "succeeded", "partial", "failed", "interrupted", "cancelled"}
@@ -28,7 +29,7 @@ TERMINAL = {"completed", "succeeded", "partial", "failed", "interrupted", "cance
 class CollectionTransferManager:
     def __init__(self, root: Path = DATA_ROOT, collection_runs: CollectionRunStore | None = None,
                  remote=None, *, interval: float = 10, max_archive_bytes: int = 2 * 1024**3,
-                 max_expanded_bytes: int = 8 * 1024**3, max_files: int = 100000):
+                 max_expanded_bytes: int = 8 * 1024**3, max_files: int = 100000, sync_policy=None):
         self.root = contained_path(Path(root))
         self.runs = collection_runs or CollectionRunStore(self.root)
         self.records = RecordStore(self.root)
@@ -38,6 +39,8 @@ class CollectionTransferManager:
         self._stop = threading.Event()
         self._thread = None
         self._guard = threading.Lock()
+        self.sync_policy = sync_policy or RemoteSyncPolicy(self.records)
+        self._sync_pool = BoundedSyncPool("collection-result-sync", max_workers=2)
 
     def start(self):
         with self._guard:
@@ -51,18 +54,18 @@ class CollectionTransferManager:
         self._stop.set()
         if self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout=5)
+        self._sync_pool.close()
 
     def _poll(self):
         while not self._stop.is_set():
             try:
-                self.recover()
+                self._schedule()
             except Exception:
                 LOG.exception("Collection result synchronization failed")
             self._stop.wait(self.interval)
 
-    def recover(self):
-        """Retry only registered, active production runs; never start collection."""
-        results = []
+    def _candidates(self):
+        candidates = []
         for run in self.runs.list_runs():
             if self._stop.is_set():
                 break
@@ -81,10 +84,34 @@ class CollectionTransferManager:
                 continue
             if run.get("remote_status") in TERMINAL and run.get("transfer_status") == "remote_failed":
                 continue
+            if self.sync_policy.due("collection", run):
+                candidates.append(run)
+        return sorted(candidates, key=lambda run: self.sync_policy.priority("collection", run))
+
+    def _schedule(self):
+        # Batch publication locks are intentionally retained. Do not consume a
+        # second worker waiting behind another transfer from the same batch.
+        for run in self._candidates():
+            if self._stop.is_set() or not self._sync_pool.available:
+                break
+            batch_id, run_id = run["batch_id"], run["collection_run_id"]
+            self._sync_pool.submit(batch_id, lambda run_id=run_id: self._background_sync(run_id))
+
+    def _background_sync(self, run_id):
+        try:
+            self.sync(run_id, force=False)
+        except Exception:
+            # Policy owns durable error state and rate-limited diagnostics.
+            pass
+
+    def recover(self):
+        """Synchronous recovery entrypoint, with the same policy as the poller."""
+        results = []
+        for run in self._candidates():
             try:
-                results.append(self.sync(run["collection_run_id"]))
+                results.append(self.sync(run["collection_run_id"], force=False))
             except Exception:
-                LOG.warning("Collection run %s is awaiting result synchronization", run["collection_run_id"], exc_info=True)
+                pass
         return results
 
     def _update(self, run_id, **changes):
@@ -243,7 +270,7 @@ class CollectionTransferManager:
         self._remove(self._temporary(run["collection_run_id"]))
         return completed
 
-    def sync(self, run_id):
+    def sync(self, run_id, *, force=True):
         run, owner = {}, None
         try:
             run = self.runs.get(run_id) or {}
@@ -255,7 +282,19 @@ class CollectionTransferManager:
             pass
         with diagnostics.trace_context(_reset=True, root=self.root, pipeline_id=owner), \
                 diagnostics.job_context({**run, "pipeline_id": owner}, "collection", self.root):
-            return self._sync_with_diagnostics(run_id)
+            if not run:
+                raise CollectionRunError("采集运行不存在", 404)
+            if (run.get("source_kind") == "rollout_import" or run.get("status") == "interrupted"
+                    or (run.get("status") == "completed" and run.get("transfer_status") == "completed")):
+                return run
+            try:
+                result = self.sync_policy.execute("collection", run,
+                    lambda: self._sync_with_diagnostics(run_id), force=force)
+            except SyncDeferred as exc:
+                raise CollectionRunError(str(exc), exc.status) from exc
+            if result.get("transfer_status") in {"completed", "remote_failed"}:
+                self.sync_policy.complete("collection", run_id)
+            return result
 
     def _sync_with_diagnostics(self, run_id):
         run = self.runs.get(run_id)
@@ -282,17 +321,21 @@ class CollectionTransferManager:
                     return self._finish(run, journal)
                 remote = self.remote.get_run(run_id)
                 if (not isinstance(remote, dict) or remote.get("collection_run_id", remote.get("run_id")) != run_id
-                        or remote.get("batch_id") != run["batch_id"] or remote.get("run_mode") != "generate"):
+                        or remote.get("batch_id") != run["batch_id"] or remote.get("run_mode") != "generate"
+                        or remote.get("agent_type", "newagent") != run.get("request", {}).get("metadata", {}).get("agent_type", "newagent")):
                     raise CollectionRunError("远端运行身份与已下发批次不匹配")
                 state = remote.get("status")
                 if not isinstance(state, str):
                     raise CollectionRunError("远端运行状态无效")
+                self.sync_policy.observe_remote("collection", run_id, state)
                 run = self._update(run_id, remote_status=state, remote_errors=remote.get("errors", []),
                     transfer_status="waiting", transfer_error=None)
                 if state not in TERMINAL:
                     return run
                 manifest = remote.get("manifest")
                 if manifest is None:
+                    if state in {"completed", "succeeded", "partial"}:
+                        raise CollectionRunError("远端运行已结束，等待可验证的完成清单", 502)
                     return self._update(run_id, status="interrupted" if state in {"interrupted", "cancelled"} else "failed",
                         transfer_status="remote_failed", transfer_error="远端运行结束但没有可验证的完成清单")
                 normalized, descriptors, size, checksum = self._manifest(run, manifest)

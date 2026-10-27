@@ -17,6 +17,7 @@ from .collection_runs import CollectionRunError, _component, _identifier
 from .data_store import ArtifactStore, DATA_ROOT, RecordStore
 from .data_store.paths import contained_path
 from .data_store.registry import utc_now
+from .display_identifiers import DisplayIdentifierStore
 from .task_generation.collection_batches import COLLECTION_COLUMNS, payload_digest
 
 
@@ -136,6 +137,7 @@ class ManualCollectionStore:
                 "download_url": f"/api/task-generation/collection-batches/{batch_id}/workbook",
                 "sheet_name": sheet, "snapshot": snapshot, "warnings": warnings,
                 "workbook_sha256": checksum}
+            display_entries = DisplayIdentifierStore(self.root).new_batch_entries(batch_id, tasks)
             temporary = contained_path(self.root, "tmp", "manual_collection", uuid.uuid4().hex + ".xlsx")
             temporary.parent.mkdir(parents=True, exist_ok=True)
             try:
@@ -148,7 +150,7 @@ class ManualCollectionStore:
                     "source_refs": [{"kind": "manual_collection", "filename": filename, "sha256": checksum}]}],
                     record_entries=[{"namespace": "manual_collection_batches", "key": batch_id,
                         "payload": {"batch_id": batch_id, "request_hash": request_hash, "created_at": created,
-                                    "payload_sha256": payload_digest(payload)}, "expected_revision": 0}])
+                                    "payload_sha256": payload_digest(payload)}, "expected_revision": 0}, *display_entries])
             finally:
                 temporary.unlink(missing_ok=True)
             return self.get(batch_id, require_workbook=True)

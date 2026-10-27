@@ -11,6 +11,12 @@ import { useTaskGenerationReview } from '@/composables/useTaskGenerationReview'
 import TaskGenerationScope from '@/components/TaskGenerationScope.vue'
 import TaskGenerationResults from '@/components/TaskGenerationResults.vue'
 import CollectionBatchSubmission from '@/components/CollectionBatchSubmission.vue'
+import DisplayId from '@/components/DisplayId.vue'
+import { useDisplayIdentifiers } from '@/composables/useDisplayIdentifiers'
+
+const { displayId, matches } = useDisplayIdentifiers()
+const pickerQuery = ref('')
+const filterJobPicker = (query: string) => { pickerQuery.value = query }
 
 const mode = ref<'new' | 'records'>('new')
 const tree = ref<TaskGenerationTreeNode[]>([])
@@ -51,7 +57,8 @@ const selectedTypes = computed(() => leaves(tree.value).filter(node => selectedA
 const selections = computed(() => selectionsFor(tree.value, selectedTypes.value.map(node => node.id), selectedApps.value))
 const ready = computed(() => Boolean(version.value && !resourceError.value && !resourceLoading.value && !replacing.value && !submitting.value && executionUnitCount(selections.value) > 0 && Number.isInteger(generateN.value) && generateN.value >= 1 && generateN.value <= 20))
 const validResources = computed(() => knowledgeBases.value.filter(item => item.valid).length)
-const filteredJobs = computed(() => jobs.value.filter(job => (!jobStatus.value || job.status === jobStatus.value) && [job.job_id, job.created_at, jobLabels[job.status]].join(' ').toLowerCase().includes(jobQuery.value.trim().toLowerCase())))
+const filteredJobs = computed(() => jobs.value.filter(job => (!jobStatus.value || job.status === jobStatus.value) && matches(jobQuery.value, 'job', job.job_id, '', job.created_at, jobLabels[job.status])))
+const pickerJobs = computed(() => jobs.value.filter(job => matches(pickerQuery.value, 'job', job.job_id, '', generationJobOptionLabel(job))))
 const activeJob = computed(() => selectedJob.value && isGenerationActive(selectedJob.value) ? selectedJob.value : null)
 const collectionTaskCount = computed(() => results.value.filter(row => !row.deleted).length)
 
@@ -136,16 +143,16 @@ onBeforeUnmount(() => { disposed = true; review.dispose(); window.removeEventLis
       <el-alert v-if="listError" :title="listError" type="error" :closable="false"><el-button text @click="review.refreshJobs">重试加载记录</el-button></el-alert>
       <div class="collection-job-selector">
         <div><b>生成批次任务</b><span>选择要审核并提交轨迹采集的生成作业</span></div>
-        <el-select v-model="selectedGenerationJobId" filterable placeholder="选择生成批次任务" aria-label="选择生成批次任务" :disabled="busy || refreshing || submitting" @change="selectGenerationJob">
-          <el-option v-for="job in jobs" :key="job.job_id" :label="generationJobOptionLabel(job)" :value="job.job_id" />
+        <el-select v-model="selectedGenerationJobId" filterable :filter-method="filterJobPicker" placeholder="选择生成批次任务" aria-label="选择生成批次任务" :disabled="busy || refreshing || submitting" @change="selectGenerationJob">
+          <el-option v-for="job in pickerJobs" :key="job.job_id" :label="generationJobOptionLabel(job, displayId('job', job.job_id))" :value="job.job_id" />
         </el-select>
       </div>
       <CollectionBatchSubmission v-if="selectedJob" :key="selectedJob.job_id" :job="selectedJob" :result-count="collectionTaskCount" :busy="busy || detailLoading || refreshing || submitting" :protect="review.protect" :run-protected="review.runExternalAction" />
       <div class="records-layout">
-        <aside class="job-directory"><el-input v-model="jobQuery" clearable :prefix-icon="Search" placeholder="搜索时间、状态或作业 ID" aria-label="搜索生成记录" /><el-select v-model="jobStatus" clearable placeholder="全部状态" aria-label="筛选作业状态"><el-option v-for="(label, value) in jobLabels" :key="value" :label="label" :value="value" /></el-select><div class="job-list"><button v-for="job in filteredJobs" :key="job.job_id" :data-job-id="job.job_id" :class="{ active: selectedJob?.job_id === job.job_id }" :disabled="busy" @click="review.selectJob(job)"><div><strong>{{ job.created_at.slice(0, 16).replace('T', ' ') }}</strong><span :class="`status-${job.status}`">{{ jobLabels[job.status] }}</span></div><p>{{ job.completed_items }} / {{ job.total_items }} 个执行单元 · {{ job.result_count }} 条结果</p><small>{{ job.job_id.slice(0, 12) }}</small></button><el-empty v-if="!filteredJobs.length" :description="jobs.length ? '没有匹配的记录' : '暂无生成记录'" :image-size="50" /></div></aside>
+        <aside class="job-directory"><el-input v-model="jobQuery" clearable :prefix-icon="Search" placeholder="搜索时间、状态或作业 ID" aria-label="搜索生成记录" /><el-select v-model="jobStatus" clearable placeholder="全部状态" aria-label="筛选作业状态"><el-option v-for="(label, value) in jobLabels" :key="value" :label="label" :value="value" /></el-select><div class="job-list"><button v-for="job in filteredJobs" :key="job.job_id" :data-job-id="job.job_id" :class="{ active: selectedJob?.job_id === job.job_id }" :disabled="busy" @click="review.selectJob(job)"><div><strong>{{ job.created_at.slice(0, 16).replace('T', ' ') }}</strong><span :class="`status-${job.status}`">{{ jobLabels[job.status] }}</span></div><p>{{ job.completed_items }} / {{ job.total_items }} 个执行单元 · {{ job.result_count }} 条结果</p><small :title="job.job_id">{{ displayId('job', job.job_id) }}</small></button><el-empty v-if="!filteredJobs.length" :description="jobs.length ? '没有匹配的记录' : '暂无生成记录'" :image-size="50" /></div></aside>
         <div class="job-detail" :aria-busy="detailLoading">
           <el-empty v-if="!selectedJob" description="提交生成后，在这里查看进度与审核结果" :image-size="70" />
-          <template v-else><header class="job-heading"><div><h2>{{ jobLabels[selectedJob.status] }}</h2><p>{{ selectedJob.created_at.slice(0, 19).replace('T', ' ') }} · 作业 {{ selectedJob.job_id }}</p></div><el-tag type="info">快照 {{ selectedJob.knowledge_base_version?.slice(0, 8) || '历史版本' }}</el-tag></header><p class="job-summary">{{ selectedJob.total_items }} 个执行单元<span v-if="selectedJob.expected_main_tasks != null"> · 预计 {{ selectedJob.expected_main_tasks }} 条主任务</span> · {{ selectedJob.result_count }} 条生成结果（含前置任务）</p>
+          <template v-else><header class="job-heading"><div><h2>{{ jobLabels[selectedJob.status] }}</h2><p>{{ selectedJob.created_at.slice(0, 19).replace('T', ' ') }} · 作业 <DisplayId kind="job" :id="selectedJob.job_id" /></p></div><el-tag type="info">快照 {{ selectedJob.knowledge_base_version?.slice(0, 8) || '历史版本' }}</el-tag></header><p class="job-summary">{{ selectedJob.total_items }} 个执行单元<span v-if="selectedJob.expected_main_tasks != null"> · 预计 {{ selectedJob.expected_main_tasks }} 条主任务</span> · {{ selectedJob.result_count }} 条生成结果（含前置任务）</p>
             <div v-if="activeJob" class="job-progress"><div><b>{{ stageLabel(activeJob.stage) }}</b><span>{{ activeJob.completed_items }} / {{ activeJob.total_items }}</span></div><el-progress :percentage="activeJob.percent" /><p>{{ unitLabel(activeJob, activeJob.current_item) }}</p><small>作业完成后显示可审核结果，切换页面不影响后台执行。</small></div>
             <details v-if="errors.length || selectedJob.error || selectedJob.warnings?.length" class="job-issues"><summary>{{ errors.length }} 项错误 · {{ selectedJob.warnings?.length || 0 }} 项提示</summary><article v-for="(error, index) in errors" :key="index"><strong>{{ unitLabel(selectedJob, error.item_id) }}<span v-if="error.stage"> · {{ stageLabel(error.stage) }}</span></strong><p>{{ error.error }}</p><small v-if="error.item_id">执行单元 {{ error.item_id }}</small></article><p v-if="selectedJob.error">{{ selectedJob.error }}</p><p v-for="warning in selectedJob.warnings" :key="warning">{{ warning }}</p></details>
             <el-alert v-if="detailError" :title="detailError" type="error" :closable="false"><el-button text @click="review.selectJob(selectedJob!, true)">重试加载结果</el-button></el-alert>

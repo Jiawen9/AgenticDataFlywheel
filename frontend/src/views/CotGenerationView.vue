@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import DisplayId from '@/components/DisplayId.vue'
+import { useDisplayIdentifiers } from '@/composables/useDisplayIdentifiers'
 import PipelineStatusBar from '@/components/PipelineStatusBar.vue'
 import { usePipelineContext } from '@/composables/usePipelineContext'
 import BatchPublishedNotice from '@/components/BatchPublishedNotice.vue'
@@ -18,6 +20,9 @@ import type { CorrectionCotJob, CorrectionCotResponse, CorrectionCotRow, Correct
 type EditableTextField = 'thought' | 'summary'
 
 const route = useRoute(), router = useRouter()
+const { displayId, matches } = useDisplayIdentifiers()
+const batchSearch = ref('')
+const visibleSessions = computed(() => sessions.value.filter(item => matches(batchSearch.value, 'batch', item.batch_id)))
 const sessions = ref<CorrectionSession[]>([])
 const selectedSessionId = ref('')
 const sessionCot = ref<CorrectionCotResponse | null>(null)
@@ -389,8 +394,9 @@ onBeforeUnmount(() => { disposed = true; ++detailRequest; ++listRequest; stopPol
       <div class="hero-metrics"><div><b>{{ editedRows }}</b><span>纠偏步骤</span></div><div><b>{{ generatedRows }}</b><span>模型生成</span></div></div>
     </header>
     <section class="toolbar">
-      <div class="toolbar-field"><span>业务批次</span><el-select v-model="selectedBatchId" :loading="loading" :disabled="pipelineContext.isPipelineRoute.value || loading || !sessions.length || hasUnsaved || jobRunning || saving || exporting" placeholder="选择批次"><el-option v-for="item in sessions" :key="item.batch_id" :label="item.batch_id" :value="item.batch_id" /></el-select></div>
+      <div class="toolbar-field"><span>业务批次</span><el-select v-model="selectedBatchId" filterable :filter-method="(value: string) => batchSearch = value" :loading="loading" :disabled="pipelineContext.isPipelineRoute.value || loading || !sessions.length || hasUnsaved || jobRunning || saving || exporting" placeholder="选择批次"><el-option v-for="item in visibleSessions" :key="item.batch_id" :label="displayId('batch', item.batch_id)" :value="item.batch_id" /></el-select></div>
       <div class="toolbar-stats"><span>任务 {{ selectedSession?.group_count ?? 0 }}</span><span>修改步骤 {{ editedRows }}</span></div>
+      <DisplayId v-if="selectedBatchId" kind="batch" :id="selectedBatchId" />
       <el-button type="primary" :loading="saving && jobRunning" :disabled="pipelineReadOnly || !selectedSessionId || !editedRows || jobRunning || hasUnsaved || !eligibleGroups.length" @click="generateAll">批量生成 bbox + COT</el-button>
       <el-button type="success" :loading="exporting" :disabled="pipelineReadOnly || !selectedSessionId || !editedRows || jobRunning || hasUnsaved || saving" @click="exportDataset">导出数据集</el-button>
       <el-button :icon="Refresh" text :disabled="loadingCot || jobRunning || hasUnsaved" @click="refreshCot">刷新</el-button>
@@ -398,7 +404,7 @@ onBeforeUnmount(() => { disposed = true; ++detailRequest; ++listRequest; stopPol
     <el-alert v-if="pendingReview" :title="`${pendingReview} 项人工修改待复核；生成和导出会排除这些任务。`" type="warning" :closable="false" show-icon><router-link :to="{ path: '/correction', query: { ...route.query, batch_id: selectedBatchId, ...(pipelineContext.isPipelineRoute.value ? { step_id: 'correction' } : {}) } }">进入当前批次复核</router-link></el-alert>
     <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />
     <section v-if="activeJob" class="job-status">
-      <div><b>{{ activeJob.status === 'succeeded' ? '生成完成' : activeJob.status === 'failed' ? '生成失败' : activeJob.stage === 'generating_bbox' ? '正在生成 bbox' : '正在生成 COT' }}</b><span v-if="activeJob.current_trajectory">{{ activeJob.current_trajectory }} · Step {{ activeJob.current_step }}</span><span v-if="activeJob.generate_bbox">bbox {{ activeJob.completed_bbox ?? 0 }}/{{ activeJob.total_steps }}</span><span>COT {{ activeJob.completed_cot ?? activeJob.completed_steps }}/{{ activeJob.total_steps }}</span><em v-if="activeJob.error">{{ activeJob.error }}</em></div>
+      <div><b>{{ activeJob.status === 'succeeded' ? '生成完成' : activeJob.status === 'failed' ? '生成失败' : activeJob.stage === 'generating_bbox' ? '正在生成 bbox' : '正在生成 COT' }}</b><span v-if="activeJob.current_trajectory"><DisplayId kind="trajectory" :id="activeJob.current_trajectory" :scope="selectedBatchId" /> · Step {{ activeJob.current_step }}</span><span v-if="activeJob.generate_bbox">bbox {{ activeJob.completed_bbox ?? 0 }}/{{ activeJob.total_steps }}</span><span>COT {{ activeJob.completed_cot ?? activeJob.completed_steps }}/{{ activeJob.total_steps }}</span><em v-if="activeJob.error">{{ activeJob.error }}</em></div>
       <el-progress :percentage="activeJob.percent" :status="activeJob.status === 'failed' ? 'exception' : activeJob.status === 'succeeded' ? 'success' : undefined" />
     </section>
     <el-empty v-if="!loading && !sessions.length" description="暂无可用批次，请先完成专家动作纠偏" :image-size="90" />
@@ -406,12 +412,12 @@ onBeforeUnmount(() => { disposed = true; ++detailRequest; ++listRequest; stopPol
       <aside class="step-panel">
         <div class="panel-title"><b>修改步骤</b><span>{{ editedRows }} 步</span></div>
         <div v-for="group in groups" :key="group.group_id" class="trajectory-group">
-          <div class="trajectory-heading"><el-icon><Document /></el-icon><b>{{ group.trajectory_id }}</b></div>
-          <button v-for="row in group.rows" :key="row.excel_row" class="step-item" :class="{ active: activeRow?.excel_row === row.excel_row }" :title="`${row.trajectory_id}-step${row.step}`" @click="selectRow(group.group_id, row)"><span>{{ row.trajectory_id }}-step{{ row.step }}</span><span class="step-check">✓</span></button>
+          <div class="trajectory-heading"><el-icon><Document /></el-icon><b><DisplayId kind="trajectory" :id="group.trajectory_id" :scope="selectedBatchId" /></b></div>
+          <button v-for="row in group.rows" :key="row.excel_row" class="step-item" :class="{ active: activeRow?.excel_row === row.excel_row }" :title="`${row.trajectory_id}-step${row.step}`" @click="selectRow(group.group_id, row)"><span>{{ displayId('trajectory', row.trajectory_id, selectedBatchId) }}-step{{ row.step }}</span><span class="step-check">✓</span></button>
         </div>
       </aside>
       <section class="image-panel">
-        <div class="panel-title"><div><b>步骤截图</b><span v-if="activeRow">{{ activeRow.trajectory_id }} · Step {{ activeRow.step }}</span></div><el-tag v-if="bboxEditing" type="warning" size="small">bbox 编辑中</el-tag></div>
+        <div class="panel-title"><div><b>步骤截图</b><span v-if="activeRow"><DisplayId kind="trajectory" :id="activeRow.trajectory_id" :scope="selectedBatchId" /> · Step {{ activeRow.step }}</span></div><el-tag v-if="bboxEditing" type="warning" size="small">bbox 编辑中</el-tag></div>
         <div class="image-stage">
           <ActionImage
             v-if="activeRow"
@@ -432,7 +438,7 @@ onBeforeUnmount(() => { disposed = true; ++detailRequest; ++listRequest; stopPol
         <div class="panel-title"><b>步骤详情</b><el-icon v-if="activeRow" class="done"><CircleCheck /></el-icon></div>
         <el-empty v-if="!activeRow" description="选择一个步骤" :image-size="70" />
         <template v-else>
-          <div class="identity"><span>任务名</span><b>{{ activeRow.task_id }}</b><p>{{ activeGroup?.task }}</p><div class="identity-meta">{{ activeRow.trajectory_id }} · Step {{ activeRow.step }}</div></div>
+          <div class="identity"><span>任务名</span><b><DisplayId kind="task" :id="activeRow.task_id" :scope="selectedBatchId" /></b><p>{{ activeGroup?.task }}</p><div class="identity-meta"><DisplayId kind="trajectory" :id="activeRow.trajectory_id" :scope="selectedBatchId" /> · Step {{ activeRow.step }}</div></div>
           <div class="field-card"><label>Action（专家纠偏结果）</label><code class="action-readonly" :title="compactAction">{{ compactAction }}</code><div class="original-value"><span>原始 Action</span><code :title="activeRow.original_action || '暂无'">{{ activeRow.original_action || '暂无' }}</code></div></div>
           <div class="bbox-card"><div class="card-head"><label>当前 bbox</label><code>{{ bboxText }}</code></div><div class="source-line">来源：{{ activeRow.bbox_source || 'original' }}</div><div class="original-value"><span>原始 bbox</span><code>{{ activeRow.original_actions_box || '未标框' }}</code></div></div>
           <div class="compare-card">

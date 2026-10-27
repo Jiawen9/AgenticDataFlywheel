@@ -21,7 +21,9 @@ from .data_store.registry import utc_now
 from .manual_collection import ManualCollectionStore
 from . import model_iteration
 from .phone_factory import DEFAULT_CONFIG, PhoneFactoryError, _atomic_write, _filename, _text
+from .remote_sync import BoundedSyncPool, RemoteSyncPolicy, SyncDeferred
 from .task_generation.collection_batches import payload_digest
+from .agent_types import normalize_agent_type, engine_capabilities, PROVENANCE_FIELDS
 
 TERMINAL = {"completed", "succeeded", "partial", "failed", "interrupted", "cancelled"}
 
@@ -34,12 +36,15 @@ class FactoryRuntime:
         self._thread = None
         self._protocol_cache = None
         self._protocol_lock = threading.Lock()
+        self.sync_policy = RemoteSyncPolicy(self.records)
+        self._evaluation_pool = BoundedSyncPool("model-iteration-sync", max_workers=2)
 
     @property
     def transfer(self):
         if self._transfer is None:
             from .collection_transfer import CollectionTransferManager
-            self._transfer = CollectionTransferManager(self.root, self.store.collection_runs, self)
+            self._transfer = CollectionTransferManager(self.root, self.store.collection_runs, self,
+                                                       sync_policy=self.sync_policy)
         return self._transfer
 
     def get_run(self, run_id):
@@ -61,41 +66,103 @@ class FactoryRuntime:
             self._transfer.close()
         if self._thread:
             self._thread.join(timeout=2)
+        self._evaluation_pool.close()
 
     def _poll_evaluations(self):
         while not self._stop.wait(10):
-            for run in self.records.list("model_iter_runs"):
-                if self._stop.is_set():
-                    return
-                needs_snapshot = (run.get("request", {}).get("evaluator_config")
-                                  and not (self.records.get("model_iter_results", run["run_id"]) or {}).get("final"))
-                if run["status"] in TERMINAL and not needs_snapshot and not (run["status"] == "failed" and run.get("dispatch_error")):
-                    continue
-                request = run.get("request", {})
-                if (request.get("result_transport") or request.get("metadata", {}).get("result_transport")) == "legacy":
-                    continue
-                try:
-                    self.sync_evaluation(run["run_id"])
-                except Exception:
-                    logging.getLogger(__name__).warning("评估状态查询失败: %s", run["run_id"], exc_info=True)
+            try:
+                self._schedule_evaluations()
+            except Exception:
+                logging.getLogger(__name__).exception("评估同步调度失败")
 
-    def sync_evaluation(self, run_id):
+    def _schedule_evaluations(self):
+        candidates = []
+        for run in self.records.list("model_iter_runs"):
+            snapshot = self.records.get("model_iter_results", run["run_id"]) or {}
+            if snapshot.get("final"):
+                self._restore_final_evaluation(run, snapshot)
+                continue
+            needs_snapshot = run.get("request", {}).get("evaluator_config") and not snapshot.get("final")
+            if run["status"] in TERMINAL and not needs_snapshot and not (run["status"] == "failed" and run.get("dispatch_error")):
+                continue
+            request = run.get("request", {})
+            if (request.get("result_transport") or request.get("metadata", {}).get("result_transport")) == "legacy":
+                continue
+            if self.sync_policy.due("evaluation", run):
+                candidates.append(run)
+        candidates.sort(key=lambda run: self.sync_policy.priority("evaluation", run))
+        for run in candidates:
+            if self._stop.is_set():
+                break
+            run_id = run["run_id"]
+            self._evaluation_pool.submit(run_id, lambda run_id=run_id: self._background_evaluation(run_id))
+
+    def _background_evaluation(self, run_id):
+        try:
+            self.sync_evaluation(run_id, force=False)
+        except Exception:
+            # The common policy persists and rate-limits diagnostics for both chains.
+            pass
+
+    def _restore_final_evaluation(self, run, snapshot):
+        """Recover a crash between saving the validated result and the run status."""
+        run_id = run["run_id"]
+        remote_status = self.sync_policy.view("evaluation", run_id).get("remote_status")
+        if remote_status in TERMINAL and (run["status"] not in TERMINAL
+                or run["status"] == "failed" and run.get("dispatch_error")):
+            def restore(current):
+                if current["status"] not in TERMINAL or current["status"] == "failed" and current.get("dispatch_error"):
+                    current.update(status=remote_status, remote_status=remote_status, dispatch_error=None,
+                                   evaluation_summary=snapshot["result"]["summary"], updated_at=utc_now())
+            run = self.records.update("model_iter_runs", run_id, restore)
+        self.sync_policy.complete("evaluation", run_id)
+        return run
+
+    def sync_evaluation(self, run_id, *, force=True, fresh=False):
         run = self.records.get("model_iter_runs", _identifier(run_id, "评估运行编号"))
         if run is None:
             raise PhoneFactoryError("评估运行不存在", 404)
+        snapshot = self.records.get("model_iter_results", run_id) or {}
+        if snapshot.get("final"):
+            return self._restore_final_evaluation(run, snapshot)
+        try:
+            result = self.sync_policy.execute("evaluation", run,
+                lambda: self._sync_evaluation(run_id), force=force, coalesce=not fresh)
+        except SyncDeferred as exc:
+            raise PhoneFactoryError(str(exc), exc.status) from exc
+        snapshot = self.records.get("model_iter_results", run_id) or {}
+        if snapshot.get("final") or (not run.get("request", {}).get("evaluator_config")
+                                      and result["status"] in TERMINAL and not result.get("dispatch_error")):
+            self.sync_policy.complete("evaluation", run_id)
+        return result
+
+    def _sync_evaluation(self, run_id):
+        run = self.records.get("model_iter_runs", run_id)
         remote = self.get_run(run_id)
+        if not isinstance(remote, dict):
+            raise PhoneFactoryError("远端评估运行响应格式无效", 502, remote_kind="protocol", remote_command="run")
         if remote.get("run_id", remote.get("collection_run_id")) != run_id or remote.get("run_mode") != "modeliter":
-            raise PhoneFactoryError("远端评估运行身份不匹配", 502)
+            raise PhoneFactoryError("远端评估运行身份不匹配", 502, remote_kind="identity", remote_command="run")
         if (run.get("request", {}).get("execution_mode") == "evaluate_only"
                 and remote.get("execution_mode") != "evaluate_only"):
-            raise PhoneFactoryError("远端运行不是独立评测任务", 502)
-        if remote.get("status") not in TERMINAL | {"queued", "running"}:
-            raise PhoneFactoryError("远端评估运行状态无效", 502)
+            raise PhoneFactoryError("远端运行不是独立评测任务", 502, remote_kind="identity", remote_command="run")
+        if (run.get("request", {}).get("execution_mode") != "evaluate_only"
+                and remote.get("agent_type", "newagent") != run.get("request", {}).get("agent_type", "newagent")):
+            raise PhoneFactoryError("远端评估运行采集引擎不匹配", 502, remote_kind="identity", remote_command="run")
+        if remote.get("status") not in TERMINAL | {"queued", "starting", "running"}:
+            raise PhoneFactoryError("远端评估运行状态无效", 502, remote_kind="protocol", remote_command="run")
+        self.sync_policy.observe_remote("evaluation", run_id, remote["status"])
         result = None
         if run.get("request", {}).get("evaluator_config"):
-            result = model_iteration.capture_results(self, run, final=remote["status"] in TERMINAL,
-                                                     remote_status=remote["status"])
+            try:
+                result = model_iteration.capture_results(self, run, final=remote["status"] in TERMINAL,
+                                                         remote_status=remote["status"])
+            except PhoneFactoryError as exc:
+                if not getattr(exc, "remote_kind", None):
+                    exc.remote_kind, exc.remote_command = "protocol", "run-evaluations"
+                raise
         def update(current):
+            current.update({key: remote[key] for key in PROVENANCE_FIELDS if key in remote})
             if result is not None:
                 current["evaluation_summary"] = result["summary"]
             if current["status"] not in TERMINAL or (current["status"] == "failed" and current.get("dispatch_error")):
@@ -147,6 +214,10 @@ class FactoryRuntime:
         if data.get("run_mode", mode) != mode:
             raise PhoneFactoryError("运行模式与接口不匹配", 409)
         state = self.store._current()
+        try:
+            agent_type = normalize_agent_type(data.get("agent_type", "newagent"))
+        except ValueError as exc:
+            raise PhoneFactoryError(str(exc)) from exc
         config = data.get("config", {})
         if not isinstance(config, dict) or set(config) - set(DEFAULT_CONFIG):
             raise PhoneFactoryError("本次采样配置无效")
@@ -170,7 +241,7 @@ class FactoryRuntime:
         associations.sort(key=lambda row: (row["phone_id"], row["app"]))
         if not associations:
             raise PhoneFactoryError("请选择已关联 App 的手机")
-        options = {"run_mode": mode, "result_transport": "http", "vla": vla, "config": config, "phone_id": phone, "app": app, "phone_apps": associations, "phone_ids": sorted({row["phone_id"] for row in associations})}
+        options = {"agent_type": agent_type, "run_mode": mode, "result_transport": "http", "vla": vla, "config": config, "phone_id": phone, "app": app, "phone_apps": associations, "phone_ids": sorted({row["phone_id"] for row in associations})}
         if mode == "modeliter":
             options.update(model_iteration.evaluation_options(self.store, data))
             if options["checklist_source"] == "auto":
@@ -195,6 +266,36 @@ class FactoryRuntime:
         if protocol == "unsupported":
             raise PhoneFactoryError("采集服务不支持批次结果回传，请升级采集服务后再运行", 409)
 
+    def agent_capabilities(self):
+        try:
+            remote = self.store._remote_result(["capabilities"])
+        except PhoneFactoryError as exc:
+            if getattr(exc, "remote_status", None) in {404, 405}:
+                return {"ok": True, "agent_types": engine_capabilities({})}
+            return {"ok": True, "agent_types": {name: {"available": False, "collection": False,
+                    "capture_logprobs": False, "model_iteration_evaluation": False,
+                    "offline_evaluation": False, "reason": f"能力检查失败：{exc}"}
+                    for name in ("newagent", "pipelineagent")}}
+        return {"ok": True, "agent_types": engine_capabilities(remote)}
+
+    def _require_agent_capability(self, options):
+        agent_type = options["agent_type"]
+        try:
+            remote = self.store._remote_result(["capabilities"])
+        except PhoneFactoryError:
+            if agent_type == "newagent":
+                return  # Preserve the established legacy newagent transport.
+            raise PhoneFactoryError("无法确认 PipelineAgent 能力，请检查并升级采集电脑", 409)
+        if agent_type == "pipelineagent" and (remote.get("protocol_version") != 1 or remote.get("batch_results") is not True):
+            raise PhoneFactoryError("PipelineAgent 需要支持批次回传的新版采集服务", 409)
+        capability = engine_capabilities(remote).get(agent_type, {})
+        if capability.get("available") is not True or capability.get("collection") is not True:
+            raise PhoneFactoryError(capability.get("reason") or f"采集电脑不支持 {agent_type}", 409)
+        if options["config"]["capture_logprobs"] and capability.get("capture_logprobs") is not True:
+            raise PhoneFactoryError(f"{agent_type} 尚不支持 Logprobs 采集", 409)
+        if options["run_mode"] == "modeliter" and capability.get("model_iteration_evaluation") is not True:
+            raise PhoneFactoryError(f"{agent_type} 尚不支持模型迭代评测，请升级采集电脑", 409)
+
     def remote_start(self, data, mode):
         task, path, content = self._task(_filename(data.get("filename")), mode)
         options = self._options(data, mode)
@@ -204,18 +305,25 @@ class FactoryRuntime:
         metadata = {**options, "filename": task["filename"]}
         # Evaluation always uses the upgraded HTTP contract; its capability is
         # checked afresh below so an in-place collector upgrade needs no platform restart.
-        protocol = "http" if mode == "modeliter" else self._protocol()
+        protocol = "http" if mode == "modeliter" or options["agent_type"] == "pipelineagent" else self._protocol()
         if protocol == "legacy":
             metadata["result_transport"] = "legacy"
         if mode == "generate":
             run, created = self.store.collection_runs.create(task["source_batch_id"], dispatch_key=request_id, metadata=metadata, workbook_sha256=digest)
             run_id = run["collection_run_id"]
+            if created:
+                def initialize_dispatch(item):
+                    # A concurrent idempotent submission may have already sent it.
+                    if item["status"] == "dispatching":
+                        item.setdefault("dispatch_attempted", False)
+                run = self.records.update("collection_runs", run_id, initialize_dispatch)
         else:
             run_id = "eval_" + payload_digest(request_id)
             request = {**metadata, "workbook_sha256": digest}
-            payload = {"run_id": run_id, "collection_run_id": run_id, "run_mode": "modeliter", "status": "dispatching", "filename": task["filename"], "vla": options["vla"], "created_at": utc_now(), "request": request, "request_digest": payload_digest(request), "errors": [], "dispatch_error": None}
+            payload = {"run_id": run_id, "collection_run_id": run_id, "run_mode": "modeliter", "status": "dispatching", "filename": task["filename"], "vla": options["vla"], "created_at": utc_now(), "request": request, "request_digest": payload_digest(request), "errors": [], "dispatch_error": None, "dispatch_attempted": False}
             try:
-                run = self.records.put("model_iter_runs", run_id, payload, expected_revision=0)
+                from .display_identifiers import DisplayIdentifierStore
+                run = DisplayIdentifierStore(self.root).create_run("model_iter_runs", run_id, payload)
                 created = True
             except RevisionConflict:
                 run = self.records.get("model_iter_runs", run_id)
@@ -238,8 +346,12 @@ class FactoryRuntime:
                     except PhoneFactoryError:
                         known = {}
                     if (known.get("run_id", known.get("collection_run_id")) == run_id
+                            and known.get("agent_type", "newagent") != options["agent_type"]):
+                        raise PhoneFactoryError("远端已有运行的采集引擎与请求不匹配，不能重新下发", 502)
+                    if (known.get("run_id", known.get("collection_run_id")) == run_id
                             and known.get("run_mode") == mode
-                            and known.get("status") in TERMINAL | {"queued", "running"}):
+                            and known.get("agent_type", "newagent") == options["agent_type"]
+                            and known.get("status") in TERMINAL | {"queued", "starting", "running"}):
                         if mode == "generate":
                             saved = self.store.collection_runs.dispatched(run_id, known)
                         else:
@@ -247,11 +359,15 @@ class FactoryRuntime:
                                 if item["status"] not in {"interrupted", "cancelled", "succeeded", "partial", "completed"}:
                                     item.update(status=known["status"], errors=known.get("errors", []), dispatch_error=None, updated_at=utc_now())
                             saved = self.records.update("model_iter_runs", run_id, recovered)
+                        self.sync_policy.reset("collection" if mode == "generate" else "evaluation", run_id)
+                        self.records.update("collection_runs" if mode == "generate" else "model_iter_runs", run_id,
+                            lambda item: item.update(dispatch_attempted=True))
                         return {**known, **saved, "ok": True, "reused": True}
+                self._require_agent_capability(options)
                 if mode == "modeliter":
                     model_iteration.require_capability(self.store, profiles=options["checklist_source"] == "auto")
                     model_iteration.verify_profile(self.store, options)
-                else:
+                elif options["agent_type"] == "newagent":
                     self._capabilities()
                 if mode == "generate":
                     with active_batch_lock(task["source_batch_id"], self.root):
@@ -267,7 +383,7 @@ class FactoryRuntime:
                     apps_path, manifest_path = directory / "apps.json", directory / "tasks.json"
                     apps_path.write_text(json.dumps(options["phone_apps"], ensure_ascii=False), encoding="utf-8")
                     manifest_path.write_text(json.dumps({"tasks": tasks}, ensure_ascii=False), encoding="utf-8")
-                    args = ["start-run", str(path), str(apps_path), options["phone_id"], options["app"], "--vla", options["vla"], "--runmode", mode, "--temperature", str(options["config"]["temperature"]), "--top-p", str(options["config"]["top_p"])]
+                    args = ["start-run", str(path), str(apps_path), options["phone_id"], options["app"], "--agent-type", options["agent_type"], "--vla", options["vla"], "--runmode", mode, "--temperature", str(options["config"]["temperature"]), "--top-p", str(options["config"]["top_p"])]
                     if mode == "modeliter":
                         args += ["--evaluator-config", json.dumps(options["evaluator_config"], ensure_ascii=False),
                                  "--checklist-source", options["checklist_source"], "--evaluation-mode", "checklist"]
@@ -287,8 +403,14 @@ class FactoryRuntime:
                     if mode == "generate":
                         with active_batch_lock(task["source_batch_id"], self.root):
                             self.records.update("collection_runs", run_id,
-                                lambda item: item.update(dispatch_attempted=True))
+                                lambda item: item.update(dispatch_attempted=True, submitted_at=utc_now()))
+                    else:
+                        self.records.update("model_iter_runs", run_id,
+                            lambda item: item.update(dispatch_attempted=True, submitted_at=utc_now()))
+                    self.sync_policy.reset("collection" if mode == "generate" else "evaluation", run_id)
                     response = self.store._remote_result(args)
+                    if response.get("agent_type", "newagent") != options["agent_type"]:
+                        raise PhoneFactoryError("远端接受运行的采集引擎与请求不匹配", 502)
                     if response.get("ok") is False:
                         raise PhoneFactoryError(response.get("error") or response.get("message") or "远端未接受运行", 502)
                 if mode == "generate":
@@ -298,6 +420,7 @@ class FactoryRuntime:
                         if item["status"] not in {"interrupted", "cancelled", "succeeded", "partial", "completed"}:
                             item.update(status="running", dispatch_response=response, dispatch_error=None, updated_at=utc_now())
                     saved = self.records.update("model_iter_runs", run_id, accepted)
+                self.sync_policy.reset("collection" if mode == "generate" else "evaluation", run_id)
                 return {**response, **saved, "ok": True}
             except Exception as exc:
                 if mode == "generate":
@@ -331,9 +454,11 @@ class FactoryRuntime:
                    "evaluation_profile_id": options["evaluation_profile_id"],
                    "evaluation_profile_digest": options["evaluation_profile_digest"],
                    "status": "dispatching", "filename": "已有轨迹评测", "vla": "", "created_at": utc_now(),
-                   "request": request, "request_digest": payload_digest(request), "errors": [], "dispatch_error": None}
+                   "request": request, "request_digest": payload_digest(request), "errors": [], "dispatch_error": None,
+                   "dispatch_attempted": False}
         try:
-            run = self.records.put("model_iter_runs", run_id, payload, expected_revision=0)
+            from .display_identifiers import DisplayIdentifierStore
+            run = DisplayIdentifierStore(self.root).create_run("model_iter_runs", run_id, payload)
             created = True
         except RevisionConflict:
             run = self.records.get("model_iter_runs", run_id)
@@ -356,16 +481,20 @@ class FactoryRuntime:
                 # a GET with only the same run id cannot establish that identity.
                 # Already accepted runs may outlive their selectable rule version.
                 remote_request = {**options, "collection_run_id": run_id, "preview_id": preview_id}
+                self.records.update("model_iter_runs", run_id,
+                    lambda item: item.update(dispatch_attempted=True, submitted_at=utc_now()))
+                self.sync_policy.reset("evaluation", run_id)
                 response = self.store._remote_result(["start-evaluation", "--payload", json.dumps(remote_request, ensure_ascii=False)])
                 if (response.get("ok") is False or response.get("run_id", response.get("collection_run_id")) != run_id
                         or response.get("run_mode") != "modeliter" or response.get("execution_mode") != "evaluate_only"
-                        or response.get("status") not in TERMINAL | {"queued", "running"}):
+                        or response.get("status") not in TERMINAL | {"queued", "starting", "running"}):
                     raise PhoneFactoryError("远端未接受独立评测，或返回的运行身份不匹配", 502)
                 def accepted(item):
                     if item["status"] not in {"interrupted", "cancelled", "succeeded", "partial", "completed"}:
                         item.update(status=response["status"], dispatch_response=response,
                                     dispatch_error=None, updated_at=utc_now())
                 saved = self.records.update("model_iter_runs", run_id, accepted)
+                self.sync_policy.reset("evaluation", run_id)
                 return {**response, **saved, "ok": True}
             except Exception as exc:
                 def failed(item):
@@ -381,17 +510,19 @@ class FactoryRuntime:
                 request = run.get("request", {})
                 metadata = {key: request[key] for key in ("source", "source_digest", "evaluation_profile_id",
                                                          "evaluation_profile_digest", "checklist_source") if key in request}
-                runs.append({**run, **metadata, "execution_mode": request.get("execution_mode", "collect_and_evaluate")})
+                runs.append({**run, **metadata, **({"agent_type": request.get("agent_type", "newagent")} if request.get("execution_mode") != "evaluate_only" else {}), "execution_mode": request.get("execution_mode", "collect_and_evaluate"),
+                             "sync": self.sync_policy.view("evaluation", run["run_id"])})
             return sorted(runs, key=lambda item: (item["created_at"], item["run_id"]))
         views = []
         for run in self.store.collection_runs.list_runs():
             transfer = self.records.get("collection_transfers", run["collection_run_id"]) or {}
             metadata = run.get("request", {}).get("metadata", {})
-            views.append({**run, "filename": metadata.get("filename"), "vla": metadata.get("vla"), **{key: transfer[key] for key in ("remote_status", "transfer_status", "transfer_error", "remote_errors", "transfer_updated_at") if key in transfer}, "trajectory_count": len(run.get("trajectories", []))})
+            views.append({**run, "filename": metadata.get("filename"), "vla": metadata.get("vla"), "agent_type": metadata.get("agent_type", "newagent"), **{key: transfer[key] for key in ("remote_status", "transfer_status", "transfer_error", "remote_errors", "transfer_updated_at") if key in transfer}, "trajectory_count": len(run.get("trajectories", [])),
+                          "sync": self.sync_policy.view("collection", run["collection_run_id"])})
         return views
 
     def public_state(self, state, mode):
-        statuses = {"dispatching": "下发中", "queued": "排队中", "running": "运行中", "completed": "已回传", "succeeded": "已完成", "partial": "部分完成", "failed": "失败", "interrupted": "已中断", "cancelled": "已中断"}
+        statuses = {"dispatching": "下发中", "queued": "排队中", "starting": "启动中", "running": "运行中", "completed": "已回传", "succeeded": "已完成", "partial": "部分完成", "failed": "失败", "interrupted": "已中断", "cancelled": "已中断"}
         runs = self.run_views(mode)
         for task in state["tasks"]:
             matching = [run for run in runs if run.get("filename") == task["filename"]]
@@ -399,7 +530,7 @@ class FactoryRuntime:
                 continue
             # A task can run on several phones; one phone finishing must not
             # hide another phone's active run, regardless of dispatch order.
-            active = [run for run in matching if run["status"] in {"dispatching", "queued", "running"}]
+            active = [run for run in matching if run["status"] in {"dispatching", "queued", "starting", "running"}]
             if active:
                 latest = active[-1]
                 # Legacy collectors own results in the phone workspace and never
@@ -462,7 +593,43 @@ class FactoryRuntime:
         self.store._update(remove)
         return {**response, "state": self.store.state(mode)}
 
+    def cancel_collection(self, run_id):
+        run_id = _identifier(run_id, "采集运行编号")
+        run = self.store.collection_runs.get(run_id)
+        if run is None:
+            raise PhoneFactoryError("采集运行不存在", 404)
+        # Serialize with dispatch and transfer/publication before requesting a stop.
+        with batch_lock(self.root, "dispatch_" + run_id), active_batch_lock(run["batch_id"], self.root):
+            from .pipeline_access import ensure_pipeline_write
+            ensure_pipeline_write(run["batch_id"], self.root, action="collect")
+            run = self.store.collection_runs.get(run_id)
+            if run["status"] in {"interrupted", "cancelled"}:
+                return {**run, "agent_type": run.get("request", {}).get("metadata", {}).get("agent_type", "newagent")}
+            if run["status"] not in {"dispatching", "queued", "starting", "running"}:
+                raise PhoneFactoryError("只有活动采集运行可以停止", 409)
+            metadata = run.get("request", {}).get("metadata", {})
+            if metadata.get("result_transport") == "legacy":
+                raise PhoneFactoryError("旧采集服务不支持按运行停止，请升级采集电脑", 409)
+            remote = self.get_run(run_id)
+            if (not isinstance(remote, dict) or remote.get("run_id", remote.get("collection_run_id")) != run_id
+                    or remote.get("run_mode") != "generate"
+                    or remote.get("agent_type", "newagent") != metadata.get("agent_type", "newagent")):
+                raise PhoneFactoryError("远端采集运行身份或引擎不匹配，未请求停止", 502)
+            result = self.store._remote_result(["cancel-run", run_id])
+            if (not isinstance(result, dict) or result.get("ok") is False
+                    or result.get("run_id", result.get("collection_run_id")) != run_id
+                    or result.get("status") not in {"cancelled", "interrupted"}):
+                raise PhoneFactoryError("采集电脑尚未确认停止，请刷新运行状态后重试", 502)
+            saved = self.records.update("collection_runs", run_id, lambda current: current.update(
+                status="interrupted", remote_status=result["status"], interrupted_at=utc_now(),
+                updated_at=utc_now(), dispatch_error=None, cancel_response=result))
+            self.sync_policy.observe_remote("collection", run_id, result["status"])
+            self.sync_policy.complete("collection", run_id)
+            return {**saved, "agent_type": metadata.get("agent_type", "newagent")}
+
     def dispatch(self, action, method, data, mode):
+        if method == "GET" and action == "agent-capabilities":
+            return True, self.agent_capabilities()
         if mode == "modeliter" and action == "evaluation-config":
             if method == "GET":
                 return True, model_iteration.get_config(self.store)
@@ -491,7 +658,8 @@ class FactoryRuntime:
         if action.startswith("runs/") and mode == "modeliter":
             parts = action.split("/")
             if method == "POST" and len(parts) == 3 and parts[2] == "sync":
-                return True, self.sync_evaluation(parts[1])
+                saved = self.sync_evaluation(parts[1], force=True)
+                return True, {**saved, "sync": self.sync_policy.view("evaluation", parts[1])}
             if method == "POST" and len(parts) == 3 and parts[2] == "cancel":
                 run_id = _identifier(parts[1], "评估运行编号")
                 if self.records.get("model_iter_runs", run_id) is None:
@@ -499,7 +667,23 @@ class FactoryRuntime:
                 result = self.store._remote_result(["cancel-run", run_id])
                 if result.get("ok") is False:
                     raise PhoneFactoryError("远端取消评测失败", 502)
-                return True, self.sync_evaluation(run_id)
+                acknowledged = (result.get("run_id", result.get("collection_run_id")) == run_id
+                                and result.get("status") == "cancelled")
+                if acknowledged:
+                    def cancelled(current):
+                        if current["status"] not in TERMINAL or current.get("dispatch_error"):
+                            current.update(status="cancelled", remote_status="cancelled", dispatch_error=None,
+                                           updated_at=utc_now())
+                    self.records.update("model_iter_runs", run_id, cancelled)
+                    self.sync_policy.observe_remote("evaluation", run_id, "cancelled")
+                try:
+                    return True, self.sync_evaluation(run_id, force=True, fresh=True)
+                except PhoneFactoryError:
+                    if not acknowledged:
+                        raise
+                    # Cancellation is confirmed even if the final results need a retry.
+                    return True, {**self.records.get("model_iter_runs", run_id),
+                                  "sync": self.sync_policy.view("evaluation", run_id)}
             if method == "GET" and len(parts) == 3 and parts[2] == "evaluations":
                 run_id = _identifier(parts[1], "评估运行编号")
                 run = self.records.get("model_iter_runs", run_id)
@@ -511,18 +695,27 @@ class FactoryRuntime:
                 if snapshot and snapshot.get("final"):
                     return True, snapshot["result"]
                 try:
-                    self.sync_evaluation(run_id)
-                    return True, self.records.get("model_iter_results", run_id)["result"]
+                    self.sync_evaluation(run_id, force=False)
+                    current_snapshot = self.records.get("model_iter_results", run_id)
+                    if not current_snapshot or not current_snapshot.get("result"):
+                        raise PhoneFactoryError("评测结果正在等待同步，请稍后重试", 503)
+                    return True, current_snapshot["result"]
                 except PhoneFactoryError as exc:
+                    snapshot = self.records.get("model_iter_results", run_id) or snapshot
                     if snapshot:
-                        return True, {**snapshot["result"], "stale": True, "sync_error": str(exc)}
+                        info = self.sync_policy.view("evaluation", run_id)
+                        stale = bool(info.get("last_error") or info.get("state") == "paused")
+                        return True, {**snapshot["result"], **({"stale": True, "sync_error": str(exc)} if stale else {})}
                     raise
         if action.startswith("collection-runs/") and mode == "modeliter":
             raise PhoneFactoryError("评估结果不进入生产采集链", 409)
         if action.startswith("collection-runs/") and method == "POST":
             parts = action.split("/")
+            if len(parts) == 3 and parts[2] == "cancel":
+                return True, self.cancel_collection(parts[1])
             if len(parts) == 3 and parts[2] == "sync":
-                return True, self.transfer.sync(parts[1])
+                saved = self.transfer.sync(parts[1], force=True)
+                return True, {**saved, "sync": self.sync_policy.view("collection", parts[1])}
         if method == "GET" and action == "batches":
             return True, {"batches": self.batches()}
         if method == "GET" and action.startswith("batches/"):
