@@ -7,6 +7,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from .data_store.registry import utc_now
 from .phone_factory import PhoneFactoryError
+from .agent_types import PROVENANCE_FIELDS
 
 ROLES = ("text", "vision")
 COUNTS = ("total", "collection_completed", "collection_failed", "evaluation_completed",
@@ -213,6 +214,8 @@ def validate_results(value, run_id, expected_phones, *, expected_sources=None, m
             or value.get("run_mode") != "modeliter" or not isinstance(value.get("cases"), list)
             or not isinstance(value.get("summary"), dict)):
         raise PhoneFactoryError("远端评测结果身份或格式不匹配", 502)
+    if (metadata or {}).get("agent_type") and value.get("agent_type", metadata["agent_type"]) != metadata["agent_type"]:
+        raise PhoneFactoryError("远端评测结果的采集引擎不匹配", 502)
     summary = value["summary"]
     if any(type(summary.get(key)) is not int or summary[key] < 0 for key in COUNTS):
         raise PhoneFactoryError("远端评测计数无效", 502)
@@ -263,7 +266,7 @@ def validate_results(value, run_id, expected_phones, *, expected_sources=None, m
             summary["evaluation_pending"] += 1
     denominator = sum(summary[key] for key in VERDICTS)
     summary["success_rate"] = summary["success"] / denominator if denominator else None
-    return {"run_id": run_id, "run_mode": "modeliter", "summary": summary, "cases": cases, **(metadata or {})}
+    return {**{key: value[key] for key in PROVENANCE_FIELDS if key in value}, "run_id": run_id, "run_mode": "modeliter", "summary": summary, "cases": cases, **(metadata or {})}
 
 
 def capture_results(runtime, run, *, final=False, remote_status=None):
@@ -274,7 +277,7 @@ def capture_results(runtime, run, *, final=False, remote_status=None):
     expected_sources = ({row["source_trajectory_id"]: row for row in request["source_cases"]}
                         if request.get("execution_mode") == "evaluate_only" else None)
     metadata = {key: request[key] for key in ("execution_mode", "source", "source_digest", "evaluation_profile_id",
-                                             "evaluation_profile_digest", "checklist_source") if key in request}
+                                             "evaluation_profile_digest", "checklist_source", "agent_type") if key in request}
     value = validate_results(runtime.store._remote_result(["run-evaluations", run["run_id"]]),
                              run["run_id"], request.get("phone_ids", []),
                              expected_sources=expected_sources, metadata=metadata)

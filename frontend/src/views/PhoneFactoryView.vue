@@ -14,6 +14,7 @@
         <dl class="device-info">
           <dt>序列号</dt><dd>{{ device.id }}</dd><dt>资产编号</dt><dd>{{ device.id }}</dd>
           <dt>手机型号</dt><dd>{{ device.model || '—' }}</dd><dt>运行 App</dt><dd>{{ device.apps.join('、') || '—' }}</dd>
+          <dt v-if="device.agent_type">采集引擎</dt><dd v-if="device.agent_type">{{ agentLabel(device.agent_type) }}</dd>
           <dt>电量</dt><dd>{{ device.battery == null ? '—' : `${device.battery}%` }}</dd><dt>状态</dt><dd>{{ device.status }}</dd>
         </dl>
         <small>查看画面与日志</small>
@@ -23,6 +24,7 @@
     <el-dialog :model-value="Boolean(selectedId)" :title="`手机监控 · ${selectedId}`" width="min(1100px, 95vw)" destroy-on-close @close="closeMonitor">
       <template v-if="selectedDevice">
         <div class="monitor-heading">
+          <el-tag v-if="monitor?.agent_type">{{ agentLabel(monitor.agent_type) }}</el-tag>
           <el-tag :type="selectedDevice.connected ? 'success' : 'info'">{{ selectedDevice.connected ? '已连接' : '离线' }}</el-tag>
           <el-tag :type="monitor?.running ? 'warning' : 'info'">{{ monitor ? (monitor.running ? '运行中' : '空闲') : '状态待查询' }}</el-tag>
           <span>运行 App：{{ selectedDevice.apps.join('、') || '—' }}</span>
@@ -39,10 +41,11 @@
 </template>
 <script setup lang="ts">
 import { computed, nextTick, ref, onMounted, onBeforeUnmount } from 'vue'
-import { phoneFactoryApi, type PhoneMonitor } from '@/phoneFactoryApi'
+import { agentLabel } from '@/utils/collectionAgents'
+import { phoneFactoryApi, type AgentType, type PhoneMonitor } from '@/phoneFactoryApi'
 import { createSerialPoller, useFactoryPolling } from '@/composables/useFactoryPolling'
 
-interface Device { id: string; apps: string[]; model: string; battery: number | null; connected: boolean; status: string }
+interface Device { agent_type?: AgentType; run_id?: string; id: string; apps: string[]; model: string; battery: number | null; connected: boolean; status: string }
 const devices = ref<Device[]>([]), taskCount = ref(0), error = ref(''), loading = ref(true), updatedAt = ref('')
 const selectedId = ref(''), monitor = ref<PhoneMonitor | null>(null), monitorError = ref(''), monitorLoading = ref(false)
 const logElement = ref<HTMLPreElement | null>(null)
@@ -63,7 +66,7 @@ const devicePoller = useFactoryPolling(async (signal, current) => {
     devices.value = ids.map(id => {
       const connected = adb.devices.find(item => item.serial === id)
       const apps = [...new Set(state.phoneApps.filter(item => item.phone_id === id).map(item => item.app))]
-      return { id, apps, model: connected?.model || '', battery: connected?.battery ?? null, connected: Boolean(connected), status: statuses.statuses.find(item => item.phone_id === id)?.status || '未知' }
+      return { id, apps, agent_type: statuses.statuses.find(item => item.phone_id === id)?.agent_type, run_id: statuses.statuses.find(item => item.phone_id === id)?.run_id, model: connected?.model || '', battery: connected?.battery ?? null, connected: Boolean(connected), status: statuses.statuses.find(item => item.phone_id === id)?.status || '未知' }
     })
     taskCount.value = state.tasks.length
     error.value = ''; updatedAt.value = new Date().toLocaleTimeString()

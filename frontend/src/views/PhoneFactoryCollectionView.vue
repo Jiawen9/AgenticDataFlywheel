@@ -79,6 +79,12 @@
           <span class="panel-tip">上传文件由后端统一保存</span>
         </div>
 
+        <div class="row-form config-row">
+          <span class="field-label">采集引擎</span>
+          <CollectionAgentSelect v-model="agentType" :capabilities="agentCapabilities" :disabled="taskBusy || savingConfig" data-testid="default-agent-type" @update:model-value="handleConfigChange" />
+          <el-button :loading="loadingAgents" :disabled="taskBusy" @click="loadAgentCapabilities">刷新引擎</el-button>
+        </div>
+        <el-alert v-if="agentIssue || agentError" :title="agentIssue || agentError" type="warning" :closable="false" />
         <!-- 3.1 VLA接口 -->
         <div class="row-form">
           <span class="field-label">VLA接口</span>
@@ -128,8 +134,8 @@
         <h3 class="sub-title">采集任务批次</h3>
         <div class="row-form">
           <span class="field-label">采集批次</span>
-          <el-select :model-value="selectedBatchId" filterable clearable :loading="loadingBatches || loadingBatch" :disabled="taskBusy || runDialogVisible" placeholder="选择已提交的采集批次" class="batch-select" @change="selectCollectionBatch">
-            <el-option v-for="batch in collectionBatches" :key="batch.batch_id" :value="batch.batch_id" :label="collectionBatchOptionLabel(batch)" />
+          <el-select :model-value="selectedBatchId" filterable :filter-method="filterCollectionBatches" clearable :loading="loadingBatches || loadingBatch" :disabled="taskBusy || runDialogVisible" placeholder="选择已提交的采集批次" class="batch-select" @change="selectCollectionBatch">
+            <el-option v-for="batch in filteredCollectionBatches" :key="batch.batch_id" :value="batch.batch_id" :label="collectionBatchOptionLabel(batch)" />
           </el-select>
           <el-button :loading="loadingBatches" :disabled="taskBusy || runDialogVisible" @click="collection.loadBatches()">刷新批次</el-button>
         </div>
@@ -137,7 +143,7 @@
         <div v-if="selectedBatch && selectedBatchRow" class="batch-summary">
           <p><strong>{{ selectedBatch.task_count }} 条任务</strong> · {{ selectedBatch.apps.join('、') }} · {{ selectedBatch.created_at.slice(0, 19).replace('T', ' ') }}</p>
           <el-alert v-if="selectedBatch.warnings?.length" :title="warningSummary(selectedBatch.warnings)" type="warning" :closable="false" show-icon class="batch-alert" data-testid="collection-classification-warning" />
-          <p>{{ selectedBatch.source_job_id ? `来源作业：${selectedBatch.source_job_id}` : '来源：手动上传' }} · {{ selectedBatchRow.status }}</p>
+          <p>批次：<DisplayId kind="batch" :id="selectedBatch.batch_id" /> · <template v-if="selectedBatch.source_job_id">来源作业：<DisplayId kind="job" :id="selectedBatch.source_job_id" /></template><template v-else>来源：手动上传</template> · {{ selectedBatchRow.status }}</p>
           <el-button type="primary" :loading="startingTask === selectedBatchRow.filename" :disabled="taskBusy || isManagedTask(selectedBatchRow)" @click="handleStartTask(selectedBatchRow)">开始运行所选批次</el-button>
           <el-button :loading="downloadingBatch" :disabled="taskBusy" @click="downloadCollectionBatch">下载采集表</el-button>
           <router-link :to="{ path: '/collection/tree-building', query: { ...route.query, batch_id: selectedBatch.batch_id, collection_batch_id: undefined, ...(pipelineContext.isPipelineRoute.value ? { step_id: 'preprocessing' } : {}) } }" class="preprocessing-link">前往预处理</router-link>
@@ -158,8 +164,8 @@
         <!-- 3.3 任务列表 -->
         <h3 class="sub-title">任务列表</h3>
         <el-table :data="tasks" border stripe>
-          <el-table-column prop="description" label="任务描述" min-width="140" show-overflow-tooltip />
-          <el-table-column prop="filename" label="文件名" min-width="140" show-overflow-tooltip />
+          <el-table-column label="任务描述" min-width="140" show-overflow-tooltip><template #default="{ row }">{{ taskDescription(row) }}</template></el-table-column>
+          <el-table-column label="文件名" min-width="140" show-overflow-tooltip><template #default="{ row }"><span :title="row.filename">{{ taskFileLabel(row) }}</span></template></el-table-column>
           <el-table-column label="状态" width="90" align="center">
             <template #default="{ row }">
               <el-tag type="warning" effect="light">{{ row.status }}</el-tag>
@@ -186,23 +192,24 @@
         </template>
 
         <h3 class="sub-title">{{ isEvaluation ? '评估运行与报告' : '采集运行与回传' }}</h3>
+        <el-input v-model="runQuery" clearable placeholder="搜索显示编号、完整编号或文件名" aria-label="搜索运行" class="run-search" />
         <el-alert v-if="runError" :title="runError" type="warning" :closable="false" />
-        <el-table :data="runs" border data-testid="factory-runs">
-          <el-table-column label="运行编号" min-width="160" show-overflow-tooltip><template #default="{ row }">{{ row.collection_run_id || row.run_id }}</template></el-table-column>
+        <el-table :data="filteredRuns" border data-testid="factory-runs">
+          <el-table-column label="运行编号" min-width="160"><template #default="{ row }"><DisplayId kind="run" :id="row.collection_run_id || row.run_id" /></template></el-table-column>
+          <el-table-column label="采集引擎" min-width="130"><template #default="{ row }">{{ row.execution_mode === 'evaluate_only' ? (row.source?.agent_type ? agentLabel(row.source.agent_type) : '已有轨迹') : agentLabel(row.agent_type) }}</template></el-table-column>
           <el-table-column v-if="isEvaluation" label="评测方式 / 规则" min-width="180"><template #default="{ row }">{{ evaluationModeLabel(row.execution_mode) }} · {{ row.evaluation_profile_id || '历史配置' }}</template></el-table-column>
-          <el-table-column v-if="isEvaluation" label="数据来源" min-width="170" show-overflow-tooltip><template #default="{ row }">{{ evaluationSourceLabel(row) }}</template></el-table-column>
+          <el-table-column v-if="isEvaluation" label="数据来源" min-width="170" show-overflow-tooltip><template #default="{ row }"><DisplayId v-if="row.source?.run_id || row.source?.source_run_id" kind="run" :id="row.source.run_id || row.source.source_run_id" /><template v-else>{{ evaluationSourceLabel(row) }}</template></template></el-table-column>
           <el-table-column label="状态" width="110"><template #default="{ row }">{{ runDisplayStatus(row) }}</template></el-table-column>
           <el-table-column label="结果" min-width="170"><template #default="{ row }">{{ runMessage(row) }}</template></el-table-column>
-          <el-table-column v-if="!isEvaluation" label="操作" min-width="100"><template #default="{ row }"><el-button link :loading="syncingRun === (row.collection_run_id || row.run_id)" :disabled="pipelineContext.isPipelineRoute.value || managedBatchIds.includes(row.batch_id)" @click="syncRun(row)">重试回传</el-button></template></el-table-column>
+          <el-table-column v-if="!isEvaluation" label="操作" min-width="160"><template #default="{ row }"><el-button link :loading="syncingRun === (row.collection_run_id || row.run_id)" :disabled="pipelineContext.isPipelineRoute.value || managedBatchIds.includes(row.batch_id)" @click="syncRun(row)">重试回传</el-button><el-button v-if="canCancelCollectionRun(row)" link type="danger" :loading="cancellingRun === (row.collection_run_id || row.run_id)" :disabled="pipelineContext.isPipelineRoute.value || managedBatchIds.includes(row.batch_id)" @click="cancelCollectionRun(row)">停止</el-button></template></el-table-column>
         </el-table>
         <section v-if="isEvaluation" data-testid="evaluation-reports">
           <div class="report-heading"><h3 class="sub-title">模型迭代评估报告</h3><el-button :loading="loadingReports" @click="reportPoller.start()">刷新报告</el-button></div>
           <el-alert v-if="reportError" :title="reportError" type="warning" :closable="false" />
           <p v-if="!reportFolders.length" class="empty-hint">{{ loadingReports ? '正在读取评估报告…' : '暂无评估报告，完成运行后将在这里显示。' }}</p>
           <section v-for="folder in reportFolders" :key="folder.run_id || folder.dir_name" class="report-folder">
-            <strong>第 {{ folder.index }} 轮 · {{ folder.dir_name }}</strong>
-            <p v-if="folder.run_id">运行标识：{{ folder.run_id }}</p>
-            <p>轮次时间：{{ reportTime(folder.modified) }}</p>
+            <strong>第 {{ folder.index }} 轮 · <DisplayId v-if="folder.run_id" kind="run" :id="folder.run_id" /><span v-else class="report-directory" :title="folder.dir_name">{{ folder.dir_name }}</span></strong>
+            <p>轮次时间：{{ reportTime(folder.modified) }}<span v-if="folder.agent_type"> · {{ agentLabel(folder.agent_type) }}</span></p>
             <el-table v-if="folder.files.length" :data="folder.files" border>
               <el-table-column prop="name" label="文件名" min-width="160" />
               <el-table-column label="生成时间" min-width="160"><template #default="{ row }">{{ reportTime(row.modified) }}</template></el-table-column>
@@ -222,12 +229,14 @@
             <span data-testid="custom-run-app">{{ runDialogApp }}</span>
           </div>
           <div class="custom-config">
+            <label>采集引擎<CollectionAgentSelect v-model="runDialogAgentType" :capabilities="agentCapabilities" :disabled="confirmingRun" data-testid="custom-agent-type" /></label>
+            <el-alert v-if="customAgentIssue" :title="customAgentIssue" type="warning" :closable="false" />
             <label>VLA 接口<el-select v-model="runDialogVla" data-testid="custom-run-vla" filterable allow-create :disabled="confirmingRun" placeholder="host:port 或 http(s)://host:port/v1"><el-option v-for="item in vla" :key="item" :value="item" :label="item" /></el-select></label>
             <label>采集 Logprobs<el-switch v-model="runDialogConfig.capture_logprobs" data-testid="custom-run-capture-logprobs" :disabled="confirmingRun" /></label>
             <label>打开采样<el-switch v-model="runDialogConfig.sampling_enabled" :disabled="confirmingRun" /></label>
             <template v-if="runDialogConfig.sampling_enabled"><label>temperature<el-input-number v-model="runDialogConfig.temperature" :min="0" :max="2" :step="0.05" :disabled="confirmingRun" /></label><label>top_p<el-input-number v-model="runDialogConfig.top_p" :min="0" :max="1" :step="0.05" :disabled="confirmingRun" /></label></template>
             <label>使用经验库<el-switch v-model="runDialogConfig.use_experience_lib" :disabled="confirmingRun" /></label>
-            <label>任务列表<el-select v-model="runDialogTaskKey" data-testid="custom-run-task-select" filterable :disabled="confirmingRun" placeholder="选择要运行的任务"><el-option v-for="option in runTaskOptions" :key="option.key" :value="option.key" :label="option.label" /></el-select></label>
+            <label>任务列表<el-select v-model="runDialogTaskKey" data-testid="custom-run-task-select" filterable :filter-method="filterRunTasks" :disabled="confirmingRun" placeholder="选择要运行的任务"><el-option v-for="option in filteredRunTaskOptions" :key="option.key" :value="option.key" :label="option.label" /></el-select></label>
           </div>
           <template #footer>
             <el-button :disabled="confirmingRun" @click="runDialogVisible = false">取消</el-button>
@@ -242,6 +251,9 @@
 
 <script setup lang="ts">
 import PipelineStatusBar from '@/components/PipelineStatusBar.vue'
+import CollectionAgentSelect from '@/components/CollectionAgentSelect.vue'
+import { agentBlockedReason, agentLabel } from '@/utils/collectionAgents'
+import type { AgentType, AgentCapabilities, FactorySettings } from '@/phoneFactoryApi'
 import { usePipelineContext } from '@/composables/usePipelineContext'
 import { api } from '@/api'
 import BatchPublishedNotice from '@/components/BatchPublishedNotice.vue'
@@ -253,12 +265,20 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { phoneFactoryApi, modelIterationApi, factoryBatchesApi, newRunRequestId, type EvaluatorConfig, type EvaluationExecutionMode, type EvaluationProfile, type FactoryConfig, type PhoneAppRow, type TaskRow, type FactoryBatchSummary, type FactoryState, type FactoryRun, type ReportFolder, type ReportFile, type AdbDevice, type CollectionWarning } from '@/phoneFactoryApi'
 import ModelIterationPanel from '@/components/ModelIterationPanel.vue'
+import DisplayId from '@/components/DisplayId.vue'
+import { useDisplayIdentifiers } from '@/composables/useDisplayIdentifiers'
 import { useFactoryPolling } from '@/composables/useFactoryPolling'
-import { runDisplayStatus, runMessage } from '@/utils/phoneFactoryRuns'
+import { runDisplayStatus, runMessage, canCancelCollectionRun } from '@/utils/phoneFactoryRuns'
 import { evaluationModeLabel, evaluationSourceLabel } from '@/utils/modelIteration'
 import { usePhoneCollectionBatches } from '@/composables/usePhoneCollectionBatches'
 
 const props = withDefaults(defineProps<{ mode?: 'generate' | 'modeliter' }>(), { mode: 'generate' })
+const { displayId, matches, resolve } = useDisplayIdentifiers()
+const batchQuery = ref(''), runQuery = ref(''), taskQuery = ref('')
+const filterCollectionBatches = (query: string) => { batchQuery.value = query }
+const filterRunTasks = (query: string) => { taskQuery.value = query }
+const taskFileLabel = (task: TaskRow) => task.original_filename || task.filename
+const taskDescription = (task: TaskRow) => task.source_batch_id ? task.description.replaceAll(task.source_batch_id, displayId('batch', task.source_batch_id)) : task.description
 const isEvaluation = props.mode === 'modeliter'
 const factoryApi = isEvaluation ? modelIterationApi : phoneFactoryApi
 const evaluationReady = ref(false), evaluatorConfig = ref<EvaluatorConfig>()
@@ -280,6 +300,24 @@ const config = reactive<FactoryConfig>({
   capture_logprobs: false,
 })
 
+const agentType = ref<AgentType>('newagent')
+const agentCapabilities = ref<AgentCapabilities | null>(null)
+const loadingAgents = ref(false), agentError = ref('')
+const agentIssue = computed(() => agentBlockedReason(agentCapabilities.value, agentType.value, config.capture_logprobs, isEvaluation))
+const runDialogAgentType = ref<AgentType>('newagent')
+const customAgentIssue = computed(() => agentBlockedReason(agentCapabilities.value, runDialogAgentType.value, runDialogConfig.capture_logprobs, isEvaluation))
+function applyConfig(saved: FactorySettings) {
+  const { agent_type, ...sampling } = saved
+  Object.assign(config, sampling)
+  agentType.value = agent_type || 'newagent'
+}
+async function loadAgentCapabilities() {
+  if (typeof factoryApi.agentCapabilities !== 'function') return
+  loadingAgents.value = true; agentError.value = ''
+  try { const value = await factoryApi.agentCapabilities(); if (!disposed) agentCapabilities.value = value.agent_types }
+  catch (cause) { if (!disposed) { agentCapabilities.value = null; agentError.value = (cause as Error).message } }
+  finally { if (!disposed) loadingAgents.value = false }
+}
 const newPhoneId = ref('')
 const newApp = ref('')
 const newVla = ref('')
@@ -309,9 +347,10 @@ const devices = ref<AdbDevice[]>([])
 const deviceError = ref('')
 const runError = ref('')
 const runs = ref<FactoryRun[]>([])
+const filteredRuns = computed(() => runs.value.filter(run => matches(runQuery.value, 'run', run.collection_run_id || run.run_id, '', run.filename || '', run.status, agentLabel(run.agent_type), run.evaluation_profile_id || '')))
 const reportFolders = ref<ReportFolder[]>([])
 const loadingReports = ref(false), reportError = ref('')
-const syncingRun = ref('')
+const syncingRun = ref(''), cancellingRun = ref('')
 const downloadingReport = ref('')
 let stateEpoch = 0
 const requestIds = new Map<string, string>()
@@ -325,9 +364,10 @@ const manualTaskBusy = computed(() => savingTask.value || Boolean(deletingTask.v
 const collection = usePhoneCollectionBatches(factoryBatchesApi, factoryApi, {
   setTasks: rows => { tasks.value = activeFactoryTasks(rows) },
   isBlocked: () => manualTaskBusy.value || runDialogVisible.value,
-  runOptions: () => ({ vla: newVla.value.trim(), run_mode: props.mode, config: { ...config } }),
+  runOptions: () => ({ agent_type: agentType.value, vla: newVla.value.trim(), run_mode: props.mode, config: { ...config } }),
 })
 const { batches: collectionBatches, selectedBatchId, selectedBatch, loadingBatches, loadingBatch, downloading: downloadingBatch, error: batchError } = collection
+const filteredCollectionBatches = computed(() => collectionBatches.value.filter(batch => matches(batchQuery.value, 'batch', batch.batch_id, '', collectionBatchOptionLabel(batch), batch.filename, ...batch.apps)))
 const pipelineContext = usePipelineContext({ batchId: () => isEvaluation ? '' : selectedBatchId.value, stepId: 'collection' })
 const managedBatchIds = ref<string[]>([])
 const isManagedTask = (task: TaskRow) => Boolean(task.source_batch_id && (managedBatchIds.value.includes(task.source_batch_id) || (pipelineContext.managed.value && pipelineContext.pipeline.value?.batch_id === task.source_batch_id)))
@@ -342,7 +382,7 @@ const runTaskOptions = computed(() => {
   for (const task of activeFactoryTasks(tasks.value)) {
     const key = !isEvaluation && task.source_batch_id ? `batch:${task.source_batch_id}` : `task:${task.filename}`
     if (isManagedTask(task)) continue
-    options.set(key, { key, label: `${task.description} · ${task.source_batch_id || task.filename}`, task })
+    options.set(key, { key, label: `${taskDescription(task)} · ${task.source_batch_id ? displayId('batch', task.source_batch_id) : taskFileLabel(task)}`, task })
   }
   if (!isEvaluation) for (const batch of collectionBatches.value) {
     if (publishedBatch(batch.batch_id) || managedBatchIds.value.includes(batch.batch_id)) continue
@@ -353,6 +393,7 @@ const runTaskOptions = computed(() => {
   return [...options.values()]
 })
 const runTargetTask = computed(() => runTaskOptions.value.find(option => option.key === runDialogTaskKey.value)?.task || null)
+const filteredRunTaskOptions = computed(() => runTaskOptions.value.filter(option => matches(taskQuery.value, 'batch', option.task.source_batch_id, '', option.label, option.task.filename, option.task.original_filename || '', option.task.description)))
 let disposed = false
 const activeFactoryTasks = (rows: TaskRow[]) => isEvaluation ? rows : rows.filter(item => !publishedBatch(item.source_batch_id))
 const lifecycle = useBatchLifecycle({
@@ -385,7 +426,7 @@ const taskBusy = computed(() => pipelineContext.isPipelineRoute.value || loading
 const collectionBatchKindLabel = (kind: FactoryBatchSummary['kind']) => kind === 'manual_collection' ? '手动上传' : kind === 'augmentation' ? '泛化扩增' : '任务生成'
 const collectionBatchTimeLabel = (createdAt: string) => createdAt.slice(0, 19).replace('T', ' ')
 const collectionBatchOptionLabel = (batch: FactoryBatchSummary) =>
-  `${batch.batch_id} · ${collectionBatchKindLabel(batch.kind)} · ${collectionBatchTimeLabel(batch.created_at)} · ${batch.task_count} 条任务`
+  `${displayId('batch', batch.batch_id)} · ${collectionBatchKindLabel(batch.kind)} · ${collectionBatchTimeLabel(batch.created_at)} · ${batch.task_count} 条任务`
 const selectedBatchRow = computed<TaskRow | null>(() => {
   const batch = selectedBatch.value
   if (!batch) return null
@@ -416,7 +457,7 @@ async function loadState() {
   const [state, savedConfig] = await Promise.all([factoryApi.state(), factoryApi.config()])
   if (disposed) return
   applyState(state)
-  Object.assign(config, savedConfig)
+  applyConfig(savedConfig)
   if (!newVla.value) newVla.value = state.vla[0] || ''
 }
 
@@ -553,6 +594,7 @@ function openCustomRun(row: PhoneAppRow) {
   runDialogTaskKey.value = ''
   runDialogPhoneId.value = row.phone_id
   runDialogApp.value = row.app
+  runDialogAgentType.value = agentType.value
   runDialogVla.value = newVla.value.trim() || vla.value[0] || ''
   Object.assign(runDialogConfig, config)
   runDialogVisible.value = true
@@ -562,6 +604,7 @@ function openCustomRun(row: PhoneAppRow) {
 // 关联文件中的所有手机都执行 ----------
 async function handleStartTask(row: TaskRow) {
   if (taskBusy.value || evaluationBlocked.value) return
+  if (agentIssue.value) return ElMessage.warning(agentIssue.value)
   if (!newVla.value.trim()) return ElMessage.warning('请选择 VLA 接口')
   startingTask.value = row.filename; stateEpoch++
   try {
@@ -569,8 +612,8 @@ async function handleStartTask(row: TaskRow) {
     if (disposed) return
     if (isManagedTask(row)) return ElMessage.warning('该批次由 Pipeline 管理，请返回 Pipeline 查看')
     if (!isEvaluation && row.source_batch_id) {
-      const remote = await collection.runBatch(row.source_batch_id)
-      if (!disposed && !publishedBatch(row.source_batch_id)) ElMessage.success(remote.message || '采集批次已下发')
+      await collection.runBatch(row.source_batch_id)
+      if (!disposed && !publishedBatch(row.source_batch_id)) ElMessage.success(`采集批次 ${displayId('batch', row.source_batch_id)} 已下发`)
     } else { await dispatchTask(row, '', '', newVla.value.trim(), { ...config }) }
   } catch (error) { if (!disposed) ElMessage.error((error as Error).message) }
   finally { stateEpoch++; startingTask.value = '' }
@@ -580,6 +623,7 @@ async function handleStartTask(row: TaskRow) {
 // 仅指定的 手机ID 执行 ----------
 async function confirmRun() {
   if (taskBusy.value || evaluationBlocked.value) return
+  if (customAgentIssue.value) return ElMessage.warning(customAgentIssue.value)
   if (!runTargetTask.value) return ElMessage.warning('请选择要运行的任务')
   if (!runDialogPhoneId.value) return ElMessage.warning('请选择手机ID')
   if (!runDialogApp.value) return ElMessage.warning('请选择运行APP')
@@ -591,16 +635,16 @@ async function confirmRun() {
     if (disposed) return
     if (isManagedTask(task)) return ElMessage.warning('该批次由 Pipeline 管理')
     if (!isEvaluation && task.source_batch_id) {
-      const remote = await collection.runBatch(task.source_batch_id, runDialogPhoneId.value, runDialogApp.value, { vla: runDialogVla.value.trim(), run_mode: 'generate', config: { ...runDialogConfig } })
-      if (!disposed && !publishedBatch(task.source_batch_id)) ElMessage.success(remote.message || '定制采集任务已下发')
-    } else { await dispatchTask(task, runDialogPhoneId.value, runDialogApp.value, runDialogVla.value.trim(), { ...runDialogConfig }) }
+      await collection.runBatch(task.source_batch_id, runDialogPhoneId.value, runDialogApp.value, { agent_type: runDialogAgentType.value, vla: runDialogVla.value.trim(), run_mode: 'generate', config: { ...runDialogConfig } })
+      if (!disposed && !publishedBatch(task.source_batch_id)) ElMessage.success(`定制采集批次 ${displayId('batch', task.source_batch_id)} 已下发`)
+    } else { await dispatchTask(task, runDialogPhoneId.value, runDialogApp.value, runDialogVla.value.trim(), { ...runDialogConfig }, runDialogAgentType.value) }
     if (!disposed && (isEvaluation || !publishedBatch(task.source_batch_id))) runDialogVisible.value = false
   } catch (error) { if (!disposed) ElMessage.error((error as Error).message) }
   finally { stateEpoch++; confirmingRun.value = false }
 }
 
-async function dispatchTask(task: TaskRow, phoneId: string, app: string, vla: string, config: FactoryConfig) {
-  const parameters = { filename: task.filename, phone_id: phoneId, app, vla, config, run_mode: props.mode,
+async function dispatchTask(task: TaskRow, phoneId: string, app: string, vla: string, config: FactoryConfig, agent: AgentType = agentType.value) {
+  const parameters = { agent_type: agent, filename: task.filename, phone_id: phoneId, app, vla, config, run_mode: props.mode,
     ...(isEvaluation ? { evaluator_config: evaluatorConfig.value, evaluation_profile_id: evaluationProfile.value?.id, evaluation_profile_digest: evaluationProfile.value?.digest, checklist_source: 'auto' as const, evaluation_mode: 'checklist' as const } : {}) }
   const key = JSON.stringify(parameters)
   const requestId = requestIds.get(key) || newRunRequestId()
@@ -608,7 +652,8 @@ async function dispatchTask(task: TaskRow, phoneId: string, app: string, vla: st
   const remote = await factoryApi.remoteStartRun({ ...parameters, request_id: requestId })
   requestIds.delete(key)
   if (disposed) return
-  ElMessage.success(remote.message || '任务已下发')
+  if (remote.run_id) await resolve([{ kind: 'run', id: remote.run_id }])
+  if (!disposed) ElMessage.success(remote.run_id ? `运行 ${displayId('run', remote.run_id)} 已下发` : '任务已下发')
   try { const state = await factoryApi.state(); if (!disposed) applyState(state) } catch { /* Subsequent polling restores state. */ }
   if (!isEvaluation) setTimeout(() => { if (!disposed) void collection.loadBatches(remote.batch_id) }, 0)
 }
@@ -617,8 +662,8 @@ async function handleConfigChange() {
   if (pipelineContext.isPipelineRoute.value) return
   savingConfig.value = true
   try {
-    const saved = await factoryApi.saveConfig({ ...config })
-    Object.assign(config, saved)
+    const saved = await factoryApi.saveConfig({ ...config, agent_type: agentType.value })
+    applyConfig(saved)
     ElMessage.success('采样配置已保存')
   } catch (error) {
     ElMessage.error((error as Error).message)
@@ -673,6 +718,20 @@ async function syncRun(run: FactoryRun) {
   catch (error) { if (!disposed) ElMessage.error((error as Error).message) }
   finally { syncingRun.value = '' }
 }
+async function cancelCollectionRun(run: FactoryRun) {
+  if (isEvaluation || !canCancelCollectionRun(run) || pipelineContext.isPipelineRoute.value || managedBatchIds.value.includes(run.batch_id || '')) return
+  const id = run.collection_run_id || run.run_id
+  if (!id || cancellingRun.value) return
+  cancellingRun.value = id
+  try {
+    const result = await factoryApi.cancelCollection(id)
+    if (!disposed) {
+      runs.value = runs.value.map(item => (item.collection_run_id || item.run_id) === id ? result : item)
+      ElMessage.success('采集电脑已确认停止，已有结果保留')
+    }
+  } catch (error) { if (!disposed) ElMessage.error((error as Error).message) }
+  finally { cancellingRun.value = '' }
+}
 async function downloadReport(folder: ReportFolder, file: ReportFile) {
   if (downloadingReport.value) return
   downloadingReport.value = `${folder.run_id || folder.dir_name}/${file.file_id || file.name}`
@@ -690,6 +749,7 @@ onMounted(async () => {
   document.body.classList.add('factory-responsive')
   await pipelineContext.refresh()
   if (pipelineContext.historyOnly.value) { loadingFactory.value = false; return }
+  void loadAgentCapabilities()
   loadState().catch((error) => ElMessage.error(`加载数据失败：${(error as Error).message}`)).finally(() => { loadingFactory.value = false })
   if (isEvaluation) return
   void loadManagedBatches().catch(() => { /* Backend enforces ownership if list lookup fails. */ })
@@ -745,6 +805,7 @@ onBeforeUnmount(() => { document.body.classList.remove('factory-responsive'); di
 
 .file-name { max-width: 200px; overflow: hidden; color: var(--accent-deep); font-size: 13px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
 .file-name.is-empty { color: var(--muted); font-weight: 400; }
+.run-search { max-width: 440px; margin-bottom: 12px; }.report-directory { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle; }
 .empty-hint { margin: 14px 0 2px; color: var(--muted); font-size: 13px; text-align: center; }
 :deep(.el-table) { --el-table-header-bg-color: #f8fafc; }
 

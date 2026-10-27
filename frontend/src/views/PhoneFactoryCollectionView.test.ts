@@ -1,9 +1,13 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createSSRApp, defineComponent, h, ref } from 'vue'
 import { renderToString } from '@vue/server-renderer'
 import { createMemoryHistory, createRouter } from 'vue-router'
-import type { FactoryBatchSummary } from '@/phoneFactoryApi'
+import { phoneFactoryApi, type FactoryBatchSummary } from '@/phoneFactoryApi'
+import { ElMessage } from 'element-plus'
 import PhoneFactoryCollectionView from './PhoneFactoryCollectionView.vue'
+
+vi.mock('element-plus', () => ({ ElMessage: { success: vi.fn(), error: vi.fn(), warning: vi.fn() }, ElMessageBox: {} }))
+afterEach(() => vi.restoreAllMocks())
 
 const mock = vi.hoisted(() => ({ state: {} as Record<string, unknown> }))
 vi.mock('@/composables/usePhoneCollectionBatches', () => ({ usePhoneCollectionBatches: () => mock.state }))
@@ -22,7 +26,7 @@ const batch = (batchId: string, kind: FactoryBatchSummary['kind'], createdAt: st
   download_url: `/api/task-generation/collection-batches/${batchId}/workbook`,
 })
 
-async function render(mode: 'generate' | 'modeliter' = 'generate') {
+async function render(mode: 'generate' | 'modeliter' = 'generate', capture?: (view: any) => void) {
   mock.state = {
     batches: ref([
       batch('generation-batch', 'task_generation', '2026-09-09T10:20:30+08:00', 12),
@@ -43,6 +47,7 @@ async function render(mode: 'generate' | 'modeliter' = 'generate') {
     dispose: vi.fn(),
   }
   const app = createSSRApp(PhoneFactoryCollectionView, { mode })
+  if (capture) app.mixin({ created() { if (this.$options.__name === 'PhoneFactoryCollectionView') capture(this.$.setupState) } })
   app.use(createRouter({ history: createMemoryHistory(), routes: [{ path: '/', component: { render: () => null } }] }))
   const empty = defineComponent({ setup: () => () => h('div') })
   const passthrough = defineComponent({ setup: (_props, { slots }) => () => h('div', null, slots.default?.()) })
@@ -74,6 +79,27 @@ async function render(mode: 'generate' | 'modeliter' = 'generate') {
 }
 
 describe('phone collection batch picker', () => {
+  it('only shows a stopped run after the server confirms cancellation and respects managed batches', async () => {
+    let view: any
+    await render('generate', value => { view = value })
+    const run = { collection_run_id: 'run-stop', batch_id: 'batch-stop', status: 'running', agent_type: 'pipelineagent' as const }
+    view.runs = [run]
+    const cancel = vi.spyOn(phoneFactoryApi, 'cancelCollection').mockRejectedValueOnce(new Error('collector unavailable'))
+    await view.cancelCollectionRun(run)
+    expect(view.runs[0].status).toBe('running')
+    expect(ElMessage.error).toHaveBeenCalledWith('collector unavailable')
+    cancel.mockResolvedValueOnce({ ...run, status: 'interrupted' })
+    await view.cancelCollectionRun(run)
+    expect(view.runs[0].status).toBe('interrupted')
+    expect(cancel).toHaveBeenCalledTimes(2)
+    view.managedBatchIds = ['batch-stop']
+    await view.cancelCollectionRun(run)
+    expect(cancel).toHaveBeenCalledTimes(2)
+    view.managedBatchIds = []
+    await view.cancelCollectionRun({ ...run, status: 'completed' })
+    expect(cancel).toHaveBeenCalledTimes(2)
+  })
+
   it('offers default-off logprob switches for saved settings and a custom run', async () => {
     const html = await render()
     expect(html).toContain('采集 Logprobs')

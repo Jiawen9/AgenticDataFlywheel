@@ -5,6 +5,7 @@ import { Download, Right } from '@element-plus/icons-vue'
 import { collectionBatchesApi } from '@/collectionBatchesApi'
 import type { TaskGenerationJob } from '@/types'
 import { useCollectionBatchSubmission, type RunCollectionBatchAction } from '@/composables/useCollectionBatchSubmission'
+import DisplayId from '@/components/DisplayId.vue'
 
 const props = defineProps<{ job: TaskGenerationJob; resultCount: number; busy: boolean; protect: () => Promise<boolean>; runProtected: RunCollectionBatchAction }>()
 const router = useRouter()
@@ -28,7 +29,7 @@ onBeforeUnmount(state.dispose)
 <template>
   <section class="collection-submission" aria-label="提交轨迹采集" :aria-busy="loading || submitting">
     <div class="collection-copy"><h3>{{ batch ? '已提交轨迹采集' : '提交轨迹采集' }}</h3>
-      <template v-if="batch"><p>{{ batch.task_count }} 条任务 · {{ batch.apps.join('、') }} · {{ batch.created_at.slice(0, 19).replace('T', ' ') }}</p><p>批次 {{ batch.batch_id }}。已冻结首次提交的数据，后续修改、删除或恢复不会改变此批次。</p></template>
+      <template v-if="batch"><p>{{ batch.task_count }} 条任务 · {{ batch.apps.join('、') }} · {{ batch.created_at.slice(0, 19).replace('T', ' ') }}</p><p>批次 <DisplayId kind="batch" :id="batch.batch_id" />。已冻结首次提交的数据，后续修改、删除或恢复不会改变此批次。</p></template>
       <template v-else><p>首次提交会保存全部未删除任务及前置任务的固定副本，不受页面筛选影响。每个作业只创建一个采集批次。</p><p>请先完成审核；提交后继续编辑源任务，不会更新这个批次。提交仅准备采集数据，手机与执行配置在采集页选择。</p></template>
       <p v-if="loading" role="status">正在读取提交状态…</p>
       <p v-if="error" class="collection-error" role="alert">{{ error }} <el-button link type="primary" :disabled="busy || loading || submitting" @click="state.refresh">重试读取</el-button></p>

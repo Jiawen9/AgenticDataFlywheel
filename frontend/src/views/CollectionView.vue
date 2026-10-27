@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import DisplayId from '@/components/DisplayId.vue'
+import { useDisplayIdentifiers } from '@/composables/useDisplayIdentifiers'
 import PipelineStatusBar from '@/components/PipelineStatusBar.vue'
 import RolloutImportDialog from '@/components/RolloutImportDialog.vue'
 import type { RolloutImportResult } from '@/rolloutImportApi'
@@ -17,6 +19,9 @@ import TrajectoryExplorer from '@/components/TrajectoryExplorer.vue'
 import { useTrajectoryPreprocessing } from '@/composables/useTrajectoryPreprocessing'
 
 const route = useRoute(), router = useRouter()
+const { displayId, matches } = useDisplayIdentifiers()
+const batchSearch = ref('')
+const visibleBatches = computed(() => batches.value.filter(batch => matches(batchSearch.value, 'batch', batch.batch_id, '', batch.label)))
 const editors = new Map<string, InstanceType<typeof TrajectoryExplorer>>()
 async function protectEditors() {
   for (const editor of editors.values()) if (!(await editor.protect())) return false
@@ -169,12 +174,12 @@ onBeforeUnmount(() => { disposed = true; flow.dispose(); window.removeEventListe
     </header>
 
     <section class="batch-directory" aria-label="预处理批次">
-      <div class="section-heading"><h2>轨迹批次</h2><div><el-button v-if="!pipelineContext.isPipelineRoute.value && !pipelineReadOnly" :disabled="busy" data-testid="open-rollout-import" @click="openRolloutImport">导入已有 Rollout</el-button><el-button :icon="Refresh" :loading="loadingBatches" :disabled="busy" @click="flow.loadBatches()">刷新批次</el-button></div></div>
+      <div class="section-heading"><h2>轨迹批次</h2><div><el-input v-model="batchSearch" clearable placeholder="搜索编号或批次名称" style="width:240px" /><el-button v-if="!pipelineContext.isPipelineRoute.value && !pipelineReadOnly" :disabled="busy" data-testid="open-rollout-import" @click="openRolloutImport">导入已有 Rollout</el-button><el-button :icon="Refresh" :loading="loadingBatches" :disabled="busy" @click="flow.loadBatches()">刷新批次</el-button></div></div>
       <el-empty v-if="!loadingBatches && !batches.length" description="暂无轨迹批次，请先采集或登记原始轨迹" :image-size="70" />
       <div v-loading="loadingBatches" class="batch-list">
-        <section v-for="batch in batches" :key="batch.batch_id" class="batch-item" :class="{ selected: batchId === batch.batch_id }">
-          <button class="batch-toggle" type="button" :aria-expanded="batchId === batch.batch_id" :aria-label="'选择批次 ' + batch.batch_id" :disabled="busy || pipelineContext.isPipelineRoute.value" @click="chooseBatch(batchId === batch.batch_id ? '' : batch.batch_id)">
-            <span class="batch-identity"><strong>{{ batch.label || batch.batch_id }}</strong><code>{{ batch.batch_id }}</code></span>
+        <section v-for="batch in visibleBatches" :key="batch.batch_id" class="batch-item" :class="{ selected: batchId === batch.batch_id }">
+          <button class="batch-toggle" type="button" :aria-expanded="batchId === batch.batch_id" :aria-label="'选择批次 ' + displayId('batch', batch.batch_id)" :disabled="busy || pipelineContext.isPipelineRoute.value" @click="chooseBatch(batchId === batch.batch_id ? '' : batch.batch_id)">
+            <span class="batch-identity"><strong>{{ batch.label && batch.label !== batch.batch_id ? batch.label : displayId('batch', batch.batch_id) }}</strong><code :title="batch.batch_id">{{ displayId('batch', batch.batch_id) }}</code></span>
             <span class="batch-kind">{{ kindText(batch.kind) }}</span>
             <span class="batch-counts">{{ batch.task_count }} 任务 · {{ batch.ready_trajectory_count }} 就绪轨迹 · {{ batch.ready_step_count }} 步</span>
             <span class="batch-status" :class="batch.preprocessing_status">{{ statusText(batch.preprocessing_status) }}</span>
@@ -182,6 +187,7 @@ onBeforeUnmount(() => { disposed = true; flow.dispose(); window.removeEventListe
           </button>
           <div v-if="batchId === batch.batch_id" class="batch-detail">
             <div class="batch-actions">
+              <DisplayId kind="batch" :id="batch.batch_id" />
               <span>采集状态：{{ statusText(batch.collection_status) }}</span>
               <el-button v-if="preprocessingJob && ['failed', 'interrupted'].includes(preprocessingJob.status)" type="primary" :loading="submitting" :disabled="pipelineReadOnly || busy || processing || building" @click="flow.start(true)">重试预处理</el-button>
               <el-button v-if="preprocessingJob && ['failed', 'interrupted'].includes(preprocessingJob.status)" :loading="submitting" :disabled="pipelineReadOnly || busy || processing || building || !batch.can_start" @click="flow.start()">开始新预处理</el-button>
@@ -195,7 +201,7 @@ onBeforeUnmount(() => { disposed = true; flow.dispose(); window.removeEventListe
                 <div class="source-task-list">
                   <details v-for="source in sourceGroups" :key="source.task_id" class="source-task">
                     <summary><b>{{ source.app || 'App 未记录' }}</b><span>{{ source.task }}</span><small>{{ source.trajectories.length }} 轨迹</small></summary>
-                    <p class="source-ident">用例 {{ source.collection_case_id }} · 任务 {{ source.task_id }}</p>
+                    <p class="source-ident">用例 {{ source.collection_case_id }} · 任务 <DisplayId kind="task" :id="source.task_id" :scope="batchId" /></p>
                     <ul v-if="source.trajectories.length"><li v-for="trajectory in source.trajectories" :key="trajectory.collection_run_id + '/' + trajectory.relative_dir"><b>{{ trajectory.source_trajectory_id }}</b><span>{{ timeText(trajectory.collected_at) }} · {{ statusText(trajectory.status) }}</span></li></ul>
                     <p v-else class="source-ident">暂无已就绪原始轨迹</p>
                     <div v-for="attempt in source.attempts" :key="attempt.collection_run_id" class="source-attempt">
@@ -225,15 +231,15 @@ onBeforeUnmount(() => { disposed = true; flow.dispose(); window.removeEventListe
       <div class="job-card__body">
         <div class="job-card__heading"><b>{{ statusText(preprocessingJob.stage) }}</b><span>{{ collecting ? '正在统计步骤' : percentage(preprocessingJob.percent) + '%' }}</span></div>
         <el-progress :percentage="collecting ? 100 : percentage(preprocessingJob.percent)" :indeterminate="collecting" :status="preprocessingJob.status === 'failed' || preprocessingJob.status === 'interrupted' ? 'exception' : preprocessingJob.status === 'succeeded' ? 'success' : undefined" :show-text="false" />
-        <p><template v-if="!collecting">步骤 {{ preprocessingJob.completed_steps }} / {{ preprocessingJob.total_steps }}</template><template v-if="preprocessingJob.current_trajectory"> · {{ preprocessingJob.current_trajectory }}</template><template v-if="preprocessingJob.current_step"> · step {{ preprocessingJob.current_step }}</template></p>
-        <p v-if="preprocessingJob.current_task">当前任务：{{ preprocessingJob.current_task }}</p>
+        <p><template v-if="!collecting">步骤 {{ preprocessingJob.completed_steps }} / {{ preprocessingJob.total_steps }}</template><template v-if="preprocessingJob.current_trajectory"> · <DisplayId kind="trajectory" :id="preprocessingJob.current_trajectory" :scope="batchId" /></template><template v-if="preprocessingJob.current_step"> · step {{ preprocessingJob.current_step }}</template></p>
+        <p v-if="preprocessingJob.current_task">当前任务：<DisplayId kind="task" :id="preprocessingJob.current_task" :scope="batchId" /></p>
         <p v-if="preprocessingJob.error" class="job-error">{{ preprocessingJob.error }}</p>
-        <small>作业 {{ preprocessingJob.job_id }}</small>
+        <small>作业 <DisplayId kind="job" :id="preprocessingJob.job_id" /></small>
       </div>
     </section>
 
     <template v-if="selectedBatch">
-      <div class="workspace-heading"><div><h2>任务与轨迹</h2><p>当前批次 {{ batchId }} · 建树已完成 {{ treeCounts.completed }} / 待处理 {{ treeCounts.pending }} / 已失效 {{ treeCounts.stale }}</p></div><el-button :disabled="busy" @click="flow.loadBatches()">刷新当前结果</el-button></div>
+      <div class="workspace-heading"><div><h2>任务与轨迹</h2><p>当前批次 <DisplayId kind="batch" :id="batchId" /> · 建树已完成 {{ treeCounts.completed }} / 待处理 {{ treeCounts.pending }} / 已失效 {{ treeCounts.stale }}</p></div><el-button :disabled="busy" @click="flow.loadBatches()">刷新当前结果</el-button></div>
       <el-empty v-if="!scope && !processing" description="完成预处理后，可查看步骤、编辑动作框并建树" :image-size="80" />
       <template v-if="scope">
         <section class="toolbar-card">
@@ -244,7 +250,7 @@ onBeforeUnmount(() => { disposed = true; flow.dispose(); window.removeEventListe
           <div class="job-card__body">
             <div class="job-card__heading"><b>{{ statusText(buildJob.stage) }}</b><span>{{ percentage(buildJob.percent) }}%</span></div>
             <el-progress :percentage="percentage(buildJob.percent)" :status="buildJob.status === 'failed' ? 'exception' : buildJob.status === 'succeeded' ? 'success' : undefined" :show-text="false" />
-            <p>分类与 Observation {{ buildJob.classified_steps }} / {{ buildJob.total_steps }}<span v-if="buildJob.current_task"> · {{ buildJob.current_task }}</span></p>
+            <p>分类与 Observation {{ buildJob.classified_steps }} / {{ buildJob.total_steps }}<span v-if="buildJob.current_task"> · <DisplayId kind="task" :id="buildJob.current_task" :scope="batchId" /></span></p>
             <p v-if="buildJob.stage === 'summarizing_trajectories'">轨迹摘要 {{ buildJob.summarized_trajectories || 0 }} / {{ buildJob.total_trajectories || 0 }}</p>
             <p v-if="buildJob.error" class="job-error">{{ buildJob.error }}</p>
             <router-link v-if="buildJob.status === 'succeeded'" :to="{ path: '/quality', query: { ...route.query, batch_id: batchId, ...(pipelineContext.isPipelineRoute.value ? { step_id: 'quality' } : {}) } }">进入本批次质检 →</router-link>
@@ -256,14 +262,14 @@ onBeforeUnmount(() => { disposed = true; flow.dispose(); window.removeEventListe
             <el-collapse-item v-for="task in tasks" :key="task.task_id" :name="task.task_id">
               <template #title><div class="task-title">
                 <el-checkbox v-model="selectedTasks" :value="task.task_id" :disabled="pipelineReadOnly || !task.annotated || busy || processing || building" @click.stop />
-                <b>{{ task.task_id }}</b><span class="task-goal" :title="task.goal">{{ task.goal }}</span><el-tag :type="task.annotated ? 'success' : 'warning'">{{ task.annotated ? '已预处理' : '待预处理' }}</el-tag><el-tag v-if="task.tree_status" :type="task.tree_status === 'succeeded' ? 'success' : 'warning'">{{ task.tree_status === 'succeeded' ? '已建树' : ['stale', 'invalidated'].includes(task.tree_status) ? '建树已失效' : '待建树' }}</el-tag><small>{{ task.trajectory_count }} 轨迹 · {{ task.step_count }} 步</small>
+                <b><DisplayId kind="task" :id="task.task_id" :scope="batchId" /></b><span class="task-goal" :title="task.goal">{{ task.goal }}</span><el-tag :type="task.annotated ? 'success' : 'warning'">{{ task.annotated ? '已预处理' : '待预处理' }}</el-tag><el-tag v-if="task.tree_status" :type="task.tree_status === 'succeeded' ? 'success' : 'warning'">{{ task.tree_status === 'succeeded' ? '已建树' : ['stale', 'invalidated'].includes(task.tree_status) ? '建树已失效' : '待建树' }}</el-tag><small>{{ task.trajectory_count }} 轨迹 · {{ task.step_count }} 步</small>
               </div></template>
               <el-alert v-if="task.warning" :title="task.warning" type="warning" :closable="false" show-icon />
               <div v-loading="loadingTasks[task.task_id]" class="trajectory-list">
                 <el-empty v-if="!loadingTasks[task.task_id] && !taskData[task.task_id]?.length" description="暂无预处理轨迹" :image-size="60" />
                 <el-collapse v-else :model-value="expandedTrajectories[task.task_id] || ''" accordion :before-collapse="(id: string | number) => toggleTrajectory(task.task_id, id)">
                   <el-collapse-item v-for="trajectory in taskData[task.task_id]" :key="trajectory.trajectory_id" :name="trajectory.trajectory_id">
-                    <template #title><div class="trajectory-title"><el-icon><Refresh /></el-icon><b :title="trajectory.trajectory_id">{{ trajectory.source_trajectory_id || trajectory.trajectory_id }}</b><span>{{ trajectory.step_count }} 步 · {{ timeText(trajectory.collected_at) }}</span></div></template>
+                    <template #title><div class="trajectory-title"><el-icon><Refresh /></el-icon><b><DisplayId kind="trajectory" :id="trajectory.trajectory_id" :scope="batchId" /></b><span>{{ trajectory.step_count }} 步 · {{ timeText(trajectory.collected_at) }}</span></div></template>
                     <div v-loading="loadingTrajectories[flow.key(task.task_id, trajectory.trajectory_id)]" class="trajectory-detail">
                       <TrajectoryExplorer v-if="trajectoryData[flow.key(task.task_id, trajectory.trajectory_id)]"
                         :ref="value => registerEditor(flow.key(task.task_id, trajectory.trajectory_id), value)"
@@ -285,6 +291,7 @@ onBeforeUnmount(() => { disposed = true; flow.dispose(); window.removeEventListe
 </template>
 
 <style scoped>
+.batch-identity strong,.batch-identity code{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.task-title>b,.trajectory-title>b{min-width:0;max-width:100%}.section-heading>div{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end}
 .source-preview{font-size:12px;margin-top:12px}.source-preview summary{cursor:pointer;color:var(--accent-deep);line-height:1.7}.source-task-list{max-height:220px;overflow:auto;margin-top:8px}.source-task{padding:9px 0;border-top:1px solid var(--line)}.source-task>summary{display:flex;gap:8px;align-items:baseline}.source-task>summary span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink)}.source-task>summary small{white-space:nowrap}.source-ident,.source-attempt{color:var(--muted);font-size:11px;overflow-wrap:anywhere;margin:7px 0}.source-task ul{padding-left:18px}.source-task li{margin:6px 0;overflow-wrap:anywhere}.source-task li span{display:block;color:var(--muted);font-size:11px}
 :global(body.preprocessing-responsive){min-width:0}
 @media(max-width:600px){.collection-page{padding:20px 12px}.collection-page .page-hero{gap:16px}.collection-page .page-hero h1{font-size:25px}.collection-page .page-hero p{font-size:13px}.collection-page .hero-metrics{gap:6px}.collection-page .hero-metrics div{min-width:0;padding:10px 8px}.collection-page .hero-metrics span{font-size:10px}}

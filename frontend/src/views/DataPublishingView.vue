@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import DisplayId from '@/components/DisplayId.vue'
+import { useDisplayIdentifiers } from '@/composables/useDisplayIdentifiers'
 import PipelineStatusBar from '@/components/PipelineStatusBar.vue'
 import { usePipelineContext } from '@/composables/usePipelineContext'
 import BatchPublishedNotice from '@/components/BatchPublishedNotice.vue'
@@ -18,6 +20,7 @@ import { datasetUploadMessage } from '@/utils/datasetUploadMessage'
 import type { DatasetRelease, DatasetReleaseCandidate, DatasetUploadJob, DatasetUploadStatus, DatasetUploadCapabilities } from '@/types'
 
 const route = useRoute()
+const { displayId, matches } = useDisplayIdentifiers()
 const pipelineContext = usePipelineContext({ stepId: 'publication' })
 const managedBatchIds = ref<string[]>([])
 const ACTIVE_UPLOAD_KEY = 'agentic-data-flywheel.active-internal-dataset-upload'
@@ -69,7 +72,7 @@ const uploadRunning = computed(() => activeUpload.value && ['queued', 'uploading
 const filteredReleases = computed(() => {
   const keyword = searchText.value.trim().toLowerCase()
   return releases.value.filter((item) => {
-    const matchesText = !keyword || item.name.toLowerCase().includes(keyword) || item.release_id.toLowerCase().includes(keyword)
+    const matchesText = matches(keyword, 'release', item.release_id, '', item.name)
     const matchesStatus = statusFilter.value === 'all' || internalStatus(item) === statusFilter.value
     return matchesText && matchesStatus
   })
@@ -153,7 +156,7 @@ async function createRelease() {
     await loadData(true)
     detailRelease.value = releases.value.find(item => item.release_id === release.release_id) || release
     detailVisible.value = true
-    ElMessage.success(`数据集 ${release.release_id} 已发布`)
+    ElMessage.success(`数据集 ${displayId('release', release.release_id)} 已发布`)
   } catch (error) {
     ElMessage.error((error as Error).message)
   } finally {
@@ -172,7 +175,7 @@ async function externalReleased(release: DatasetRelease) {
   ++detailEpoch
   detailRelease.value = release
   detailVisible.value = true
-  ElMessage.success('数据集 ' + release.release_id + ' 已发布')
+  ElMessage.success('数据集 ' + displayId('release', release.release_id) + ' 已发布')
   try {
     const next = await api.datasetReleases()
     if (disposed || history !== historyEpoch) return
@@ -315,7 +318,7 @@ onBeforeUnmount(() => { disposed = true; ++pollEpoch; clearPoll() })
         <label v-for="candidate in candidates" :key="candidate.session_id" class="candidate" :class="{ disabled: !candidate.ready, selected: selectedSessionIds.includes(candidate.session_id) }">
           <el-checkbox v-model="selectedSessionIds" :value="candidate.session_id" :disabled="!candidate.ready" />
           <div class="candidate-main">
-            <div class="candidate-title"><b>{{ candidate.batch_id || '未命名批次' }}</b><el-tag v-if="candidate.ready" type="success" size="small">可发布</el-tag><el-tag v-else type="warning" size="small">缺少完整导出</el-tag></div>
+            <div class="candidate-title"><b><DisplayId v-if="candidate.batch_id" kind="batch" :id="candidate.batch_id" /><template v-else>未命名批次</template></b><el-tag v-if="candidate.ready" type="success" size="small">可发布</el-tag><el-tag v-else type="warning" size="small">缺少完整导出</el-tag></div>
             <span v-if="candidate.ready">{{ candidate.latest_excel.filename }} · {{ candidate.step_count }} 行 · 更新于 {{ formatDate(candidate.updated_at) }}</span>
             <span v-else class="candidate-error">{{ candidate.reason }}</span>
           </div>
@@ -326,7 +329,7 @@ onBeforeUnmount(() => { disposed = true; ++pollEpoch; clearPoll() })
     </section>
 
     <section v-if="activeUpload" class="panel upload-progress">
-      <div class="upload-progress__head"><div><span class="status-dot" :class="activeUpload.status" /><b>{{ statusText(activeUpload.status) }}</b><span>{{ activeUpload.release_id }}</span></div><strong>{{ activeUpload.percent }}%</strong></div>
+      <div class="upload-progress__head"><div><span class="status-dot" :class="activeUpload.status" /><b>{{ statusText(activeUpload.status) }}</b><DisplayId kind="release" :id="activeUpload.release_id" /></div><strong>{{ activeUpload.percent }}%</strong></div>
       <el-progress :percentage="activeUpload.percent" :status="activeUpload.status === 'failed' ? 'exception' : activeUpload.status === 'succeeded' ? 'success' : undefined" />
       <div class="upload-progress__meta"><span>已确认 {{ activeUpload.completed_files }}/{{ activeUpload.total_files }} 个 Excel</span><span>{{ formatBytes(activeUpload.completed_bytes) }}/{{ formatBytes(activeUpload.total_bytes) }}</span><span v-if="activeUpload.current_file" class="current-file" :title="activeUpload.current_file">当前文件：{{ activeUpload.current_file }}</span></div>
       <el-alert v-if="activeUpload.error" :title="datasetUploadMessage(activeUpload.error)" type="error" :closable="false" />
@@ -340,7 +343,7 @@ onBeforeUnmount(() => { disposed = true; ++pollEpoch; clearPoll() })
         <div class="filters"><el-input v-model="searchText" :prefix-icon="Search" clearable placeholder="搜索名称或发布 ID" /><el-select v-model="statusFilter" aria-label="上传状态筛选"><el-option label="全部状态" value="all" /><el-option label="待上传" value="not_uploaded" /><el-option label="上传中" value="uploading" /><el-option label="已上传" value="succeeded" /><el-option label="失败" value="failed" /><el-option label="已中断" value="interrupted" /></el-select></div>
       </div>
       <el-table v-if="filteredReleases.length" :data="filteredReleases" row-key="release_id" class="release-table">
-        <el-table-column label="数据集" min-width="250"><template #default="{ row }"><div class="release-name"><b>{{ row.name }}</b><code>{{ row.release_id }}</code></div></template></el-table-column>
+        <el-table-column label="数据集" min-width="250"><template #default="{ row }"><div class="release-name"><b>{{ row.name }}</b><DisplayId kind="release" :id="row.release_id" /></div></template></el-table-column>
         <el-table-column label="来源" min-width="120"><template #default="{ row }"><el-tag :type="isExternalRelease(row) ? 'info' : 'success'">{{ releaseSource(row) }}</el-tag><small v-if="isExternalRelease(row)" class="release-progress">{{ row.external_import?.data_source || '人工采集' }}</small></template></el-table-column>
         <el-table-column label="发布时间" min-width="170"><template #default="{ row }">{{ formatDate(row.created_at) }}</template></el-table-column>
         <el-table-column label="规模" min-width="180"><template #default="{ row }">{{ row.excel_paths.length }} Excel · {{ row.trajectory_count }} 轨迹 · {{ row.step_count }} 步</template></el-table-column>
@@ -352,7 +355,7 @@ onBeforeUnmount(() => { disposed = true; ++pollEpoch; clearPoll() })
 
     <el-dialog v-model="detailVisible" width="min(760px, 92vw)" title="数据集详情" destroy-on-close>
       <template v-if="detailRelease">
-        <div class="detail-title"><h3>{{ detailRelease.name }}</h3><code>{{ detailRelease.release_id }}</code></div>
+        <div class="detail-title"><h3>{{ detailRelease.name }}</h3><DisplayId kind="release" :id="detailRelease.release_id" /></div>
         <el-descriptions :column="2" border>
           <el-descriptions-item label="发布时间">{{ formatDate(detailRelease.created_at) }}</el-descriptions-item><el-descriptions-item label="云道S3上传"><el-tag :type="statusType(internalStatus(detailRelease))">{{ statusText(internalStatus(detailRelease)) }}</el-tag></el-descriptions-item>
           <el-descriptions-item label="数据来源">{{ releaseSource(detailRelease) }}</el-descriptions-item>

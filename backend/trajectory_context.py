@@ -10,7 +10,9 @@ from typing import Any
 
 from .data_store import ArtifactStore, DATA_ROOT, rebase_data_path
 
-IDENTITY_FIELDS = ("task_id", "trajectory_id", "source_trajectory_id", "collection_run_id", "collected_at")
+from .agent_types import PROVENANCE_FIELDS
+
+IDENTITY_FIELDS = ("task_id", "trajectory_id", "source_trajectory_id", "collection_run_id", "collected_at") + PROVENANCE_FIELDS
 
 
 class AnnotationVersionConflict(ValueError):

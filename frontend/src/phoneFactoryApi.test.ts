@@ -2,6 +2,27 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { factoryBatchesApi, modelIterationApi, phoneFactoryApi } from './phoneFactoryApi'
 afterEach(() => vi.unstubAllGlobals())
 describe('phone factory transport contracts', () => {
+  it('requests production cancellation without mutating the evaluation endpoint', async () => {
+    const fetcher = vi.fn(async () => new Response('{"status":"interrupted"}'))
+    vi.stubGlobal('fetch', fetcher)
+    await phoneFactoryApi.cancelCollection('cr/a')
+    expect(fetcher.mock.calls[0]?.[0]).toBe('/api/phone-factory/collection-runs/cr%2Fa/cancel')
+    expect(fetcher.mock.calls[0]?.[1]?.method).toBe('POST')
+  })
+  it('keeps the engine at the request top level and persists a separate default', async () => {
+    const fetcher = vi.fn(async () => new Response('{"ok":true,"agent_types":{}}'))
+    vi.stubGlobal('fetch', fetcher)
+    const config = { sampling_enabled: true, temperature: 0.4, top_p: 0.8, use_experience_lib: false, capture_logprobs: true }
+    await phoneFactoryApi.agentCapabilities()
+    await phoneFactoryApi.saveConfig({ ...config, agent_type: 'pipelineagent' })
+    await phoneFactoryApi.remoteStartRun({ filename: 'cases.xlsx', request_id: 'pipeline-one', vla: 'vla:8000', agent_type: 'pipelineagent', config })
+    expect(fetcher.mock.calls[0]?.[0]).toBe('/api/phone-factory/agent-capabilities')
+    expect(JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body)).agent_type).toBe('pipelineagent')
+    const request = JSON.parse(String(fetcher.mock.calls[2]?.[1]?.body))
+    expect(request.agent_type).toBe('pipelineagent')
+    expect(request.config).toEqual(config)
+    expect(request.config).not.toHaveProperty('agent_type')
+  })
   it('saves logprob defaults and sends an explicit per-run override without changing sampling', async () => {
     const fetcher = vi.fn(async () => new Response('{"ok":true}'))
     vi.stubGlobal('fetch', fetcher)

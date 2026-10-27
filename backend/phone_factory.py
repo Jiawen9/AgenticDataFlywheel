@@ -27,35 +27,75 @@ from .batch_lifecycle import is_batch_active
 from .data_store import DATA_ROOT, RecordStore, RevisionConflict
 from .data_store.paths import contained_path
 from .collection_runs import CollectionRunError, CollectionRunStore
+from .agent_types import normalize_agent_type
 
 DEFAULT_CONFIG = {
     "sampling_enabled": False, "temperature": 0.7,
     "top_p": 0.85, "use_experience_lib": False, "capture_logprobs": False,
 }
 CLIENT_SCRIPT = Path(__file__).resolve().with_name("phonefactory_client.py")
+CLIENT_ERROR_PREFIX = "__PHONE_FACTORY_ERROR__="
+CLIENT_TIMEOUT_MESSAGE = "错误：采集服务请求超时，请用同一请求编号重试"
 
 
 class PhoneFactoryError(ValueError):
-    def __init__(self, message: str, status: int = 400):
+    def __init__(self, message: str, status: int = 400, *,
+                 remote_kind: str | None = None, remote_status: int | None = None,
+                 remote_command: str | None = None):
         super().__init__(message)
         self.status = status
+        # Internal metadata is separate from the existing public HTTP status/message.
+        self.remote_kind = remote_kind
+        self.remote_status = remote_status
+        self.remote_command = remote_command
+
+
+def _client_failure(output: str) -> dict:
+    """Read the opt-in stderr envelope; accept only unambiguous legacy errors."""
+    output = output.strip()
+    details = {}
+    first, _, remainder = output.partition("\n")
+    if first.startswith(CLIENT_ERROR_PREFIX):
+        output = remainder.strip()
+        try:
+            metadata = json.loads(first[len(CLIENT_ERROR_PREFIX):])
+            kind = metadata.get("remote_kind") if isinstance(metadata, dict) else None
+            code = metadata.get("remote_status") if isinstance(metadata, dict) else None
+            if kind in {"http", "timeout", "connection", "protocol", "client"}:
+                details["remote_kind"] = kind
+                if kind == "http" and type(code) is int and 100 <= code <= 599:
+                    details["remote_status"] = code
+        except (TypeError, ValueError):
+            pass
+    if not details:
+        # Do not classify arbitrary messages containing 404/timeout as remote errors.
+        match = re.search(r"(?:（HTTP ([1-5]\d{2})）|\(HTTP ([1-5]\d{2})\))$", output)
+        if output.startswith("错误：") and match:
+            details = {"remote_kind": "http", "remote_status": int(match[1] or match[2])}
+        elif output == CLIENT_TIMEOUT_MESSAGE:
+            details = {"remote_kind": "timeout"}
+    return {"ok": False, "output": output, **details}
 
 
 def run_client(args: list[str]) -> dict:
     """Keep the existing client protocol and a bounded subprocess timeout."""
     try:
+        environment = dict(os.environ, PHONE_FACTORY_CLIENT_ERROR_METADATA="1")
         result = subprocess.run(
             [sys.executable, str(CLIENT_SCRIPT), *args],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=float(os.environ.get("PHONE_FACTORY_TRANSFER_TIMEOUT", "300") if args and args[0] in {"run-archive", "report-download"} else os.environ.get("PHONE_FACTORY_TIMEOUT", "30")) + 5, check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            env=environment,
         )
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        return {"ok": False, "output": f"功能不支持或者网络断连：{exc}"}
-    return {
-        "ok": result.returncode == 0,
-        "output": (result.stdout if result.returncode == 0 else result.stderr or result.stdout).strip(),
-    }
+    except subprocess.TimeoutExpired:
+        # TimeoutExpired.__str__ includes the command, which may contain request data.
+        return {"ok": False, "output": CLIENT_TIMEOUT_MESSAGE, "remote_kind": "timeout"}
+    except OSError:
+        return {"ok": False, "output": "功能不支持或者网络断连：采集客户端启动失败", "remote_kind": "client"}
+    if result.returncode == 0:
+        return {"ok": True, "output": result.stdout.strip()}
+    return _client_failure(result.stderr or result.stdout)
 
 
 def _text(value) -> str:
@@ -98,7 +138,7 @@ class PhoneFactoryStore:
     @staticmethod
     def _empty_state() -> dict:
         return {"phones": [], "apps": [], "phoneApps": [], "vla": [], "tasks": [],
-                "config": dict(DEFAULT_CONFIG)}
+                "config": dict(DEFAULT_CONFIG), "agent_type": "newagent"}
 
     def initialize_settings(self, settings: dict) -> dict:
         """Explicitly seed devices/configuration once, without task history or files.
@@ -106,7 +146,7 @@ class PhoneFactoryStore:
         This is an administrative Python entry point, never called by API reads.
         The caller supplies reviewed values; this method reads no old directories.
         """
-        allowed = {"phones", "apps", "phoneApps", "vla", "config"}
+        allowed = {"phones", "apps", "phoneApps", "vla", "config", "agent_type"}
         if not isinstance(settings, dict) or set(settings) - allowed:
             raise PhoneFactoryError("初始化仅支持设备、App、关联关系、VLA 和配置，不支持任务或运行记录", 409)
         state = self._empty_state()
@@ -143,6 +183,10 @@ class PhoneFactoryStore:
                 raise PhoneFactoryError(f"初始化 {key} 必须为有限数字", 409)
         state["config"] = config
         try:
+            state["agent_type"] = normalize_agent_type(settings.get("agent_type", "newagent"))
+        except ValueError as exc:
+            raise PhoneFactoryError(str(exc)) from exc
+        try:
             saved = self.records.put("phone_factory", "state", state, expected_revision=0)
         except RevisionConflict as exc:
             raise PhoneFactoryError("手机采集状态已经初始化，不覆盖现有数据", 409) from exc
@@ -169,7 +213,7 @@ class PhoneFactoryStore:
         return self.runtime.public_state(self._public(self._current()), mode)
 
     def config(self) -> dict:
-        return {**DEFAULT_CONFIG, **self._current()["config"]}
+        return {**DEFAULT_CONFIG, **self._current()["config"], "agent_type": self._current().get("agent_type", "newagent")}
 
     def _update(self, mutator: Callable[[dict], None]) -> dict:
         return self.records.update("phone_factory", "state", mutator, default=self._empty_state())
@@ -268,7 +312,11 @@ class PhoneFactoryStore:
     def _remote_result(self, args: list[str]):
         result = self.run_client(args)
         if not result["ok"]:
-            raise PhoneFactoryError(result.get("output") or "功能不支持或者网络断连", 502)
+            failure = _client_failure(result.get("output") or "功能不支持或者网络断连")
+            raise PhoneFactoryError(failure["output"], 502,
+                remote_kind=result.get("remote_kind") or failure.get("remote_kind"),
+                remote_status=result.get("remote_status", failure.get("remote_status")),
+                remote_command=args[0] if args else None)
         try:
             return json.loads(result["output"])
         except (TypeError, ValueError):
@@ -325,8 +373,12 @@ class PhoneFactoryStore:
                 if not math.isfinite(value) and data.get("sampling_enabled"):
                     raise PhoneFactoryError("temperature 与 top_p 必须是数字")
                 config[key] = value if math.isfinite(value) else DEFAULT_CONFIG[key]
-            self._update(lambda state: state.update(config=config))
-            return config
+            try:
+                agent_type = normalize_agent_type(data.get("agent_type", self._current().get("agent_type", "newagent")))
+            except ValueError as exc:
+                raise PhoneFactoryError(str(exc)) from exc
+            self._update(lambda state: state.update(config=config, agent_type=agent_type))
+            return {**config, "agent_type": agent_type}
         if method == "POST" and action in {"phones", "apps", "vla"}:
             key, label = {"phones": ("phone_id", "手机ID"), "apps": ("app", "APP名称"), "vla": ("value", "VLA接口")}[action]
             value = _text(data.get(key))

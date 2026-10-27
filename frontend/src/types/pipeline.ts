@@ -1,4 +1,4 @@
-import type { FactoryConfig } from '@/phoneFactoryApi'
+import type { FactoryConfig, AgentType } from '@/phoneFactoryApi'
 
 export type PipelineMode = 'manual' | 'automatic'
 export type PipelineStatus = 'running' | 'retry_waiting' | 'paused' | 'waiting_for_correction' | 'failed' | 'terminating' | 'terminated' | 'no_publishable_data' | 'succeeded' | 'published_summary_failed'
@@ -12,7 +12,7 @@ export interface PipelineStep {
   retry_info?: PipelineRetryInfo | null;
   started_at?: string | null; completed_at?: string | null
 }
-export interface PipelineCollectionConfig { phone_id: string; app: string; vla: string; config: FactoryConfig }
+export interface PipelineCollectionConfig { agent_type?: AgentType; phone_id: string; app: string; vla: string; config: FactoryConfig }
 export interface Pipeline {
   pipeline_id: string; name: string; batch_id: string; mode: PipelineMode; start_mode: 'collect' | 'existing';
   threshold?: number | null; task_ids: string[]; collection_config?: PipelineCollectionConfig | null;

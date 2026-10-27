@@ -1,5 +1,13 @@
 # 手机工厂接入与本地验收
 
+双引擎增量：采集页默认配置、手机/App 定制运行和自动 Pipeline 的采集配置均可选择 NewAgent 或 PipelineAgent。选择通过请求顶层 `agent_type`（`newagent` / `pipelineagent`）传到同一台采集电脑的 9011 服务；未传该字段的旧调用仍使用 NewAgent。`GET /api/phone-factory/agent-capabilities`（评估入口同样支持）返回电脑声明的 `agent_types` 能力，未部署或不支持 Logprobs/模型迭代评测的引擎会在下发前被拒绝。规划、反思等辅助模型继续由采集电脑配置。
+
+`/config` 增加保存和返回默认 `agent_type`；运行时 `config` 仍只包含原采样、经验库和 Logprobs 参数，引擎字段独立冻结并参与幂等校验。自动 Pipeline 的旧冻结配置缺失此字段时保持 NewAgent，历史请求和归档摘要不重写。生产 `generate` 结果仍进入预处理/质检/发布，`modeliter` 仍是独立的边采边评入口。
+
+PipelineAgent 轨迹保留原始模型 `content` 与 Logprobs；规范化导出的 `action` 必须来自已记录的 `executed_action`，坐标系标为 `pixel`，并逐步与 `_trajectory_for_evaluate.json` 的 `actions_flat` 核对一致。模型坐标的 `parsed_action` 仅保留作诊断，原文不可解析时只允许明确 `parsed`/`repaired` 证据支持的摘要回退。预处理优先使用 `stepNNN_vla_input_stability_ui.xml`，再使用原输入 XML 与既有 done XML 回退。引擎、版本、实际运行代码/配置摘要保留于清单和下游 JSON 来源元数据，业务 Excel 列保持原有格式。
+
+生产运行列表的“停止”调用 `POST /api/phone-factory/collection-runs/{id}/cancel`；只有采集电脑确认相同运行已取消后才记录中断，已有文件继续保留。自动 Pipeline 管理的批次仍由流程页面控制。
+
 本轮以 e5ae05c 为基准，在 codex/merge-phone-factory 分支按功能合入采集、监控和模型迭代评估。平台继续运行现有 FastAPI + SQLite，没有引入 Vite 业务中间件、前端 JSON 状态或同事的数据库与设备目录。
 
 ## 部署和配置

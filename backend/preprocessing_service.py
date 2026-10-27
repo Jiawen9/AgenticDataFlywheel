@@ -12,6 +12,7 @@ from typing import Any, Callable
 from .data_store.paths import contained_path, rebase_data_path
 from .export_vla_trajectories import STEP_RESPONSE_RE, extract_response_fields
 from .stage_artifacts import fingerprint
+from .agent_types import PROVENANCE_FIELDS
 from .trajectories_preprocessing import DEFAULT_ENV_FILE, read_env_file
 
 SHEET = "VLA trajectories"
@@ -89,7 +90,9 @@ def convert_input(snapshot: dict, progress: Callable[[dict], None], *, data_root
         directory = Path(trajectory["relative_dir"])
         image = (directory / f"step{step:03d}_vla_input.jpg").as_posix()
         logprobs = (directory / f"step{step:03d}_logprobs.json").as_posix()
-        xml = (directory / f"step{step:03d}_vla_input_ui.xml").as_posix()
+        xml = (directory / f"step{step:03d}_vla_input_stability_ui.xml").as_posix()
+        if xml not in files:
+            xml = (directory / f"step{step:03d}_vla_input_ui.xml").as_posix()
         fallback = (directory / f"step{step-1:03d}_vla_done_ui.xml").as_posix()
         reason = None
         if image not in files:
@@ -113,7 +116,9 @@ def convert_input(snapshot: dict, progress: Callable[[dict], None], *, data_root
             identity = [snapshot["batch_id"], run_id, trajectory["task_id"], trajectory["relative_dir"]]
             trajectory_id = "tr_" + hashlib.sha256(json.dumps(
                 identity, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
-            rows.append({"文件夹名": source_id,
+            rows.append({"agent_type": trajectory.get("agent_type", "newagent"),
+                         **{key: trajectory[key] for key in PROVENANCE_FIELDS if key in trajectory},
+                         "文件夹名": source_id,
                          "image": (Path("runs") / run_id / image).as_posix(),
                          "xml": (Path("runs") / run_id / xml).as_posix(),
                          "action": action, "summary": summary,
@@ -129,7 +134,7 @@ def convert_input(snapshot: dict, progress: Callable[[dict], None], *, data_root
     if not rows:
         raise PreprocessingError("所选采集结果没有可转换步骤")
     payload = {"schema_version": 1, "batch_id": snapshot["batch_id"],
-               "raw_root": snapshot["raw_root"], "columns": {SHEET: COLUMNS},
+               "raw_root": snapshot["raw_root"], "columns": {SHEET: list(COLUMNS)},
                "sheets": {SHEET: rows}}
     metadata = {"response_count": len(work), "row_count": len(rows),
                 "trajectory_count": len({row["trajectory_id"] for row in rows}),

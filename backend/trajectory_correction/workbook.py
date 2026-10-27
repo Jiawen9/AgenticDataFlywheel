@@ -331,7 +331,7 @@ def _annotated_row_payload(
     task = text(source_row.get("task")) or _trajectory_task(asset_root, trajectory_id, image, task_cache) or task_id or trajectory_id
     summary = text(_cell_value(sheet, row_number, headers, "summary"))
     thought = text(_cell_value(sheet, row_number, headers, "thought")) or _original_thought(image, asset_root)
-    identity = {key: source_row[key] for key in ("task_id", "source_trajectory_id", "collection_run_id", "collection_case_id", "source_result_id", "collected_at") if key in source_row}
+    identity = {key: source_row[key] for key in ("task_id", "source_trajectory_id", "collection_run_id", "collection_case_id", "source_result_id", "collected_at", "agent_type", "agent_version", "trajectory_format", "normalizer_version", "runtime_digest", "configuration_digest") if key in source_row}
     return {
         **identity,
         "excel_row": row_number,

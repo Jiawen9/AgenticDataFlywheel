@@ -56,6 +56,7 @@ from .pipelines import PipelineManager, PipelineRuntime
 from .pipeline_access import PipelineManagedError
 from .rollout_imports import RolloutImportStore
 from .rollout_import_router import router as rollout_import_router, configure_rollout_import_store
+from .display_identifiers_router import router as display_identifiers_router
 
 
 FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
@@ -185,6 +186,7 @@ app.include_router(preprocessing_router)
 app.include_router(rollout_import_router)
 app.include_router(training_overview_router)
 app.include_router(pipeline_router)
+app.include_router(display_identifiers_router)
 model_job_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="model-job")
 job_manager = TreeBuildJobManager(executor=model_job_executor)
 quality_job_manager = QualityJobManager(executor=model_job_executor)

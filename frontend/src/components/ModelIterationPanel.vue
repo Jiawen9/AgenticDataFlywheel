@@ -36,11 +36,12 @@
         <el-radio value="run">9011 已有采集运行</el-radio><el-radio value="directory">服务器轨迹目录</el-radio>
       </el-radio-group>
       <label v-if="sourceKind === 'run'">采集运行
-        <el-select v-model="sourceRunId" filterable :disabled="starting || sourcesLoading || !offlineSupported" placeholder="选择已有采集结果">
-          <el-option v-for="source in sources" :key="source.run_id" :value="source.run_id" :label="`${source.run_id} · ${source.trajectory_count ?? 0} 条轨迹 · ${source.status || ''}`" />
+        <el-select v-model="sourceRunId" filterable :filter-method="filterSources" :disabled="starting || sourcesLoading || !offlineSupported" placeholder="选择已有采集结果">
+          <el-option v-for="source in filteredSources" :key="source.run_id" :value="source.run_id" :label="`${displayId('run', source.run_id)} · ${source.trajectory_count ?? 0} 条轨迹 · ${source.status || ''}`" />
         </el-select>
       </label>
-      <label v-else>轨迹目录<el-input v-model="sourcePath" :disabled="starting || !offlineSupported" placeholder="9011 服务器上的完整轨迹目录" /></label>
+      <p v-if="sourceKind === 'run' && sourceRunId" class="hint">来源运行：<DisplayId kind="run" :id="sourceRunId" /></p>
+      <label v-if="sourceKind === 'directory'">轨迹目录<el-input v-model="sourcePath" :disabled="starting || !offlineSupported" placeholder="9011 服务器上的完整轨迹目录" /></label>
       <p v-if="sourceKind === 'directory'" class="hint">目录位于采集服务器，而非当前浏览器所在电脑。{{ allowedRoots.length ? `允许范围：${allowedRoots.join('；')}` : '允许范围由采集服务器配置。' }}</p>
       <el-button :loading="sourcesLoading" :disabled="starting || loading || !offlineSupported" @click="loadSources">刷新可用采集结果</el-button>
       <el-button :loading="previewLoading" :disabled="!canPreview" @click="previewSource">检查轨迹并预览</el-button>
@@ -60,14 +61,15 @@
     </section>
 
     <h2>用例评测进度</h2>
-    <el-select v-model="selectedRun" placeholder="选择评估运行" class="run-picker" :disabled="cancelling">
-      <el-option v-for="run in runs" :key="run.run_id" :label="`${run.run_id} · ${evaluationModeLabel(run.execution_mode)} · ${run.evaluation_profile_id || '历史规则'}`" :value="run.run_id" />
+    <el-select v-model="selectedRun" filterable :filter-method="filterRuns" placeholder="选择评估运行" class="run-picker" :disabled="cancelling">
+      <el-option v-for="run in filteredRuns" :key="run.run_id" :label="`${displayId('run', run.run_id)} · ${evaluationModeLabel(run.execution_mode)} · ${run.evaluation_profile_id || '历史规则'}`" :value="run.run_id" />
     </el-select>
+    <p v-if="selectedRun" class="hint">运行：<DisplayId kind="run" :id="selectedRun" /></p>
     <el-button v-if="canCancel" type="danger" plain :loading="cancelling" class="cancel-run" @click="cancelRun">停止本次运行</el-button>
     <el-alert v-if="resultError" :title="resultError" type="warning" :closable="false" />
     <p v-if="!runs.length" class="hint">可上传 17 列用例表开始采集并评测，或选择已有轨迹创建独立评测运行。</p>
     <template v-if="results">
-      <p class="hint">方式：{{ evaluationModeLabel(resultMetadata.execution_mode) }} · 规则版本：{{ resultMetadata.evaluation_profile_name || resultMetadata.evaluation_profile_id || '历史配置' }} · 数据来源：{{ evaluationSourceLabel(resultMetadata) }}</p>
+      <p class="hint">方式：{{ evaluationModeLabel(resultMetadata.execution_mode) }} · 规则版本：{{ resultMetadata.evaluation_profile_name || resultMetadata.evaluation_profile_id || '历史配置' }} · 数据来源：<DisplayId v-if="sourceIdentifier(resultMetadata)" kind="run" :id="sourceIdentifier(resultMetadata)" /><template v-else>{{ evaluationSourceLabel(resultMetadata) }}</template></p>
       <div class="progress" data-testid="evaluation-summary">
         <span>总轨迹 {{ results.summary.total }}</span>
         <template v-if="resultMetadata.execution_mode !== 'evaluate_only'"><span>采集完成 {{ results.summary.collection_completed }}</span><span>采集失败 {{ results.summary.collection_failed }}</span></template>
@@ -98,9 +100,17 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessageBox } from 'element-plus'
 import { modelIterationApi, newRunRequestId, type EvaluatorConfig, type EvaluationCase, type EvaluationResults, type FactoryRun, type EvaluationExecutionMode, type EvaluationProfile, type EvaluationIssue, type EvaluationSource, type EvaluationSourceInput, type EvaluationPreview } from '@/phoneFactoryApi'
 import { useFactoryPolling } from '@/composables/useFactoryPolling'
+import DisplayId from '@/components/DisplayId.vue'
+import { useDisplayIdentifiers } from '@/composables/useDisplayIdentifiers'
 import { defaultEvaluatorConfig, formatSuccessRate, evaluationStatus, collectionStatus, verdictLabel, checklistSourceLabel, evaluationIssueText, evaluationModeLabel, evaluationSourceLabel } from '@/utils/modelIteration'
 
 const props = defineProps<{ runs: FactoryRun[] }>()
+const { displayId, matches, resolve } = useDisplayIdentifiers()
+const sourceQuery = ref(''), runQuery = ref('')
+const filterSources = (query: string) => { sourceQuery.value = query }
+const filterRuns = (query: string) => { runQuery.value = query }
+const sourceIdentifier = (run: { source?: EvaluationSource }) => run.source?.run_id || run.source?.source_run_id || ''
+const filteredRuns = computed(() => props.runs.filter(run => matches(runQuery.value, 'run', run.run_id, '', run.filename || '', run.evaluation_profile_id || '', evaluationModeLabel(run.execution_mode))))
 const emit = defineEmits<{ ready: [value: boolean]; config: [value: EvaluatorConfig]; mode: [value: EvaluationExecutionMode]; profile: [value: EvaluationProfile | undefined]; started: [runId: string]; changed: [runId: string] }>()
 const roles = ['text', 'vision'] as const
 const draft = reactive<EvaluatorConfig>(defaultEvaluatorConfig())
@@ -116,6 +126,7 @@ const canCancel = computed(() => !!selectedRunRecord.value && !['completed', 'su
 const resultMetadata = computed(() => ({ ...props.runs.find(run => run.run_id === selectedRun.value), ...results.value }))
 const sourceKind = ref<'run' | 'directory'>('run'), sourceRunId = ref(''), sourcePath = ref('')
 const sources = ref<EvaluationSource[]>([]), allowedRoots = ref<string[]>([]), sourcesLoading = ref(false), sourceError = ref('')
+const filteredSources = computed(() => sources.value.filter(source => matches(sourceQuery.value, 'run', source.run_id, '', source.status || '', source.created_at || '')))
 const preview = ref<EvaluationPreview | null>(null), previewLoading = ref(false), starting = ref(false), startError = ref(''), startMessage = ref('')
 const requestIds = new Map<string, string>()
 const dirty = computed(() => JSON.stringify(draft) !== saved.value)
@@ -197,7 +208,9 @@ async function startOffline() {
     const value = await modelIterationApi.remoteStartEvaluation({ ...parameters, request_id: requestId })
     requestIds.delete(key)
     if (disposed) return
-    startMessage.value = `已创建评测运行 ${value.run_id || ''}。本次报告独立保存，原报告保留。`
+    if (value.run_id) await resolve([{ kind: 'run', id: value.run_id }])
+    if (disposed) return
+    startMessage.value = `已创建评测运行 ${displayId('run', value.run_id)}。本次报告独立保存，原报告保留。`
     if (value.run_id) { selectedRun.value = value.run_id; emit('started', value.run_id) }
   } catch (cause) { if (!disposed) startError.value = `${(cause as Error).message}；原参数重试会复用本次请求编号，避免重复创建。` }
   finally { if (!disposed) starting.value = false }

@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { runDisplayStatus, runMessage } from './phoneFactoryRuns'
+import { runDisplayStatus, runMessage, canCancelCollectionRun } from './phoneFactoryRuns'
 
 describe('factory run status and warnings', () => {
+  it('only offers stop for active collection states including durable starting', () => {
+    for (const status of ['dispatching', 'queued', 'starting', 'running']) expect(canCancelCollectionRun({ status })).toBe(true)
+    for (const status of ['completed', 'partial', 'failed', 'interrupted', 'cancelled']) expect(canCancelCollectionRun({ status })).toBe(false)
+    expect(runDisplayStatus({ status: 'starting' })).toBe('启动中')
+  })
   it('shows partial remote results after trajectories are successfully transferred', () => {
     const run = { status: 'completed', remote_status: 'partial', trajectory_count: 2,
       errors: [], remote_errors: [{ error: 'task-a step2: logprobs missing' }] }

@@ -1,6 +1,11 @@
 import { notifyBatchesPublished, activeBatchItems } from '@/utils/batchLifecycle'
 import type { CollectionBatchDetail, CollectionBatchSummary } from '@/collectionBatchesApi'
 
+export type AgentType = 'newagent' | 'pipelineagent'
+export interface AgentCapability { available: boolean; reason?: string; collection: boolean; capture_logprobs: boolean; model_iteration_evaluation: boolean; offline_evaluation: boolean }
+export type AgentCapabilities = Partial<Record<AgentType, AgentCapability>>
+export interface AgentProvenance { agent_type?: AgentType; agent_version?: string; trajectory_format?: string; normalizer_version?: string; runtime_digest?: string; configuration_digest?: string }
+export interface FactorySettings extends FactoryConfig { agent_type?: AgentType }
 export interface PhoneAppRow { phone_id: string; app: string; status: string }
 export interface CollectionWarning { sheet: string; row: number; field: string; message: string }
 export interface TaskRow { warnings?: CollectionWarning[]; original_filename?: string; description: string; filename: string; status: string; source_batch_id?: string }
@@ -11,21 +16,21 @@ export interface EvaluatorConfig { text: EvaluatorModel; vision: EvaluatorModel 
 export type EvaluationExecutionMode = 'collect_and_evaluate' | 'evaluate_only'
 export interface EvaluationProfile { id: string; name: string; digest: string }
 export type EvaluationIssue = string | { message?: string; error?: string; case_id?: string; path?: string }
-export interface EvaluationSource { run_id?: string; source_run_id?: string; path?: string; source_path?: string; run_mode?: string; status?: string; created_at?: string; trajectory_count?: number }
+export interface EvaluationSource extends AgentProvenance { run_id?: string; source_run_id?: string; path?: string; source_path?: string; run_mode?: string; status?: string; created_at?: string; trajectory_count?: number }
 export type EvaluationSourceInput = { source_run_id: string; source_path?: never } | { source_path: string; source_run_id?: never }
 export interface EvaluationPreview { preview_id: string; valid: boolean; trajectory_count: number; cases: Array<{ source_trajectory_id: string; case_id: string; task: string; phone_id?: string; key_elements?: string }>; errors: EvaluationIssue[]; source: EvaluationSource; source_digest: string }
 export interface EvaluationRunMetadata { execution_mode?: EvaluationExecutionMode; evaluation_profile_id?: string; evaluation_profile_name?: string; evaluation_profile_digest?: string; source?: EvaluationSource }
 export interface StartEvaluationOptions { request_id: string; evaluator_config: EvaluatorConfig; evaluation_profile_id: string; evaluation_profile_digest: string; preview_id: string; checklist_source: 'auto' }
 export interface EvaluationSummary { total: number; collection_completed: number; collection_failed: number; evaluation_completed: number; evaluation_failed: number; evaluation_running: number; evaluation_pending: number; success: number; partial_success: number; fail: number; success_rate: number | null }
-export interface EvaluationCase { case_key: string; phone_id: string; case_id: string; session_id?: string; source_trajectory_id?: string; checklist_source?: string; collection_status: string; evaluation_status: string; verdict?: string | null; failure_reason?: string; attempt_count: number; report_file_id?: string | null; report_name?: string; errors: Array<{ error?: string; message?: string } | string> }
+export interface EvaluationCase extends AgentProvenance { case_key: string; phone_id: string; case_id: string; session_id?: string; source_trajectory_id?: string; checklist_source?: string; collection_status: string; evaluation_status: string; verdict?: string | null; failure_reason?: string; attempt_count: number; report_file_id?: string | null; report_name?: string; errors: Array<{ error?: string; message?: string } | string> }
 export interface EvaluationResults extends EvaluationRunMetadata { run_id: string; run_mode: 'modeliter'; summary: EvaluationSummary; cases: EvaluationCase[]; stale?: boolean; sync_error?: string }
-export interface RunOptions { evaluator_config?: EvaluatorConfig; evaluation_profile_id?: string; evaluation_profile_digest?: string; checklist_source?: 'llm' | 'auto'; evaluation_mode?: 'checklist'; filename: string; phone_id?: string; app?: string; request_id: string; vla: string; run_mode?: 'generate' | 'modeliter'; config?: FactoryConfig }
+export interface RunOptions extends AgentProvenance { evaluator_config?: EvaluatorConfig; evaluation_profile_id?: string; evaluation_profile_digest?: string; checklist_source?: 'llm' | 'auto'; evaluation_mode?: 'checklist'; filename: string; phone_id?: string; app?: string; request_id: string; vla: string; run_mode?: 'generate' | 'modeliter'; config?: FactoryConfig }
 export interface RemoteResult { ok: boolean; message?: string; error?: string; run_id?: string; collection_run_id?: string; batch_id?: string }
 export interface AdbDevice { serial: string; model: string; battery: number | null }
-export interface PhoneMonitor { ok: boolean; screenshot: string | null; log: string; running: boolean; device_size?: { width: number; height: number } | null }
-export interface FactoryRun extends EvaluationRunMetadata { evaluation_summary?: EvaluationSummary; run_id?: string; collection_run_id?: string; batch_id?: string; status: string; created_at?: string; filename?: string; vla?: string; error?: string; dispatch_error?: string; transfer_error?: string; transfer_status?: string; remote_status?: string; remote_errors?: Array<{ error?: string; message?: string }>; errors?: Array<{ error?: string; message?: string }>; trajectory_count?: number }
+export interface PhoneMonitor extends AgentProvenance { run_id?: string; ok: boolean; screenshot: string | null; log: string; running: boolean; device_size?: { width: number; height: number } | null }
+export interface FactoryRun extends EvaluationRunMetadata, AgentProvenance { evaluation_summary?: EvaluationSummary; run_id?: string; collection_run_id?: string; batch_id?: string; status: string; created_at?: string; filename?: string; vla?: string; error?: string; dispatch_error?: string; transfer_error?: string; transfer_status?: string; remote_status?: string; remote_errors?: Array<{ error?: string; message?: string }>; errors?: Array<{ error?: string; message?: string }>; trajectory_count?: number }
 export interface ReportFile { name: string; size: number; modified?: number; file_id?: string }
-export interface ReportFolder { index: number; dir_name: string; modified?: number; run_id?: string; files: ReportFile[] }
+export interface ReportFolder extends AgentProvenance { index: number; dir_name: string; modified?: number; run_id?: string; files: ReportFile[] }
 export type FactoryBatchSummary = Omit<CollectionBatchSummary, 'kind' | 'source_job_id'> & { warnings?: CollectionWarning[]; kind: CollectionBatchSummary['kind'] | 'manual_collection'; source_job_id: string | null }
 export type FactoryBatchDetail = Omit<CollectionBatchDetail, 'kind' | 'source_job_id' | 'snapshot'> & FactoryBatchSummary & { snapshot: { tasks: Array<Record<string, unknown>> } }
 
@@ -78,15 +83,17 @@ export function createFactoryApi(base: '/api/phone-factory' | '/api/model-iter')
     addTask: (description: string, filename: string, contentBase64: string, sourceBatchId?: string, requestId?: string) => req<FactoryState>('/tasks', jsonInit('POST', { description, filename, content_base64: contentBase64, ...(sourceBatchId ? { source_batch_id: sourceBatchId } : {}), ...(requestId ? { request_id: requestId } : {}) })),
     startTask: (filename: string) => req<FactoryState>('/tasks/start', jsonInit('POST', { filename })),
     removeTask: (filename: string) => req<FactoryState>('/tasks', jsonInit('DELETE', { filename })),
-    config: () => req<FactoryConfig>('/config'),
-    saveConfig: (config: FactoryConfig) => req<FactoryConfig>('/config', jsonInit('POST', config)),
+    agentCapabilities: () => req<{ ok: boolean; agent_types: AgentCapabilities }>('/agent-capabilities'),
+    config: () => req<FactorySettings>('/config'),
+    saveConfig: (config: FactorySettings) => req<FactorySettings>('/config', jsonInit('POST', config)),
     remoteAddPhone: (phoneId: string) => req<RemoteResult>('/remote/add-phone', jsonInit('POST', { phone_id: phoneId })),
     remoteDeletePhone: (phoneId: string) => req<RemoteResult & { state?: FactoryState }>('/remote/del-phone', jsonInit('POST', { phone_id: phoneId })),
     remoteStartRun: (options: RunOptions) => req<RemoteResult>('/remote/start-run', jsonInit('POST', options)),
-    remoteStatus: (phones: string[], signal?: AbortSignal) => req<{ ok: boolean; statuses: Array<{ phone_id: string; status: string }> }>('/remote/status', jsonInit('POST', { phones }, signal)),
+    remoteStatus: (phones: string[], signal?: AbortSignal) => req<{ ok: boolean; statuses: Array<{ phone_id: string; status: string; agent_type?: AgentType; run_id?: string }> }>('/remote/status', jsonInit('POST', { phones }, signal)),
     adbDevices: (signal?: AbortSignal) => req<{ ok: boolean; devices: AdbDevice[] }>('/remote/adb-devices', jsonInit('POST', {}, signal)),
     monitor: (phoneId: string, signal?: AbortSignal) => req<PhoneMonitor>('/remote/monitor', jsonInit('POST', { phone_id: phoneId }, signal)),
     runs: (signal?: AbortSignal) => req<{ runs: FactoryRun[] }>(base === '/api/model-iter' ? '/runs' : '/collection-runs', { signal }),
+    cancelCollection: (id: string) => req<FactoryRun>(`/collection-runs/${encodeURIComponent(id)}/cancel`, jsonInit('POST', {})),
     syncRun: (id: string) => req<FactoryRun>(`/collection-runs/${encodeURIComponent(id)}/sync`, jsonInit('POST', {})),
     reports: (signal?: AbortSignal) => req<{ ok: boolean; folders: ReportFolder[] }>('/reports', { signal }),
     async reportDownload(folder: ReportFolder, file: ReportFile) {

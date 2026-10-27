@@ -244,7 +244,10 @@ class PreprocessingJobManager:
                     # On an established batch, preserve the complete old chain until
                     # the replacement annotation is ready. A failed retry changes nothing.
                     if self.artifacts.get(job["batch_id"], "02_annotation") is None:
-                        conversion = self.artifacts.publish_many(job["batch_id"], [pending_conversion])[0]
+                        from .display_identifiers import DisplayIdentifierStore
+                        display_entries = DisplayIdentifierStore(self.root).conversion_entries(job["batch_id"], payload)
+                        conversion = self.artifacts.publish_many(job["batch_id"], [pending_conversion],
+                                                                 record_entries=display_entries)[0]
                         pending_conversion = None
                         saved = [conversion]
                         self._update(job_id, artifacts=saved)
@@ -307,6 +310,8 @@ class PreprocessingJobManager:
                             entry["expected_version"] = current["version"]
                         notifications = [invalidation_record_entry(self.artifacts, job["batch_id"], "annotation", changed)] if changed else []
                         if pending_conversion:
+                            from .display_identifiers import DisplayIdentifierStore
+                            notifications.extend(DisplayIdentifierStore(self.root).conversion_entries(job["batch_id"], payload))
                             entry["source_stages"] = ["01_conversion"]
                             conversion, annotation = self.artifacts.publish_many(job["batch_id"], [pending_conversion, entry], record_entries=notifications)
                         else:

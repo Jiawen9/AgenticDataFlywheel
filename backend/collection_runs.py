@@ -17,6 +17,7 @@ from .batch_operations import active_batch_lock
 from .data_store import DATA_ROOT, RecordStore, RevisionConflict, rebase_data_path
 from .data_store.paths import contained_path
 from .file_io import io_path, iterdir, rglob, is_link_or_junction
+from .agent_types import normalize_agent_type, PROVENANCE_FIELDS
 from .task_generation.collection_batches import (
     CollectionBatchDetail, collection_batch_payload, payload_digest, workbook_digest,
 )
@@ -33,15 +34,20 @@ class CollectionRunError(ValueError):
 
 
 def matches_legacy_logprobs_request(existing: dict, request: dict, *, nested_metadata: bool = False) -> bool:
-    """Allow only the added false default when replaying a pre-logprob request."""
+    """Replay historical requests only by removing newly introduced defaults."""
     frozen = existing.get("request", {})
     options = request.get("metadata", {}) if nested_metadata else request
     frozen_options = frozen.get("metadata", {}) if nested_metadata else frozen
+    legacy_options = dict(options)
+    if "agent_type" not in frozen_options:
+        if legacy_options.get("agent_type", "newagent") != "newagent":
+            return False
+        legacy_options.pop("agent_type", None)
     config, frozen_config = options.get("config"), frozen_options.get("config")
-    if (not isinstance(config, dict) or not isinstance(frozen_config, dict)
-            or config.get("capture_logprobs") is not False or "capture_logprobs" in frozen_config):
-        return False
-    legacy_options = {**options, "config": {key: value for key, value in config.items() if key != "capture_logprobs"}}
+    if isinstance(config, dict) and isinstance(frozen_config, dict) and "capture_logprobs" not in frozen_config:
+        if config.get("capture_logprobs", False) is not False:
+            return False
+        legacy_options["config"] = {key: value for key, value in config.items() if key != "capture_logprobs"}
     legacy_request = {**request, "metadata": legacy_options} if nested_metadata else legacy_options
     return payload_digest(legacy_request) == existing.get("request_digest")
 
@@ -211,7 +217,8 @@ class CollectionRunStore:
             }
             io_path(root).mkdir(parents=True, exist_ok=True)
             try:
-                saved = self.records.put("collection_runs", run_id, payload, expected_revision=0)
+                from .display_identifiers import DisplayIdentifierStore
+                saved = DisplayIdentifierStore(self.root).create_run("collection_runs", run_id, payload)
                 return saved, True
             except RevisionConflict:
                 existing = self.get(run_id)
@@ -263,6 +270,19 @@ class CollectionRunStore:
             raise CollectionRunError("完成清单的 batch_id 与采集运行不匹配")
         if manifest.get("collection_run_id", run["collection_run_id"]) != run["collection_run_id"]:
             raise CollectionRunError("完成清单的 collection_run_id 不匹配")
+        options = run.get("request", {}).get("metadata", {})
+        expected_agent = options.get("agent_type", "newagent")
+        try:
+            manifest_agent = normalize_agent_type(manifest.get("agent_type", "newagent"))
+        except ValueError as exc:
+            raise CollectionRunError(str(exc)) from exc
+        if manifest_agent != expected_agent:
+            raise CollectionRunError("完成清单的采集引擎与下发配置不匹配")
+        # Missing provenance stays missing in frozen historical manifests.
+        provenance = {key: manifest[key] for key in PROVENANCE_FIELDS if key in manifest}
+        for key, value in provenance.items():
+            if not isinstance(value, str) or not value or len(value) > 256:
+                raise CollectionRunError(f"完成清单 {key} 无效")
         entries, errors = manifest.get("trajectories"), manifest.get("errors", [])
         if not isinstance(entries, list) or not isinstance(errors, list):
             raise CollectionRunError("trajectories 与 errors 必须为列表")
@@ -304,7 +324,14 @@ class CollectionRunStore:
                         raise CollectionRunError("源文件 size 无效")
                     value["size"] = item["size"]
                 files.append(value)
+            entry_provenance = {**provenance, **{key: entry[key] for key in PROVENANCE_FIELDS if key in entry}}
+            if entry_provenance.get("agent_type", manifest_agent) != manifest_agent:
+                raise CollectionRunError("轨迹采集引擎与运行不匹配")
+            for key, value in entry_provenance.items():
+                if not isinstance(value, str) or not value or len(value) > 256:
+                    raise CollectionRunError(f"轨迹 {key} 无效")
             trajectories.append({
+                **entry_provenance,
                 "collection_run_id": run["collection_run_id"], "collection_case_id": case_id,
                 "task_id": source_task["task_id"], "source_result_id": source_task["source_result_id"],
                 "task": source_task.get("task"), "app": source_task.get("app"),
@@ -323,7 +350,7 @@ class CollectionRunStore:
             if case_id is not None and case_id not in run["batch_tasks"]:
                 raise CollectionRunError("失败用例不属于本采集批次")
             normalized_errors.append({"collection_case_id": case_id, "error": item.get("error", item.get("message"))})
-        return {"batch_id": run["batch_id"], "collection_run_id": run["collection_run_id"],
+        return {**provenance, "batch_id": run["batch_id"], "collection_run_id": run["collection_run_id"],
                 "trajectories": sorted(trajectories, key=lambda item: item["relative_dir"]),
                 "errors": normalized_errors}
 
@@ -340,7 +367,7 @@ class CollectionRunStore:
         return CollectionRunError("采集源文件校验失败", file_failure={
             "code": code, "trajectory": trajectory, "paths": list(paths), **counts})
 
-    def _validate_trajectory_content(self, directory: Path, relative_dir: str, *, rows_and_warnings=None) -> None:
+    def _validate_trajectory_content(self, directory: Path, relative_dir: str, *, rows_and_warnings=None, agent_type=None) -> None:
         """Validate structure, optionally sharing the rows parsed in this same scan."""
         evaluation = directory / "_trajectory_for_evaluate.json"
         if not io_path(evaluation).is_file():
@@ -354,6 +381,15 @@ class CollectionRunStore:
         from .export_vla_trajectories import STEP_RESPONSE_RE, collect_rows
         if not any(io_path(path).is_file() and STEP_RESPONSE_RE.fullmatch(path.name) for path in iterdir(directory)):
             raise self._file_error("trajectory_invalid", relative_dir)
+        if agent_type == "pipelineagent" or content.get("agent_type") == "pipelineagent":
+            from .export_vla_trajectories import pipeline_executed_action
+            try:
+                for path in iterdir(directory):
+                    if io_path(path).is_file() and STEP_RESPONSE_RE.fullmatch(path.name):
+                        response = json.loads(io_path(path).read_text(encoding="utf-8-sig"))
+                        pipeline_executed_action(path, response)
+            except (OSError, ValueError, AttributeError) as exc:
+                raise self._file_error("trajectory_invalid", relative_dir) from exc
         rows, warnings = rows_and_warnings if rows_and_warnings is not None else collect_rows(directory)
         if not rows or any(not row[3] for row in rows) or any("skipped because" in warning for warning in warnings):
             raise self._file_error("trajectory_invalid", relative_dir)
@@ -392,7 +428,8 @@ class CollectionRunStore:
                         raise self._file_error("source_hash_mismatch", relative_dir, paths=[item["path"]])
                 except OSError as exc:
                     raise self._file_error("source_unreadable", relative_dir, paths=[item["path"]]) from exc
-            self._validate_trajectory_content(directory, relative_dir)
+            self._validate_trajectory_content(directory, relative_dir,
+                agent_type=trajectory.get("agent_type", run.get("request", {}).get("metadata", {}).get("agent_type", "newagent")))
 
     def complete(self, run_id: str, manifest: dict) -> tuple[dict, bool]:
         current = self.get(run_id)
@@ -426,7 +463,7 @@ class CollectionRunStore:
         for run in self.list_runs(batch_id):
             if run["status"] != "completed":
                 continue
-            normalized = {key: run[key] for key in ("batch_id", "collection_run_id", "trajectories", "errors")}
+            normalized = {key: run[key] for key in ("batch_id", "collection_run_id", "trajectories", "errors") + PROVENANCE_FIELDS if key in run}
             if payload_digest(normalized) != run.get("manifest_sha256"):
                 raise CollectionRunError("已完成采集运行的清单校验失败")
             self._validate_sources(run, normalized)

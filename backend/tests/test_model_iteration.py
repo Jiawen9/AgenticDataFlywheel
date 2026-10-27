@@ -125,7 +125,10 @@ class ModelIterationTests(unittest.TestCase):
         self.store.runtime.sync_evaluation(run_id)
         self.assertEqual(self.store.records.get("model_iter_runs", run_id)["evaluation_summary"]["success_rate"], 1)
         self.unreachable = True
-        stale = self.store.dispatch(f"runs/{run_id}/evaluations", "GET", {}, mode="modeliter")
+        policy = self.store.runtime.sync_policy
+        # Page reads now respect the successful poll's ten-second interval.
+        with patch.object(policy, "clock", return_value=policy.clock() + 11):
+            stale = self.store.dispatch(f"runs/{run_id}/evaluations", "GET", {}, mode="modeliter")
         self.assertTrue(stale["stale"])
         self.unreachable = False; self.runs[run_id]["status"] = "succeeded"
         self.store.runtime.sync_evaluation(run_id)

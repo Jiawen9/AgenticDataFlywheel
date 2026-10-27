@@ -151,6 +151,8 @@ class HandoffLegacyCompatibilityTests(unittest.TestCase):
         stop.is_set.return_value = False
         with patch.object(store.runtime, "_stop", stop):
             store.runtime._poll_evaluations()
+        # Polling now schedules bounded workers; join them before inspecting results.
+        store.runtime._evaluation_pool.close()
         self.assertEqual([args for args in self.calls if args[0] == "run"], [["run", modern["run_id"]]])
         self.assertEqual(store.records.get("model_iter_runs", modern["run_id"])["status"], "succeeded")
         for identifier, saved in before.items():
@@ -169,7 +171,7 @@ class HandoffLegacyCompatibilityTests(unittest.TestCase):
         before = store.collection_runs.get(legacy["collection_run_id"])
         with patch.object(store.runtime.transfer, "sync", return_value={"status": "waiting"}) as sync:
             self.assertEqual(store.runtime.transfer.recover(), [{"status": "waiting"}])
-        sync.assert_called_once_with(modern["collection_run_id"])
+        sync.assert_called_once_with(modern["collection_run_id"], force=False)
         self.assertEqual(store.collection_runs.get(legacy["collection_run_id"]), before)
         self.assertEqual([args for args in self.calls if args[0] in {"run", "run-archive"}], [])
 

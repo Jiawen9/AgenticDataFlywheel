@@ -7,6 +7,9 @@ import { api, taskGenerationDownloadUrl } from '@/api'
 import type { AugmentationSeed, TaskGenerationJob, TaskGenerationResult } from '@/types'
 import AugmentationSceneTree from '@/components/AugmentationSceneTree.vue'
 import CollectionBatchSubmission from '@/components/CollectionBatchSubmission.vue'
+import DisplayId from '@/components/DisplayId.vue'
+import { useDisplayIdentifiers } from '@/composables/useDisplayIdentifiers'
+const { displayId } = useDisplayIdentifiers()
 import { useAugmentationPreview } from '@/composables/useAugmentationPreview'
 import { findNode, nodePath } from '@/utils/scenarioTree'
 import { augmentationResultGroupId, groupAugmentationResults, type AugmentationResultGroup } from '@/utils/augmentationReview'
@@ -218,10 +221,10 @@ onBeforeUnmount(() => { review.dispose(); window.removeEventListener('beforeunlo
     <section class="jobs-card">
       <div class="section-title"><div><span class="eyebrow">AUGMENTATION QUEUE</span><h2>场景匹配与扩增</h2></div><el-button :disabled="busy || refreshing" @click="selectedJob ? refreshSelected() : review.loadJobs()">刷新</el-button></div>
       <el-alert v-if="listError" type="error" :title="listError" :closable="false" show-icon />
-      <div v-if="jobs.length" class="job-tabs"><button v-for="job in jobs" :key="job.job_id" :class="{ active: selectedJob?.job_id === job.job_id }" :disabled="busy" @click="selectJob(job)"><b>{{ job.created_at.slice(0, 16).replace('T', ' ') }}</b><span>{{ statusText(job.status) }} · {{ job.result_count }} 条</span><small>{{ job.input_filename || job.job_id.slice(0, 12) }}</small></button></div>
+      <div v-if="jobs.length" class="job-tabs"><button v-for="job in jobs" :key="job.job_id" :class="{ active: selectedJob?.job_id === job.job_id }" :disabled="busy" @click="selectJob(job)"><b>{{ job.created_at.slice(0, 16).replace('T', ' ') }}</b><span>{{ statusText(job.status) }} · {{ job.result_count }} 条</span><small :title="job.job_id">{{ job.input_filename || displayId('job', job.job_id) }}</small></button></div>
       <el-alert v-if="detailError" type="error" :title="detailError" description="请点击刷新重试。" :closable="false" show-icon />
       <template v-if="selectedJob">
-        <div class="job-meta"><span>{{ statusText(selectedJob.status) }} · {{ selectedJob.input_filename || selectedJob.job_id }}</span><span v-if="snapshotVersion" :title="snapshotVersion">场景树快照版本：{{ snapshotVersion }}</span></div>
+        <div class="job-meta"><span>{{ statusText(selectedJob.status) }} · {{ selectedJob.input_filename }} <DisplayId kind="job" :id="selectedJob.job_id" /></span><span v-if="snapshotVersion" :title="snapshotVersion">场景树快照版本：{{ snapshotVersion }}</span></div>
         <CollectionBatchSubmission :key="selectedJob.job_id" :job="selectedJob" :result-count="activeResults.length" :busy="busy || loading || refreshing" :protect="review.protect" :run-protected="review.runExternalAction" />
         <div v-if="active" class="progress-card"><div><b>{{ stageText(selectedJob.stage) }}</b><span>{{ selectedJob.current_item || '等待执行' }} · {{ selectedJob.completed_items }} / {{ selectedJob.total_items || '待读取' }}</span></div><el-progress :percentage="selectedJob.percent" /></div>
         <div v-if="selectedJob.status === 'awaiting_confirmation'" class="confirmation-card"><div><b>场景匹配完成，等待确认扩增</b><p>{{ preview?.stats.total || 0 }} 条失败用例 · {{ preview?.stats.matched || 0 }} 条已关联 · {{ preview?.stats.unmatched || 0 }} 条未关联 · {{ preview?.stats.classification_failed || 0 }} 条分类失败</p><p v-if="preview?.stats.eligible">将为 {{ preview.stats.eligible }} 条可扩增用例分别生成 {{ selectedJob.generate_n }} 条变体。未关联用例仍按现有扩增规则处理；分类失败用例跳过。</p><p v-else>没有可扩增的用例，请检查下方分类结果。</p></div><el-button type="primary" :loading="busy" :disabled="!canStart || loading || refreshing" @click="review.start()">开始扩增</el-button></div>

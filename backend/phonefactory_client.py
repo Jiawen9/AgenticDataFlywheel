@@ -18,11 +18,23 @@ TIMEOUT = float(os.environ.get("PHONE_FACTORY_TIMEOUT", "30"))
 TRANSFER_TIMEOUT = float(os.environ.get("PHONE_FACTORY_TRANSFER_TIMEOUT", "300"))
 MAX_DOWNLOAD = int(os.environ.get("PHONE_FACTORY_MAX_ARCHIVE_BYTES", str(10 * 1024**3)))
 UNREACHABLE_MSG = "功能不支持或者网络断连"
+CLIENT_ERROR_PREFIX = "__PHONE_FACTORY_ERROR__="
 
 
 def _headers():
     token = os.environ.get("PHONE_FACTORY_TOKEN", "")
     return {"Authorization": "Bearer " + token} if token else {}
+
+
+def _exit_error(message, kind, status=None):
+    # The CLI's human-readable error stays unchanged. Only the platform parent
+    # opts in to machine-readable metadata, on a separate stderr line.
+    if os.environ.get("PHONE_FACTORY_CLIENT_ERROR_METADATA") == "1":
+        metadata = {"remote_kind": kind}
+        if status is not None:
+            metadata["remote_status"] = status
+        print(CLIENT_ERROR_PREFIX + json.dumps(metadata), file=sys.stderr, flush=True)
+    sys.exit(message)
 
 
 def _error(exc):
@@ -34,10 +46,14 @@ def _error(exc):
                 message = message.get("message")
         except Exception:
             message = None
-        sys.exit(f"错误：{message or UNREACHABLE_MSG}（HTTP {exc.code}）")
-    if isinstance(exc, (socket.timeout, TimeoutError)):
-        sys.exit("错误：采集服务请求超时，请用同一请求编号重试")
-    sys.exit(f"错误：{UNREACHABLE_MSG}（{type(exc).__name__}）")
+        _exit_error(f"错误：{message or UNREACHABLE_MSG}（HTTP {exc.code}）", "http", exc.code)
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if isinstance(reason, (socket.timeout, TimeoutError)):
+        _exit_error("错误：采集服务请求超时，请用同一请求编号重试", "timeout")
+    kind = "protocol" if isinstance(exc, ValueError) else "connection"
+    if isinstance(exc, (PermissionError, FileNotFoundError, FileExistsError)):
+        kind = "client"
+    _exit_error(f"错误：{UNREACHABLE_MSG}（{type(exc).__name__}）", kind)
 
 
 def _request(req):
@@ -112,7 +128,8 @@ def cmd_start_run(args):
         "sampling_enabled": str(args.sampling).lower(), "temperature": str(args.temperature),
         "top_p": str(args.top_p), "use_experience_lib": str(args.exp).lower(),
         "capture_logprobs": str(getattr(args, "capture_logprobs", False)).lower(),
-        "vla": getattr(args, "vla", "") or "", "runmode": getattr(args, "runmode", "generate")}
+        "vla": getattr(args, "vla", "") or "", "runmode": getattr(args, "runmode", "generate"),
+        "agent_type": getattr(args, "agent_type", "newagent")}
     evaluator_config = getattr(args, "evaluator_config", None)
     if fields["runmode"] == "modeliter" and evaluator_config:
         fields.update(evaluator_config=evaluator_config, checklist_source=args.checklist_source,
@@ -153,6 +170,7 @@ def build_parser():
     run.add_argument("--temperature", type=float, default=0.7)
     run.add_argument("--top-p", type=float, default=0.85)
     run.add_argument("--exp", action="store_true")
+    run.add_argument("--agent-type", choices=("newagent", "pipelineagent"), default="newagent")
     run.add_argument("--vla", default="")
     run.add_argument("--runmode", choices=["generate", "modeliter"], default="generate")
     run.add_argument("--batch-id")

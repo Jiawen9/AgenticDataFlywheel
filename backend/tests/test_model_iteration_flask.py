@@ -357,7 +357,10 @@ class ModelIterationFlaskTests(unittest.TestCase):
         self.finish_job(self.jobs[0],'success')
         self.finish_job(self.jobs[1],'fail')
         self.dispatcher.tick()
-        state = self.results(run['run_id'])
+        policy = self.factory.runtime.sync_policy
+        # Page refreshes respect the shared polling interval.
+        with patch.object(policy, 'clock', return_value=policy.clock() + 11):
+            state = self.results(run['run_id'])
         self.assertEqual(state['summary']['evaluation_completed'],2)
         self.assertEqual(state['summary']['success_rate'],0.5)
         frozen = self.archive_collected(record,[first,second])
