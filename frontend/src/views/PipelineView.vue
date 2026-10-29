@@ -10,24 +10,30 @@ import RolloutImportDialog from '@/components/RolloutImportDialog.vue'
 import type { RolloutImportResult } from '@/rolloutImportApi'
 import { PIPELINE_DIAGRAM_STAGES, diagramNodeState, diagramStageState, diagramStageTarget, type DiagramStage, type DiagramNodeState } from '@/utils/pipelineDiagram'
 import CollectionAgentSelect from '@/components/CollectionAgentSelect.vue'
-import { agentBlockedReason } from '@/utils/collectionAgents'
+import PipelineModelFields from '@/components/PipelineModelFields.vue'
+import { modelDraft, modelOptions, modelBlockedReason } from '@/utils/pipelineModels'
+import { agentBlockedReason, agentLabel } from '@/utils/collectionAgents'
+import { isCollectionResult } from '@/utils/collectionResults'
 import { factoryBatchesApi, newRunRequestId, phoneFactoryApi, type AgentCapabilities, type AgentType, type FactoryState } from '@/phoneFactoryApi'
 import { usePipelineContext } from '@/composables/usePipelineContext'
-import { activeBatchItems, subscribeBatchLifecycle } from '@/utils/batchLifecycle'
+import { publishedBatch, subscribeBatchLifecycle } from '@/utils/batchLifecycle'
 import { retryProgress } from '@/utils/pipelineRetry'
 import { PIPELINE_TERMINAL, pipelineStatusLabels, pipelineStepLabels, pipelineStepLocation, type CreatePipeline, type Pipeline, type PipelineAction, type PipelineStepId } from '@/types/pipeline'
 const route = useRoute(), router = useRouter(), context = usePipelineContext()
 const { displayId, matches } = useDisplayIdentifiers()
 const batchSearch = ref(''), historySearch = ref('')
-const filteredHistory = computed(() => history.value.filter(item => matches(historySearch.value, 'pipeline', item.pipeline_id, '', item.name) || matches(historySearch.value, 'batch', item.batch_id)))
+const filteredHistory = computed(() => history.value.filter(item => matches(historySearch.value, 'pipeline', item.pipeline_id, '', item.name) || matches(historySearch.value, 'batch', item.batch_id) || matches(historySearch.value, 'batch', item.task_source_batch_id)))
 const visibleChoices = computed(() => choices.value.filter(item => matches(batchSearch.value, 'batch', item.batch_id, '', item.label)))
 function childJobKind(stepId: PipelineStepId) { return stepId === 'collection' ? 'run' : 'job' }
 const pipeline = context.pipeline, history = ref<Pipeline[]>([])
 const error = ref(''), createError = ref(''), loading = ref(false), submitting = ref(false), controlling = ref(false), dialogVisible = ref(false), choicesLoading = ref(false)
-const batches = ref<Array<{ batch_id: string; label: string; collectible: boolean; task_count: number }>>([])
+interface BatchChoice { batch_id: string; label: string; collectible: boolean; prepared: boolean; task_count: number }
+const batches = ref<BatchChoice[]>([])
 const factory = ref<FactoryState>({ phones: [], apps: [], phoneApps: [], vla: [], tasks: [] })
 const rolloutImportVisible = ref(false)
 const agentCapabilities = ref<AgentCapabilities | null>(null)
+const models = reactive(modelDraft())
+const collectionIssue = computed(() => agentBlockedReason(agentCapabilities.value, draft.agent_type, draft.capture_logprobs) || modelBlockedReason(agentCapabilities.value, draft.agent_type, models))
 const draft = reactive({ agent_type: 'newagent' as AgentType, name: '', batch_id: '', start_mode: 'existing' as 'existing' | 'collect', mode: 'manual' as 'manual' | 'automatic', threshold: 3, phone_id: '', app: '', vla: '', sampling_enabled: false, temperature: 1, top_p: 1, use_experience_lib: false, capture_logprobs: false })
 let disposed = false, listGeneration = 0, choicesGeneration = 0, listController: AbortController | undefined
 const requests = new Map<string, string>()
@@ -73,7 +79,7 @@ function openStage(stage: DiagramStage) {
   if (target) openStep(target)
 }
 function percentage(value: number | undefined) { return Number.isFinite(value) ? Math.max(0, Math.min(100, value!)) : undefined }
-const choices = computed(() => activeBatchItems(batches.value).filter(batch => draft.start_mode !== 'collect' || batch.collectible))
+const choices = computed(() => batches.value.filter(batch => draft.start_mode === 'collect' ? batch.collectible : batch.prepared && !publishedBatch(batch.batch_id)))
 const apps = computed(() => draft.phone_id ? factory.value.phoneApps.filter(row => row.phone_id === draft.phone_id).map(row => row.app) : factory.value.apps)
 const canSubmit = computed(() => Boolean(draft.name.trim() && draft.batch_id && choices.value.some(batch => batch.batch_id === draft.batch_id) && (draft.mode !== 'automatic' || (Number.isFinite(draft.threshold) && draft.threshold >= 0 && draft.threshold <= 5)) && (draft.start_mode !== 'collect' || draft.vla.trim())))
 const done = computed(() => pipeline.value?.steps.filter(step => ['succeeded', 'skipped'].includes(step.status)).length || 0)
@@ -100,12 +106,22 @@ async function loadChoices(hydrateConfig = true) {
     try { const value = await phoneFactoryApi.agentCapabilities(); if (!disposed && generation === choicesGeneration) agentCapabilities.value = value.agent_types } catch { if (!disposed && generation === choicesGeneration) agentCapabilities.value = null }
   }
   if (disposed || generation !== choicesGeneration) return
-  const options = new Map<string, { batch_id: string; label: string; collectible: boolean; task_count: number }>()
-  if (collection.status === 'fulfilled') for (const batch of collection.value) options.set(batch.batch_id, { batch_id: batch.batch_id, label: batch.batch_id, collectible: true, task_count: batch.task_count })
-  if (prepared.status === 'fulfilled') for (const batch of prepared.value) options.set(batch.batch_id, { batch_id: batch.batch_id, label: batch.label || batch.batch_id, collectible: options.get(batch.batch_id)?.collectible || false, task_count: batch.task_count })
-  batches.value = activeBatchItems([...options.values()])
+  const options = new Map<string, BatchChoice>()
+  if (collection.status === 'fulfilled') for (const batch of collection.value) {
+    if (!isCollectionResult(batch)) options.set(batch.batch_id, { batch_id: batch.batch_id, label: batch.batch_id, collectible: true, prepared: false, task_count: batch.task_count })
+  }
+  if (prepared.status === 'fulfilled') for (const batch of prepared.value) {
+    const label = [batch.label || batch.batch_id, ...(batch.agent_type ? [agentLabel(batch.agent_type)] : []), ...(batch.task_source_batch_id ? [`来源 ${displayId('batch', batch.task_source_batch_id)}`] : [])].join(' · ')
+    options.set(batch.batch_id, { batch_id: batch.batch_id, label, collectible: options.get(batch.batch_id)?.collectible || false, prepared: batch.ready_trajectory_count > 0 || Boolean(batch.annotation_version), task_count: batch.task_count })
+  }
+  batches.value = [...options.values()]
   if (state.status === 'fulfilled') { factory.value = state.value; if (hydrateConfig && !draft.vla) draft.vla = state.value.vla[0] || '' }
-  if (hydrateConfig && config.status === 'fulfilled') Object.assign(draft, config.value)
+  if (hydrateConfig && config.status === 'fulfilled') {
+    const { model_defaults, ...settings } = config.value
+    Object.assign(draft, settings)
+    Object.assign(models, modelDraft(model_defaults))
+    if (model_defaults?.vla) draft.vla = model_defaults.vla
+  }
   if (collection.status === 'rejected' && prepared.status === 'rejected') createError.value = '批次列表读取失败，请关闭弹窗后重试'
   else if (state.status === 'rejected' || config.status === 'rejected') createError.value = '手机工厂配置读取失败；可接续已有结果，下发采集请先检查配置'
   choicesLoading.value = false
@@ -128,11 +144,11 @@ function openCreate() {
 }
 async function create() {
   if (!canSubmit.value || submitting.value) return
-  if (draft.start_mode === 'collect' && agentBlockedReason(agentCapabilities.value, draft.agent_type, draft.capture_logprobs)) { createError.value = agentBlockedReason(agentCapabilities.value, draft.agent_type, draft.capture_logprobs); return }
+  if (draft.start_mode === 'collect' && collectionIssue.value) { createError.value = collectionIssue.value; return }
   submitting.value = true; createError.value = ''
   const body: Omit<CreatePipeline, 'request_id'> = { name: draft.name.trim(), batch_id: draft.batch_id, start_mode: draft.start_mode, mode: draft.mode,
     ...(draft.mode === 'automatic' ? { threshold: draft.threshold } : {}),
-    ...(draft.start_mode === 'collect' ? { collection_config: { agent_type: draft.agent_type, phone_id: draft.phone_id, app: draft.app, vla: draft.vla.trim(), config: { sampling_enabled: draft.sampling_enabled, temperature: draft.temperature, top_p: draft.top_p, use_experience_lib: draft.use_experience_lib, capture_logprobs: draft.capture_logprobs } } } : {}),
+    ...(draft.start_mode === 'collect' ? { collection_config: { ...modelOptions(draft.agent_type, models), agent_type: draft.agent_type, phone_id: draft.phone_id, app: draft.app, vla: draft.vla.trim(), config: { sampling_enabled: draft.sampling_enabled, temperature: draft.temperature, top_p: draft.top_p, use_experience_lib: draft.use_experience_lib, capture_logprobs: draft.capture_logprobs } } } : {}),
   }
   const key = JSON.stringify(body), requestId = requests.get(key) || newRunRequestId(); requests.set(key, requestId)
   try {
@@ -160,7 +176,10 @@ watch(() => draft.phone_id, () => { if (draft.app && !apps.value.includes(draft.
 watch(() => draft.start_mode, () => { if (!choices.value.some(batch => batch.batch_id === draft.batch_id)) draft.batch_id = '' })
 function focus() { void loadHistory() }
 function visible() { if (document.visibilityState === 'visible') void loadHistory() }
-const unsubscribe = subscribeBatchLifecycle(event => { batches.value = batches.value.filter(batch => !event.batch_ids.includes(batch.batch_id)); if (event.batch_ids.includes(draft.batch_id)) draft.batch_id = '' })
+const unsubscribe = subscribeBatchLifecycle(event => {
+  batches.value = batches.value.map(batch => event.batch_ids.includes(batch.batch_id) ? { ...batch, prepared: false } : batch)
+  if (draft.start_mode === 'existing' && event.batch_ids.includes(draft.batch_id)) draft.batch_id = ''
+})
 onMounted(() => { localStorage.removeItem('automatic-pipeline-circuit-v3'); void loadHistory(); window.addEventListener('focus', focus); document.addEventListener('visibilitychange', visible) })
 onBeforeUnmount(() => { disposed = true; stopRetryClock(); listGeneration++; choicesGeneration++; listController?.abort(); unsubscribe(); window.removeEventListener('focus', focus); document.removeEventListener('visibilitychange', visible) })
 </script>
@@ -172,7 +191,7 @@ onBeforeUnmount(() => { disposed = true; stopRetryClock(); listGeneration++; cho
     <section class="circuit-shell">
       <header class="run-strip">
         <div class="run-signal" :class="'is-' + runSignal"><i></i><span>{{ pipeline ? pipelineStatusLabels[pipeline.status] : '等待创建或选择 Pipeline' }}</span></div>
-        <span v-if="pipeline" class="run-name">{{ pipeline.name }} · <DisplayId kind="batch" :id="pipeline.batch_id" /></span>
+        <span v-if="pipeline" class="run-name">{{ pipeline.name }} · 结果批次 <DisplayId kind="batch" :id="pipeline.batch_id" /><template v-if="pipeline.task_source_batch_id"> · 任务来源 <DisplayId kind="batch" :id="pipeline.task_source_batch_id" /></template></span>
         <span class="run-current">{{ pipeline ? currentStep?.label : '点击“新建 Pipeline”配置并启动一次迭代' }}</span>
         <div v-if="pipeline" class="run-controls">
           <el-button v-if="pipeline.status === 'running' || pipeline.status === 'retry_waiting' || pipeline.status === 'waiting_for_correction'" size="small" :loading="controlling" @click="control('pause')">暂停</el-button>
@@ -234,7 +253,7 @@ onBeforeUnmount(() => { disposed = true; stopRetryClock(); listGeneration++; cho
     </section>
     <section class="history-panel"><div class="history-heading"><h2>运行记录</h2><el-input v-model="historySearch" clearable placeholder="搜索编号、批次或名称" style="max-width:280px" /><el-button size="small" :loading="loading" @click="loadHistory"><el-icon><Refresh /></el-icon>刷新</el-button></div>
       <el-table :data="filteredHistory" stripe empty-text="暂无 Pipeline，点击右上角新建" @row-click="(row: Pipeline) => selectPipeline(row.pipeline_id)">
-        <el-table-column label="名称" min-width="180"><template #default="{ row }"><div>{{ row.name }}</div><DisplayId kind="pipeline" :id="row.pipeline_id" /></template></el-table-column><el-table-column label="业务批次" min-width="180"><template #default="{ row }"><DisplayId kind="batch" :id="row.batch_id" /></template></el-table-column>
+        <el-table-column label="名称" min-width="180"><template #default="{ row }"><div>{{ row.name }}</div><DisplayId kind="pipeline" :id="row.pipeline_id" /></template></el-table-column><el-table-column label="任务来源" min-width="150"><template #default="{ row }"><DisplayId kind="batch" :id="row.task_source_batch_id || row.batch_id" /></template></el-table-column><el-table-column label="采集结果批次" min-width="180"><template #default="{ row }"><DisplayId kind="batch" :id="row.batch_id" /><small v-if="!row.task_source_batch_id"> · 历史批次</small></template></el-table-column>
         <el-table-column label="模式" width="120"><template #default="{ row }">{{ row.mode === 'manual' ? '人工修正' : '自动发布' }}</template></el-table-column>
         <el-table-column label="状态" min-width="160"><template #default="{ row }">{{ pipelineStatusLabels[row.status as Pipeline['status']] }}</template></el-table-column>
         <el-table-column label="创建时间" min-width="165"><template #default="{ row }">{{ date(row.created_at) }}</template></el-table-column>
@@ -246,20 +265,22 @@ onBeforeUnmount(() => { disposed = true; stopRetryClock(); listGeneration++; cho
       <el-form label-position="top" :disabled="submitting">
         <el-form-item label="名称" required><el-input v-model="draft.name" maxlength="100" placeholder="例如：手机采集批次验收" /></el-form-item>
         <el-form-item label="起点" required><el-radio-group v-model="draft.start_mode"><el-radio-button value="existing">接续已有结果</el-radio-button><el-radio-button value="collect">下发采集</el-radio-button></el-radio-group></el-form-item>
-        <el-form-item label="业务批次" required><el-select v-model="draft.batch_id" filterable :filter-method="(value: string) => batchSearch = value" :loading="choicesLoading" placeholder="选择未发布批次" style="width:100%"><el-option v-for="batch in visibleChoices" :key="batch.batch_id" :label="`${displayId('batch', batch.batch_id)}${batch.label && batch.label !== batch.batch_id ? ' · ' + batch.label : ''} · ${batch.task_count} 个任务`" :value="batch.batch_id" /></el-select></el-form-item>
+        <el-form-item :label="draft.start_mode === 'collect' ? '任务来源' : '采集结果批次'" required><el-select v-model="draft.batch_id" filterable :filter-method="(value: string) => batchSearch = value" :loading="choicesLoading" :placeholder="draft.start_mode === 'collect' ? '选择可复用的任务来源' : '选择已有轨迹的未发布结果批次'" style="width:100%"><el-option v-for="batch in visibleChoices" :key="batch.batch_id" :label="`${displayId('batch', batch.batch_id)}${batch.label && batch.label !== batch.batch_id ? ' · ' + batch.label : ''} · ${batch.task_count} 个任务`" :value="batch.batch_id" /></el-select></el-form-item>
+        <p v-if="draft.start_mode === 'collect'" class="form-hint">本次流程会创建独立结果批次，后续预处理、质检和发布仅处理本次采集。</p>
         <el-form-item v-if="draft.start_mode === 'existing'"><el-button :disabled="choicesLoading || submitting" data-testid="open-rollout-import" @click="rolloutImportVisible = true">导入已有 Rollout</el-button><span class="form-hint">已有本地轨迹尚未登记时，从这里添加新批次。</span></el-form-item>
         <el-form-item label="处理模式" required><el-radio-group v-model="draft.mode"><el-radio-button value="manual">人工修正</el-radio-button><el-radio-button value="automatic">自动发布</el-radio-button></el-radio-group></el-form-item>
         <p class="form-hint">{{ draft.mode === 'manual' ? '每任务选择一条 Top1，修正关卡等待人工确认；无需修改的轨迹也会导出。' : '每任务选择一条达标的最高分轨迹，未达标任务跳过；发布成功后整个批次结束处理。' }}</p>
         <el-form-item v-if="draft.mode === 'automatic'" label="质检总分阈值（0～5）" required><el-input-number v-model="draft.threshold" :min="0" :max="5" :step="0.1" /></el-form-item>
         <template v-if="draft.start_mode === 'collect'">
           <el-form-item label="采集引擎"><CollectionAgentSelect v-model="draft.agent_type" :capabilities="agentCapabilities" /></el-form-item>
-          <el-alert v-if="agentBlockedReason(agentCapabilities, draft.agent_type, draft.capture_logprobs)" :title="agentBlockedReason(agentCapabilities, draft.agent_type, draft.capture_logprobs)" type="warning" :closable="false" />
+          <el-alert v-if="collectionIssue" :title="collectionIssue" type="warning" :closable="false" />
           <div class="form-grid"><el-form-item label="手机"><el-select v-model="draft.phone_id" clearable placeholder="全部关联手机"><el-option v-for="phone in factory.phones" :key="phone" :label="phone" :value="phone" /></el-select></el-form-item><el-form-item label="App"><el-select v-model="draft.app" clearable placeholder="全部关联 App"><el-option v-for="app in apps" :key="app" :label="app" :value="app" /></el-select></el-form-item></div>
-          <el-form-item label="VLA" required><el-select v-model="draft.vla" filterable allow-create default-first-option placeholder="host:port 或 http(s)://host:port/v1" style="width:100%"><el-option v-for="vla in factory.vla" :key="vla" :label="vla" :value="vla" /></el-select></el-form-item>
+          <el-form-item label="执行接口（VLA）" required><el-select v-model="draft.vla" filterable allow-create default-first-option placeholder="host:port 或 http(s)://host:port/v1" style="width:100%"><el-option v-for="vla in factory.vla" :key="vla" :label="vla" :value="vla" /></el-select></el-form-item>
+          <PipelineModelFields v-if="draft.agent_type === 'pipelineagent'" :model-value="models" :disabled="submitting" @update:model-value="Object.assign(models, $event)" />
           <div class="form-grid"><el-form-item label="采集 Logprobs"><el-switch v-model="draft.capture_logprobs" /></el-form-item><el-form-item label="采样"><el-switch v-model="draft.sampling_enabled" /></el-form-item><el-form-item label="经验库"><el-switch v-model="draft.use_experience_lib" /></el-form-item><el-form-item label="temperature"><el-input-number v-model="draft.temperature" :min="0" :max="2" :step="0.1" /></el-form-item><el-form-item label="top_p"><el-input-number v-model="draft.top_p" :min="0" :max="1" :step="0.05" /></el-form-item></div>
         </template>
       </el-form>
-      <template #footer><el-button :disabled="submitting" @click="dialogVisible = false">取消</el-button><el-button type="primary" :disabled="!canSubmit || choicesLoading || (draft.start_mode === 'collect' && Boolean(agentBlockedReason(agentCapabilities, draft.agent_type, draft.capture_logprobs)))" :loading="submitting" @click="create">创建并开始</el-button></template>
+      <template #footer><el-button :disabled="submitting" @click="dialogVisible = false">取消</el-button><el-button type="primary" :disabled="!canSubmit || choicesLoading || (draft.start_mode === 'collect' && Boolean(collectionIssue))" :loading="submitting" @click="create">创建并开始</el-button></template>
     </el-dialog>
     <RolloutImportDialog v-model="rolloutImportVisible" @imported="importedRollout" />
   </div>

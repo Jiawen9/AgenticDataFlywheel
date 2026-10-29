@@ -60,8 +60,8 @@
       <el-alert v-if="startError" :title="startError" type="error" :closable="false" />
     </section>
 
-    <h2>用例评测进度</h2>
-    <el-select v-model="selectedRun" filterable :filter-method="filterRuns" placeholder="选择评估运行" class="run-picker" :disabled="cancelling">
+    <div class="heading"><h2>用例评测进度</h2><el-button :disabled="!selectedRun" @click="emit('details')">查看用例明细</el-button></div>
+    <el-select :model-value="selectedRun" filterable :filter-method="filterRuns" placeholder="选择评估运行" class="run-picker" :disabled="progressBusy" @update:model-value="selectRun">
       <el-option v-for="run in filteredRuns" :key="run.run_id" :label="`${displayId('run', run.run_id)} · ${evaluationModeLabel(run.execution_mode)} · ${run.evaluation_profile_id || '历史规则'}`" :value="run.run_id" />
     </el-select>
     <p v-if="selectedRun" class="hint">运行：<DisplayId kind="run" :id="selectedRun" /></p>
@@ -80,38 +80,26 @@
         <strong>成功率 {{ formatSuccessRate(results.summary.success_rate) }}</strong>
       </div>
       <p class="hint">成功率 = success /（success + partial_success + fail）；待评测和技术异常不计入分母。</p>
-      <el-table :data="results.cases" row-key="case_key" border data-testid="evaluation-cases">
-        <el-table-column prop="phone_id" label="来源手机" min-width="140" />
-        <el-table-column prop="case_id" label="用例" min-width="130" />
-        <el-table-column v-if="resultMetadata.execution_mode !== 'evaluate_only'" label="采集状态" min-width="110"><template #default="{ row }">{{ collectionStatus(row.collection_status) }}</template></el-table-column>
-        <el-table-column label="评测状态" min-width="110"><template #default="{ row }">{{ evaluationStatus(row.evaluation_status) }}</template></el-table-column>
-        <el-table-column label="清单来源" min-width="140"><template #default="{ row }">{{ checklistSourceLabel(row.checklist_source) }}</template></el-table-column>
-        <el-table-column label="结论" min-width="110"><template #default="{ row }">{{ verdictLabel(row.verdict) }}</template></el-table-column>
-        <el-table-column prop="failure_reason" label="原因" min-width="220" show-overflow-tooltip />
-        <el-table-column prop="attempt_count" label="尝试次数" width="100" />
-        <el-table-column label="报告" width="110"><template #default="{ row }"><el-button v-if="row.report_file_id" link :loading="downloading === row.case_key" @click="download(row)">下载 JSON</el-button></template></el-table-column>
-      </el-table>
     </template>
   </section>
 </template>
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { ElMessageBox } from 'element-plus'
-import { modelIterationApi, newRunRequestId, type EvaluatorConfig, type EvaluationCase, type EvaluationResults, type FactoryRun, type EvaluationExecutionMode, type EvaluationProfile, type EvaluationIssue, type EvaluationSource, type EvaluationSourceInput, type EvaluationPreview } from '@/phoneFactoryApi'
-import { useFactoryPolling } from '@/composables/useFactoryPolling'
+import { modelIterationApi, newRunRequestId, type EvaluatorConfig, type FactoryRun, type EvaluationExecutionMode, type EvaluationProfile, type EvaluationIssue, type EvaluationSource, type EvaluationSourceInput, type EvaluationPreview } from '@/phoneFactoryApi'
+import type { EvaluationProgress } from '@/composables/useEvaluationProgress'
 import DisplayId from '@/components/DisplayId.vue'
 import { useDisplayIdentifiers } from '@/composables/useDisplayIdentifiers'
-import { defaultEvaluatorConfig, formatSuccessRate, evaluationStatus, collectionStatus, verdictLabel, checklistSourceLabel, evaluationIssueText, evaluationModeLabel, evaluationSourceLabel } from '@/utils/modelIteration'
+import { defaultEvaluatorConfig, formatSuccessRate, evaluationIssueText, evaluationModeLabel, evaluationSourceLabel } from '@/utils/modelIteration'
 
-const props = defineProps<{ runs: FactoryRun[] }>()
+const props = defineProps<{ runs: FactoryRun[]; progress: EvaluationProgress }>()
 const { displayId, matches, resolve } = useDisplayIdentifiers()
 const sourceQuery = ref(''), runQuery = ref('')
 const filterSources = (query: string) => { sourceQuery.value = query }
 const filterRuns = (query: string) => { runQuery.value = query }
 const sourceIdentifier = (run: { source?: EvaluationSource }) => run.source?.run_id || run.source?.source_run_id || ''
 const filteredRuns = computed(() => props.runs.filter(run => matches(runQuery.value, 'run', run.run_id, '', run.filename || '', run.evaluation_profile_id || '', evaluationModeLabel(run.execution_mode))))
-const emit = defineEmits<{ ready: [value: boolean]; config: [value: EvaluatorConfig]; mode: [value: EvaluationExecutionMode]; profile: [value: EvaluationProfile | undefined]; started: [runId: string]; changed: [runId: string] }>()
+const emit = defineEmits<{ ready: [value: boolean]; config: [value: EvaluatorConfig]; mode: [value: EvaluationExecutionMode]; profile: [value: EvaluationProfile | undefined]; started: [runId: string]; details: [] }>()
 const roles = ['text', 'vision'] as const
 const draft = reactive<EvaluatorConfig>(defaultEvaluatorConfig())
 const saved = ref(''), supported = ref(false), profilesSupported = ref(false), offlineSupported = ref(false), loading = ref(false), saving = ref(false)
@@ -119,11 +107,7 @@ const capabilityMessage = ref('正在确认采集服务是否支持评测'), err
 const executionMode = ref<EvaluationExecutionMode>('collect_and_evaluate')
 const profiles = ref<EvaluationProfile[]>([]), profileErrors = ref<EvaluationIssue[]>([]), selectedProfileId = ref('')
 const selectedProfile = computed(() => profiles.value.find(item => item.id === selectedProfileId.value))
-const selectedRun = ref(''), results = ref<EvaluationResults | null>(null), resultError = ref(''), downloading = ref('')
-const cancelling = ref(false)
-const selectedRunRecord = computed(() => props.runs.find(run => run.run_id === selectedRun.value))
-const canCancel = computed(() => !!selectedRunRecord.value && !['completed', 'succeeded', 'partial', 'failed', 'interrupted', 'cancelled'].includes(selectedRunRecord.value.status))
-const resultMetadata = computed(() => ({ ...props.runs.find(run => run.run_id === selectedRun.value), ...results.value }))
+const { selectedRun, results, resultError, cancelling, canCancel, resultMetadata, busy: progressBusy, selectRun, cancelRun } = props.progress
 const sourceKind = ref<'run' | 'directory'>('run'), sourceRunId = ref(''), sourcePath = ref('')
 const sources = ref<EvaluationSource[]>([]), allowedRoots = ref<string[]>([]), sourcesLoading = ref(false), sourceError = ref('')
 const filteredSources = computed(() => sources.value.filter(source => matches(sourceQuery.value, 'run', source.run_id, '', source.status || '', source.created_at || '')))
@@ -141,10 +125,6 @@ watch(ready, value => emit('ready', value), { immediate: true })
 watch(executionMode, value => emit('mode', value), { immediate: true })
 watch(selectedProfile, value => emit('profile', value), { immediate: true })
 watch(sourceKey, () => { previewEpoch++; previewController?.abort(); preview.value = null; previewLoading.value = false; sourceError.value = ''; startError.value = ''; startMessage.value = '' }, { flush: 'sync' })
-watch(() => props.runs.map(run => run.run_id), ids => {
-  if (!ids.includes(selectedRun.value)) selectedRun.value = ids.at(-1) || ''
-}, { immediate: true })
-watch(selectedRun, () => { results.value = null; resultError.value = '' })
 
 async function loadSources() {
   if (sourcesLoading.value || starting.value || !offlineSupported.value) return
@@ -211,46 +191,9 @@ async function startOffline() {
     if (value.run_id) await resolve([{ kind: 'run', id: value.run_id }])
     if (disposed) return
     startMessage.value = `已创建评测运行 ${displayId('run', value.run_id)}。本次报告独立保存，原报告保留。`
-    if (value.run_id) { selectedRun.value = value.run_id; emit('started', value.run_id) }
+    if (value.run_id) emit('started', value.run_id)
   } catch (cause) { if (!disposed) startError.value = `${(cause as Error).message}；原参数重试会复用本次请求编号，避免重复创建。` }
   finally { if (!disposed) starting.value = false }
-}
-async function cancelRun() {
-  if (!canCancel.value || cancelling.value) return
-  const run = selectedRun.value
-  cancelling.value = true
-  try {
-    const message = selectedRunRecord.value?.execution_mode === 'evaluate_only' ? '将停止这个运行中尚未完成的评测，保留已有轨迹和报告。' : '将停止这个运行的采集及尚未完成的评测，保留已有结果。'
-    try { await ElMessageBox.confirm(message, '停止本次运行', { type: 'warning', confirmButtonText: '停止运行', cancelButtonText: '继续运行' }) }
-    catch { return }
-    if (disposed) return
-    await modelIterationApi.cancelEvaluation(run)
-    if (disposed) return
-    if (run === selectedRun.value) { results.value = null; resultError.value = '' }
-    emit('changed', run)
-  } catch (cause) { if (!disposed && run === selectedRun.value) resultError.value = (cause as Error).message }
-  finally { if (!disposed) cancelling.value = false }
-}
-useFactoryPolling(async (signal, current) => {
-  const run = selectedRun.value
-  if (!run) return
-  try {
-    const value = await modelIterationApi.evaluations(run, signal)
-    if (current() && run === selectedRun.value) { results.value = value; resultError.value = value.stale ? `显示上次结果：${value.sync_error || '同步暂不可用'}` : '' }
-  } catch (cause) { if (current() && run === selectedRun.value) resultError.value = (cause as Error).message }
-})
-async function download(row: EvaluationCase) {
-  const run = selectedRun.value
-  if (!row.report_file_id || downloading.value) return
-  downloading.value = row.case_key
-  try {
-    const name = row.report_name || 'evaluation-report.json'
-    const blob = await modelIterationApi.reportDownload({ index: 0, dir_name: run, run_id: run, files: [] }, { file_id: row.report_file_id, name, size: 0 })
-    if (disposed) return
-    const url = URL.createObjectURL(blob), link = document.createElement('a')
-    link.href = url; link.download = name; link.click(); setTimeout(() => URL.revokeObjectURL(url), 0)
-  } catch (cause) { if (!disposed) resultError.value = (cause as Error).message }
-  finally { if (!disposed) downloading.value = '' }
 }
 onMounted(load)
 onBeforeUnmount(() => { disposed = true; previewEpoch++; previewController?.abort() })

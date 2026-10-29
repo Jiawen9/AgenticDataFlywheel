@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { CollectionBatchDetail } from '@/collectionBatchesApi'
 import type { FactoryState } from '@/phoneFactoryApi'
 import { usePhoneCollectionBatches } from './usePhoneCollectionBatches'
+import { notifyBatchesPublished } from '@/utils/batchLifecycle'
 
 const detail = (id = 'batch-a') => ({
   schema_version: 1, batch_id: id, source_job_id: `job-${id}`, kind: 'task_generation', job_status: 'succeeded',
@@ -20,13 +21,50 @@ function setup() {
 }
 
 describe('phone collection batch selection and dispatch', () => {
+  it('keeps published task sources reusable and excludes result batches from source choices', async () => {
+    const { collection, batchApi, factoryApi } = setup()
+    const source = detail('published-task-source')
+    const result = { ...detail('independent-result'), batch_role: 'collection_result' as const, task_source_batch_id: source.batch_id }
+    notifyBatchesPublished({ batch_ids: [source.batch_id, result.batch_id], release_id: 'old-release' })
+    batchApi.list.mockResolvedValueOnce([source, result])
+    await collection.loadBatches(source.batch_id)
+    expect(collection.batches.value.map(row => row.batch_id)).toEqual([source.batch_id])
+    expect(collection.selectedBatchId.value).toBe(source.batch_id)
+    await collection.runBatch(source.batch_id)
+    await collection.runBatch(source.batch_id)
+    const calls = factoryApi.remoteStartRun.mock.calls as unknown as Array<[{ request_id: string }]>
+    expect(calls[0]![0].request_id).not.toBe(calls[1]![0].request_id)
+    expect(collection.selectedBatchId.value).toBe(source.batch_id)
+  })
+
+  it('resolves a result navigation to its task source and refuses appending a new run to the result', async () => {
+    const { collection, batchApi, factoryApi } = setup()
+    const result = { ...detail('result-b'), batch_role: 'collection_result' as const, task_source_batch_id: 'batch-a' }
+    batchApi.detail.mockImplementation(id => Promise.resolve(id === 'result-b' ? result : detail(id)))
+    await collection.selectBatch('result-b')
+    expect(collection.selectedBatchId.value).toBe('batch-a')
+    expect(collection.selectedBatch.value?.batch_id).toBe('batch-a')
+    await expect(collection.runBatch('result-b')).rejects.toThrow('不能追加新运行')
+    expect(factoryApi.remoteStartRun).not.toHaveBeenCalled()
+  })
+
+  it('returns the server result identity without replacing the selected task source', async () => {
+    const { collection, factoryApi } = setup()
+    await collection.selectBatch('batch-a')
+    const accepted = { ok: true, message: 'accepted', batch_id: 'result-1', task_source_batch_id: 'batch-a', collection_run_id: 'cr-1' }
+    factoryApi.remoteStartRun.mockResolvedValueOnce(accepted)
+    expect(await collection.runBatch('batch-a')).toEqual(accepted)
+    expect(collection.selectedBatchId.value).toBe('batch-a')
+    expect(collection.selectedBatch.value?.batch_id).toBe('batch-a')
+  })
+
   it('retiring one batch blocks its retry while keeping another batch request identity', async () => {
     const { collection, factoryApi } = setup()
     factoryApi.remoteStartRun.mockRejectedValueOnce(new Error('lost a')).mockRejectedValueOnce(new Error('lost b'))
     await expect(collection.runBatch('batch-a')).rejects.toThrow('lost a')
     await expect(collection.runBatch('batch-b')).rejects.toThrow('lost b')
     collection.retireBatches(['batch-a'])
-    await expect(collection.runBatch('batch-a')).rejects.toThrow('已发布')
+    await expect(collection.runBatch('batch-a')).rejects.toThrow('已移除')
     await collection.runBatch('batch-b')
     expect(factoryApi.remoteStartRun.mock.calls[1]).toEqual(factoryApi.remoteStartRun.mock.calls[2])
   })
@@ -75,7 +113,7 @@ describe('phone collection batch selection and dispatch', () => {
     const { collection, batchApi, factoryApi, setTasks } = setup()
     await collection.selectBatch('batch-a')
     await collection.runBatch('batch-a', 'phone-1', 'AppA')
-    expect(factoryApi.addTask).toHaveBeenCalledWith('采集批次 batch-a · 1 条任务', 'collection-batch-batch-a.xlsx', btoa('workbook bytes'), 'batch-a')
+    expect(factoryApi.addTask).toHaveBeenCalledWith('任务来源 batch-a · 1 条任务', 'collection-batch-batch-a.xlsx', btoa('workbook bytes'), 'batch-a')
     expect(factoryApi.remoteStartRun).toHaveBeenCalledWith(expect.objectContaining({ filename: 'collection-batch-batch-a.xlsx', phone_id: 'phone-1', app: 'AppA', vla: 'http://vla.test/v1', request_id: expect.any(String), run_mode: 'generate' }))
     expect(batchApi.workbook.mock.invocationCallOrder[0]!).toBeLessThan(factoryApi.addTask.mock.invocationCallOrder[0]!)
     expect(factoryApi.addTask.mock.invocationCallOrder[0]!).toBeLessThan(factoryApi.remoteStartRun.mock.invocationCallOrder[0]!)
@@ -157,7 +195,7 @@ describe('phone collection batch selection and dispatch', () => {
     collection.retireBatches(['batch-a'])
     const callsBefore = setTasks.mock.calls.length
     response.resolve({ ok: true, message: 'accepted' })
-    await expect(run).rejects.toThrow('已发布')
+    await expect(run).rejects.toThrow('已移除')
     expect(factoryApi.state).not.toHaveBeenCalled()
     expect(setTasks).toHaveBeenCalledTimes(callsBefore)
   })

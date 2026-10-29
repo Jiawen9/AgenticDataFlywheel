@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from backend.phone_factory import DEFAULT_CONFIG, PhoneFactoryError, PhoneFactoryStore, create_router, run_client
+from backend.pipeline_model_config import default_models
 from backend.tests.test_manual_collection import workbook_bytes
 
 
@@ -58,7 +59,7 @@ class PhoneFactoryTests(unittest.TestCase):
         (self.legacy / "tasks.json").write_text('[{"filename": "old.xlsx", "status": "运行中"}]', encoding="utf-8")
         old_bytes = {file.name: file.read_bytes() for file in self.legacy.iterdir()}
         self.assertEqual(self.store.state(), {key: [] for key in ("phones", "apps", "phoneApps", "vla", "tasks")})
-        self.assertEqual(self.store.config(), {**DEFAULT_CONFIG, "agent_type": "newagent"})
+        self.assertEqual(self.store.config(), {**DEFAULT_CONFIG, "agent_type": "newagent", "model_defaults": default_models()})
         self.assertFalse(self.store.records.database_path.exists())
         state = self.store.dispatch("phone-apps", "POST", {"phone_id": "new-phone", "app": "App"})
         self.assertEqual(state["phones"], ["new-phone"])
@@ -75,13 +76,13 @@ class PhoneFactoryTests(unittest.TestCase):
         legacy = {key: value for key, value in DEFAULT_CONFIG.items() if key != "capture_logprobs"}
         self.store._update(lambda state: state.update(config=legacy))
         before = self.store.records.get("phone_factory", "state")
-        self.assertEqual(self.store.config(), {**DEFAULT_CONFIG, "agent_type": "newagent"})
+        self.assertEqual(self.store.config(), {**DEFAULT_CONFIG, "agent_type": "newagent", "model_defaults": default_models()})
         self.assertEqual(self.store.records.get("phone_factory", "state"), before)
 
     def test_config_saves_logprob_default_and_rejects_non_boolean_flags_without_writes(self):
         saved = {**DEFAULT_CONFIG, "capture_logprobs": True, "temperature": 0.4}
-        self.assertEqual(self.store.dispatch("config", "POST", saved), {**saved, "agent_type": "newagent"})
-        self.assertEqual(self.new_store().config(), {**saved, "agent_type": "newagent"})
+        self.assertEqual(self.store.dispatch("config", "POST", saved), {**saved, "agent_type": "newagent", "model_defaults": default_models()})
+        self.assertEqual(self.new_store().config(), {**saved, "agent_type": "newagent", "model_defaults": default_models()})
         before = self.store.records.get("phone_factory", "state")
         for key in ("capture_logprobs", "sampling_enabled", "use_experience_lib"):
             for invalid in ("false", "true", 0, 1, None, [], {}):
@@ -98,7 +99,7 @@ class PhoneFactoryTests(unittest.TestCase):
         self.assertEqual(state["tasks"], [])
         self.assertEqual(state["phoneApps"], [{"phone_id": "phone", "app": "App", "status": "空闲"}])
         self.assertEqual(self.new_store().state(), state)
-        self.assertEqual(self.store.config(), {**DEFAULT_CONFIG, "temperature": 0.4, "agent_type": "newagent"})
+        self.assertEqual(self.store.config(), {**DEFAULT_CONFIG, "temperature": 0.4, "agent_type": "newagent", "model_defaults": default_models()})
         self.assertEqual(settings["phoneApps"][0]["status"], "运行中")
         self.store.add_task(batch())
         self.store.start_task(batch()["filename"])
@@ -157,14 +158,17 @@ class PhoneFactoryTests(unittest.TestCase):
         registered = self.store.add_task(request)
         request["filename"] = registered["tasks"][0]["filename"]
         self.store.dispatch("vla", "POST", {"value": "http://model.invalid"})
-        self.store.dispatch("phone-apps", "POST", {"phone_id": "phone", "app": "App"})
+        self.store.dispatch("phone-apps", "POST", {"phone_id": "phone", "app": "Demo"})
         self.store.dispatch("config", "POST", {"sampling_enabled": True, "temperature": 0.5, "top_p": 0.9, "use_experience_lib": True, "capture_logprobs": True})
-        result = self.store.remote_start({"filename": request["filename"], "phone_id": "phone", "app": "App"})
+        result = self.store.remote_start({"filename": request["filename"], "phone_id": "phone", "app": "Demo"})
         self.assertTrue(result["ok"])
         call = self.calls[-1]
-        self.assertEqual(call["task"], original)
-        self.assertEqual(call["phoneApps"], [{"phone_id": "phone", "app": "App", "status": "空闲"}])
-        self.assertEqual(call["args"][3:5], ["phone", "App"])
+        result_batch = self.store.collection_runs.batch(result["batch_id"], require_workbook=True)
+        self.assertEqual(call["task"], Path(result_batch["workbook_path"]).read_bytes())
+        source = self.store.collection_runs.batch(result["task_source_batch_id"], require_workbook=True)
+        self.assertEqual(Path(source["workbook_path"]).read_bytes(), original)
+        self.assertEqual(call["phoneApps"], [{"phone_id": "phone", "app": "Demo", "status": "空闲"}])
+        self.assertEqual(call["args"][3:5], ["phone", "Demo"])
         self.assertIn("--sampling", call["args"])
         self.assertIn("--exp", call["args"])
         self.assertIn("--capture-logprobs", call["args"])

@@ -34,6 +34,10 @@ export interface PreprocessingJob {
 
 export interface PreprocessingBatch {
   batch_id: string
+  batch_role?: 'collection_result'
+  task_source_batch_id?: string
+  agent_type?: 'newagent' | 'pipelineagent'
+  collection_run_id?: string
   kind: string
   label: string
   task_count: number
@@ -54,6 +58,7 @@ export interface CollectionSourceTrajectory {
   collected_at: string; relative_dir: string
 }
 export interface CollectionSourceRun {
+  batch_role?: 'collection_result'; task_source_batch_id?: string; agent_type?: 'newagent' | 'pipelineagent';
   collection_run_id: string; batch_id: string; status: string; created_at: string; completed_at: string | null;
   batch_tasks: Record<string, CollectionSourceTask>; trajectories: CollectionSourceTrajectory[];
   errors: Array<{ collection_case_id: string | null; error: string }>; dispatch_error: string | null

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { factoryBatchesApi, modelIterationApi, phoneFactoryApi } from './phoneFactoryApi'
+import { notifyBatchesPublished } from '@/utils/batchLifecycle'
 afterEach(() => vi.unstubAllGlobals())
 describe('phone factory transport contracts', () => {
   it('requests production cancellation without mutating the evaluation endpoint', async () => {
@@ -98,11 +99,24 @@ describe('phone factory transport contracts', () => {
     await modelIterationApi.remoteStartRun(options)
     expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual(options)
   })
+  it('keeps published task sources and run history visible while result writes remain separate', async () => {
+    notifyBatchesPublished({ batch_ids: ['published-source-api'], release_id: 'release-old' })
+    const fetcher = vi.fn(async () => new Response(JSON.stringify({ batches: [{ batch_id: 'published-source-api' }], runs: [] })))
+    vi.stubGlobal('fetch', fetcher)
+    expect(await factoryBatchesApi.list()).toEqual([{ batch_id: 'published-source-api' }])
+    await factoryBatchesApi.list({ batch_role: 'collection_result', include_published: false })
+    expect(fetcher.mock.calls[1]?.[0]).toBe('/api/phone-factory/batches?batch_role=collection_result&include_published=false')
+    await phoneFactoryApi.runs()
+    expect(fetcher.mock.calls[2]?.[0]).toBe('/api/phone-factory/collection-runs?include_published=true')
+    await modelIterationApi.runs()
+    expect(fetcher.mock.calls[3]?.[0]).toBe('/api/model-iter/runs')
+  })
+
   it('queries the unified batch source and reports remote deletion failure', async () => {
     const fetcher = vi.fn(async () => new Response('{"batches":[]}'))
     vi.stubGlobal('fetch', fetcher)
     await factoryBatchesApi.list()
-    expect(fetcher.mock.calls[0]?.[0]).toBe('/api/phone-factory/batches')
+    expect(fetcher.mock.calls[0]?.[0]).toBe('/api/phone-factory/batches?batch_role=source&include_published=true')
     fetcher.mockResolvedValueOnce(new Response('{"ok":false,"error":"device stop failed"}'))
     await expect(phoneFactoryApi.remoteDeletePhone('phone-1')).rejects.toThrow('device stop failed')
     expect(fetcher.mock.calls).toHaveLength(2)

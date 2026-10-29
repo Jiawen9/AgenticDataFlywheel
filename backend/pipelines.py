@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import threading
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -103,14 +104,28 @@ class PipelineRuntime:
             tasks.update(str(t["task_id"]) for t in batch["snapshot"]["tasks"])
         if not tasks:
             raise PipelineError("该批次没有可处理任务")
-        return {"task_ids": sorted(tasks), "collection_digest": digest(collection.get("snapshot", {})) if collection else None}
+        snapshot = {"task_ids": sorted(tasks), "collection_digest": digest(collection.get("snapshot", {})) if collection else None}
+        if collection and collection.get("batch_role") == "collection_result":
+            snapshot.update(batch_role="collection_result", task_source_batch_id=collection["task_source_batch_id"])
+        return snapshot
 
     def collection_options(self, config):
         options = self.factory.runtime._options(config or {}, "generate")
-        return {key: options[key] for key in ("agent_type", "phone_id", "app", "vla", "config", "phone_apps", "phone_ids")}
+        return {key: options[key] for key in ("agent_type", "phone_id", "app", "vla", "config", "phone_apps", "phone_ids", "execution_model", "planner_config") if key in options}
 
     def collection_runs(self, batch_id):
         return self.factory.collection_runs.list_runs(batch_id)
+
+    def prepare_collection(self, source_batch_id, request_id, options):
+        """Freeze a result batch before acquiring downstream ownership."""
+        # Let the result store resolve a prepared request before consulting the
+        # source. Its first creation validates the frozen source workbook; a
+        # retry after the pipeline record commit failed only needs the child.
+        metadata = {**options, "run_mode": "generate", "result_transport": "http",
+                    "filename": f"collection-batch-{source_batch_id}.xlsx"}
+        batch, _ = self.factory.collection_runs.prepare_result_batch(source_batch_id,
+            dispatch_key=request_id, metadata=metadata, workbook_sha256=None)
+        return batch
 
     def dispatch_collection(self, pipeline):
         batch = self.factory.collection_runs.batch(pipeline["batch_id"], require_workbook=True)
@@ -125,8 +140,17 @@ class PipelineRuntime:
         current = self.collection_options(options)
         if current != options:
             raise PipelineError("手机或 App 关联已变化，请结束流程后重新创建")
-        return self.factory.remote_start({**options, "filename": batch["filename"],
-                                         "request_id": pipeline["pipeline_id"], "run_mode": "generate"})
+        request = {**options, "filename": batch["filename"],
+                   "request_id": pipeline.get("collection_dispatch_key", pipeline["pipeline_id"]),
+                   "run_mode": "generate"}
+        if pipeline.get("task_source_batch_id"):
+            if (batch.get("batch_role") != "collection_result"
+                    or batch.get("task_source_batch_id") != pipeline["task_source_batch_id"]
+                    or batch.get("execution_request_id") != request["request_id"]):
+                raise PipelineError("自动流程绑定的采集结果批次或请求身份不匹配")
+            return self.factory.runtime.remote_start(request, "generate", bound_batch_id=pipeline["batch_id"])
+        # Historical pipelines retain their target and frozen request identity.
+        return self.factory.runtime.remote_start(request, "generate", legacy_batch=True)
 
     def input_ready(self, pipeline):
         runs = self.collection_runs(pipeline["batch_id"])
@@ -139,7 +163,10 @@ class PipelineRuntime:
                     return False
                 if (pipeline["start_mode"] == "collect" and run["collection_run_id"] in bound
                         and (run["status"] != "completed" or run.get("errors"))):
-                    raise PipelineError("本次采集存在失败或不完整用例，请补采后接续已有结果")
+                    guidance = ("请从任务来源重新采集，并选择新结果批次继续"
+                                if pipeline.get("batch_role") == "collection_result"
+                                else "请补采后接续已有结果")
+                    raise PipelineError("本次采集存在失败或不完整用例，" + guidance)
             ready = self.factory.collection_runs.ready_input(pipeline["batch_id"])
             present = {str(t.get("task_id")) for t in ready["trajectories"]}
             if not set(pipeline["task_ids"]).issubset(present):
@@ -294,24 +321,36 @@ class PipelineManager:
                                     or not math.isfinite(threshold) or not 0 <= threshold <= 5):
             raise PipelineError("自动发布总分阈值必须在 0～5 之间", 422)
         key, request_digest = digest(request_id), digest(data)
-        with self.artifacts.batch_lock("pipeline_create"), self.artifacts.batch_lock(batch):
+        with self.artifacts.batch_lock("pipeline_create"), self.artifacts.batch_lock(batch), ExitStack() as locks:
             old = self.records.get("pipeline_requests", key)
             if old:
                 if old["request_digest"] != request_digest:
                     raise PipelineError("相同请求编号对应的 Pipeline 配置不同")
                 return self.get(old["pipeline_id"])
+            options = self.runtime.collection_options(data.get("collection_config") or {}) if start == "collect" else None
+            now, identifier = utc_now(), allocate_id("p", self.root, key=["pipeline", request_id], request_fingerprint=request_digest)
+            configuration = self.runtime.configurations()
+            source_batch = batch
+            if start == "collect":
+                result = self.runtime.prepare_collection(source_batch, identifier, options)
+                if (result.get("batch_role") != "collection_result"
+                        or result.get("task_source_batch_id") != source_batch
+                        or result.get("batch_id") == source_batch):
+                    raise PipelineError("采集结果批次未与任务来源正确隔离")
+                batch = result["batch_id"]
+                locks.enter_context(self.artifacts.batch_lock(batch))
+            # Source batches remain read-only, including after publication.
+            # Ownership and lifecycle checks apply to the downstream result.
             ensure_batch_active(batch, self.root)
             if active_pipeline(batch, self.root):
                 raise PipelineError("该批次已有未结束的 Pipeline")
             if self._busy(batch):
                 raise PipelineError("该批次已有执行中作业，请完成后再启动 Pipeline")
             snapshot = self.runtime.snapshot(batch)
-            options = self.runtime.collection_options(data.get("collection_config") or {}) if start == "collect" else None
-            now, identifier = utc_now(), allocate_id("p", self.root, key=["pipeline", request_id], request_fingerprint=request_digest)
             pipeline = {"pipeline_id": identifier, "id_scheme": ID_SCHEME, "batch_id": batch, "name": name, "mode": mode,
                 "start_mode": start, "threshold": threshold if mode == "automatic" else None,
                 "task_ids": snapshot["task_ids"], "batch_snapshot": snapshot, "collection_config": options,
-                "config_fingerprints": self.runtime.configurations(), "retry_policy": dict(RETRY_POLICY),
+                "config_fingerprints": configuration, "retry_policy": dict(RETRY_POLICY),
                 "status": "running", "current_step": "collection",
                 "created_at": now, "updated_at": now, "error": None, "session_id": None, "release_id": None,
                 "selection": None, "confirmation": None, "collection_run_ids": [], "logs": [],
@@ -320,6 +359,11 @@ class PipelineManager:
                            "retry_info": {"attempts": 0, "max_attempts": RETRY_POLICY["max_attempts"],
                                           "last_error": None, "next_retry_at": None}}
                           for key, label in STEPS]}
+            if start == "collect":
+                pipeline.update(task_source_batch_id=source_batch, batch_role="collection_result",
+                                collection_dispatch_key=identifier)
+            elif snapshot.get("batch_role") == "collection_result":
+                pipeline.update(task_source_batch_id=snapshot["task_source_batch_id"], batch_role="collection_result")
             owner = self.records.get("pipeline_owners", batch)
             self.records.put_many([
                 {"namespace": "pipelines", "key": identifier, "payload": pipeline, "expected_revision": 0},

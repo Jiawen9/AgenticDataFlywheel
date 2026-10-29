@@ -122,7 +122,7 @@ class DualAgentDispatchTests(unittest.TestCase):
 
     def test_historical_newagent_replay_does_not_rewrite_frozen_request(self):
         request = {**self.request(), "agent_type": "newagent"}
-        first = self.store.remote_start(request)
+        first = self.store.runtime.remote_start(request, "generate", legacy_batch=True)
         def old_record(item):
             del item["request"]["metadata"]["agent_type"]
             del item["request"]["metadata"]["config"]["capture_logprobs"]

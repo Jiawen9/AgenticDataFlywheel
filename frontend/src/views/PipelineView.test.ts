@@ -6,6 +6,7 @@ import { api } from '@/api'
 import { factoryBatchesApi, phoneFactoryApi } from '@/phoneFactoryApi'
 import PipelineView from './PipelineView.vue'
 import { useDisplayIdentifiers } from '@/composables/useDisplayIdentifiers'
+import { notifyBatchesPublished } from '@/utils/batchLifecycle'
 
 vi.mock('element-plus', () => ({ ElMessage: { success: vi.fn() }, ElMessageBox: {} }))
 vi.mock('@/composables/usePipelineContext', () => ({
@@ -22,7 +23,7 @@ describe('Pipeline collection configuration', () => {
     vi.spyOn(phoneFactoryApi, 'config').mockResolvedValue({ capture_logprobs: false } as never)
     vi.spyOn(phoneFactoryApi, 'state').mockResolvedValue({ phones: [], apps: [], phoneApps: [], tasks: [], vla: ['http://mock.invalid/vla'] })
     vi.spyOn(factoryBatchesApi, 'list').mockResolvedValue([{ batch_id: batchId, task_count: 2 }] as never)
-    vi.spyOn(api, 'preprocessingBatches').mockResolvedValue([{ batch_id: batchId, label: '导入的验证用例', task_count: 2 }] as never)
+    vi.spyOn(api, 'preprocessingBatches').mockResolvedValue([{ batch_id: batchId, label: '导入的验证用例', task_count: 2, ready_trajectory_count: 2 }] as never)
     const create = vi.spyOn(api, 'createPipeline').mockResolvedValue({ pipeline_id: 'pipeline-alias-test' } as never)
     const app = createSSRApp(PipelineView)
     app.use(createRouter({ history: createMemoryHistory(), routes: [{ path: '/:pathMatch(.*)*', component: { render: () => null } }] }))
@@ -41,6 +42,42 @@ describe('Pipeline collection configuration', () => {
     await view.create()
     expect(create.mock.calls[0]?.[0].batch_id).toBe(batchId)
     expect(create.mock.calls[0]?.[0].batch_id).not.toBe(alias)
+  })
+
+  it('separates reusable collection sources from existing results and retains a published source', async () => {
+    vi.spyOn(phoneFactoryApi, 'config').mockResolvedValue({ capture_logprobs: false } as never)
+    vi.spyOn(phoneFactoryApi, 'state').mockResolvedValue({ phones: [], apps: [], phoneApps: [], tasks: [], vla: ['http://mock.invalid/vla'] })
+    vi.spyOn(factoryBatchesApi, 'list').mockResolvedValue([
+      { batch_id: 'reusable-source', task_count: 2 },
+      { batch_id: 'result-new', task_source_batch_id: 'reusable-source', batch_role: 'collection_result', task_count: 2 },
+    ] as never)
+    vi.spyOn(api, 'preprocessingBatches').mockResolvedValue([
+      { batch_id: 'result-new', task_source_batch_id: 'reusable-source', batch_role: 'collection_result', task_count: 2, ready_trajectory_count: 2, agent_type: 'newagent' },
+      { batch_id: 'result-pipeline', task_source_batch_id: 'reusable-source', batch_role: 'collection_result', task_count: 2, ready_trajectory_count: 2, agent_type: 'pipelineagent' },
+      { batch_id: 'legacy-empty', task_count: 2, ready_trajectory_count: 0 },
+    ] as never)
+    const create = vi.spyOn(api, 'createPipeline').mockResolvedValue({ pipeline_id: 'pipeline-result', batch_id: 'fresh-result', task_source_batch_id: 'reusable-source' } as never)
+    const app = createSSRApp(PipelineView)
+    app.use(createRouter({ history: createMemoryHistory(), routes: [{ path: '/:pathMatch(.*)*', component: { render: () => null } }] }))
+    let view: any
+    app.mixin({ created() { if (this.$options.__name === 'PipelineView') view = this.$.setupState } })
+    const empty = defineComponent({ setup: () => () => h('div') })
+    for (const name of ['button', 'icon', 'alert', 'progress', 'tag', 'table', 'table-column', 'input', 'switch', 'input-number', 'select', 'option', 'form-item', 'radio-group', 'radio-button', 'dialog', 'form']) app.component('el-' + name, empty)
+    await renderToString(app)
+    await view.loadChoices()
+    expect(view.choices.map((item: { batch_id: string }) => item.batch_id)).toEqual(['result-new', 'result-pipeline'])
+    view.draft.start_mode = 'collect'
+    await nextTick()
+    notifyBatchesPublished({ batch_ids: ['reusable-source', 'result-new'], release_id: 'closed-one' })
+    expect(view.choices.map((item: { batch_id: string }) => item.batch_id)).toEqual(['reusable-source'])
+    Object.assign(view.draft, { name: 'fresh collection', batch_id: 'reusable-source' })
+    await view.create()
+    expect(create.mock.calls[0]?.[0].batch_id).toBe('reusable-source')
+    expect(view.history[0].batch_id).toBe('fresh-result')
+    expect(view.history[0].task_source_batch_id).toBe('reusable-source')
+    view.draft.start_mode = 'existing'
+    await nextTick()
+    expect(view.choices.map((item: { batch_id: string }) => item.batch_id)).toEqual(['result-pipeline'])
   })
 
   it('hydrates the saved logprob default and preserves it in a collection request', async () => {

@@ -20,6 +20,22 @@ beforeEach(() => {
 })
 afterEach(() => { hooks.cleanup.splice(0).forEach(callback => callback()); vi.useRealTimers(); vi.unstubAllGlobals() })
 describe('authoritative Pipeline module context', () => {
+  it('does not bind a reusable task source to its old pipeline, but verifies explicit result routes', async () => {
+    hooks.route.query = { batch_id: 'source-batch' }
+    const source = usePipelineContext({ lookupByBatch: false, stepId: 'collection' })
+    await source.refresh()
+    expect(api.listPipelines).not.toHaveBeenCalled()
+    expect(source.readOnly.value).toBe(false)
+    source.dispose()
+    hooks.route.query = { pipeline_id: 'p', batch_id: 'result-batch', step_id: 'quality' }
+    vi.mocked(api.pipeline).mockResolvedValue(record({ batch_id: 'result-batch', task_source_batch_id: 'source-batch' }))
+    const result = usePipelineContext({ lookupByBatch: false, stepId: 'quality' })
+    await result.refresh()
+    expect(result.error.value).toBe('')
+    expect(result.batchId.value).toBe('result-batch')
+    expect(result.readOnly.value).toBe(true)
+  })
+
   it('binds exact jobs and observing never submits a job or control action', async () => {
     const context = usePipelineContext({ stepId: 'quality' }); expect(context.readOnly.value).toBe(true)
     await context.refresh()

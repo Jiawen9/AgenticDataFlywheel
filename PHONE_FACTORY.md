@@ -36,15 +36,23 @@ python -m uvicorn backend.api:app --host 127.0.0.1 --port 8000
 ## 生产采集
 
 1. 在采集页选择生成／扩增批次，或上传现有 17 列 .xlsx 采集任务表。手工表必须保留模板列序，用例编号唯一且可作路径；任务和 App 必填，场景缺失时显示提示并保留未分类。
-2. 手工表登记为 manual_collection 业务批次。原件字节、摘要、所有列值与任务分类冻结在 batches/<batch_id>/00_collection/，没有伪造的任务生成作业。上传请求编号保证失败重试复用批次；发布后再次上传可创建新的批次。
+2. 手工表登记为 manual_collection 任务来源。原件字节、摘要、所有列值与任务分类冻结在 batches/<batch_id>/00_collection/，没有伪造的任务生成作业。上传请求编号保证失败重试复用来源；同一来源可供不同引擎或不同轮次反复采集。
 3. 在手机／App 行点击“定制运行”，弹窗固定该手机和 App，再选择任务、VLA、采样参数和经验库。本次配置不会改动全局配置。任务可以选择已提交但尚未登记到手机工厂的生成／扩增批次，也可以选择手工上传批次；评估页只显示评估任务。每次实际配置参与幂等校验；丢失响应后按同一运行编号查询，不能用同一请求编号换参数。
-4. 采集服务先持久保存运行，后台执行。运行产物按运行、设备和用例隔离。同名轨迹不会相互覆盖。
+4. 平台为每次新采集先创建独立结果批次（batch_role=collection_result），冻结本次手机/App 实际匹配的用例及全部17列，再登记一次采集运行。task_source_batch_id 指向可复用的原任务来源，task_id、用例编号和来源分类保持不变。采集服务持久保存该运行后后台执行；同名轨迹按批次、运行、设备和用例隔离。
 5. 平台后台串行拉取完成清单和 ZIP。验证批次、任务、设备、文件路径、清单、大小和 SHA256，暂存后登记到 raw/collection_batches/<batch_id>/runs/<collection_run_id>/。
 6. 文件和完成登记都成功后，采集页才显示已回传，预处理页显示可处理轨迹。部分成功保留有效轨迹及错误清单；零有效轨迹不会登记成功。回传失败可以重试同步，不重启手机执行。
 
-采集批次 `batch_id` 固定任务清单和 App／场景，关联后续过程件；`collection_run_id` 标识一次实际下发。同一批次可以由手机 A、B 分次执行，各自的运行结果共同归入该批次，完成登记后进入预处理。手机占用按物理设备判断，某次运行不会锁住整批其他空闲手机；同一手机的不同 App、生产和评估之间仍互斥。“开始运行”向所有匹配手机下发，命中忙设备则整次拒绝，不默默跳过。批次区保留查看信息、下载采集表、整批启动和前往预处理。
+新采集响应中的 `batch_id` 是结果批次，`collection_run_id` 标识本次下发，`task_source_batch_id` 标识任务来源。同一来源每次真正重新采集都会得到新结果批次，即使用同一引擎也不追加到旧结果；一次下发中的多手机仍属于一个结果批次。相同请求编号的网络重试复用原批次和运行，更改引擎或参数则冲突。原始结果、预处理、标框、建树、质检和发布全部按结果批次隔离。
 
-采集状态、传输状态及作业记录保存在平台 SQLite；采集服务独立保存其运行和归档。文件替换与数据库提交中断通过恢复日志重试，已完成原始结果不覆盖。已发布批次不再下发或接受迟到写入。当前唯一过程件、修正、发布关闭、外部表发布和 DEV 看板沿用现有链路，分类通过冻结的 00_collection 引用延续。
+手机占用仍按物理设备判断；同一手机的不同 App、生产和评估之间互斥。“开始运行”向所有匹配手机下发，命中忙设备则整次拒绝，不默默跳过。页面按任务来源列出各次结果，预处理入口使用所选运行的结果批次编号，不能使用任务来源编号。
+
+自动流程从采集开始时先预留结果批次，后续下发复用这个批次；从已有结果继续时不新建。发布结果只关闭自身，任务来源仍可只读复用，包括拥有历史已发布结果的来源。结果快照和工作簿独立保存，后续不依赖来源目录。历史混合批次保持原目录和原处理范围，不自动拆分或重写；历史请求重放不会转成新批次。
+
+新结果采集要求 9011 声明 `protocol_version: 1` 和 `batch_results: true`，并支持所选引擎。能力检查失败时保留本次批次和请求供重试，不退回省略批次／运行编号的旧协议。已有历史运行继续按其冻结的传输方式查询和恢复。
+
+采集状态、传输状态及作业记录保存在平台 SQLite；采集服务独立保存其运行和归档。文件替换与数据库提交中断通过恢复日志重试，已完成原始结果不覆盖。已发布结果批次不再下发或接受迟到写入，完整任务来源可只读复用。当前唯一过程件、修正、发布关闭、外部表发布和 DEV 看板沿用现有链路，分类通过冻结的 00_collection 引用延续。
+
+本次上线同步更新平台后端和创新平台内嵌的前端模块，不修改 9011 或两种执行引擎。停止新下发后更新并重启平台；保留当前数据库、数据目录和原代码，勿拆分或搬迁历史混合批次。回滚前停止新版本活动流程并保存新增结果数据，不用旧版本向新增结果批次追加运行。
 
 ## 监控与评估
 
@@ -60,6 +68,7 @@ python -m uvicorn backend.api:app --host 127.0.0.1 --port 8000
 - 平台下发、评估状态及报告代理：backend/phone_factory_runtime.py
 - HTTP 客户端：backend/phonefactory_client.py
 - 手工采集登记：backend/manual_collection.py
+- 每次下发的独立结果批次及17列冻结：backend/collection_result_batches.py
 - 结果下载、验证及恢复：backend/collection_transfer.py
 - 原始结果完成登记：backend/collection_runs.py
 - 独立服务：backend/phonefactory_manager.py、backend/collector_service/
@@ -69,11 +78,11 @@ python -m uvicorn backend.api:app --host 127.0.0.1 --port 8000
 
 | 接口 | 用途 |
 | --- | --- |
-| /api/phone-factory/batches | 统一查询未发布的生成、扩增、手工批次 |
+| /api/phone-factory/batches | 查询任务来源；batch_role 可选 source／collection_result／all，include_published=true 包含已发布项 |
 | /api/phone-factory/batches/{id}/workbook | 下载冻结采集表 |
 | POST /api/phone-factory/tasks | 上传并登记手工批次，返回 imported_task |
 | POST /api/phone-factory/remote/start-run | 具名配置下发生产采集 |
-| GET /api/phone-factory/collection-runs | 运行及回传状态 |
+| GET /api/phone-factory/collection-runs | 运行及回传状态；task_source_batch_id 筛选同一任务来源的各次结果 |
 | POST /api/phone-factory/collection-runs/{id}/sync | 重试拉取并完成登记 |
 | /api/phone-factory/remote/status、adb-devices、monitor、del-phone | 设备状态、监控及删除 |
 | /api/model-iter/remote/start-run、runs、reports、report-download | 独立评估与报告 |
