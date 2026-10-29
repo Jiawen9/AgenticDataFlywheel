@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from openpyxl import Workbook
 from backend.phone_factory import PhoneFactoryStore, PhoneFactoryError, create_router
+from backend.pipeline_model_config import default_models
 from backend.batch_lifecycle import BatchPublishedError
 from backend.task_generation.collection_batches import COLLECTION_COLUMNS, payload_digest
 
@@ -70,7 +71,8 @@ class FactoryRuntimeTests(unittest.TestCase):
         self.assertIsNone(batch['source_job_id'])
         self.assertEqual(batch['snapshot']['tasks'][0]['scene'], '购物')
         result = self.store.remote_start(self.request())
-        self.assertEqual(result['batch_id'], batch['batch_id'])
+        self.assertNotEqual(result['batch_id'], batch['batch_id'])
+        self.assertEqual(result['task_source_batch_id'], batch['batch_id'])
         self.assertEqual(result['request']['metadata']['phone_ids'], ['phone-1'])
         self.assertEqual(self.store.state()['tasks'][0]['status'], '运行中')
         self.assertEqual(self.store.records.list('model_iter_runs'), [])
@@ -105,7 +107,7 @@ class FactoryRuntimeTests(unittest.TestCase):
                 self.assertIn('--sampling', args)
                 self.assertEqual(args[args.index('--temperature') + 1], '0.35')
                 self.assertEqual(args[args.index('--top-p') + 1], '0.75')
-                self.assertEqual(store.config(), {**config, "agent_type": "newagent"})
+                self.assertEqual(store.config(), {**config, "agent_type": "newagent", "model_defaults": default_models()})
 
     def test_invalid_logprob_override_is_rejected_before_dispatch(self):
         self.store.add_task(self.upload)
@@ -122,7 +124,9 @@ class FactoryRuntimeTests(unittest.TestCase):
                 task = self.store.add_task(self.upload, mode=mode)['imported_task']
                 request = self.request(filename=task['filename'], request_id='legacy-' + mode,
                     config={'capture_logprobs': False})
-                initial = self.store.remote_start(request, mode=mode)
+                # Seed an actual pre-result-batch run, whose identity belongs to
+                # the source batch; new result snapshots must never be weakened.
+                initial = self.store.runtime.remote_start(request, mode, legacy_batch=mode == 'generate')
                 run_id = initial['collection_run_id']
                 def legacy(item):
                     options = item['request']['metadata'] if mode == 'generate' else item['request']
@@ -219,10 +223,10 @@ class FactoryRuntimeTests(unittest.TestCase):
     def test_new_upload_id_starts_new_batch_after_previous_publication(self):
         first = self.store.add_task({**self.upload, 'request_id': 'upload-one'})['tasks'][0]
         self.store.records.put('batch_lifecycle', first['source_batch_id'], {'batch_id': first['source_batch_id'], 'status': 'published', 'release_id': 'release-1'})
-        second = self.store.add_task({**self.upload, 'request_id': 'upload-two'})['tasks'][0]
+        second = self.store.add_task({**self.upload, 'request_id': 'upload-two'})['imported_task']
         self.assertNotEqual(first['source_batch_id'], second['source_batch_id'])
-        self.assertEqual(self.store.add_task({**self.upload, 'request_id': 'upload-two'})['tasks'], [second])
-        self.assertEqual(self.store.remote_start(self.request())['batch_id'], second['source_batch_id'])
+        self.assertEqual(self.store.add_task({**self.upload, 'request_id': 'upload-two'})['tasks'], [first, second])
+        self.assertEqual(self.store.remote_start(self.request())['task_source_batch_id'], second['source_batch_id'])
 
     def test_old_evaluation_completion_does_not_hide_new_round(self):
         self.store.add_task(self.upload, mode='modeliter')
@@ -235,15 +239,20 @@ class FactoryRuntimeTests(unittest.TestCase):
         self.remote[second['run_id']]['status'] = 'running'  # Delayed poll captured before completion.
         self.assertEqual(self.store.runtime.sync_evaluation(second['run_id'])['status'], 'succeeded')
 
-    def test_closed_batch_cannot_run_or_restore_to_work_list(self):
+    def test_published_source_can_seed_new_result_without_reopening_old_batch(self):
         row = self.store.add_task(self.upload)['tasks'][0]
         batch_id = row['source_batch_id']
         self.store.records.put('batch_lifecycle', batch_id, {'batch_id': batch_id, 'status': 'published', 'release_id': 'release-1', 'published_at': '2026-09-21'})
-        with self.assertRaises(BatchPublishedError):
-            self.store.remote_start(self.request())
-        self.assertEqual(self.store.state()['tasks'], [])
+        before = self.store.records.get('batch_lifecycle', batch_id)
+        run = self.store.remote_start(self.request())
+        self.assertEqual(run['task_source_batch_id'], batch_id)
+        self.assertNotEqual(run['batch_id'], batch_id)
+        self.assertEqual(self.store.records.get('batch_lifecycle', batch_id), before)
+        self.assertEqual(len(self.store.state()['tasks']), 1)
         self.assertEqual(self.store.runtime.batches(), [])
-        self.assertEqual(self.calls, [])
+        self.assertEqual(len(self.store.runtime.batches(include_published=True)), 1)
+        with self.assertRaises(BatchPublishedError):
+            self.store.remove_task(row['filename'])
 
     def test_newer_completion_does_not_hide_older_active_run_in_either_mode(self):
         self.store.dispatch('phone-apps', 'POST', {'phone_id': 'phone-2', 'app': 'App'})

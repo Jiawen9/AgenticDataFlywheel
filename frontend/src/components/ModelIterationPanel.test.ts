@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { createRenderer, h, nextTick, ssrContextKey } from 'vue'
+import { createRenderer, h, nextTick, ref, ssrContextKey } from 'vue'
 import ModelIterationPanel from './ModelIterationPanel.vue'
+import { useEvaluationProgress } from '@/composables/useEvaluationProgress'
 
 const mocks = vi.hoisted(() => ({ config: vi.fn(), capability: vi.fn(), profiles: vi.fn(), sources: vi.fn(), preview: vi.fn(), start: vi.fn(), cancel: vi.fn(), confirm: vi.fn(), requestId: vi.fn(), save: vi.fn(), evaluations: vi.fn(), poll: undefined as undefined | ((signal: AbortSignal, current: () => boolean) => Promise<void>) }))
 vi.mock('@/phoneFactoryApi', () => ({ newRunRequestId: mocks.requestId, modelIterationApi: { evaluationConfig: mocks.config, evaluationCapabilities: mocks.capability, evaluationProfiles: mocks.profiles, evaluationSources: mocks.sources, evaluationPreview: mocks.preview, remoteStartEvaluation: mocks.start, cancelEvaluation: mocks.cancel, saveEvaluationConfig: mocks.save, evaluations: mocks.evaluations } }))
@@ -17,10 +18,13 @@ function mount(runs: Array<{ run_id: string; status: string }> = []) {
   const renderer = createRenderer<object, object>({ createElement: () => ({}), createText: () => ({}), createComment: () => ({}), setText() {}, setElementText() {}, parentNode: () => null, nextSibling: () => null, patchProp() {}, insert() {}, remove() {} })
   const events = { ready: [] as boolean[], config: [] as ReturnType<typeof config>[], profile: [] as any[], mode: [] as string[], started: [] as string[], changed: [] as string[] }
   const component = { ...ModelIterationPanel, render: () => h('div') }
-  const app = renderer.createApp(component, { runs, onReady: (value: boolean) => events.ready.push(value), onConfig: (value: ReturnType<typeof config>) => events.config.push(value), onProfile: (value: unknown) => events.profile.push(value), onMode: (value: string) => events.mode.push(value), onStarted: (value: string) => events.started.push(value), onChanged: (value: string) => events.changed.push(value) })
+  const app = renderer.createApp({ setup() {
+    const progress = useEvaluationProgress(ref(runs), value => { events.changed.push(value) })
+    return () => h(component, { runs, progress, onReady: (value: boolean) => events.ready.push(value), onConfig: (value: ReturnType<typeof config>) => events.config.push(value), onProfile: (value: unknown) => events.profile.push(value), onMode: (value: string) => events.mode.push(value), onStarted: (value: string) => { progress.selectRun(value); events.started.push(value) } })
+  } })
   app.provide(ssrContextKey, { modules: new Set() })
   app.mount({})
-  const state = app._instance!.setupState as Record<string, any>
+  const state = app._instance!.subTree.component!.setupState as Record<string, any>
   return { app, events, state }
 }
 

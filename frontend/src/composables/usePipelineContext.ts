@@ -5,7 +5,7 @@ import { notifyBatchesPublished, publishedBatch, subscribeBatchLifecycle } from 
 import { PIPELINE_TERMINAL, type Pipeline, type PipelineStepId } from '@/types/pipeline'
 
 /** Resolves authoritative backend bindings; route identifiers never authorize writes. */
-export function usePipelineContext(options: { batchId?: MaybeRefOrGetter<string>; stepId?: PipelineStepId } = {}) {
+export function usePipelineContext(options: { batchId?: MaybeRefOrGetter<string>; stepId?: PipelineStepId; lookupByBatch?: boolean } = {}) {
   const route = useRoute()
   const pipeline = ref<Pipeline | null>(null)
   const error = ref('')
@@ -14,7 +14,8 @@ export function usePipelineContext(options: { batchId?: MaybeRefOrGetter<string>
   const controlling = ref(false)
   const routePipelineId = computed(() => typeof route?.query?.pipeline_id === 'string' ? route.query.pipeline_id : '')
   const routeBatchId = computed(() => typeof route?.query?.batch_id === 'string' ? route.query.batch_id : '')
-  const batchId = computed(() => toValue(options.batchId) || routeBatchId.value || '')
+  // Task-source selection does not own a result pipeline. Explicit pipeline routes still verify their result binding.
+  const batchId = computed(() => options.lookupByBatch === false && !routePipelineId.value ? '' : toValue(options.batchId) || routeBatchId.value || '')
   const isPipelineRoute = computed(() => Boolean(routePipelineId.value))
   const routeStepId = computed(() => typeof route?.query?.step_id === 'string' ? route.query.step_id : options.stepId)
   const selectedStepId = computed(() => routeStepId.value || pipeline.value?.current_step)

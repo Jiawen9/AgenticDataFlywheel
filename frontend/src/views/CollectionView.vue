@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import DisplayId from '@/components/DisplayId.vue'
+import CollectionBatchProvenance from '@/components/CollectionBatchProvenance.vue'
 import { useDisplayIdentifiers } from '@/composables/useDisplayIdentifiers'
 import PipelineStatusBar from '@/components/PipelineStatusBar.vue'
 import RolloutImportDialog from '@/components/RolloutImportDialog.vue'
@@ -186,6 +187,7 @@ onBeforeUnmount(() => { disposed = true; flow.dispose(); window.removeEventListe
             <el-icon :class="{ rotated: batchId === batch.batch_id }"><ArrowDown /></el-icon>
           </button>
           <div v-if="batchId === batch.batch_id" class="batch-detail">
+            <CollectionBatchProvenance :batch="batch" :runs="sourceRuns" />
             <div class="batch-actions">
               <DisplayId kind="batch" :id="batch.batch_id" />
               <span>采集状态：{{ statusText(batch.collection_status) }}</span>

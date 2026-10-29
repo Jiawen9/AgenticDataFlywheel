@@ -68,7 +68,7 @@ class CollectionRunTests(unittest.TestCase):
         return self.store.create("batch-one", dispatch_key=key)[0]
 
     def complete(self, run, entry=None, **kwargs):
-        value = {"batch_id": "batch-one", "trajectories": [entry or raw_trajectory(run)], **kwargs}
+        value = {"batch_id": run["batch_id"], "trajectories": [entry or raw_trajectory(run)], **kwargs}
         return self.store.complete(run["collection_run_id"], value)
 
     def test_request_key_is_stable_across_restart_and_parallel_creation(self):
@@ -285,10 +285,13 @@ class CollectionRunTests(unittest.TestCase):
             self.assertEqual(conflict.status_code, 409)
             run = factory.collection_runs.get(run_id)
             entry = raw_trajectory(run)
-            done = client.post(f"/api/phone-factory/collection-runs/{run_id}/complete", json={"batch_id": "batch-one", "trajectories": [entry]})
+            self.assertNotEqual(run["batch_id"], "batch-one")
+            self.assertEqual(run["task_source_batch_id"], "batch-one")
+            done = client.post(f"/api/phone-factory/collection-runs/{run_id}/complete", json={"batch_id": run["batch_id"], "trajectories": [entry]})
             self.assertEqual(done.status_code, 200, done.text)
             self.assertEqual(done.json()["status"], "completed")
-            self.assertEqual(client.get("/api/phone-factory/collection-runs?batch_id=batch-one").json()["runs"][0]["collection_run_id"], run_id)
+            self.assertEqual(client.get("/api/phone-factory/collection-runs?task_source_batch_id=batch-one").json()["runs"][0]["collection_run_id"], run_id)
+            self.assertEqual(client.get("/api/phone-factory/collection-runs?batch_id=batch-one").json()["runs"], [])
             self.assertEqual(client.post("/api/phone-factory/collection-runs/missing/complete", json={}).status_code, 404)
             self.assertEqual(client.post(f"/api/phone-factory/collection-runs/{run_id}/complete", json={"batch_id": "other", "trajectories": [entry]}).status_code, 409)
 

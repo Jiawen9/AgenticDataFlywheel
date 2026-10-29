@@ -222,6 +222,9 @@ class FullCollectionPipelineIntegrationTests(unittest.TestCase):
                     "batch_id": batch, "mode": "automatic", "start_mode": "collect", "threshold": 4,
                     "collection_config": {"phone_id": "phone-a", "app": "App", "vla": "http://mock.invalid/vla",
                         "config": {"sampling_enabled": True, "temperature": .3, "top_p": .8, "use_experience_lib": True}}})
+                self.assertNotEqual(pipeline["batch_id"], batch)
+                self.assertEqual(pipeline["task_source_batch_id"], batch)
+                self.assertEqual(pipeline["batch_role"], "collection_result")
                 for _ in range(22):
                     manager.tick(pipeline["pipeline_id"])
                     current = manager.get(pipeline["pipeline_id"])
@@ -232,6 +235,11 @@ class FullCollectionPipelineIntegrationTests(unittest.TestCase):
                     queue.drain()
                 self.assertEqual(current["status"], "succeeded", current.get("error"))
                 self.assertEqual(execution.calls, 1)
+                from backend.batch_lifecycle import lifecycle
+                self.assertEqual(lifecycle(batch, root)["status"], "active")
+                self.assertEqual(lifecycle(current["batch_id"], root)["status"], "published")
+                self.assertIsNone(ArtifactStore(root).get(batch, "01_conversion"))
+                self.assertIsNotNone(ArtifactStore(root).get(current["batch_id"], "01_conversion"))
                 self.assertEqual(current["selection"]["tasks"][0]["goal"], "搜索商品")
                 self.assertEqual(len(current["collection_run_ids"]), 1)
                 run = platform.collection_runs.get(current["collection_run_ids"][0])

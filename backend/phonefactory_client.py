@@ -130,6 +130,9 @@ def cmd_start_run(args):
         "capture_logprobs": str(getattr(args, "capture_logprobs", False)).lower(),
         "vla": getattr(args, "vla", "") or "", "runmode": getattr(args, "runmode", "generate"),
         "agent_type": getattr(args, "agent_type", "newagent")}
+    for key in ("execution_model", "planner_config"):
+        if getattr(args, key, None):
+            fields[key] = getattr(args, key)
     evaluator_config = getattr(args, "evaluator_config", None)
     if fields["runmode"] == "modeliter" and evaluator_config:
         fields.update(evaluator_config=evaluator_config, checklist_source=args.checklist_source,
@@ -172,6 +175,8 @@ def build_parser():
     run.add_argument("--exp", action="store_true")
     run.add_argument("--agent-type", choices=("newagent", "pipelineagent"), default="newagent")
     run.add_argument("--vla", default="")
+    run.add_argument("--execution-model", default="")
+    run.add_argument("--planner-config")
     run.add_argument("--runmode", choices=["generate", "modeliter"], default="generate")
     run.add_argument("--batch-id")
     run.add_argument("--collection-run-id")

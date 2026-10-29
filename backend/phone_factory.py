@@ -26,8 +26,10 @@ from .batch_operations import active_batch_lock
 from .batch_lifecycle import is_batch_active
 from .data_store import DATA_ROOT, RecordStore, RevisionConflict
 from .data_store.paths import contained_path
+from .data_store.locking import batch_lock
 from .collection_runs import CollectionRunError, CollectionRunStore
 from .agent_types import normalize_agent_type
+from .pipeline_model_config import default_models, normalize_defaults
 
 DEFAULT_CONFIG = {
     "sampling_enabled": False, "temperature": 0.7,
@@ -205,15 +207,27 @@ class PhoneFactoryStore:
 
     def _public(self, state: dict) -> dict:
         result = {key: state.get(key, []) for key in ("phones", "apps", "phoneApps", "vla", "tasks")}
-        result["tasks"] = [item for item in result["tasks"] if not item.get("source_batch_id")
-                           or is_batch_active(item["source_batch_id"], self.root)]
+        tasks = []
+        for item in result["tasks"]:
+            batch_id = item.get("source_batch_id")
+            batch = self.collection_runs.result_batches.get(batch_id) if batch_id else None
+            if batch is not None:
+                if not is_batch_active(batch_id, self.root):
+                    continue
+                item = {**item, "batch_role": "collection_result", "task_source_batch_id": batch["task_source_batch_id"]}
+            # Source workbooks are reusable read-only inputs, including sources
+            # whose historical results have already been published.
+            tasks.append(dict(item))
+        result["tasks"] = tasks
         return result
 
     def state(self, mode="generate") -> dict:
         return self.runtime.public_state(self._public(self._current()), mode)
 
-    def config(self) -> dict:
-        return {**DEFAULT_CONFIG, **self._current()["config"], "agent_type": self._current().get("agent_type", "newagent")}
+    def config(self, mode="generate") -> dict:
+        state = self._current()
+        return {**DEFAULT_CONFIG, **state["config"], "agent_type": state.get("agent_type", "newagent"),
+                "model_defaults": state.get("model_defaults", {}).get(mode, default_models())}
 
     def _update(self, mutator: Callable[[dict], None]) -> dict:
         return self.records.update("phone_factory", "state", mutator, default=self._empty_state())
@@ -244,6 +258,19 @@ class PhoneFactoryStore:
             raise PhoneFactoryError("该文件名前缀仅供采集批次使用，请重命名手动上传文件", 409)
         digest = hashlib.sha256(content).hexdigest()
         destination = contained_path(self.upload_dir, filename)
+        source_registration = False
+        if batch and mode == "generate":
+            try:
+                frozen = self.collection_runs.batch(batch, require_workbook=True)
+            except CollectionRunError as exc:
+                # Preserve legacy input registration; dispatch still requires a
+                # real frozen batch. Never bypass a closed source's write guard.
+                if exc.status != 404 or not is_batch_active(batch, self.root):
+                    raise
+            else:
+                source_registration = frozen.get("batch_role") != "collection_result"
+                if frozen.get("workbook_sha256") != digest:
+                    raise PhoneFactoryError("上传文件与冻结的采集批次 Excel 不一致", 409)
 
         def mutate(state):
             tasks = state["tasks"]
@@ -279,9 +306,13 @@ class PhoneFactoryStore:
                 row.update(source_batch_id=batch, content_sha256=digest)
             tasks.append(row)
 
-        with active_batch_lock(batch, self.root):
+        # Registering an immutable source only updates the factory's input list;
+        # it must not acquire write ownership of that source's historical result.
+        lock = batch_lock(self.root, batch) if source_registration else active_batch_lock(batch, self.root)
+        with lock:
             from .pipeline_access import ensure_pipeline_write
-            ensure_pipeline_write(batch, self.root, action="collect")
+            if not source_registration:
+                ensure_pipeline_write(batch, self.root, action="collect")
             state = self.runtime.public_state(self._public(self._update(mutate)), mode)
             imported = next(row for row in state["tasks"] if row["filename"] == filename)
             return {**state, "imported_task": dict(imported)}
@@ -344,7 +375,7 @@ class PhoneFactoryStore:
         if method == "GET" and action == "state":
             return self.state(mode)
         if method == "GET" and action == "config":
-            return self.config()
+            return self.config(mode)
         if method == "POST" and action == "tasks":
             return self.add_task(data, mode=mode)
         if method == "POST" and action == "tasks/start":
@@ -375,10 +406,15 @@ class PhoneFactoryStore:
                 config[key] = value if math.isfinite(value) else DEFAULT_CONFIG[key]
             try:
                 agent_type = normalize_agent_type(data.get("agent_type", self._current().get("agent_type", "newagent")))
+                models = normalize_defaults(data["model_defaults"]) if "model_defaults" in data else None
             except ValueError as exc:
                 raise PhoneFactoryError(str(exc)) from exc
-            self._update(lambda state: state.update(config=config, agent_type=agent_type))
-            return {**config, "agent_type": agent_type}
+            def update_config(state):
+                state.update(config=config, agent_type=agent_type)
+                if models is not None:
+                    state.setdefault("model_defaults", {})[mode] = models
+            self._update(update_config)
+            return self.config(mode)
         if method == "POST" and action in {"phones", "apps", "vla"}:
             key, label = {"phones": ("phone_id", "手机ID"), "apps": ("app", "APP名称"), "vla": ("value", "VLA接口")}[action]
             value = _text(data.get(key))

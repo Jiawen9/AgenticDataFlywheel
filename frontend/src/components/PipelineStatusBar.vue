@@ -20,7 +20,7 @@ function progress(job: Record<string, unknown>): number | null {
 <template>
   <aside v-if="pipeline || context.isPipelineRoute.value || error" class="pipeline-status-bar" data-testid="pipeline-status-bar">
     <div class="pipeline-status-heading">
-      <div><strong>{{ pipeline?.name || 'Pipeline' }}</strong><span v-if="pipeline">{{ pipelineStatusLabels[pipeline.status] }} · <DisplayId kind="batch" :id="pipeline.batch_id" /></span></div>
+      <div><strong>{{ pipeline?.name || 'Pipeline' }}</strong><span v-if="pipeline">{{ pipelineStatusLabels[pipeline.status] }} · 结果批次 <DisplayId kind="batch" :id="pipeline.batch_id" /><template v-if="pipeline.task_source_batch_id"> · 任务来源 <DisplayId kind="batch" :id="pipeline.task_source_batch_id" /></template></span></div>
       <el-button size="small" @click="router.push({ path: '/pipeline', query: { ...(pipeline ? { pipeline_id: pipeline.pipeline_id } : {}) } })">返回 Pipeline</el-button>
     </div>
     <el-alert v-if="context.historyOnly.value" title="流程已结束，仅展示本次运行记录；当前批次结果可能已更新，请从业务页面重新选择批次查看。" type="info" :closable="false" />

@@ -31,6 +31,8 @@ class OfflineRuntime:
     def configurations(self): return dict(self.config)
     def snapshot(self, batch): return {"task_ids": list(self.tasks), "collection_digest": "frozen"}
     def collection_options(self, config): return deepcopy(config)
+    def prepare_collection(self, source, request_id, options):
+        return {"batch_id": "result-" + request_id, "batch_role": "collection_result", "task_source_batch_id": source}
     def collection_runs(self, batch): return deepcopy(self.collection_values)
     def input_ready(self, p): return not self.collection_values or all(j["status"] == "completed" for j in self.collection_values)
     def ready(self, step, p): return step in self.ready_stages

@@ -102,8 +102,16 @@ class CollectionRunStore:
         self.records = RecordStore(self.root)
         self.batch_loader = batch_loader
 
+    @property
+    def result_batches(self):
+        from .collection_result_batches import CollectionResultBatchStore
+        return CollectionResultBatchStore(self.root, sources=self)
+
     def batch(self, batch_id: str, *, require_workbook: bool = False) -> dict:
         batch_id = _identifier(batch_id, "采集批次编号")
+        result = self.result_batches.get(batch_id, require_workbook=require_workbook)
+        if result is not None:
+            return result
         if self.batch_loader is not None:
             payload = self.batch_loader(batch_id)
             if payload is None:
@@ -177,13 +185,56 @@ class CollectionRunStore:
         return sorted((self._current_paths(run) for run in self.records.list("collection_runs")
                        if batch_id is None or run["batch_id"] == batch_id), key=lambda run: (run["created_at"], run["collection_run_id"]))
 
+    def prepare_result_batch(self, source_batch_id: str, *, dispatch_key: str, metadata: dict,
+                             workbook_sha256: str | None = None) -> tuple[dict, bool]:
+        return self.result_batches.prepare(source_batch_id, dispatch_key=dispatch_key,
+                                           metadata=metadata, workbook_sha256=workbook_sha256)
+
+    def create_result_run(self, source_batch_id: str, *, dispatch_key: str, metadata: dict,
+                          workbook_sha256: str | None = None) -> tuple[dict, bool]:
+        """New collection owns a child batch; a historical request keeps its identity."""
+        _identifier(source_batch_id, "任务来源批次编号")
+        _identifier(dispatch_key, "request_id")
+        legacy = self.get("cr_" + payload_digest([source_batch_id, dispatch_key]))
+        if legacy is not None:
+            request = {"batch_id": source_batch_id, "metadata": metadata,
+                       "workbook_sha256": workbook_sha256 or legacy["request"].get("workbook_sha256")}
+            if (legacy.get("request_digest") != payload_digest(request)
+                    and not matches_legacy_logprobs_request(legacy, request, nested_metadata=True)):
+                raise CollectionRunError("相同 request_id 对应的运行参数不同")
+            return legacy, False
+        batch, _ = self.prepare_result_batch(source_batch_id, dispatch_key=dispatch_key,
+                                            metadata=metadata, workbook_sha256=workbook_sha256)
+        return self.create(batch["batch_id"], dispatch_key=batch["execution_request_id"],
+                           metadata=batch["execution_metadata"], workbook_sha256=batch["workbook_sha256"])
+
+    @staticmethod
+    def _validate_result_dispatch(batch, dispatch_key, metadata, workbook_sha256):
+        if (dispatch_key != batch["execution_request_id"]
+                or payload_digest(metadata or {}) != payload_digest(batch["execution_metadata"])
+                or (workbook_sha256 is not None and workbook_sha256 != batch["workbook_sha256"])):
+            raise CollectionRunError("采集结果批次只允许其冻结的单次运行；重新采集请从任务来源创建新批次")
+
     def create(self, batch_id: str, *, dispatch_key: str | None = None,
                metadata: dict | None = None, workbook_sha256: str | None = None) -> tuple[dict, bool]:
+        # A replay is a read even when its completed child has since been published.
+        result_batch = self.result_batches.get(batch_id)
+        if result_batch is not None:
+            self._validate_result_dispatch(result_batch, dispatch_key, metadata, workbook_sha256)
+            existing = self.get(result_batch["collection_run_id"])
+            if existing is not None:
+                request = {"batch_id": batch_id, "metadata": metadata or {},
+                           "workbook_sha256": workbook_sha256 or result_batch["workbook_sha256"]}
+                if existing.get("request_digest") != payload_digest(request):
+                    raise CollectionRunError("已登记运行与结果批次的冻结参数不匹配")
+                return existing, False
         with active_batch_lock(batch_id, self.root):
             """Reserve one dispatch. Repeated keys never create or dispatch twice."""
             from .pipeline_access import ensure_pipeline_write
             ensure_pipeline_write(batch_id, self.root, action="collect")
             batch = self.batch(batch_id, require_workbook=True)
+            if batch.get("batch_role") == "collection_result":
+                self._validate_result_dispatch(batch, dispatch_key, metadata, workbook_sha256)
             if dispatch_key is not None:
                 _identifier(dispatch_key, "request_id")
             if workbook_sha256 is not None and batch.get("workbook_sha256") != workbook_sha256:
@@ -215,6 +266,11 @@ class CollectionRunStore:
                 "batch_snapshot_sha256": payload_digest(batch["snapshot"]),
                 "trajectories": [], "errors": [], "dispatch_error": None,
             }
+            if batch.get("batch_role") == "collection_result":
+                if run_id != batch["collection_run_id"]:
+                    raise CollectionRunError("结果批次的预留运行编号不匹配")
+                payload.update({key: batch[key] for key in ("batch_role", "task_source_batch_id",
+                    "task_source_snapshot_sha256", "task_source_workbook_sha256", "agent_type")})
             io_path(root).mkdir(parents=True, exist_ok=True)
             try:
                 from .display_identifiers import DisplayIdentifierStore
@@ -280,6 +336,8 @@ class CollectionRunStore:
             raise CollectionRunError("完成清单的采集引擎与下发配置不匹配")
         # Missing provenance stays missing in frozen historical manifests.
         provenance = {key: manifest[key] for key in PROVENANCE_FIELDS if key in manifest}
+        if run.get("batch_role") == "collection_result":
+            provenance.setdefault("agent_type", manifest_agent)
         for key, value in provenance.items():
             if not isinstance(value, str) or not value or len(value) > 256:
                 raise CollectionRunError(f"完成清单 {key} 无效")
@@ -458,9 +516,11 @@ class CollectionRunStore:
                     continue
 
     def ready_input(self, batch_id: str) -> dict:
-        self.batch(batch_id)
+        batch = self.batch(batch_id)
         runs, trajectories, errors = [], [], []
         for run in self.list_runs(batch_id):
+            if batch.get("batch_role") == "collection_result" and run["collection_run_id"] != batch["collection_run_id"]:
+                raise CollectionRunError("结果批次包含未绑定的采集运行，不能合并处理")
             if run["status"] != "completed":
                 continue
             normalized = {key: run[key] for key in ("batch_id", "collection_run_id", "trajectories", "errors") + PROVENANCE_FIELDS if key in run}
@@ -475,6 +535,9 @@ class CollectionRunStore:
             raise CollectionRunError("该采集批次尚无已登记完成的可用轨迹")
         value = {"schema_version": 1, "batch_id": batch_id, "raw_root": str(self.raw_root(batch_id)),
                  "runs": runs, "trajectories": trajectories, "errors": errors}
+        if batch.get("batch_role") == "collection_result":
+            value.update({key: batch[key] for key in ("batch_role", "task_source_batch_id",
+                "task_source_snapshot_sha256", "task_source_workbook_sha256")})
         return {**value, "input_digest": payload_digest({key: value[key] for key in ("batch_id", "runs", "trajectories", "errors")})}
 
     def freeze_ready_input(self, batch_id: str) -> dict:

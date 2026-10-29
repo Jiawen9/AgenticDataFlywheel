@@ -10,7 +10,7 @@
         <p>{{ isEvaluation ? '采集并即时评测，或用已有轨迹创建独立评测；选择规则版本，保留每轮结果。' : '管理采集手机与运行 APP，配置 VLA 接口，上传轨迹生产任务文件。' }}</p>
       </div>
     </header>
-    <ModelIterationPanel v-if="isEvaluation" :runs="runs" @ready="evaluationReady = $event" @config="evaluatorConfig = $event" @mode="evaluationMode = $event" @profile="evaluationProfile = $event" @started="refreshEvaluationRuns" @changed="refreshEvaluationRuns" />
+    <ModelIterationPanel v-if="evaluationProgress" :runs="runs" :progress="evaluationProgress" @ready="evaluationReady = $event" @config="evaluatorConfig = $event" @mode="evaluationMode = $event" @profile="evaluationProfile = $event" @started="onEvaluationStarted" @details="openDetails('cases')" />
 
     <div class="factory-layout" :class="{ 'offline-layout': !showCollectionControls }">
       <!-- ============ 左列：新增手机（含手机列表） ============ -->
@@ -87,7 +87,7 @@
         <el-alert v-if="agentIssue || agentError" :title="agentIssue || agentError" type="warning" :closable="false" />
         <!-- 3.1 VLA接口 -->
         <div class="row-form">
-          <span class="field-label">VLA接口</span>
+          <span class="field-label">执行接口（VLA）</span>
           <el-select
             v-model="newVla"
             :disabled="taskBusy"
@@ -104,6 +104,11 @@
           <el-button :disabled="taskBusy" :loading="savingVla" @click="handleSaveVla">保存</el-button>
         </div>
 
+        <template v-if="agentType === 'pipelineagent'">
+          <PipelineModelFields :model-value="models" :disabled="taskBusy || savingConfig" @update:model-value="Object.assign(models, $event)" />
+          <el-button :disabled="taskBusy || Boolean(modelValidationIssue(models))" :loading="savingConfig" data-testid="save-model-defaults" @click="saveModelDefaults">保存模型默认配置</el-button>
+          <p class="empty-hint">默认配置用于本模块的新运行；定制运行可单独覆盖。</p>
+        </template>
         <div class="row-form config-row">
           <span class="field-label">采集 Logprobs</span>
           <el-switch v-model="config.capture_logprobs" data-testid="capture-logprobs" :disabled="taskBusy || savingConfig" @change="handleConfigChange" />
@@ -131,10 +136,10 @@
         </div>
 
         <template v-if="!isEvaluation">
-        <h3 class="sub-title">采集任务批次</h3>
+        <h3 class="sub-title">采集任务来源</h3>
         <div class="row-form">
-          <span class="field-label">采集批次</span>
-          <el-select :model-value="selectedBatchId" filterable :filter-method="filterCollectionBatches" clearable :loading="loadingBatches || loadingBatch" :disabled="taskBusy || runDialogVisible" placeholder="选择已提交的采集批次" class="batch-select" @change="selectCollectionBatch">
+          <span class="field-label">任务来源</span>
+          <el-select :model-value="selectedBatchId" filterable :filter-method="filterCollectionBatches" clearable :loading="loadingBatches || loadingBatch" :disabled="taskBusy || runDialogVisible" placeholder="选择可复用的任务来源" class="batch-select" @change="selectCollectionBatch">
             <el-option v-for="batch in filteredCollectionBatches" :key="batch.batch_id" :value="batch.batch_id" :label="collectionBatchOptionLabel(batch)" />
           </el-select>
           <el-button :loading="loadingBatches" :disabled="taskBusy || runDialogVisible" @click="collection.loadBatches()">刷新批次</el-button>
@@ -143,12 +148,12 @@
         <div v-if="selectedBatch && selectedBatchRow" class="batch-summary">
           <p><strong>{{ selectedBatch.task_count }} 条任务</strong> · {{ selectedBatch.apps.join('、') }} · {{ selectedBatch.created_at.slice(0, 19).replace('T', ' ') }}</p>
           <el-alert v-if="selectedBatch.warnings?.length" :title="warningSummary(selectedBatch.warnings)" type="warning" :closable="false" show-icon class="batch-alert" data-testid="collection-classification-warning" />
-          <p>批次：<DisplayId kind="batch" :id="selectedBatch.batch_id" /> · <template v-if="selectedBatch.source_job_id">来源作业：<DisplayId kind="job" :id="selectedBatch.source_job_id" /></template><template v-else>来源：手动上传</template> · {{ selectedBatchRow.status }}</p>
-          <el-button type="primary" :loading="startingTask === selectedBatchRow.filename" :disabled="taskBusy || isManagedTask(selectedBatchRow)" @click="handleStartTask(selectedBatchRow)">开始运行所选批次</el-button>
+          <p>任务来源：<DisplayId kind="batch" :id="selectedBatch.batch_id" /> · <template v-if="selectedBatch.source_job_id">来源作业：<DisplayId kind="job" :id="selectedBatch.source_job_id" /></template><template v-else>来源：手动上传</template> · {{ selectedBatchRow.status }}</p>
+          <el-button type="primary" :loading="startingTask === selectedBatchRow.filename" :disabled="taskBusy || isManagedTask(selectedBatchRow)" @click="handleStartTask(selectedBatchRow)">使用此任务来源开始新采集</el-button>
           <el-button :loading="downloadingBatch" :disabled="taskBusy" @click="downloadCollectionBatch">下载采集表</el-button>
-          <router-link :to="{ path: '/collection/tree-building', query: { ...route.query, batch_id: selectedBatch.batch_id, collection_batch_id: undefined, ...(pipelineContext.isPipelineRoute.value ? { step_id: 'preprocessing' } : {}) } }" class="preprocessing-link">前往预处理</router-link>
+          <p>每次新采集会创建独立结果批次。请从下方对应运行进入预处理。</p>
         </div>
-        <p class="empty-hint">选择批次仅查看信息；手动上传任务也会登记业务批次，采集结果回传完成后可进入预处理。</p>
+        <p class="empty-hint">任务来源可以反复使用；不同引擎或再次采集的结果分别预处理、质检和发布。</p>
         </template>
 
         <!-- 3.2 新增任务 -->
@@ -191,33 +196,8 @@
         <p v-if="!tasks.length" class="empty-hint">暂无任务，请在上方新增。</p>
         </template>
 
-        <h3 class="sub-title">{{ isEvaluation ? '评估运行与报告' : '采集运行与回传' }}</h3>
-        <el-input v-model="runQuery" clearable placeholder="搜索显示编号、完整编号或文件名" aria-label="搜索运行" class="run-search" />
-        <el-alert v-if="runError" :title="runError" type="warning" :closable="false" />
-        <el-table :data="filteredRuns" border data-testid="factory-runs">
-          <el-table-column label="运行编号" min-width="160"><template #default="{ row }"><DisplayId kind="run" :id="row.collection_run_id || row.run_id" /></template></el-table-column>
-          <el-table-column label="采集引擎" min-width="130"><template #default="{ row }">{{ row.execution_mode === 'evaluate_only' ? (row.source?.agent_type ? agentLabel(row.source.agent_type) : '已有轨迹') : agentLabel(row.agent_type) }}</template></el-table-column>
-          <el-table-column v-if="isEvaluation" label="评测方式 / 规则" min-width="180"><template #default="{ row }">{{ evaluationModeLabel(row.execution_mode) }} · {{ row.evaluation_profile_id || '历史配置' }}</template></el-table-column>
-          <el-table-column v-if="isEvaluation" label="数据来源" min-width="170" show-overflow-tooltip><template #default="{ row }"><DisplayId v-if="row.source?.run_id || row.source?.source_run_id" kind="run" :id="row.source.run_id || row.source.source_run_id" /><template v-else>{{ evaluationSourceLabel(row) }}</template></template></el-table-column>
-          <el-table-column label="状态" width="110"><template #default="{ row }">{{ runDisplayStatus(row) }}</template></el-table-column>
-          <el-table-column label="结果" min-width="170"><template #default="{ row }">{{ runMessage(row) }}</template></el-table-column>
-          <el-table-column v-if="!isEvaluation" label="操作" min-width="160"><template #default="{ row }"><el-button link :loading="syncingRun === (row.collection_run_id || row.run_id)" :disabled="pipelineContext.isPipelineRoute.value || managedBatchIds.includes(row.batch_id)" @click="syncRun(row)">重试回传</el-button><el-button v-if="canCancelCollectionRun(row)" link type="danger" :loading="cancellingRun === (row.collection_run_id || row.run_id)" :disabled="pipelineContext.isPipelineRoute.value || managedBatchIds.includes(row.batch_id)" @click="cancelCollectionRun(row)">停止</el-button></template></el-table-column>
-        </el-table>
-        <section v-if="isEvaluation" data-testid="evaluation-reports">
-          <div class="report-heading"><h3 class="sub-title">模型迭代评估报告</h3><el-button :loading="loadingReports" @click="reportPoller.start()">刷新报告</el-button></div>
-          <el-alert v-if="reportError" :title="reportError" type="warning" :closable="false" />
-          <p v-if="!reportFolders.length" class="empty-hint">{{ loadingReports ? '正在读取评估报告…' : '暂无评估报告，完成运行后将在这里显示。' }}</p>
-          <section v-for="folder in reportFolders" :key="folder.run_id || folder.dir_name" class="report-folder">
-            <strong>第 {{ folder.index }} 轮 · <DisplayId v-if="folder.run_id" kind="run" :id="folder.run_id" /><span v-else class="report-directory" :title="folder.dir_name">{{ folder.dir_name }}</span></strong>
-            <p>轮次时间：{{ reportTime(folder.modified) }}<span v-if="folder.agent_type"> · {{ agentLabel(folder.agent_type) }}</span></p>
-            <el-table v-if="folder.files.length" :data="folder.files" border>
-              <el-table-column prop="name" label="文件名" min-width="160" />
-              <el-table-column label="生成时间" min-width="160"><template #default="{ row }">{{ reportTime(row.modified) }}</template></el-table-column>
-              <el-table-column label="操作" width="100"><template #default="{ row }"><el-button link type="primary" :loading="downloadingReport === `${folder.run_id || folder.dir_name}/${row.file_id || row.name}`" @click="downloadReport(folder, row)">下载报告</el-button></template></el-table-column>
-            </el-table>
-            <p v-else class="empty-hint">第 {{ folder.index }} 轮暂无 xlsx 报告文件</p>
-          </section>
-        </section>
+        <FactoryRunSummary :runs="filteredRuns" :evaluation="isEvaluation" :error="runError || (isEvaluation ? reportError : '')" @open="openRunDetails" @reports="openDetails('reports')" />
+        <p v-if="!isEvaluation && selectedBatchId" class="empty-hint">当前仅展示所选任务来源的各次采集；清空任务来源可查看全部运行。</p>
         <!-- 定制运行只覆盖此次运行的配置 -->
         <el-dialog v-if="showCollectionControls" v-model="runDialogVisible" title="定制运行" width="480px" :close-on-click-modal="false" :close-on-press-escape="!confirmingRun" :show-close="!confirmingRun">
           <div class="row-form">
@@ -232,6 +212,7 @@
             <label>采集引擎<CollectionAgentSelect v-model="runDialogAgentType" :capabilities="agentCapabilities" :disabled="confirmingRun" data-testid="custom-agent-type" /></label>
             <el-alert v-if="customAgentIssue" :title="customAgentIssue" type="warning" :closable="false" />
             <label>VLA 接口<el-select v-model="runDialogVla" data-testid="custom-run-vla" filterable allow-create :disabled="confirmingRun" placeholder="host:port 或 http(s)://host:port/v1"><el-option v-for="item in vla" :key="item" :value="item" :label="item" /></el-select></label>
+            <PipelineModelFields v-if="runDialogAgentType === 'pipelineagent'" :model-value="runDialogModels" :disabled="confirmingRun" @update:model-value="Object.assign(runDialogModels, $event)" />
             <label>采集 Logprobs<el-switch v-model="runDialogConfig.capture_logprobs" data-testid="custom-run-capture-logprobs" :disabled="confirmingRun" /></label>
             <label>打开采样<el-switch v-model="runDialogConfig.sampling_enabled" :disabled="confirmingRun" /></label>
             <template v-if="runDialogConfig.sampling_enabled"><label>temperature<el-input-number v-model="runDialogConfig.temperature" :min="0" :max="2" :step="0.05" :disabled="confirmingRun" /></label><label>top_p<el-input-number v-model="runDialogConfig.top_p" :min="0" :max="1" :step="0.05" :disabled="confirmingRun" /></label></template>
@@ -245,6 +226,9 @@
         </el-dialog>
       </section>
     </div>
+    <FactoryRunDetailsDrawer v-model="detailsVisible" v-model:tab="detailsTab" v-model:run-filter="detailsRunFilter" :focused-run="detailsFocusedRun" :scope-key="selectedBatchId" :evaluation="isEvaluation" :runs="filteredRuns" :progress="evaluationProgress" :folders="reportFolders" :run-error="runError" :report-error="reportError" :loading-reports="loadingReports" :downloading-report="downloadingReport" @refresh-reports="reportPoller.start()" @download-report="downloadReport">
+      <template #run-actions="{ run: row }"><router-link v-if="isPublishedRun(row)" :to="publishedRunLocation(row)" class="preprocessing-link">查看发布记录</router-link><router-link v-if="row.batch_id && row.status === 'completed' && !isPublishedRun(row) && !pipelineContext.isPipelineRoute.value && !managedBatchIds.includes(row.batch_id)" :to="collectionResultLocation(row)" class="preprocessing-link">前往预处理</router-link><el-button link :loading="syncingRun === (row.collection_run_id || row.run_id)" :disabled="pipelineContext.isPipelineRoute.value || managedBatchIds.includes(row.batch_id) || isPublishedRun(row)" @click="syncRun(row)">重试回传</el-button><el-button v-if="canCancelCollectionRun(row) && !isPublishedRun(row)" link type="danger" :loading="cancellingRun === (row.collection_run_id || row.run_id)" :disabled="pipelineContext.isPipelineRoute.value || managedBatchIds.includes(row.batch_id)" @click="cancelCollectionRun(row)">停止</el-button></template>
+    </FactoryRunDetailsDrawer>
     </template>
   </div>
 </template>
@@ -252,29 +236,34 @@
 <script setup lang="ts">
 import PipelineStatusBar from '@/components/PipelineStatusBar.vue'
 import CollectionAgentSelect from '@/components/CollectionAgentSelect.vue'
-import { agentBlockedReason, agentLabel } from '@/utils/collectionAgents'
+import PipelineModelFields from '@/components/PipelineModelFields.vue'
+import { modelDraft, modelOptions, modelDefaults, modelValidationIssue, modelBlockedReason, type PipelineModelDraft } from '@/utils/pipelineModels'
+import { agentBlockedReason } from '@/utils/collectionAgents'
 import type { AgentType, AgentCapabilities, FactorySettings } from '@/phoneFactoryApi'
 import { usePipelineContext } from '@/composables/usePipelineContext'
 import { api } from '@/api'
 import BatchPublishedNotice from '@/components/BatchPublishedNotice.vue'
 import { useBatchLifecycle } from '@/composables/useBatchLifecycle'
-import { eventMatchesRoute, publishedBatch, withoutBatchQuery, type PublishedBatchEvent } from '@/utils/batchLifecycle'
+import { publishedBatch, type PublishedBatchEvent } from '@/utils/batchLifecycle'
+import { collectionRunBelongsToSource, collectionResultLocation, isCollectionResult } from '@/utils/collectionResults'
 
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { phoneFactoryApi, modelIterationApi, factoryBatchesApi, newRunRequestId, type EvaluatorConfig, type EvaluationExecutionMode, type EvaluationProfile, type FactoryConfig, type PhoneAppRow, type TaskRow, type FactoryBatchSummary, type FactoryState, type FactoryRun, type ReportFolder, type ReportFile, type AdbDevice, type CollectionWarning } from '@/phoneFactoryApi'
 import ModelIterationPanel from '@/components/ModelIterationPanel.vue'
+import FactoryRunSummary from '@/components/FactoryRunSummary.vue'
+import FactoryRunDetailsDrawer, { type FactoryDetailsTab } from '@/components/FactoryRunDetailsDrawer.vue'
+import { useEvaluationProgress } from '@/composables/useEvaluationProgress'
 import DisplayId from '@/components/DisplayId.vue'
 import { useDisplayIdentifiers } from '@/composables/useDisplayIdentifiers'
 import { useFactoryPolling } from '@/composables/useFactoryPolling'
-import { runDisplayStatus, runMessage, canCancelCollectionRun } from '@/utils/phoneFactoryRuns'
-import { evaluationModeLabel, evaluationSourceLabel } from '@/utils/modelIteration'
+import { canCancelCollectionRun } from '@/utils/phoneFactoryRuns'
 import { usePhoneCollectionBatches } from '@/composables/usePhoneCollectionBatches'
 
 const props = withDefaults(defineProps<{ mode?: 'generate' | 'modeliter' }>(), { mode: 'generate' })
 const { displayId, matches, resolve } = useDisplayIdentifiers()
-const batchQuery = ref(''), runQuery = ref(''), taskQuery = ref('')
+const batchQuery = ref(''), taskQuery = ref('')
 const filterCollectionBatches = (query: string) => { batchQuery.value = query }
 const filterRunTasks = (query: string) => { taskQuery.value = query }
 const taskFileLabel = (task: TaskRow) => task.original_filename || task.filename
@@ -300,16 +289,22 @@ const config = reactive<FactoryConfig>({
   capture_logprobs: false,
 })
 
+const models = reactive(modelDraft())
+const runDialogModels = reactive(modelDraft())
 const agentType = ref<AgentType>('newagent')
 const agentCapabilities = ref<AgentCapabilities | null>(null)
 const loadingAgents = ref(false), agentError = ref('')
-const agentIssue = computed(() => agentBlockedReason(agentCapabilities.value, agentType.value, config.capture_logprobs, isEvaluation))
+const agentIssue = computed(() => agentBlockedReason(agentCapabilities.value, agentType.value, config.capture_logprobs, isEvaluation) || modelBlockedReason(agentCapabilities.value, agentType.value, models))
 const runDialogAgentType = ref<AgentType>('newagent')
-const customAgentIssue = computed(() => agentBlockedReason(agentCapabilities.value, runDialogAgentType.value, runDialogConfig.capture_logprobs, isEvaluation))
-function applyConfig(saved: FactorySettings) {
-  const { agent_type, ...sampling } = saved
+const customAgentIssue = computed(() => agentBlockedReason(agentCapabilities.value, runDialogAgentType.value, runDialogConfig.capture_logprobs, isEvaluation) || modelBlockedReason(agentCapabilities.value, runDialogAgentType.value, runDialogModels))
+function applyConfig(saved: FactorySettings, hydrateModels = false) {
+  const { agent_type, model_defaults, ...sampling } = saved
   Object.assign(config, sampling)
   agentType.value = agent_type || 'newagent'
+  if (hydrateModels) {
+    Object.assign(models, modelDraft(model_defaults))
+    if (model_defaults?.vla) newVla.value = model_defaults.vla
+  }
 }
 async function loadAgentCapabilities() {
   if (typeof factoryApi.agentCapabilities !== 'function') return
@@ -347,7 +342,26 @@ const devices = ref<AdbDevice[]>([])
 const deviceError = ref('')
 const runError = ref('')
 const runs = ref<FactoryRun[]>([])
-const filteredRuns = computed(() => runs.value.filter(run => matches(runQuery.value, 'run', run.collection_run_id || run.run_id, '', run.filename || '', run.status, agentLabel(run.agent_type), run.evaluation_profile_id || '')))
+const filteredRuns = computed(() => runs.value.filter(run => isEvaluation || pipelineContext.isPipelineRoute.value || collectionRunBelongsToSource(run, selectedBatchId.value)))
+const evaluationProgress = isEvaluation ? useEvaluationProgress(runs, refreshEvaluationRuns) : undefined
+const detailsVisible = ref(false), detailsTab = ref<FactoryDetailsTab>('runs')
+const detailsRunFilter = ref<'all' | 'active' | 'abnormal'>('all'), detailsFocusedRun = ref('')
+function openDetails(tab: FactoryDetailsTab) { detailsTab.value = tab; detailsVisible.value = true }
+function openRunDetails(filter: 'all' | 'active' | 'abnormal', runId = '') {
+  detailsRunFilter.value = filter; detailsFocusedRun.value = runId; openDetails('runs')
+}
+async function onEvaluationStarted(runId: string) {
+  evaluationProgress?.selectRun(runId)
+  await refreshEvaluationRuns()
+}
+function isPublishedRun(run: FactoryRun): boolean {
+  // A publication event can arrive before the next run-list refresh.
+  return run.batch_status === 'published' || Boolean(publishedBatch(run.batch_id))
+}
+function publishedRunLocation(run: FactoryRun) {
+  const releaseId = run.release_id || publishedBatch(run.batch_id)?.release_id
+  return { path: '/data-publishing/archive', query: releaseId ? { release_id: releaseId } : {} }
+}
 const reportFolders = ref<ReportFolder[]>([])
 const loadingReports = ref(false), reportError = ref('')
 const syncingRun = ref(''), cancellingRun = ref('')
@@ -359,18 +373,18 @@ const warningSummary = (warnings: CollectionWarning[]) => {
   return first ? `${warnings.length} 条分类提示：${first.sheet} 第 ${first.row} 行（${first.field}）：${first.message}` : ''
 }
 const deviceFor = (id: string) => devices.value.find(device => device.serial === id)
-const route = useRoute(), router = useRouter()
+const route = useRoute()
 const manualTaskBusy = computed(() => savingTask.value || Boolean(deletingTask.value) || Boolean(startingTask.value) || confirmingRun.value)
 const collection = usePhoneCollectionBatches(factoryBatchesApi, factoryApi, {
   setTasks: rows => { tasks.value = activeFactoryTasks(rows) },
   isBlocked: () => manualTaskBusy.value || runDialogVisible.value,
-  runOptions: () => ({ agent_type: agentType.value, vla: newVla.value.trim(), run_mode: props.mode, config: { ...config } }),
+  runOptions: () => ({ ...modelOptions(agentType.value, models), agent_type: agentType.value, vla: newVla.value.trim(), run_mode: props.mode, config: { ...config } }),
 })
 const { batches: collectionBatches, selectedBatchId, selectedBatch, loadingBatches, loadingBatch, downloading: downloadingBatch, error: batchError } = collection
 const filteredCollectionBatches = computed(() => collectionBatches.value.filter(batch => matches(batchQuery.value, 'batch', batch.batch_id, '', collectionBatchOptionLabel(batch), batch.filename, ...batch.apps)))
-const pipelineContext = usePipelineContext({ batchId: () => isEvaluation ? '' : selectedBatchId.value, stepId: 'collection' })
+const pipelineContext = usePipelineContext({ lookupByBatch: false, stepId: 'collection' })
 const managedBatchIds = ref<string[]>([])
-const isManagedTask = (task: TaskRow) => Boolean(task.source_batch_id && (managedBatchIds.value.includes(task.source_batch_id) || (pipelineContext.managed.value && pipelineContext.pipeline.value?.batch_id === task.source_batch_id)))
+const isManagedTask = (task: TaskRow) => Boolean(isCollectionResult(task) && task.source_batch_id && (managedBatchIds.value.includes(task.source_batch_id) || (pipelineContext.managed.value && pipelineContext.pipeline.value?.batch_id === task.source_batch_id)))
 async function loadManagedBatches() {
   if (isEvaluation || typeof api.listPipelines !== 'function') return
   const pipelines = await api.listPipelines({ active_only: true })
@@ -385,7 +399,7 @@ const runTaskOptions = computed(() => {
     options.set(key, { key, label: `${taskDescription(task)} · ${task.source_batch_id ? displayId('batch', task.source_batch_id) : taskFileLabel(task)}`, task })
   }
   if (!isEvaluation) for (const batch of collectionBatches.value) {
-    if (publishedBatch(batch.batch_id) || managedBatchIds.value.includes(batch.batch_id)) continue
+    if (isCollectionResult(batch)) continue
     const key = `batch:${batch.batch_id}`
     const task = options.get(key)?.task || { description: `采集批次 ${batch.batch_id}`, filename: batch.filename, source_batch_id: batch.batch_id, status: '未运行' }
     options.set(key, { key, label: collectionBatchOptionLabel(batch), task })
@@ -395,33 +409,24 @@ const runTaskOptions = computed(() => {
 const runTargetTask = computed(() => runTaskOptions.value.find(option => option.key === runDialogTaskKey.value)?.task || null)
 const filteredRunTaskOptions = computed(() => runTaskOptions.value.filter(option => matches(taskQuery.value, 'batch', option.task.source_batch_id, '', option.label, option.task.filename, option.task.original_filename || '', option.task.description)))
 let disposed = false
-const activeFactoryTasks = (rows: TaskRow[]) => isEvaluation ? rows : rows.filter(item => !publishedBatch(item.source_batch_id))
+const activeFactoryTasks = (rows: TaskRow[]) => isEvaluation ? rows : rows.filter(item => !isCollectionResult(item))
 const lifecycle = useBatchLifecycle({
-  currentBatch: () => isEvaluation ? '' : selectedBatchId.value || String(route.query.collection_batch_id ?? route.query.batch_id ?? ''),
+  currentBatch: () => pipelineContext.isPipelineRoute.value ? pipelineContext.batchId.value : '',
   onPublished,
   async refreshChoices() {
     if (pipelineContext.historyOnly.value) return
     if (isEvaluation) return
-    // The batch area and the phone's draft can refer to two independent batches.
-    const target = runDialogVisible.value && runDialogTaskKey.value.startsWith('batch:') ? runDialogTaskKey.value.slice(6) : ''
-    if (target && target !== selectedBatchId.value) await lifecycle.checkBatch(target)
     await collection.loadBatches()
   },
 })
 const { notice: publishedNotice } = lifecycle
 function onPublished(event: PublishedBatchEvent) {
   if (isEvaluation) return
-  const targetPublished = event.batch_ids.some(id => runDialogTaskKey.value === `batch:${id}`)
-  const selectedPublished = eventMatchesRoute(event, selectedBatchId.value, route.query)
-  const current = selectedPublished || targetPublished
-  stateEpoch++
-  collection.retireBatches(event.batch_ids, selectedPublished); tasks.value = activeFactoryTasks(tasks.value)
-  runs.value = runs.value.filter(item => !item.batch_id || !event.batch_ids.includes(item.batch_id))
-  if (targetPublished) { runDialogTaskKey.value = ''; runDialogVisible.value = false }
-  if (!current) return
-  publishedNotice.value = event
-  if (selectedPublished) void router.replace({ query: withoutBatchQuery(route.query) })
+  // Publishing a result closes that result only. Its task source and sibling
+  // runs remain visible, including a published source reused for new collection.
+  if (pipelineContext.isPipelineRoute.value && event.batch_ids.includes(pipelineContext.batchId.value)) publishedNotice.value = event
 }
+
 const taskBusy = computed(() => pipelineContext.isPipelineRoute.value || loadingFactory.value || manualTaskBusy.value || collection.busy.value || Boolean(deletingKey.value))
 const collectionBatchKindLabel = (kind: FactoryBatchSummary['kind']) => kind === 'manual_collection' ? '手动上传' : kind === 'augmentation' ? '泛化扩增' : '任务生成'
 const collectionBatchTimeLabel = (createdAt: string) => createdAt.slice(0, 19).replace('T', ' ')
@@ -434,7 +439,12 @@ const selectedBatchRow = computed<TaskRow | null>(() => {
     description: `采集批次 ${batch.batch_id}`, filename: batch.filename, source_batch_id: batch.batch_id, status: '未运行',
   }
 })
-async function selectCollectionBatch(value: unknown) { if (pipelineContext.isPipelineRoute.value) return; const id = typeof value === 'string' ? value : ''; if (!await lifecycle.checkBatch(id)) return; publishedNotice.value = null; await collection.selectBatch(id) }
+async function selectCollectionBatch(value: unknown) {
+  if (pipelineContext.isPipelineRoute.value) return
+  const id = typeof value === 'string' ? value : ''
+  publishedNotice.value = null
+  await collection.selectBatch(id)
+}
 async function downloadCollectionBatch() {
   if (taskBusy.value) return
   try { await collection.downloadBatch() }
@@ -457,7 +467,7 @@ async function loadState() {
   const [state, savedConfig] = await Promise.all([factoryApi.state(), factoryApi.config()])
   if (disposed) return
   applyState(state)
-  applyConfig(savedConfig)
+  applyConfig(savedConfig, true)
   if (!newVla.value) newVla.value = state.vla[0] || ''
 }
 
@@ -597,6 +607,7 @@ function openCustomRun(row: PhoneAppRow) {
   runDialogAgentType.value = agentType.value
   runDialogVla.value = newVla.value.trim() || vla.value[0] || ''
   Object.assign(runDialogConfig, config)
+  Object.assign(runDialogModels, models)
   runDialogVisible.value = true
 }
 
@@ -612,8 +623,8 @@ async function handleStartTask(row: TaskRow) {
     if (disposed) return
     if (isManagedTask(row)) return ElMessage.warning('该批次由 Pipeline 管理，请返回 Pipeline 查看')
     if (!isEvaluation && row.source_batch_id) {
-      await collection.runBatch(row.source_batch_id)
-      if (!disposed && !publishedBatch(row.source_batch_id)) ElMessage.success(`采集批次 ${displayId('batch', row.source_batch_id)} 已下发`)
+      const remote = await collection.runBatch(row.source_batch_id)
+      if (!disposed) { ElMessage.success(`采集结果批次 ${displayId('batch', remote.batch_id)} 已下发`); runsPoller.start() }
     } else { await dispatchTask(row, '', '', newVla.value.trim(), { ...config }) }
   } catch (error) { if (!disposed) ElMessage.error((error as Error).message) }
   finally { stateEpoch++; startingTask.value = '' }
@@ -635,16 +646,16 @@ async function confirmRun() {
     if (disposed) return
     if (isManagedTask(task)) return ElMessage.warning('该批次由 Pipeline 管理')
     if (!isEvaluation && task.source_batch_id) {
-      await collection.runBatch(task.source_batch_id, runDialogPhoneId.value, runDialogApp.value, { agent_type: runDialogAgentType.value, vla: runDialogVla.value.trim(), run_mode: 'generate', config: { ...runDialogConfig } })
-      if (!disposed && !publishedBatch(task.source_batch_id)) ElMessage.success(`定制采集批次 ${displayId('batch', task.source_batch_id)} 已下发`)
-    } else { await dispatchTask(task, runDialogPhoneId.value, runDialogApp.value, runDialogVla.value.trim(), { ...runDialogConfig }, runDialogAgentType.value) }
-    if (!disposed && (isEvaluation || !publishedBatch(task.source_batch_id))) runDialogVisible.value = false
+      const remote = await collection.runBatch(task.source_batch_id, runDialogPhoneId.value, runDialogApp.value, { ...modelOptions(runDialogAgentType.value, runDialogModels), agent_type: runDialogAgentType.value, vla: runDialogVla.value.trim(), run_mode: 'generate', config: { ...runDialogConfig } })
+      if (!disposed) { ElMessage.success(`采集结果批次 ${displayId('batch', remote.batch_id)} 已下发`); runsPoller.start() }
+    } else { await dispatchTask(task, runDialogPhoneId.value, runDialogApp.value, runDialogVla.value.trim(), { ...runDialogConfig }, runDialogAgentType.value, runDialogModels) }
+    if (!disposed) runDialogVisible.value = false
   } catch (error) { if (!disposed) ElMessage.error((error as Error).message) }
   finally { stateEpoch++; confirmingRun.value = false }
 }
 
-async function dispatchTask(task: TaskRow, phoneId: string, app: string, vla: string, config: FactoryConfig, agent: AgentType = agentType.value) {
-  const parameters = { agent_type: agent, filename: task.filename, phone_id: phoneId, app, vla, config, run_mode: props.mode,
+async function dispatchTask(task: TaskRow, phoneId: string, app: string, vla: string, config: FactoryConfig, agent: AgentType = agentType.value, modelConfig: PipelineModelDraft = models) {
+  const parameters = { ...modelOptions(agent, modelConfig), agent_type: agent, filename: task.filename, phone_id: phoneId, app, vla, config, run_mode: props.mode,
     ...(isEvaluation ? { evaluator_config: evaluatorConfig.value, evaluation_profile_id: evaluationProfile.value?.id, evaluation_profile_digest: evaluationProfile.value?.digest, checklist_source: 'auto' as const, evaluation_mode: 'checklist' as const } : {}) }
   const key = JSON.stringify(parameters)
   const requestId = requestIds.get(key) || newRunRequestId()
@@ -653,9 +664,21 @@ async function dispatchTask(task: TaskRow, phoneId: string, app: string, vla: st
   requestIds.delete(key)
   if (disposed) return
   if (remote.run_id) await resolve([{ kind: 'run', id: remote.run_id }])
+  if (!disposed && isEvaluation && remote.run_id) await onEvaluationStarted(remote.run_id)
   if (!disposed) ElMessage.success(remote.run_id ? `运行 ${displayId('run', remote.run_id)} 已下发` : '任务已下发')
   try { const state = await factoryApi.state(); if (!disposed) applyState(state) } catch { /* Subsequent polling restores state. */ }
-  if (!isEvaluation) setTimeout(() => { if (!disposed) void collection.loadBatches(remote.batch_id) }, 0)
+  if (!isEvaluation) setTimeout(() => { if (!disposed) void collection.loadBatches(remote.task_source_batch_id || remote.batch_id) }, 0)
+}
+
+async function saveModelDefaults() {
+  if (pipelineContext.isPipelineRoute.value || taskBusy.value || savingConfig.value) return
+  savingConfig.value = true
+  try {
+    const saved = await factoryApi.saveConfig({ ...config, agent_type: agentType.value, model_defaults: modelDefaults(newVla.value, models) })
+    applyConfig(saved, true)
+    ElMessage.success('模型默认配置已保存，仅用于新运行')
+  } catch (error) { ElMessage.error((error as Error).message) }
+  finally { savingConfig.value = false }
 }
 
 async function handleConfigChange() {
@@ -679,7 +702,7 @@ async function refreshEvaluationRuns() {
   try { const result = await factoryApi.runs(); if (!disposed) { runs.value = result.runs; runError.value = '' } }
   catch (error) { if (!disposed) runError.value = `运行状态暂不可用：${(error as Error).message}` }
 }
-useFactoryPolling(async (signal, current) => {
+const runsPoller = useFactoryPolling(async (signal, current) => {
   if (pipelineContext.historyOnly.value || (pipelineContext.isPipelineRoute.value && !pipelineContext.resolved.value)) return
   const epoch = stateEpoch, pipelineId = pipelineContext.pipeline.value?.pipeline_id
   if (showCollectionControls.value) try {
@@ -697,7 +720,7 @@ useFactoryPolling(async (signal, current) => {
   if (!current()) return
   try {
     const result = await factoryApi.runs(signal)
-    if (current() && !pipelineContext.historyOnly.value && pipelineId === pipelineContext.pipeline.value?.pipeline_id) { runs.value = result.runs.filter(item => isEvaluation || ((!publishedBatch(item.batch_id)) && (!pipelineContext.isPipelineRoute.value || (pipelineContext.pipeline.value?.collection_run_ids || []).includes(item.collection_run_id || item.run_id || '')))); runError.value = '' }
+    if (current() && !pipelineContext.historyOnly.value && pipelineId === pipelineContext.pipeline.value?.pipeline_id) { runs.value = result.runs.filter(item => isEvaluation || !pipelineContext.isPipelineRoute.value || (pipelineContext.pipeline.value?.collection_run_ids || []).includes(item.collection_run_id || item.run_id || '')); runError.value = '' }
   } catch (error) { if (current()) runError.value = `运行状态暂不可用：${(error as Error).message}` }
 })
 const reportPoller = isEvaluation ? useFactoryPolling(async (signal, current) => {
@@ -708,9 +731,8 @@ const reportPoller = isEvaluation ? useFactoryPolling(async (signal, current) =>
   } catch (error) { if (current()) reportError.value = `报告读取失败：${(error as Error).message}` }
   finally { if (current()) loadingReports.value = false }
 }) : { start() {} }
-const reportTime = (value?: number) => value != null && Number.isFinite(value) ? new Date(value * 1000).toLocaleString('zh-CN', { hour12: false }) : '—'
 async function syncRun(run: FactoryRun) {
-  if (pipelineContext.isPipelineRoute.value || managedBatchIds.value.includes(run.batch_id || '')) return
+  if (pipelineContext.isPipelineRoute.value || managedBatchIds.value.includes(run.batch_id || '') || isPublishedRun(run)) return
   const id = run.collection_run_id || run.run_id
   if (!id || syncingRun.value) return
   syncingRun.value = id
@@ -719,7 +741,7 @@ async function syncRun(run: FactoryRun) {
   finally { syncingRun.value = '' }
 }
 async function cancelCollectionRun(run: FactoryRun) {
-  if (isEvaluation || !canCancelCollectionRun(run) || pipelineContext.isPipelineRoute.value || managedBatchIds.value.includes(run.batch_id || '')) return
+  if (isEvaluation || isPublishedRun(run) || !canCancelCollectionRun(run) || pipelineContext.isPipelineRoute.value || managedBatchIds.value.includes(run.batch_id || '')) return
   const id = run.collection_run_id || run.run_id
   if (!id || cancellingRun.value) return
   cancellingRun.value = id
@@ -754,7 +776,7 @@ onMounted(async () => {
   if (isEvaluation) return
   void loadManagedBatches().catch(() => { /* Backend enforces ownership if list lookup fails. */ })
   const requested = typeof route.query.batch_id === 'string' ? route.query.batch_id : typeof route.query.collection_batch_id === 'string' ? route.query.collection_batch_id : undefined
-  void lifecycle.checkBatch(requested || '').then(active => collection.loadBatches(active ? requested : undefined)).catch(cause => { batchError.value = (cause as Error).message })
+  void collection.loadBatches().then(() => { if (requested && !pipelineContext.isPipelineRoute.value) return selectCollectionBatch(requested) }).catch(cause => { batchError.value = (cause as Error).message })
 })
 watch(pipelineContext.historyOnly, value => { if (value) { stateEpoch++; runs.value = []; void collection.selectBatch('') } })
 onBeforeUnmount(() => { document.body.classList.remove('factory-responsive'); disposed = true; collection.dispose() })

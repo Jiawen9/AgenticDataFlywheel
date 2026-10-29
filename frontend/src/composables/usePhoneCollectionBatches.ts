@@ -1,6 +1,6 @@
-import { activeBatchItems, publishedBatch } from '@/utils/batchLifecycle'
+import { isCollectionResult } from '@/utils/collectionResults'
 import { computed, ref } from 'vue'
-import { newRunRequestId, type FactoryBatchDetail, type FactoryBatchSummary, type FactoryState, type TaskRow, type RunOptions } from '@/phoneFactoryApi'
+import { newRunRequestId, type FactoryBatchDetail, type FactoryBatchSummary, type FactoryState, type TaskRow, type RunOptions, type RemoteResult } from '@/phoneFactoryApi'
 
 interface BatchApi {
   list(): Promise<FactoryBatchSummary[]>
@@ -9,7 +9,7 @@ interface BatchApi {
 }
 interface FactoryApi {
   addTask(description: string, filename: string, contentBase64: string, sourceBatchId?: string): Promise<FactoryState>
-  remoteStartRun(options: RunOptions): Promise<{ ok: boolean; message?: string; error?: string }>
+  remoteStartRun(options: RunOptions): Promise<RemoteResult>
   state(): Promise<FactoryState>
 }
 
@@ -34,7 +34,7 @@ export function usePhoneCollectionBatches(batchApi: BatchApi, factoryApi: Factor
   setTasks: (tasks: TaskRow[]) => void
   isBlocked?: () => boolean
   downloadFile?: (blob: Blob, filename: string) => void
-  runOptions?: () => Pick<RunOptions, 'agent_type' | 'vla' | 'run_mode' | 'config'>
+  runOptions?: () => Pick<RunOptions, 'agent_type' | 'vla' | 'run_mode' | 'config' | 'execution_model' | 'planner_config'>
 }) {
   const retiredIds = new Set<string>()
   const batches = ref<FactoryBatchSummary[]>([])
@@ -52,7 +52,7 @@ export function usePhoneCollectionBatches(batchApi: BatchApi, factoryApi: Factor
   const blocked = computed(() => busy.value || Boolean(options.isBlocked?.()))
 
   async function selectBatch(id: string): Promise<boolean> {
-    if (publishedBatch(id) || retiredIds.has(id)) { retireBatches([id]); return false }
+    if (retiredIds.has(id)) { retireBatches([id]); return false }
     if (disposed || blocked.value) return false
     const revision = ++selectionRevision
     selectedBatchId.value = id
@@ -61,8 +61,15 @@ export function usePhoneCollectionBatches(batchApi: BatchApi, factoryApi: Factor
     loadingBatch.value = Boolean(id)
     if (!id) return true
     try {
-      const batch = await batchApi.detail(id)
+      let batch = await batchApi.detail(id)
       if (disposed || revision !== selectionRevision) return false
+      if (isCollectionResult(batch)) {
+        if (!batch.task_source_batch_id) throw new Error('采集结果缺少任务来源，不能发起新采集')
+        batch = await batchApi.detail(batch.task_source_batch_id)
+        if (disposed || revision !== selectionRevision) return false
+        if (isCollectionResult(batch)) throw new Error('任务来源不能是另一采集结果批次')
+        selectedBatchId.value = batch.batch_id
+      }
       selectedBatch.value = batch
       return true
     } catch (cause) {
@@ -81,7 +88,7 @@ export function usePhoneCollectionBatches(batchApi: BatchApi, factoryApi: Factor
     try {
       const rows = await batchApi.list()
       if (disposed || revision !== listRevision) return
-      batches.value = activeBatchItems(rows).filter(batch => !retiredIds.has(batch.batch_id))
+      batches.value = rows.filter(batch => !isCollectionResult(batch) && !retiredIds.has(batch.batch_id))
       if (preferredId && selection === selectionRevision) await selectBatch(preferredId)
     } catch (cause) {
       if (!disposed && revision === listRevision) error.value = (cause as Error).message
@@ -90,26 +97,27 @@ export function usePhoneCollectionBatches(batchApi: BatchApi, factoryApi: Factor
     }
   }
 
-  async function runBatch(batchId: string, phoneId = '', app = '', overrides?: Pick<RunOptions, 'agent_type' | 'vla' | 'run_mode' | 'config'>) {
-    if (publishedBatch(batchId) || retiredIds.has(batchId)) throw new Error('该批次已发布，处理已结束')
+  async function runBatch(batchId: string, phoneId = '', app = '', overrides?: Pick<RunOptions, 'agent_type' | 'vla' | 'run_mode' | 'config' | 'execution_model' | 'planner_config'>) {
+    if (retiredIds.has(batchId)) throw new Error('任务来源已移除，不能继续下发')
     if (disposed || busy.value) throw new Error('正在处理采集任务，请稍候')
     busy.value = true
     const supplied = overrides || options.runOptions?.() || { vla: '' }
     const runOptions = { ...supplied, ...(supplied.config ? { config: { ...supplied.config } } : {}) }
     const revision = selectionRevision
     const followsSelection = selectedBatchId.value === batchId
-    const isCurrent = () => !disposed && (!followsSelection || revision === selectionRevision) && !retiredIds.has(batchId) && !publishedBatch(batchId)
+    const isCurrent = () => !disposed && (!followsSelection || revision === selectionRevision) && !retiredIds.has(batchId)
     const ensureCurrent = () => {
-      if (!isCurrent()) throw new Error('批次选择已变化或已发布，本次未继续下发')
+      if (!isCurrent()) throw new Error('任务来源选择已变化或已移除，本次未继续下发')
     }
     try {
       const batch = selectedBatch.value?.batch_id === batchId ? selectedBatch.value : await batchApi.detail(batchId)
       ensureCurrent()
+      if (isCollectionResult(batch)) throw new Error('采集结果批次不能追加新运行，请选择任务来源')
       const workbook = await batchApi.workbook(batchId)
       ensureCurrent()
       const content = await blobToBase64(workbook)
       ensureCurrent()
-      const imported = await factoryApi.addTask(`采集批次 ${batchId} · ${batch.task_count} 条任务`, batch.filename, content, batchId)
+      const imported = await factoryApi.addTask(`任务来源 ${batchId} · ${batch.task_count} 条任务`, batch.filename, content, batchId)
       ensureCurrent()
       options.setTasks(imported.tasks)
       const task = imported.tasks.find(row => row.source_batch_id === batchId && row.filename === batch.filename)

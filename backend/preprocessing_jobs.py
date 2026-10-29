@@ -366,12 +366,14 @@ class PreprocessingJobManager:
                                  "collecting" if running else
                                  "error" if any(run["status"] == "failed" for run in batch_runs) or source_errors else "waiting")
             kind, task_count, reason = "existing_trajectories", 0, None
+            lineage = {}
             annotation_version = latest.get("02_annotation", {}).get("version")
             if "00_collection" in latest:
                 try:
                     stored = self.artifacts.read_payload(latest["00_collection"])
                     kind = stored.get("kind", "task_generation")
                     task_count = stored.get("task_count", 0)
+                    lineage = {key: stored[key] for key in ("batch_role", "task_source_batch_id", "agent_type", "collection_run_id") if key in stored}
                 except (ValueError, OSError) as exc:
                     reason = f"采集批次快照无法读取：{exc}"
             preview = latest.get("02_annotation") or latest.get("01_conversion")
@@ -398,7 +400,7 @@ class PreprocessingJobManager:
             updated_at = max([item["created_at"] for item in items] +
                              [item["created_at"] for item in batch_runs] +
                              [latest_job["created_at"] if latest_job else ""])
-            result.append({"batch_id": batch_id, "kind": kind,
+            result.append({"batch_id": batch_id, "kind": kind, **lineage,
                 "label": {"task_generation": "任务生成", "augmentation": "任务泛化扩增",
                           "manual_collection": "手工采集任务", "rollout_import": "导入 Rollout",
                           "existing_trajectories": "已有轨迹批次"}.get(kind, kind),

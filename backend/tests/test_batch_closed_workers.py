@@ -140,7 +140,8 @@ class ClosedBatchWorkerTests(unittest.TestCase):
         annotator.assert_not_called()
         self.assertEqual(manager.get(job["job_id"])["status"], "failed")
 
-    def test_phone_choices_hide_closed_and_upload_start_reject_without_deletion(self):
+    def test_closed_source_stays_readable_but_missing_snapshot_cannot_dispatch(self):
+        from backend.collection_runs import CollectionRunError
         from backend.phone_factory import PhoneFactoryStore
         client = Mock()
         store = PhoneFactoryStore(self.root, run_client_fn=client)
@@ -148,11 +149,17 @@ class ClosedBatchWorkerTests(unittest.TestCase):
                    "content_base64": base64.b64encode(b"workbook").decode(), "source_batch_id": self.batch}
         store.add_task(payload)
         self.close()
-        self.assertEqual(store.state()["tasks"], [])
-        for call in (lambda: store.add_task(payload), lambda: store.start_task(payload["filename"]),
-                     lambda: store.remove_task(payload["filename"]), lambda: store.remote_start({"filename": payload["filename"]})):
+        self.assertEqual(len(store.state()["tasks"]), 1)
+        # A source remains visible, but this legacy registration has no frozen
+        # workbook and therefore cannot be reused as a new collection source.
+        with self.assertRaises(CollectionRunError):
+            store.add_task(payload)
+        for call in (lambda: store.start_task(payload["filename"]),
+                     lambda: store.remove_task(payload["filename"])):
             with self.assertRaises(BatchPublishedError):
                 call()
+        with self.assertRaises(ValueError):
+            store.remote_start({"filename": payload["filename"]})
         client.assert_not_called()
         self.assertEqual(store.task_path(payload["filename"]).read_bytes(), b"workbook")
         self.assertEqual(len(store._current()["tasks"]), 1)
