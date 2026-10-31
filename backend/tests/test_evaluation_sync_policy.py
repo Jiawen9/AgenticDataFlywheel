@@ -131,19 +131,35 @@ class EvaluationSyncPolicyTests(unittest.TestCase):
         self.assertTrue(self.store.records.get("model_iter_results", run_id)["final"])
 
     def test_pre_dispatch_failure_never_enters_automatic_polling(self):
-        self.supported = False
-        with self.assertRaises(PhoneFactoryError):
-            self.start()
+        # The general collector capability check now runs before reserving a
+        # result batch. Fail the later evaluator check to exercise a persisted
+        # run that has not submitted a start request yet.
+        with patch("backend.phone_factory_runtime.model_iteration.require_capability",
+                   side_effect=PhoneFactoryError("评测能力检查失败", 409)):
+            with self.assertRaises(PhoneFactoryError):
+                self.start()
         run = self.store.records.list("model_iter_runs")[0]
         self.assertIs(run["dispatch_attempted"], False)
         count = len(self.calls)
         self.runtime._schedule_evaluations()
         self.assertEqual(len(self.calls), count)
         self.assertFalse(self.runtime.sync_policy.due("evaluation", run))
-        self.supported = True
         resumed = self.start()
         self.assertIs(self.store.records.get("model_iter_runs", run["run_id"])["dispatch_attempted"], True)
         self.assertTrue(self.runtime.sync_policy.due("evaluation", resumed))
+
+    def test_initial_capability_failure_does_not_reserve_or_poll_a_run(self):
+        self.supported = False
+        with self.assertRaises(PhoneFactoryError):
+            self.start()
+        self.assertEqual(self.store.records.list("model_iter_runs"), [])
+        self.assertEqual(self.store.records.list("collection_runs"), [])
+        count = len(self.calls)
+        self.runtime._schedule_evaluations()
+        self.assertEqual(len(self.calls), count)
+        self.supported = True
+        resumed = self.start()
+        self.assertTrue(resumed["dispatch_attempted"])
 
     def test_legacy_runs_without_dispatch_marker_are_still_checked(self):
         run_id = self.old_run()["run_id"]

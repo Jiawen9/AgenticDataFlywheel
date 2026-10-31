@@ -54,6 +54,37 @@ class FactoryRuntime:
     def get_run(self, run_id):
         return self.store._remote_result(["run", run_id])
 
+    def _can_reject_dispatch(self, run, mode):
+        """Missing historical evidence is uncertainty, never proof of non-acceptance."""
+        if run.get("dispatch_attempted") is not False and run.get("dispatch_rejected") is not True:
+            return False
+        run_id = run.get("collection_run_id") or run["run_id"]
+        related = [run]
+        if mode == "modeliter":
+            related.append(self.store.collection_runs.get(run_id) or {})
+        for item in related:
+            if (item.get("dispatch_response") or item.get("dispatched_at") or item.get("remote_status")
+                    or item.get("trajectories") or item.get("transfer_status") == "completed"):
+                return False
+        for kind in (("collection", "evaluation") if mode == "modeliter" else ("collection",)):
+            sync = self.sync_policy.view(kind, run_id)
+            if sync.get("remote_status") or sync.get("last_success_at"):
+                return False
+        return True
+
+    def _begin_dispatch(self, run_id, mode, incremental):
+        def begin(item):
+            if item.get("dispatch_rejected") is True:
+                item.update(transfer_error=None, transfer_status="waiting")
+            item.update(dispatch_attempted=True, submitted_at=utc_now(), dispatch_rejected=False)
+            item.pop("dispatch_rejection", None)
+        namespace = "collection_runs" if mode == "generate" else "model_iter_runs"
+        self.records.update(namespace, run_id, begin)
+        if mode == "modeliter" and incremental:
+            self.records.update("collection_runs", run_id, begin)
+            self.sync_policy.reset("collection", run_id)
+        self.sync_policy.reset("collection" if mode == "generate" else "evaluation", run_id)
+
     def download_archive(self, run_id, destination):
         self.store._remote_result(["run-archive", run_id, "--out", str(destination)])
 
@@ -181,6 +212,8 @@ class FactoryRuntime:
                     exc.remote_kind, exc.remote_command = "protocol", "run-evaluations"
                 raise
         def update(current):
+            if current.get("dispatch_rejected") is True:
+                return  # A response from before the rejected submission is stale.
             current.update({key: remote[key] for key in PROVENANCE_FIELDS if key in remote})
             if result is not None:
                 current["evaluation_summary"] = result["summary"]
@@ -511,6 +544,7 @@ class FactoryRuntime:
             current = self.store.collection_runs.get(run_id) if mode == "generate" else self.records.get("model_iter_runs", run_id)
             if current["status"] not in {"failed", "dispatching"}:
                 return {"ok": True, "reused": True, **current}
+            can_reject = self._can_reject_dispatch(current, mode)
             try:
                 if not created:
                     # An acknowledgement can be lost after remote acceptance. Query that
@@ -531,7 +565,9 @@ class FactoryRuntime:
                         else:
                             def recovered(item):
                                 if item["status"] not in {"interrupted", "cancelled", "succeeded", "partial", "completed"}:
-                                    item.update(status=known["status"], errors=known.get("errors", []), dispatch_error=None, updated_at=utc_now())
+                                    item.update(status=known["status"], errors=known.get("errors", []), dispatch_error=None,
+                                                dispatch_rejected=False, updated_at=utc_now())
+                                    item.pop("dispatch_rejection", None)
                             saved = self.records.update("model_iter_runs", run_id, recovered)
                             if incremental:
                                 self.store.collection_runs.dispatched(run_id, known)
@@ -602,17 +638,11 @@ class FactoryRuntime:
                         args.append("--exp")
                     if options["config"]["capture_logprobs"]:
                         args.append("--capture-logprobs")
-                    if mode == "generate":
-                        with active_batch_lock(task["source_batch_id"], self.root):
-                            self.records.update("collection_runs", run_id,
-                                lambda item: item.update(dispatch_attempted=True, submitted_at=utc_now()))
+                    if mode == "generate" or incremental:
+                        with active_batch_lock(current["batch_id"], self.root):
+                            self._begin_dispatch(run_id, mode, incremental)
                     else:
-                        self.records.update("model_iter_runs", run_id,
-                            lambda item: item.update(dispatch_attempted=True, submitted_at=utc_now()))
-                        if incremental:
-                            self.records.update("collection_runs", run_id,
-                                lambda item: item.update(dispatch_attempted=True, submitted_at=utc_now()))
-                    self.sync_policy.reset("collection" if mode == "generate" else "evaluation", run_id)
+                        self._begin_dispatch(run_id, mode, incremental)
                     response = self.store._remote_result(args)
                     if response.get("agent_type", "newagent") != options["agent_type"]:
                         raise PhoneFactoryError("远端接受运行的采集引擎与请求不匹配", 502)
@@ -623,7 +653,9 @@ class FactoryRuntime:
                 else:
                     def accepted(item):
                         if item["status"] not in {"interrupted", "cancelled", "succeeded", "partial", "completed"}:
-                            item.update(status="running", dispatch_response=response, dispatch_error=None, updated_at=utc_now())
+                            item.update(status="running", dispatch_response=response, dispatch_error=None,
+                                        dispatch_rejected=False, updated_at=utc_now())
+                            item.pop("dispatch_rejection", None)
                     saved = self.records.update("model_iter_runs", run_id, accepted)
                     if incremental:
                         self.store.collection_runs.dispatched(run_id, response)
@@ -631,15 +663,29 @@ class FactoryRuntime:
                 self.sync_policy.reset("collection" if mode == "generate" else "evaluation", run_id)
                 return {**response, **saved, "ok": True}
             except Exception as exc:
+                explicit_rejection = (getattr(exc, "remote_command", None) == "start-run"
+                    and (getattr(exc, "dispatch_not_sent", False) is True
+                         or (getattr(exc, "remote_kind", None) == "http"
+                             and getattr(exc, "remote_status", None) == 413)))
+                rejection = ({"message": str(exc), "at": utc_now(),
+                              "remote_status": getattr(exc, "remote_status", None),
+                              "dispatch_not_sent": getattr(exc, "dispatch_not_sent", False) is True}
+                             if can_reject and explicit_rejection else None)
                 if mode == "generate":
-                    self.store.collection_runs.dispatch_failed(run_id, str(exc))
+                    self.store.collection_runs.dispatch_failed(run_id, str(exc), rejection=rejection)
                 else:
                     def failed(item):
                         if item["status"] not in {"interrupted", "cancelled", "succeeded", "partial", "completed"}:
                             item.update(status="failed", dispatch_error=str(exc))
+                            if rejection is not None:
+                                item.update(dispatch_rejected=True, dispatch_rejection=rejection)
                     self.records.update("model_iter_runs", run_id, failed)
                     if incremental:
-                        self.store.collection_runs.dispatch_failed(run_id, str(exc))
+                        self.store.collection_runs.dispatch_failed(run_id, str(exc), rejection=rejection)
+                if rejection is not None:
+                    self.sync_policy.reject_dispatch("collection" if mode == "generate" else "evaluation", run_id, str(exc))
+                    if mode == "modeliter" and incremental:
+                        self.sync_policy.reject_dispatch("collection", run_id, str(exc))
                 raise
 
     def remote_start_evaluation(self, data):

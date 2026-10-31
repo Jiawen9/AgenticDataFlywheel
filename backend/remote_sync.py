@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from .file_io import io_path
+from .data_store.locking import batch_lock
 
 LOG = logging.getLogger(__name__)
 TERMINAL = {"completed", "succeeded", "partial", "failed", "interrupted", "cancelled"}
@@ -105,7 +106,7 @@ class RemoteSyncPolicy:
                                    lambda value: value.update(**changes), default={})
 
     def due(self, kind, run):
-        if run.get("dispatch_attempted") is False:
+        if run.get("dispatch_attempted") is False or run.get("dispatch_rejected") is True:
             return False
         state = self.view(kind, self.run_id(run))
         if state["state"] in {"paused", "complete"}:
@@ -129,6 +130,21 @@ class RemoteSyncPolicy:
         self._update(kind, run_id, state="active", failure_count=0, not_found_count=0,
                      final_failure_count=0, pause_reason=None, last_error=None,
                      last_error_category=None, next_retry_at=None)
+
+    def reject_dispatch(self, kind, run_id, message):
+        self._update(kind, run_id, state="paused", pause_reason="dispatch_rejected",
+                     last_error=message, last_error_category="dispatch_rejected",
+                     next_retry_at=None, failure_count=0, not_found_count=0, final_failure_count=0)
+
+    def _check_dispatch(self, kind, run):
+        namespace = "collection_runs" if kind == "collection" else "model_iter_runs"
+        current = self.records.get(namespace, self.run_id(run)) or run
+        if current.get("dispatch_rejected") is True:
+            raise SyncDeferred("采集请求未被接受，请修复下发错误后使用原请求编号重试；当前没有可回传的运行",
+                               self.view(kind, self.run_id(run)), 409)
+        if current.get("dispatch_attempted") is False:
+            raise SyncDeferred("采集请求尚未下发，请先完成下发后再同步", self.view(kind, self.run_id(run)), 409)
+        return current
 
     def complete(self, kind, run_id):
         if self.view(kind, run_id)["state"] != "complete":
@@ -210,6 +226,8 @@ class RemoteSyncPolicy:
             if not force or not flight.done.wait(35):
                 raise SyncDeferred("该运行正在同步，请稍后查看结果", self.view(kind, run_id), 409)
             if coalesce:
+                with batch_lock(self.records.root, "dispatch_" + run_id):
+                    self._check_dispatch(kind, run)
                 if flight.error is not None:
                     raise flight.error
                 return flight.result
@@ -220,28 +238,36 @@ class RemoteSyncPolicy:
             with _process_lock(self.records, self._key(kind, run_id)) as locked:
                 if not locked:
                     raise SyncDeferred("该运行正在其他进程同步", self.view(kind, run_id), 409)
-                if not force and not self.due(kind, run):
-                    info = self.view(kind, run_id)
-                    message = "自动同步已暂停，请手动同步重试" if info["state"] == "paused" else "等待下一次同步"
-                    raise SyncDeferred(message, info)
-                previous = self.view(kind, run_id)
-                if force:
-                    self.reset(kind, run_id)
-                now = _iso(self.clock())
-                self._update(kind, run_id, last_attempt_at=now,
-                             first_attempt_at=previous.get("first_attempt_at") or now)
+                # Serialize only state transitions with submission. Downloads and
+                # evaluation calls remain independent and never hold this lock.
+                with batch_lock(self.records.root, "dispatch_" + run_id):
+                    run = self._check_dispatch(kind, run)
+                    if not force and not self.due(kind, run):
+                        info = self.view(kind, run_id)
+                        message = "自动同步已暂停，请手动同步重试" if info["state"] == "paused" else "等待下一次同步"
+                        raise SyncDeferred(message, info)
+                    previous = self.view(kind, run_id)
+                    if force:
+                        self.reset(kind, run_id)
+                    now = _iso(self.clock())
+                    self._update(kind, run_id, last_attempt_at=now,
+                                 first_attempt_at=previous.get("first_attempt_at") or now)
                 try:
                     result = callback()
                 except SyncDeferred:
                     raise
                 except Exception as exc:
-                    self._failed(kind, run, exc)
+                    with batch_lock(self.records.root, "dispatch_" + run_id):
+                        self._check_dispatch(kind, run)
+                        self._failed(kind, run, exc)
                     raise
-                after = self.view(kind, run_id)
-                self._update(kind, run_id, state="complete" if after["state"] == "complete" else "active",
-                             failure_count=0, not_found_count=0, final_failure_count=0, pause_reason=None,
-                             last_error=None, last_error_category=None, last_success_at=_iso(self.clock()),
-                             next_retry_at=None if after["state"] == "complete" else _iso(self.clock() + 10))
+                with batch_lock(self.records.root, "dispatch_" + run_id):
+                    self._check_dispatch(kind, run)
+                    after = self.view(kind, run_id)
+                    self._update(kind, run_id, state="complete" if after["state"] == "complete" else "active",
+                                 failure_count=0, not_found_count=0, final_failure_count=0, pause_reason=None,
+                                 last_error=None, last_error_category=None, last_success_at=_iso(self.clock()),
+                                 next_retry_at=None if after["state"] == "complete" else _iso(self.clock() + 10))
                 if previous.get("failure_count") or previous["state"] == "paused":
                     LOG.info("Remote sync %s/%s recovered", kind, run_id)
                 flight.result = result

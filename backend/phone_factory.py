@@ -44,13 +44,14 @@ CLIENT_TIMEOUT_MESSAGE = "错误：采集服务请求超时，请用同一请求
 class PhoneFactoryError(ValueError):
     def __init__(self, message: str, status: int = 400, *,
                  remote_kind: str | None = None, remote_status: int | None = None,
-                 remote_command: str | None = None):
+                 remote_command: str | None = None, dispatch_not_sent: bool = False):
         super().__init__(message)
         self.status = status
         # Internal metadata is separate from the existing public HTTP status/message.
         self.remote_kind = remote_kind
         self.remote_status = remote_status
         self.remote_command = remote_command
+        self.dispatch_not_sent = dispatch_not_sent is True
 
 
 def _client_failure(output: str) -> dict:
@@ -68,6 +69,8 @@ def _client_failure(output: str) -> dict:
                 details["remote_kind"] = kind
                 if kind == "http" and type(code) is int and 100 <= code <= 599:
                     details["remote_status"] = code
+                if metadata.get("dispatch_not_sent") is True:
+                    details["dispatch_not_sent"] = True
         except (TypeError, ValueError):
             pass
     if not details:
@@ -84,10 +87,17 @@ def run_client(args: list[str]) -> dict:
     """Keep the existing client protocol and a bounded subprocess timeout."""
     try:
         environment = dict(os.environ, PHONE_FACTORY_CLIENT_ERROR_METADATA="1")
+        command = args[0] if args else None
+        request_timeout = float(os.environ.get("PHONE_FACTORY_TIMEOUT", "30"))
+        if command in {"run-archive", "report-download"}:
+            client_timeout = float(os.environ.get("PHONE_FACTORY_TRANSFER_TIMEOUT", "300")) + 5
+        else:
+            # start-run negotiates manifest transport before its separate POST.
+            client_timeout = request_timeout * (2 if command == "start-run" else 1) + 5
         result = subprocess.run(
             [sys.executable, str(CLIENT_SCRIPT), *args],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=float(os.environ.get("PHONE_FACTORY_TRANSFER_TIMEOUT", "300") if args and args[0] in {"run-archive", "report-download"} else os.environ.get("PHONE_FACTORY_TIMEOUT", "30")) + 5, check=False,
+            timeout=client_timeout, check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             env=environment,
         )
@@ -346,10 +356,15 @@ class PhoneFactoryStore:
         result = self.run_client(args)
         if not result["ok"]:
             failure = _client_failure(result.get("output") or "功能不支持或者网络断连")
-            raise PhoneFactoryError(failure["output"], 502,
-                remote_kind=result.get("remote_kind") or failure.get("remote_kind"),
-                remote_status=result.get("remote_status", failure.get("remote_status")),
-                remote_command=args[0] if args else None)
+            kind = result.get("remote_kind") or failure.get("remote_kind")
+            status = result.get("remote_status", failure.get("remote_status"))
+            not_sent = result.get("dispatch_not_sent", failure.get("dispatch_not_sent")) is True
+            command = args[0] if args else None
+            # Other remote commands retain the established gateway error contract.
+            rejected = command == "start-run" and kind == "http" and status == 413 and not not_sent
+            raise PhoneFactoryError(failure["output"], 413 if rejected else 502,
+                remote_kind=kind, remote_status=status, remote_command=command,
+                dispatch_not_sent=not_sent)
         try:
             return json.loads(result["output"])
         except (TypeError, ValueError):
