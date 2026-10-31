@@ -10,6 +10,7 @@ from pathlib import Path
 from backend.phone_factory import DEFAULT_CONFIG, PhoneFactoryStore
 from backend.pipelines import PipelineError, PipelineRuntime
 from backend.tests.test_phone_factory_runtime import workbook_bytes
+from backend.tests.collector_protocol_support import current_capabilities
 
 
 class PipelineCollectionConfigTests(unittest.TestCase):
@@ -34,6 +35,7 @@ class PipelineCollectionConfigTests(unittest.TestCase):
         response = {'ok': True}
         if args[0] == 'capabilities':
             response.update(protocol_version=1, batch_results=True)
+            current_capabilities(response)
         return {'ok': True, 'output': json.dumps(response)}
 
     def pipeline(self, config):

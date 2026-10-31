@@ -65,6 +65,8 @@
       <el-option v-for="run in filteredRuns" :key="run.run_id" :label="`${displayId('run', run.run_id)} · ${evaluationModeLabel(run.execution_mode)} · ${run.evaluation_profile_id || '历史规则'}`" :value="run.run_id" />
     </el-select>
     <p v-if="selectedRun" class="hint">运行：<DisplayId kind="run" :id="selectedRun" /></p>
+    <CollectionRunProgress :run="resultMetadata" />
+    <p v-if="resultMetadata.batch_id && resultMetadata.execution_mode !== 'evaluate_only'" class="hint">采集结果批次：<DisplayId kind="batch" :id="resultMetadata.batch_id" /> · 采集、回传和评测分别更新。</p>
     <el-button v-if="canCancel" type="danger" plain :loading="cancelling" class="cancel-run" @click="cancelRun">停止本次运行</el-button>
     <el-alert v-if="resultError" :title="resultError" type="warning" :closable="false" />
     <p v-if="!runs.length" class="hint">可上传 17 列用例表开始采集并评测，或选择已有轨迹创建独立评测运行。</p>
@@ -89,6 +91,7 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { modelIterationApi, newRunRequestId, type EvaluatorConfig, type FactoryRun, type EvaluationExecutionMode, type EvaluationProfile, type EvaluationIssue, type EvaluationSource, type EvaluationSourceInput, type EvaluationPreview } from '@/phoneFactoryApi'
 import type { EvaluationProgress } from '@/composables/useEvaluationProgress'
 import DisplayId from '@/components/DisplayId.vue'
+import CollectionRunProgress from '@/components/CollectionRunProgress.vue'
 import { useDisplayIdentifiers } from '@/composables/useDisplayIdentifiers'
 import { defaultEvaluatorConfig, formatSuccessRate, evaluationIssueText, evaluationModeLabel, evaluationSourceLabel } from '@/utils/modelIteration'
 

@@ -99,6 +99,15 @@ describe('phone factory transport contracts', () => {
     await modelIterationApi.remoteStartRun(options)
     expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual(options)
   })
+  it('uses the evaluation transfer retry endpoint without starting another collection or evaluation', async () => {
+    const fetcher = vi.fn(async () => new Response('{"run_id":"eval/a","status":"running","transfer_status":"waiting"}'))
+    vi.stubGlobal('fetch', fetcher)
+    await modelIterationApi.retryTransfer('eval/a')
+    expect(fetcher.mock.calls).toHaveLength(1)
+    expect(fetcher.mock.calls[0]?.[0]).toBe('/api/model-iter/runs/eval%2Fa/retry-transfer')
+    expect(fetcher.mock.calls[0]?.[1]?.method).toBe('POST')
+    expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({})
+  })
   it('keeps published task sources and run history visible while result writes remain separate', async () => {
     notifyBatchesPublished({ batch_ids: ['published-source-api'], release_id: 'release-old' })
     const fetcher = vi.fn(async () => new Response(JSON.stringify({ batches: [{ batch_id: 'published-source-api' }], runs: [] })))

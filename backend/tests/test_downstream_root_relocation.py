@@ -18,7 +18,7 @@ from backend.data_publishing.service import DatasetReleaseRegistry
 from backend.data_publishing.upload_jobs import DatasetUploadJobManager
 from backend.phone_factory import PhoneFactoryError, PhoneFactoryStore
 from backend.task_generation.jobs import TaskGenerationJobManager
-from backend.tests.test_collection_runs import raw_trajectory, seed_batch
+from backend.tests.test_collection_runs import raw_trajectory, seed_batch, STREAM_CAPABILITIES
 from backend.tests.test_correction_storage import DeferredExecutor
 from backend.trajectory_correction import cot_jobs
 
@@ -76,11 +76,11 @@ class DownstreamRootRelocationTests(unittest.TestCase):
             if args[0] == "run":
                 return {"ok": False, "output": "unknown remote run"}
             if args[0] == "capabilities":
-                return {"ok": True, "output": '{"protocol_version":1,"batch_results":true}'}
+                return {"ok": True, "output": STREAM_CAPABILITIES}
             calls.append(args)
             return {"ok": len(calls) > 1, "output": '{"ok":true}' if len(calls) > 1 else "mock timeout"}
         phone = PhoneFactoryStore(self.root, run_client_fn=remote)
-        phone.initialize_settings({"vla": ["http://mock.invalid/vla"], "phoneApps": [{"phone_id": "phone", "app": "App"}]})
+        phone.initialize_settings({"vla": ["http://mock.invalid/vla"], "phoneApps": [{"phone_id": "phone", "app": "Demo"}]})
         phone.add_task({"filename": batch["filename"], "description": "test batch", "source_batch_id": batch["batch_id"],
                         "content_base64": base64.b64encode(workbook.read_bytes()).decode()})
         request = {"filename": batch["filename"], "request_id": "once"}

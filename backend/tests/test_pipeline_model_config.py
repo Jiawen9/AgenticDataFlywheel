@@ -87,6 +87,8 @@ class ModelRunTests(unittest.TestCase):
         if args[0] == "capabilities":
             value["agent_types"] = {name: {"available": True, "collection": True, "capture_logprobs": True,
                 "model_iteration_evaluation": True, "model_overrides": True} for name in ("pipelineagent", "newagent")}
+            from backend.tests.collector_protocol_support import current_capabilities
+            current_capabilities(value)
         elif args[0] == "start-run":
             value["agent_type"] = args[args.index("--agent-type") + 1]
             self.remote[value["run_id"]]["agent_type"] = value["agent_type"]

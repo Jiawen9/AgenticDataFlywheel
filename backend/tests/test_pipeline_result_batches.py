@@ -17,6 +17,7 @@ from backend.phone_factory import PhoneFactoryStore
 from backend.pipeline_access import active_pipeline
 from backend.pipelines import PipelineError, PipelineManager, PipelineRuntime
 from backend.task_generation.collection_batches import COLLECTION_COLUMNS
+from backend.tests.collector_protocol_support import current_capabilities
 
 
 class PipelineResultBatchTests(unittest.TestCase):
@@ -55,6 +56,7 @@ class PipelineResultBatchTests(unittest.TestCase):
             response.update(protocol_version=1, batch_results=True, agent_types={
                 name: {"available": True, "collection": True, "capture_logprobs": True}
                 for name in ("newagent", "pipelineagent")})
+            current_capabilities(response)
         elif args[0] == "start-run":
             run_id = args[args.index("--collection-run-id") + 1]
             self.remote[run_id] = {"run_id": run_id, "collection_run_id": run_id,

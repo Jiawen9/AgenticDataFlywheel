@@ -13,6 +13,7 @@ from backend.phone_factory import PhoneFactoryStore, PhoneFactoryError, create_r
 from backend.pipeline_model_config import default_models
 from backend.batch_lifecycle import BatchPublishedError
 from backend.task_generation.collection_batches import COLLECTION_COLUMNS, payload_digest
+from backend.tests.collector_protocol_support import current_capabilities
 
 
 def workbook_bytes():
@@ -42,6 +43,7 @@ class FactoryRuntimeTests(unittest.TestCase):
         value = {'ok': True}
         if args[0] == 'capabilities':
             value.update(protocol_version=1, batch_results=True, model_iteration_evaluation=1)
+            current_capabilities(value)
         if args[0] == 'start-run':
             run_id = args[args.index('--collection-run-id') + 1]
             mode = args[args.index('--runmode') + 1]
@@ -107,7 +109,7 @@ class FactoryRuntimeTests(unittest.TestCase):
                 self.assertIn('--sampling', args)
                 self.assertEqual(args[args.index('--temperature') + 1], '0.35')
                 self.assertEqual(args[args.index('--top-p') + 1], '0.75')
-                self.assertEqual(store.config(), {**config, "agent_type": "newagent", "model_defaults": default_models()})
+                self.assertEqual(store.config(), {**config, "agent_type": "newagent", "repeat_times": 1, "model_defaults": default_models()})
 
     def test_invalid_logprob_override_is_rejected_before_dispatch(self):
         self.store.add_task(self.upload)
@@ -145,13 +147,13 @@ class FactoryRuntimeTests(unittest.TestCase):
                 self.assertEqual(len([args for args in self.calls if args[0] == 'start-run']), starts)
                 self.assertEqual(self.store.records.get(namespace, run_id), original)
 
-    def test_model_iteration_run_persistence_reports_and_no_production_artifacts(self):
+    def test_model_iteration_run_persistence_reports_and_linked_collection(self):
         self.store.add_task(self.upload, mode='modeliter')
         result = self.store.remote_start(self.request(run_mode='modeliter'), mode='modeliter')
         self.assertTrue(result['run_id'].startswith('eval_'))
-        self.assertEqual(self.store.records.list('collection_runs'), [])
-        self.assertEqual(self.store.runtime.batches(), [])
-        self.assertFalse((self.root / 'batches').exists())
+        self.assertEqual(self.store.collection_runs.get(result['run_id'])['batch_id'], result['batch_id'])
+        self.assertEqual(len(self.store.runtime.batches()), 1)
+        self.assertTrue((self.root / 'batches').exists())
         self.assertEqual(self.store.state('generate')['tasks'][0]['status'], '未运行')
         self.assertEqual(self.store.state('modeliter')['tasks'][0]['status'], '运行中')
         rebuilt = PhoneFactoryStore(self.root, run_client_fn=self.client)
@@ -171,7 +173,7 @@ class FactoryRuntimeTests(unittest.TestCase):
         self.store.run_client = lambda args: {'ok': True, 'output': '{"ok":true}'}
         with self.assertRaisesRegex(PhoneFactoryError, '升级'):
             self.store.remote_start(self.request())
-        run_id = self.store.collection_runs.list_runs()[0]['collection_run_id']
+        self.assertEqual(self.store.collection_runs.list_runs(), [])
         failed_once = [False]
         def losing_client(args):
             result = real(args)
@@ -182,6 +184,7 @@ class FactoryRuntimeTests(unittest.TestCase):
         self.store.run_client = losing_client
         with self.assertRaisesRegex(PhoneFactoryError, 'response lost'):
             self.store.remote_start(self.request())
+        run_id = self.store.collection_runs.list_runs()[0]['collection_run_id']
         self.assertEqual(self.store.remote_start(self.request())['collection_run_id'], run_id)
         self.assertEqual(len(self.store.collection_runs.list_runs()), 1)
 
@@ -196,7 +199,8 @@ class FactoryRuntimeTests(unittest.TestCase):
         self.store.run_client = real
         self.store.dispatch('remote/del-phone', 'POST', {'phone_id': 'phone-1'})
         self.assertEqual(self.store.state()['phones'], [])
-        self.assertEqual(self.store.collection_runs.get(run['collection_run_id'])['status'], 'interrupted')
+        stopped = self.store.collection_runs.get(run['collection_run_id'])
+        self.assertEqual((stopped['status'], stopped['collection_status']), ('running', 'cancelled'))
         self.assertTrue(Path(run['output_dir']).exists())
 
     def test_model_iteration_late_dispatch_never_overwrites_interrupted(self):

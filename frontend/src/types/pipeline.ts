@@ -12,7 +12,7 @@ export interface PipelineStep {
   retry_info?: PipelineRetryInfo | null;
   started_at?: string | null; completed_at?: string | null
 }
-export interface PipelineCollectionConfig extends ModelOverrides { agent_type?: AgentType; phone_id: string; app: string; vla: string; config: FactoryConfig }
+export interface PipelineCollectionConfig extends ModelOverrides { agent_type?: AgentType; repeat_times?: number; phone_id: string; app: string; vla: string; config: FactoryConfig }
 export interface Pipeline {
   pipeline_id: string; name: string; batch_id: string; mode: PipelineMode; start_mode: 'collect' | 'existing';
   batch_role?: 'collection_result'; task_source_batch_id?: string;

@@ -22,9 +22,11 @@ from backend.trajectory_context import row_identity_metadata
 
 def capabilities(**overrides):
     available = dict(available=True, collection=True, capture_logprobs=True,
-                     model_iteration_evaluation=True, offline_evaluation=True)
+                     model_iteration_evaluation=True, offline_evaluation=True,
+                     collection_artifacts_version=1, repeat_times=True, max_repeat_times=100)
     return {"ok": True, "protocol_version": 1, "batch_results": True,
             "model_iteration_evaluation": 1,
+            "collection_artifacts_version": 1,
             "agent_types": {"newagent": available, "pipelineagent": {**available, **overrides}}}
 
 
@@ -149,12 +151,12 @@ class DualAgentDispatchTests(unittest.TestCase):
         self.assertEqual(result["request"]["metadata"]["agent_type"], "newagent")
         self.assertEqual(legacy, before)
 
-    def test_modeliter_keeps_pipeline_engine_and_stays_out_of_production(self):
+    def test_modeliter_keeps_pipeline_engine_and_links_collection_batch(self):
         task = self.store.add_task(self.fixture.upload, mode="modeliter")["imported_task"]
         request = {**self.request(), "filename": task["filename"], "run_mode": "modeliter"}
         result = self.store.remote_start(request, mode="modeliter")
         self.assertEqual(result["request"]["agent_type"], "pipelineagent")
-        self.assertEqual(self.store.records.list("collection_runs"), [])
+        self.assertEqual(self.store.collection_runs.get(result["run_id"])["batch_id"], result["batch_id"])
         self.assertEqual(self.store.runtime.run_views("modeliter")[0]["agent_type"], "pipelineagent")
 
     def test_collection_cancel_confirms_remote_identity_before_retaining_artifacts(self):
@@ -174,14 +176,16 @@ class DualAgentDispatchTests(unittest.TestCase):
                 with patch.object(self.store, "_remote_result", side_effect=[self.responses[run_id], {"run_id": run_id, "status": "cancelled"}]) as remote:
                     result = TestClient(app).post(f"/api/phone-factory/collection-runs/{run_id}/cancel")
                 self.assertEqual(result.status_code, 200, result.text)
-                self.assertEqual(result.json()["status"], "interrupted")
+                self.assertEqual(result.json()["status"], "running")
+                self.assertEqual(result.json()["collection_status"], "cancelled")
                 self.assertEqual(result.json()["agent_type"], engine)
                 self.assertEqual(remote.call_args_list[-1].args[0], ["cancel-run", run_id])
                 self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserved")
                 self.assertEqual(result.json()["trajectories"], [{"existing": str(sentinel)}])
                 with patch.object(self.store, "_remote_result") as retry:
                     again = self.store.runtime.cancel_collection(run_id)
-                self.assertEqual(again["status"], "interrupted")
+                self.assertEqual(again["status"], "running")
+                self.assertEqual(again["collection_status"], "cancelled")
                 retry.assert_not_called()
 
     def test_collection_cancel_failures_never_claim_stopped(self):

@@ -1,6 +1,7 @@
 """Platform orchestration; device execution belongs to the independent collector."""
 from __future__ import annotations
 import hashlib
+import io
 import json
 import logging
 import math
@@ -8,6 +9,7 @@ import tempfile
 import threading
 import uuid
 import mimetypes
+import zipfile
 from pathlib import Path
 from urllib.parse import urlsplit
 from fastapi.responses import FileResponse
@@ -25,6 +27,7 @@ from .remote_sync import BoundedSyncPool, RemoteSyncPolicy, SyncDeferred
 from .task_generation.collection_batches import payload_digest
 from .agent_types import normalize_agent_type, engine_capabilities, PROVENANCE_FIELDS
 from .pipeline_model_config import MODEL_OVERRIDE_FIELDS, normalize_overrides
+from .collection_protocol import repeat_times, COLLECTION_ARTIFACTS_VERSION
 
 TERMINAL = {"completed", "succeeded", "partial", "failed", "interrupted", "cancelled"}
 
@@ -53,6 +56,21 @@ class FactoryRuntime:
 
     def download_archive(self, run_id, destination):
         self.store._remote_result(["run-archive", run_id, "--out", str(destination)])
+
+    def get_collection_artifacts(self, run_id, cursor=0, limit=100):
+        return self.store._remote_result(["collection-artifacts", run_id, "--cursor", str(cursor), "--limit", str(limit)])
+
+    def get_collection_artifact(self, run_id, artifact_id):
+        return self.store._remote_result(["collection-artifact", run_id, artifact_id])
+
+    def download_collection_artifact(self, run_id, artifact_id, destination):
+        return self.store._remote_result(["collection-artifact-archive", run_id, artifact_id, "--out", str(destination)])
+
+    def get_collection_manifest(self, run_id):
+        return self.store._remote_result(["collection-manifest", run_id])
+
+    def download_collection_archive(self, run_id, destination):
+        return self.store._remote_result(["collection-archive", run_id, "--out", str(destination)])
 
     def start(self):
         self.transfer.start()
@@ -216,6 +234,53 @@ class FactoryRuntime:
             task, path = registered, self.store.task_path(registered["filename"])
         return task, path, content
 
+    def _evaluation_collection_source(self, task, content):
+        """Preserve the upload byte-for-byte and freeze an internal 17-column workbook."""
+        from openpyxl import load_workbook, Workbook
+        from .task_generation.collection_batches import COLLECTION_COLUMNS
+        source_id = payload_digest([task["filename"], hashlib.sha256(content).hexdigest()])
+        directory = self.root / "system" / "model_iteration_sources" / source_id
+        with batch_lock(self.root, "modeliter_source_" + source_id):
+            directory.mkdir(parents=True, exist_ok=True)
+            original, canonical = directory / "original.xlsx", directory / "canonical.xlsx"
+            if original.exists() and original.read_bytes() != content:
+                raise PhoneFactoryError("评测任务原件快照校验失败", 409)
+            if not original.exists():
+                _atomic_write(original, content)
+            if not canonical.exists():
+                try:
+                    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                        if sum(item.file_size for item in archive.infolist()) > 512 * 1024 * 1024:
+                            raise PhoneFactoryError("评测任务 Excel 解压后超过 512 MiB", 413)
+                except zipfile.BadZipFile as exc:
+                    raise PhoneFactoryError("无法读取评测任务 Excel", 422) from exc
+                book = load_workbook(io.BytesIO(content), read_only=True, data_only=False, keep_links=False)
+                normalized = Workbook()
+                try:
+                    sheet = book.active
+                    rows = sheet.iter_rows(values_only=True)
+                    headers = list(next(rows, ()))
+                    if any(headers.count(name) != 1 for name in COLLECTION_COLUMNS):
+                        raise PhoneFactoryError("评测任务必须包含唯一的标准17列；原始列顺序和额外列可以保留", 422)
+                    indices = [headers.index(name) for name in COLLECTION_COLUMNS]
+                    normalized.active.title = sheet.title
+                    normalized.active.append(COLLECTION_COLUMNS)
+                    for row in rows:
+                        if not any(value is not None and value != "" for value in row):
+                            continue
+                        normalized.active.append([row[index] if index < len(row) else None for index in indices])
+                    output = io.BytesIO()
+                    normalized.save(output)
+                    _atomic_write(canonical, output.getvalue())
+                finally:
+                    book.close()
+                    normalized.close()
+            source = self.manual.register(task["filename"], canonical.read_bytes(), task.get("description", ""),
+                                          "modeliter_source_" + source_id)
+        return source, {"original_filename": task["filename"], "sha256": hashlib.sha256(content).hexdigest(),
+                        "relative_path": original.relative_to(self.root).as_posix(),
+                        "normalized_sha256": source["workbook_sha256"]}
+
     def _options(self, data, mode):
         if data.get("run_mode", mode) != mode:
             raise PhoneFactoryError("运行模式与接口不匹配", 409)
@@ -223,6 +288,10 @@ class FactoryRuntime:
         try:
             agent_type = normalize_agent_type(data.get("agent_type", "newagent"))
             model_overrides = normalize_overrides(data, agent_type)
+            repeats = repeat_times(data.get("repeat_times", 1), mode=mode)
+            if "collection_artifacts_version" in data and (type(data["collection_artifacts_version"]) is not int
+                    or data["collection_artifacts_version"] != COLLECTION_ARTIFACTS_VERSION):
+                raise ValueError("collection_artifacts_version 必须为 1")
         except ValueError as exc:
             raise PhoneFactoryError(str(exc)) from exc
         config = data.get("config", {})
@@ -250,6 +319,9 @@ class FactoryRuntime:
             raise PhoneFactoryError("请选择已关联 App 的手机")
         options = {"agent_type": agent_type, "run_mode": mode, "result_transport": "http", "vla": vla, "config": config, "phone_id": phone, "app": app, "phone_apps": associations, "phone_ids": sorted({row["phone_id"] for row in associations})}
         options.update(model_overrides)
+        options["repeat_times"] = repeats
+        if "collection_artifacts_version" in data:
+            options["collection_artifacts_version"] = data["collection_artifacts_version"]
         if mode == "modeliter":
             options.update(model_iteration.evaluation_options(self.store, data))
             if options["checklist_source"] == "auto":
@@ -294,7 +366,8 @@ class FactoryRuntime:
         try:
             remote = self.store._remote_result(["capabilities"])
         except PhoneFactoryError:
-            if agent_type == "newagent" and not require_batch_protocol:
+            if (agent_type == "newagent" and not require_batch_protocol
+                    and options.get("repeat_times", 1) == 1 and not options.get("collection_artifacts_version")):
                 return  # Preserve the established legacy newagent transport.
             if require_batch_protocol:
                 raise
@@ -302,6 +375,15 @@ class FactoryRuntime:
         if (agent_type == "pipelineagent" or require_batch_protocol) and (remote.get("protocol_version") != 1 or remote.get("batch_results") is not True):
             raise PhoneFactoryError("独立结果采集需要支持批次回传的采集服务，请升级采集电脑", 409)
         capability = engine_capabilities(remote).get(agent_type, {})
+        if options.get("collection_artifacts_version") == 1:
+            if (type(remote.get("collection_artifacts_version")) is not int or remote["collection_artifacts_version"] != 1
+                    or type(capability.get("collection_artifacts_version")) is not int
+                    or capability["collection_artifacts_version"] != 1):
+                raise PhoneFactoryError("采集电脑不支持逐条轨迹回传，请合入本次采集端增量包后重试", 409)
+        if options.get("repeat_times", 1) > 1 or options.get("collection_artifacts_version") == 1:
+            maximum = capability.get("max_repeat_times", 0)
+            if capability.get("repeat_times") is not True or type(maximum) is not int or maximum < options.get("repeat_times", 1):
+                raise PhoneFactoryError("采集电脑不支持本次重复采集次数，请升级采集电脑", 409)
         if capability.get("available") is not True or capability.get("collection") is not True:
             raise PhoneFactoryError(capability.get("reason") or f"采集电脑不支持 {agent_type}", 409)
         if any(key in options for key in MODEL_OVERRIDE_FIELDS) and capability.get("model_overrides") is not True:
@@ -328,6 +410,27 @@ class FactoryRuntime:
         request_id = data.get("request_id") or uuid.uuid4().hex
         _identifier(request_id, "request_id")
         digest = hashlib.sha256(content).hexdigest() if content is not None else task.get("content_sha256")
+        existing = self.records.get("model_iter_runs", "eval_" + payload_digest(request_id)) if mode == "modeliter" else None
+        frozen = bound.get("execution_metadata") if bound else None
+        if mode == "generate" and bound is None:
+            existing = self.store.collection_runs.get("cr_" + payload_digest([task["source_batch_id"], request_id]))
+            prepared = self.records.get("collection_result_requests", payload_digest([task["source_batch_id"], request_id]))
+            if prepared:
+                prepared_batch = self.store.collection_runs.result_batches.get(prepared["batch_id"])
+                frozen = prepared_batch["execution_metadata"]
+                existing = self.store.collection_runs.get(prepared_batch["collection_run_id"])
+        if existing is not None:
+            frozen = existing.get("request", {}).get("metadata", existing.get("request", {}))
+        if frozen is not None:
+            if "repeat_times" not in frozen and options["repeat_times"] == 1:
+                options.pop("repeat_times")
+            if "collection_artifacts_version" in frozen:
+                options["collection_artifacts_version"] = frozen["collection_artifacts_version"]
+        elif not legacy_batch:
+            options["collection_artifacts_version"] = COLLECTION_ARTIFACTS_VERSION
+        incremental = options.get("collection_artifacts_version") == 1
+        if incremental and existing is None:
+            self._require_agent_capability(options, require_batch_protocol=True)
         metadata = {**options, "filename": task["filename"]}
         # Evaluation always uses the upgraded HTTP contract; its capability is
         # checked afresh below so an in-place collector upgrade needs no platform restart.
@@ -374,6 +477,24 @@ class FactoryRuntime:
             run_id = "eval_" + payload_digest(request_id)
             request = {**metadata, "workbook_sha256": digest}
             payload = {"run_id": run_id, "collection_run_id": run_id, "run_mode": "modeliter", "status": "dispatching", "filename": task["filename"], "vla": options["vla"], "created_at": utc_now(), "request": request, "request_digest": payload_digest(request), "errors": [], "dispatch_error": None, "dispatch_attempted": False}
+            # Accepted historical requests keep their original data ownership.
+            # For the new protocol, freeze a real collection result batch before
+            # dispatch; the evaluation is a separate consumer of the same run.
+            if incremental:
+                if existing and (existing["request_digest"] != payload["request_digest"]
+                        and not matches_legacy_logprobs_request(existing, request)):
+                    raise PhoneFactoryError("相同 request_id 对应的运行参数不同", 409)
+                if existing and existing.get("batch_id"):
+                    collection = self.store.collection_runs.get(run_id)
+                    if collection is None:
+                        raise PhoneFactoryError("评测关联的采集运行缺失，不能重新下发", 409)
+                else:
+                    source, original = self._evaluation_collection_source(task, content)
+                    collection, _ = self.store.collection_runs.create_result_run(source["batch_id"],
+                        dispatch_key=request_id, metadata={**metadata, "original_workbook": original},
+                        workbook_sha256=source["workbook_sha256"])
+                payload.update(batch_id=collection["batch_id"], task_source_batch_id=collection["task_source_batch_id"],
+                               collection_artifacts_version=1, repeat_times=1)
             try:
                 from .display_identifiers import DisplayIdentifierStore
                 run = DisplayIdentifierStore(self.root).create_run("model_iter_runs", run_id, payload)
@@ -412,11 +533,14 @@ class FactoryRuntime:
                                 if item["status"] not in {"interrupted", "cancelled", "succeeded", "partial", "completed"}:
                                     item.update(status=known["status"], errors=known.get("errors", []), dispatch_error=None, updated_at=utc_now())
                             saved = self.records.update("model_iter_runs", run_id, recovered)
+                            if incremental:
+                                self.store.collection_runs.dispatched(run_id, known)
+                                self.sync_policy.reset("collection", run_id)
                         self.sync_policy.reset("collection" if mode == "generate" else "evaluation", run_id)
                         self.records.update("collection_runs" if mode == "generate" else "model_iter_runs", run_id,
                             lambda item: item.update(dispatch_attempted=True))
                         return {**known, **saved, "ok": True, "reused": True}
-                requires_identity = mode == "generate" and current.get("batch_role") == "collection_result"
+                requires_identity = incremental or mode == "generate" and current.get("batch_role") == "collection_result"
                 if requires_identity and protocol != "http":
                     raise PhoneFactoryError("采集结果批次必须使用支持运行编号的 HTTP 协议", 409)
                 self._require_agent_capability(options, require_batch_protocol=requires_identity)
@@ -425,16 +549,26 @@ class FactoryRuntime:
                     model_iteration.verify_profile(self.store, options)
                 elif options["agent_type"] == "newagent" and not requires_identity:
                     self._capabilities()
-                if mode == "generate":
+                if mode == "generate" or incremental:
                     # Query an uncertain remote acknowledgement before needing
                     # files. Only a genuinely new dispatch reads the workbook.
                     batch = self.store.collection_runs.batch(current["batch_id"], require_workbook=True)
                     path = Path(batch.get("workbook_path") or self.root / "system" / "task_generation" /
                                 "collection_batches" / current["batch_id"] / batch["filename"])
-                    with active_batch_lock(task["source_batch_id"], self.root):
-                        if current["status"] == "failed":
+                    collection = self.store.collection_runs.get(run_id)
+                    if mode == "modeliter":
+                        # The internal batch uses canonical columns, while the
+                        # collector still receives the exact accepted upload,
+                        # including any intranet-specific extra task fields.
+                        from .data_store.paths import contained_path
+                        original = collection["request"]["metadata"]["original_workbook"]
+                        path = contained_path(self.root, original["relative_path"])
+                        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != original["sha256"]:
+                            raise PhoneFactoryError("评测采集原始任务快照缺失或摘要不匹配", 409)
+                    with active_batch_lock(current["batch_id"], self.root):
+                        if collection["status"] == "failed":
                             self.store.collection_runs.retry_dispatch(run_id)
-                    tasks = list(current["batch_tasks"].values())
+                    tasks = list(collection["batch_tasks"].values())
                 else:
                     _, tasks, _ = self.manual._parse(content, run_id)
                 temp_root = self.root / "tmp" / "phone_factory"
@@ -445,6 +579,9 @@ class FactoryRuntime:
                     apps_path.write_text(json.dumps(options["phone_apps"], ensure_ascii=False), encoding="utf-8")
                     manifest_path.write_text(json.dumps({"tasks": tasks}, ensure_ascii=False), encoding="utf-8")
                     args = ["start-run", str(path), str(apps_path), options["phone_id"], options["app"], "--agent-type", options["agent_type"], "--vla", options["vla"], "--runmode", mode, "--temperature", str(options["config"]["temperature"]), "--top-p", str(options["config"]["top_p"])]
+                    for key in ("repeat_times", "collection_artifacts_version"):
+                        if key in options:
+                            args += ["--" + key.replace("_", "-"), str(options[key])]
                     if "execution_model" in options:
                         args += ["--execution-model", options["execution_model"]]
                     if "planner_config" in options:
@@ -457,8 +594,8 @@ class FactoryRuntime:
                                      "--evaluation-profile-digest", options["evaluation_profile_digest"]]
                     if protocol == "http":
                         args += ["--collection-run-id", run_id, "--task-manifest", str(manifest_path)]
-                        if mode == "generate":
-                            args += ["--batch-id", current["batch_id"], "--output-dir", current["output_dir"]]
+                        if mode == "generate" or incremental:
+                            args += ["--batch-id", collection["batch_id"], "--output-dir", collection["output_dir"]]
                     if options["config"]["sampling_enabled"]:
                         args.append("--sampling")
                     if options["config"]["use_experience_lib"]:
@@ -472,6 +609,9 @@ class FactoryRuntime:
                     else:
                         self.records.update("model_iter_runs", run_id,
                             lambda item: item.update(dispatch_attempted=True, submitted_at=utc_now()))
+                        if incremental:
+                            self.records.update("collection_runs", run_id,
+                                lambda item: item.update(dispatch_attempted=True, submitted_at=utc_now()))
                     self.sync_policy.reset("collection" if mode == "generate" else "evaluation", run_id)
                     response = self.store._remote_result(args)
                     if response.get("agent_type", "newagent") != options["agent_type"]:
@@ -485,6 +625,9 @@ class FactoryRuntime:
                         if item["status"] not in {"interrupted", "cancelled", "succeeded", "partial", "completed"}:
                             item.update(status="running", dispatch_response=response, dispatch_error=None, updated_at=utc_now())
                     saved = self.records.update("model_iter_runs", run_id, accepted)
+                    if incremental:
+                        self.store.collection_runs.dispatched(run_id, response)
+                        self.sync_policy.reset("collection", run_id)
                 self.sync_policy.reset("collection" if mode == "generate" else "evaluation", run_id)
                 return {**response, **saved, "ok": True}
             except Exception as exc:
@@ -495,6 +638,8 @@ class FactoryRuntime:
                         if item["status"] not in {"interrupted", "cancelled", "succeeded", "partial", "completed"}:
                             item.update(status="failed", dispatch_error=str(exc))
                     self.records.update("model_iter_runs", run_id, failed)
+                    if incremental:
+                        self.store.collection_runs.dispatch_failed(run_id, str(exc))
                 raise
 
     def remote_start_evaluation(self, data):
@@ -568,6 +713,36 @@ class FactoryRuntime:
                 self.records.update("model_iter_runs", run_id, failed)
                 raise
 
+    def _collection_progress(self, run_id):
+        collection = self.store.collection_runs.get(run_id)
+        if collection is None:
+            return {}
+        metadata = collection.get("request", {}).get("metadata", {})
+        summary = dict(collection.get("collection_summary") or {})
+        for key in ("transferred_trajectory_count", "transferred_diagnostic_count"):
+            if key in collection:
+                summary[key] = collection[key]
+        batch_state = lifecycle(collection["batch_id"], self.root)
+        journal = self.records.get("collection_artifact_transfers", run_id) or {}
+        artifacts = []
+        for slot in sorted((journal.get("items") or {}).values(), key=lambda item: item.get("item", {}).get("sequence", 0)):
+            item, manifest = slot.get("item", {}), slot.get("manifest") or {}
+            entry = manifest.get("trajectory") or manifest.get("diagnostic") or {}
+            artifacts.append({"artifact_id": item.get("artifact_id"), "kind": item.get("kind"),
+                "transfer_status": slot.get("status"), **{key: entry[key] for key in (
+                    "collection_case_id", "phone_id", "expanded_case_id", "repeat_index", "repeat_times",
+                    "execution_status", "error", "source_trajectory_id") if key in entry},
+                **({"transfer_error": slot["error"]} if slot.get("error") else {})})
+        return {**{key: collection[key] for key in ("batch_id", "task_source_batch_id", "collection_status",
+                "transfer_status", "transfer_error", "transfer_updated_at", "transferred_trajectory_count",
+                "transferred_diagnostic_count") if key in collection},
+                "repeat_times": metadata.get("repeat_times", 1),
+                "batch_status": batch_state["status"], "release_id": batch_state["release_id"],
+                "published_at": batch_state["published_at"], "collection_artifacts": artifacts,
+                **({"collection_artifacts_version": metadata["collection_artifacts_version"]}
+                   if "collection_artifacts_version" in metadata else {}),
+                "collection_summary": summary, "collection_sync": self.sync_policy.view("collection", run_id)}
+
     def run_views(self, mode):
         if mode == "modeliter":
             runs = []
@@ -575,15 +750,17 @@ class FactoryRuntime:
                 request = run.get("request", {})
                 metadata = {key: request[key] for key in ("source", "source_digest", "evaluation_profile_id",
                                                          "evaluation_profile_digest", "checklist_source", *MODEL_OVERRIDE_FIELDS) if key in request}
-                runs.append({**run, **metadata, **({"agent_type": request.get("agent_type", "newagent")} if request.get("execution_mode") != "evaluate_only" else {}), "execution_mode": request.get("execution_mode", "collect_and_evaluate"),
+                runs.append({**run, **metadata, **self._collection_progress(run["run_id"]), **({"agent_type": request.get("agent_type", "newagent")} if request.get("execution_mode") != "evaluate_only" else {}), "execution_mode": request.get("execution_mode", "collect_and_evaluate"),
                              "sync": self.sync_policy.view("evaluation", run["run_id"])})
             return sorted(runs, key=lambda item: (item["created_at"], item["run_id"]))
         views = []
         for run in self.store.collection_runs.list_runs():
             transfer = self.records.get("collection_transfers", run["collection_run_id"]) or {}
             metadata = run.get("request", {}).get("metadata", {})
+            if metadata.get("run_mode", "generate") != "generate":
+                continue
             batch_state = lifecycle(run["batch_id"], self.root)
-            views.append({**run, "batch_status": batch_state["status"], "release_id": batch_state["release_id"],
+            views.append({**run, **self._collection_progress(run["collection_run_id"]), "batch_status": batch_state["status"], "release_id": batch_state["release_id"],
                           "published_at": batch_state["published_at"], "filename": metadata.get("filename"), "vla": metadata.get("vla"), "agent_type": metadata.get("agent_type", "newagent"), **{key: metadata[key] for key in MODEL_OVERRIDE_FIELDS if key in metadata}, **{key: transfer[key] for key in ("remote_status", "transfer_status", "transfer_error", "remote_errors", "transfer_updated_at") if key in transfer}, "trajectory_count": len(run.get("trajectories", [])),
                           "sync": self.sync_policy.view("collection", run["collection_run_id"])})
         return views
@@ -654,10 +831,16 @@ class FactoryRuntime:
                 if run["status"] not in TERMINAL and any(row["phone_id"] == phone for row in options.get("phone_apps", [])):
                     def interrupt(current):
                         if current["status"] not in TERMINAL:
+                            if namespace == "collection_runs" and options.get("collection_artifacts_version") == 1:
+                                current.update(status="running", collection_status="cancelled", interrupted_at=utc_now(),
+                                               stop_reason="设备已删除，等待已采集结果封存及回传")
+                                return
                             current.update(status="interrupted", dispatch_error="设备已删除，运行已中断", interrupted_at=utc_now())
                     try:
                         with active_batch_lock(run.get("batch_id") if namespace == "collection_runs" else None, self.root):
                             self.records.update(namespace, run.get("run_id", run.get("collection_run_id")), interrupt)
+                            if namespace == "collection_runs" and options.get("collection_artifacts_version") == 1:
+                                self.sync_policy.reset("collection", run["collection_run_id"])
                     except BatchPublishedError:
                         pass  # Finished, published artifacts and logs remain unchanged.
         def remove(state):
@@ -665,6 +848,20 @@ class FactoryRuntime:
             state["phoneApps"] = [item for item in state["phoneApps"] if item["phone_id"] != phone]
         self.store._update(remove)
         return {**response, "state": self.store.state(mode)}
+
+    def _collection_stopped(self, run_id, result):
+        collection = self.store.collection_runs.get(run_id)
+        if not collection or collection.get("request", {}).get("metadata", {}).get("collection_artifacts_version") != 1:
+            return None
+        if collection.get("transfer_status") == "completed":
+            return collection
+        def stopped(current):
+            if current.get("transfer_status") != "completed":
+                current.update(status="running", collection_status=result.get("collection_status", "cancelled"),
+                               stop_requested_at=utc_now(), cancel_response=result, dispatch_error=None)
+        saved = self.records.update("collection_runs", run_id, stopped)
+        self.sync_policy.reset("collection", run_id)
+        return saved
 
     def cancel_collection(self, run_id):
         run_id = _identifier(run_id, "采集运行编号")
@@ -676,6 +873,8 @@ class FactoryRuntime:
             from .pipeline_access import ensure_pipeline_write
             ensure_pipeline_write(run["batch_id"], self.root, action="collect")
             run = self.store.collection_runs.get(run_id)
+            if run.get("stop_requested_at"):
+                return run
             if run["status"] in {"interrupted", "cancelled"}:
                 return {**run, "agent_type": run.get("request", {}).get("metadata", {}).get("agent_type", "newagent")}
             if run["status"] not in {"dispatching", "queued", "starting", "running"}:
@@ -693,6 +892,8 @@ class FactoryRuntime:
                     or result.get("run_id", result.get("collection_run_id")) != run_id
                     or result.get("status") not in {"cancelled", "interrupted"}):
                 raise PhoneFactoryError("采集电脑尚未确认停止，请刷新运行状态后重试", 502)
+            if metadata.get("collection_artifacts_version") == 1:
+                return self._collection_stopped(run_id, result)
             saved = self.records.update("collection_runs", run_id, lambda current: current.update(
                 status="interrupted", remote_status=result["status"], interrupted_at=utc_now(),
                 updated_at=utc_now(), dispatch_error=None, cancel_response=result))
@@ -732,6 +933,18 @@ class FactoryRuntime:
             return True, {"runs": runs}
         if action.startswith("runs/") and mode == "modeliter":
             parts = action.split("/")
+            if method == "GET" and len(parts) == 2:
+                run = next((run for run in self.run_views(mode) if run["run_id"] == parts[1]), None)
+                if run is None:
+                    raise PhoneFactoryError("评估运行不存在", 404)
+                return True, run
+            if method == "POST" and len(parts) == 3 and parts[2] == "retry-transfer":
+                run_id = _identifier(parts[1], "评估运行编号")
+                evaluation = self.records.get("model_iter_runs", run_id)
+                if not evaluation or not evaluation.get("batch_id") or evaluation.get("request", {}).get("execution_mode") == "evaluate_only":
+                    raise PhoneFactoryError("此评测运行没有关联的采集回传", 409)
+                self.transfer.sync(run_id, force=True)
+                return True, next(run for run in self.run_views(mode) if run["run_id"] == run_id)
             if method == "POST" and len(parts) == 3 and parts[2] == "sync":
                 saved = self.sync_evaluation(parts[1], force=True)
                 return True, {**saved, "sync": self.sync_policy.view("evaluation", parts[1])}
@@ -745,6 +958,7 @@ class FactoryRuntime:
                 acknowledged = (result.get("run_id", result.get("collection_run_id")) == run_id
                                 and result.get("status") == "cancelled")
                 if acknowledged:
+                    self._collection_stopped(run_id, result)
                     def cancelled(current):
                         if current["status"] not in TERMINAL or current.get("dispatch_error"):
                             current.update(status="cancelled", remote_status="cancelled", dispatch_error=None,
@@ -783,7 +997,16 @@ class FactoryRuntime:
                         return True, {**snapshot["result"], **({"stale": True, "sync_error": str(exc)} if stale else {})}
                     raise
         if action.startswith("collection-runs/") and mode == "modeliter":
-            raise PhoneFactoryError("评估结果不进入生产采集链", 409)
+            parts = action.split("/")
+            evaluation = self.records.get("model_iter_runs", _identifier(parts[1], "评估运行编号"))
+            if not evaluation or not evaluation.get("batch_id"):
+                raise PhoneFactoryError("此评测运行没有关联的采集回传", 409)
+            if method == "GET" and len(parts) == 2:
+                return True, self.store.collection_runs.get(parts[1])
+            if method == "POST" and len(parts) == 3 and parts[2] == "sync":
+                saved = self.transfer.sync(parts[1], force=True)
+                return True, {**saved, "sync": self.sync_policy.view("collection", parts[1])}
+            raise PhoneFactoryError("评测页只允许查看或重试关联采集的回传", 409)
         if action.startswith("collection-runs/") and method == "POST":
             parts = action.split("/")
             if len(parts) == 3 and parts[2] == "cancel":

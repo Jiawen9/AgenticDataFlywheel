@@ -34,7 +34,7 @@ export function usePhoneCollectionBatches(batchApi: BatchApi, factoryApi: Factor
   setTasks: (tasks: TaskRow[]) => void
   isBlocked?: () => boolean
   downloadFile?: (blob: Blob, filename: string) => void
-  runOptions?: () => Pick<RunOptions, 'agent_type' | 'vla' | 'run_mode' | 'config' | 'execution_model' | 'planner_config'>
+  runOptions?: () => Pick<RunOptions, 'agent_type' | 'vla' | 'run_mode' | 'config' | 'execution_model' | 'planner_config' | 'repeat_times'>
 }) {
   const retiredIds = new Set<string>()
   const batches = ref<FactoryBatchSummary[]>([])
@@ -97,7 +97,7 @@ export function usePhoneCollectionBatches(batchApi: BatchApi, factoryApi: Factor
     }
   }
 
-  async function runBatch(batchId: string, phoneId = '', app = '', overrides?: Pick<RunOptions, 'agent_type' | 'vla' | 'run_mode' | 'config' | 'execution_model' | 'planner_config'>) {
+  async function runBatch(batchId: string, phoneId = '', app = '', overrides?: Pick<RunOptions, 'agent_type' | 'vla' | 'run_mode' | 'config' | 'execution_model' | 'planner_config' | 'repeat_times'>) {
     if (retiredIds.has(batchId)) throw new Error('任务来源已移除，不能继续下发')
     if (disposed || busy.value) throw new Error('正在处理采集任务，请稍候')
     busy.value = true

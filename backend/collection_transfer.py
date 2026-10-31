@@ -21,6 +21,7 @@ from .file_io import io_path, iterdir, rglob, resolve_path, is_link_or_junction
 from .task_generation.collection_batches import payload_digest, workbook_digest
 from . import pipeline_diagnostics as diagnostics
 from .remote_sync import BoundedSyncPool, RemoteSyncPolicy, SyncDeferred
+from .collection_artifact_transfer import ArtifactTransfer, stream_enabled
 
 LOG = logging.getLogger(__name__)
 TERMINAL = {"completed", "succeeded", "partial", "failed", "interrupted", "cancelled"}
@@ -69,10 +70,10 @@ class CollectionTransferManager:
         for run in self.runs.list_runs():
             if self._stop.is_set():
                 break
-            if run["status"] == "interrupted" or (run["status"] == "completed" and run.get("transfer_status") == "completed") or not is_batch_active(run["batch_id"], self.root):
+            if (run["status"] == "interrupted" and not stream_enabled(run)) or (run["status"] == "completed" and run.get("transfer_status") == "completed") or not is_batch_active(run["batch_id"], self.root):
                 continue
             metadata = run.get("request", {}).get("metadata", {})
-            if metadata.get("run_mode", "generate") != "generate":
+            if metadata.get("run_mode", "generate") != "generate" and not stream_enabled(run):
                 continue
             # Legacy collectors own their results in the phone workspace and
             # expose no /runs/{id}; never poll them for batch-result transfer.
@@ -284,24 +285,34 @@ class CollectionTransferManager:
                 diagnostics.job_context({**run, "pipeline_id": owner}, "collection", self.root):
             if not run:
                 raise CollectionRunError("采集运行不存在", 404)
-            if (run.get("source_kind") == "rollout_import" or run.get("status") == "interrupted"
+            if (run.get("source_kind") == "rollout_import" or (run.get("status") == "interrupted" and not stream_enabled(run))
                     or (run.get("status") == "completed" and run.get("transfer_status") == "completed")):
                 return run
             try:
                 result = self.sync_policy.execute("collection", run,
-                    lambda: self._sync_with_diagnostics(run_id), force=force)
+                    lambda: self._sync_with_diagnostics(run_id, force=force), force=force)
             except SyncDeferred as exc:
                 raise CollectionRunError(str(exc), exc.status) from exc
             if result.get("transfer_status") in {"completed", "remote_failed"}:
                 self.sync_policy.complete("collection", run_id)
             return result
 
-    def _sync_with_diagnostics(self, run_id):
+    def _sync_with_diagnostics(self, run_id, *, force=False):
         run = self.runs.get(run_id)
         if run is None:
             raise CollectionRunError("采集运行不存在", 404)
         if run.get("source_kind") == "rollout_import":
             return run  # Local imports have no remote execution to synchronize.
+        if stream_enabled(run):
+            with active_batch_lock(run["batch_id"], self.root):
+                run = self.runs.get(run_id)
+                if run["status"] == "completed" and run.get("transfer_status") == "completed":
+                    return run
+                try:
+                    return ArtifactTransfer(self).sync(run, force=force)
+                except Exception as exc:
+                    self._update(run_id, transfer_status="failed", transfer_error=str(exc))
+                    raise
         if run["status"] == "interrupted":
             return run
         if run["status"] == "completed" and (run.get("transfer_status") == "completed" or not is_batch_active(run["batch_id"], self.root)):

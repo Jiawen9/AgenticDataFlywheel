@@ -14,6 +14,7 @@ def engine_capabilities(remote):
     declared = remote.get("agent_types") if isinstance(remote, dict) else None
     if isinstance(declared, dict):
         result = {name: {"available": False, "collection": False, "capture_logprobs": False,
+                       "repeat_times": False, "max_repeat_times": 1, "collection_artifacts_version": 0,
                        "model_iteration_evaluation": False, "offline_evaluation": False,
                        "reason": "采集电脑未声明此引擎", **(declared.get(name) or {})}
                 for name in AGENT_TYPES if isinstance(declared.get(name, {}), dict)}
