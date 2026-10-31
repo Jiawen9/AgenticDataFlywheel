@@ -116,8 +116,11 @@ class CollectionTransferManager:
         return results
 
     def _update(self, run_id, **changes):
-        saved = self.records.update("collection_runs", run_id, lambda value: value.update(
-            **changes, transfer_updated_at=utc_now()))
+        def update(value):
+            # An in-flight 404 must not replace the definitive submission error.
+            if value.get("dispatch_rejected") is not True:
+                value.update(**changes, transfer_updated_at=utc_now())
+        saved = self.records.update("collection_runs", run_id, update)
         diagnostics.record_job_snapshot(saved, "collection", self.root)
         diagnostics.log_event("collection_transfer_progress", collection_run_id=run_id, **changes)
         return saved

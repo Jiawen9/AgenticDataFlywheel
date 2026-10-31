@@ -315,10 +315,12 @@ class CollectionRunStore:
                 # A fast collector may finish before its dispatch response arrives.
                 if run["status"] not in {"completed", "interrupted"}:
                     run["status"] = "running"
-                run.update(dispatch_response=response, dispatched_at=_now(), dispatch_error=None)
+                run.update(dispatch_response=response, dispatched_at=_now(), dispatch_error=None,
+                           dispatch_rejected=False)
+                run.pop("dispatch_rejection", None)
             return self.records.update("collection_runs", run_id, mutate)
 
-    def dispatch_failed(self, run_id: str, error: str) -> dict:
+    def dispatch_failed(self, run_id: str, error: str, *, rejection: dict | None = None) -> dict:
         current = self.get(run_id)
         if current is None:
             raise CollectionRunError("采集运行不存在", 404)
@@ -326,6 +328,9 @@ class CollectionRunStore:
             def mutate(run):
                 if run["status"] not in {"completed", "interrupted"}:
                     run.update(status="failed", dispatch_error=str(error))
+                    if rejection is not None:
+                        run.update(dispatch_rejected=True, dispatch_rejection=rejection,
+                                   transfer_error=None, transfer_status="waiting")
             return self.records.update("collection_runs", run_id, mutate)
 
     def _normalize(self, run: dict, manifest: dict, completed_at: str) -> dict:

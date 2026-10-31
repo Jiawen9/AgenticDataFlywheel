@@ -19,6 +19,7 @@ TRANSFER_TIMEOUT = float(os.environ.get("PHONE_FACTORY_TRANSFER_TIMEOUT", "300")
 MAX_DOWNLOAD = int(os.environ.get("PHONE_FACTORY_MAX_ARCHIVE_BYTES", str(10 * 1024**3)))
 UNREACHABLE_MSG = "功能不支持或者网络断连"
 CLIENT_ERROR_PREFIX = "__PHONE_FACTORY_ERROR__="
+LEGACY_MANIFEST_MAX_BYTES = 256 * 1024
 
 
 def _headers():
@@ -26,18 +27,20 @@ def _headers():
     return {"Authorization": "Bearer " + token} if token else {}
 
 
-def _exit_error(message, kind, status=None):
+def _exit_error(message, kind, status=None, *, dispatch_not_sent=False):
     # The CLI's human-readable error stays unchanged. Only the platform parent
     # opts in to machine-readable metadata, on a separate stderr line.
     if os.environ.get("PHONE_FACTORY_CLIENT_ERROR_METADATA") == "1":
         metadata = {"remote_kind": kind}
         if status is not None:
             metadata["remote_status"] = status
+        if dispatch_not_sent:
+            metadata["dispatch_not_sent"] = True
         print(CLIENT_ERROR_PREFIX + json.dumps(metadata), file=sys.stderr, flush=True)
     sys.exit(message)
 
 
-def _error(exc):
+def _error(exc, *, dispatch_not_sent=False):
     if isinstance(exc, urllib.error.HTTPError):
         try:
             body = json.loads(exc.read(8192).decode("utf-8"))
@@ -46,25 +49,35 @@ def _error(exc):
                 message = message.get("message")
         except Exception:
             message = None
-        _exit_error(f"错误：{message or UNREACHABLE_MSG}（HTTP {exc.code}）", "http", exc.code)
+        fallback = "请求超过采集服务接收限制" if exc.code == 413 else UNREACHABLE_MSG
+        _exit_error(f"错误：{message or fallback}（HTTP {exc.code}）", "http", exc.code,
+                    dispatch_not_sent=dispatch_not_sent)
     reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
     if isinstance(reason, (socket.timeout, TimeoutError)):
-        _exit_error("错误：采集服务请求超时，请用同一请求编号重试", "timeout")
+        _exit_error("错误：采集服务请求超时，请用同一请求编号重试", "timeout",
+                    dispatch_not_sent=dispatch_not_sent)
     kind = "protocol" if isinstance(exc, ValueError) else "connection"
     if isinstance(exc, (PermissionError, FileNotFoundError, FileExistsError)):
         kind = "client"
-    _exit_error(f"错误：{UNREACHABLE_MSG}（{type(exc).__name__}）", kind)
+    _exit_error(f"错误：{UNREACHABLE_MSG}（{type(exc).__name__}）", kind,
+                dispatch_not_sent=dispatch_not_sent)
 
 
-def _request(req):
+def _request(req, *, legacy_statuses=(), dispatch_not_sent=False, require_json=False):
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
             raw = response.read(32 * 1024**2 + 1)
             if len(raw) > 32 * 1024**2:
                 raise ValueError("采集服务响应过大")
-            return json.loads(raw.decode("utf-8") or "{}")
+            text = raw.decode("utf-8")
+            return json.loads(text if require_json else text or "{}")
+    except urllib.error.HTTPError as exc:
+        if exc.code in legacy_statuses:
+            exc.close()
+            return {}
+        _error(exc, dispatch_not_sent=dispatch_not_sent)
     except (OSError, ValueError) as exc:
-        _error(exc)
+        _error(exc, dispatch_not_sent=dispatch_not_sent)
 
 
 def post_json(path, payload):
@@ -77,20 +90,44 @@ def get_json(path):
     return _request(urllib.request.Request(SERVER + path, headers=_headers()))
 
 
-def post_multipart(path, fields, file_fields):
+def post_multipart(path, fields, file_fields, *, max_body_bytes=None):
     boundary = "----phonefactory" + uuid.uuid4().hex
     chunks = []
     for key, value in fields.items():
         chunks.append((f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\""
                        f"\r\n\r\n{value}\r\n").encode("utf-8"))
-    for key, filename, content in file_fields:
+    for item in file_fields:
+        key, filename, content = item[:3]
+        content_type = item[3] if len(item) == 4 else "application/octet-stream"
         safe_name = filename.replace('"', "_").replace("\r", "_").replace("\n", "_")
         chunks.append((f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"; filename=\"{safe_name}\""
-                       "\r\nContent-Type: application/octet-stream\r\n\r\n").encode("utf-8"))
+                       f"\r\nContent-Type: {content_type}\r\n\r\n").encode("utf-8"))
         chunks.extend((content, b"\r\n"))
     chunks.append(f"--{boundary}--\r\n".encode())
+    body_bytes = sum(len(chunk) for chunk in chunks)
+    if max_body_bytes is not None and body_bytes > max_body_bytes:
+        _exit_error(f"错误：启动请求为 {body_bytes} 字节，超过采集服务接收上限 {max_body_bytes} 字节，未下发任务",
+                    "client", dispatch_not_sent=True)
     return _request(urllib.request.Request(SERVER + path, data=b"".join(chunks), method="POST",
         headers={**_headers(), "Content-Type": f"multipart/form-data; boundary={boundary}"}))
+
+
+def _manifest_upload_limits():
+    """Negotiate only with the target collector; uncertain failures never downgrade."""
+    capability = _request(urllib.request.Request(SERVER + "/capabilities", headers=_headers()),
+                          legacy_statuses=(404, 405), dispatch_not_sent=True, require_json=True)
+    if not isinstance(capability, dict):
+        _exit_error("错误：采集服务能力响应必须为 JSON 对象，未下发任务", "protocol", dispatch_not_sent=True)
+    if "task_manifest_file_version" not in capability:
+        return None
+    version = capability["task_manifest_file_version"]
+    limits = capability.get("start_run_limits")
+    if (type(version) is not int or version != 1 or not isinstance(limits, dict)
+            or any(type(limits.get(key)) is not int or limits[key] <= 0
+                   for key in ("task_manifest_bytes", "request_bytes"))):
+        _exit_error("错误：采集服务任务清单上传能力或大小限制声明无效，请检查采集端，未下发任务",
+                    "protocol", dispatch_not_sent=True)
+    return limits
 
 
 def download_file(path, destination):
@@ -155,10 +192,31 @@ def cmd_start_run(args):
     if output:
         fields["output_dir"] = output
     manifest = getattr(args, "task_manifest", None)
+    files = [("task_file", task.name, task.read_bytes()), ("apps_file", apps.name, apps.read_bytes())]
     if manifest:
-        fields["task_manifest"] = Path(manifest).read_text(encoding="utf-8")
-    return post_multipart("/start_run", fields, [
-        ("task_file", task.name, task.read_bytes()), ("apps_file", apps.name, apps.read_bytes())])
+        try:
+            # Preserve the previous text-file newline handling and exact logical
+            # contents. Encoding, not JSON reserialization, changes the transport.
+            text = Path(manifest).read_text(encoding="utf-8")
+            content = text.encode("utf-8")
+        except (OSError, UnicodeError) as exc:
+            _exit_error(f"错误：无法读取 UTF-8 任务清单（{type(exc).__name__}），未下发任务",
+                        "client", dispatch_not_sent=True)
+        limits = _manifest_upload_limits()
+        if limits is None:
+            if len(content) > LEGACY_MANIFEST_MAX_BYTES:
+                _exit_error(f"错误：采集服务尚不支持任务清单文件上传；当前清单为 {len(content)} 字节，"
+                            f"超过旧文本兼容上限 {LEGACY_MANIFEST_MAX_BYTES} 字节，请升级采集端后使用同一请求编号重试，未下发任务",
+                            "client", dispatch_not_sent=True)
+            fields["task_manifest"] = text
+        else:
+            if len(content) > limits["task_manifest_bytes"]:
+                _exit_error(f"错误：任务清单文件为 {len(content)} 字节，超过采集服务清单上限 "
+                            f"{limits['task_manifest_bytes']} 字节，未下发任务",
+                            "client", dispatch_not_sent=True)
+            files.append(("task_manifest_file", "tasks.json", content, "application/json"))
+            return post_multipart("/start_run", fields, files, max_body_bytes=limits["request_bytes"])
+    return post_multipart("/start_run", fields, files)
 
 
 def build_parser():
