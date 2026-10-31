@@ -13,6 +13,7 @@ import CollectionAgentSelect from '@/components/CollectionAgentSelect.vue'
 import PipelineModelFields from '@/components/PipelineModelFields.vue'
 import { modelDraft, modelOptions, modelBlockedReason } from '@/utils/pipelineModels'
 import { agentBlockedReason, agentLabel } from '@/utils/collectionAgents'
+import { repeatBlockedReason } from '@/utils/collectionRepeats'
 import { isCollectionResult } from '@/utils/collectionResults'
 import { factoryBatchesApi, newRunRequestId, phoneFactoryApi, type AgentCapabilities, type AgentType, type FactoryState } from '@/phoneFactoryApi'
 import { usePipelineContext } from '@/composables/usePipelineContext'
@@ -33,8 +34,8 @@ const factory = ref<FactoryState>({ phones: [], apps: [], phoneApps: [], vla: []
 const rolloutImportVisible = ref(false)
 const agentCapabilities = ref<AgentCapabilities | null>(null)
 const models = reactive(modelDraft())
-const collectionIssue = computed(() => agentBlockedReason(agentCapabilities.value, draft.agent_type, draft.capture_logprobs) || modelBlockedReason(agentCapabilities.value, draft.agent_type, models))
-const draft = reactive({ agent_type: 'newagent' as AgentType, name: '', batch_id: '', start_mode: 'existing' as 'existing' | 'collect', mode: 'manual' as 'manual' | 'automatic', threshold: 3, phone_id: '', app: '', vla: '', sampling_enabled: false, temperature: 1, top_p: 1, use_experience_lib: false, capture_logprobs: false })
+const collectionIssue = computed(() => agentBlockedReason(agentCapabilities.value, draft.agent_type, draft.capture_logprobs) || modelBlockedReason(agentCapabilities.value, draft.agent_type, models) || repeatBlockedReason(agentCapabilities.value, draft.agent_type, draft.repeat_times))
+const draft = reactive({ agent_type: 'newagent' as AgentType, repeat_times: 1, name: '', batch_id: '', start_mode: 'existing' as 'existing' | 'collect', mode: 'manual' as 'manual' | 'automatic', threshold: 3, phone_id: '', app: '', vla: '', sampling_enabled: false, temperature: 1, top_p: 1, use_experience_lib: false, capture_logprobs: false })
 let disposed = false, listGeneration = 0, choicesGeneration = 0, listController: AbortController | undefined
 const requests = new Map<string, string>()
 const icons = { TrendCharts, DataAnalysis, Collection, Upload, Cpu, Promotion }
@@ -118,7 +119,7 @@ async function loadChoices(hydrateConfig = true) {
   if (state.status === 'fulfilled') { factory.value = state.value; if (hydrateConfig && !draft.vla) draft.vla = state.value.vla[0] || '' }
   if (hydrateConfig && config.status === 'fulfilled') {
     const { model_defaults, ...settings } = config.value
-    Object.assign(draft, settings)
+    Object.assign(draft, { repeat_times: 1, ...settings })
     Object.assign(models, modelDraft(model_defaults))
     if (model_defaults?.vla) draft.vla = model_defaults.vla
   }
@@ -148,7 +149,7 @@ async function create() {
   submitting.value = true; createError.value = ''
   const body: Omit<CreatePipeline, 'request_id'> = { name: draft.name.trim(), batch_id: draft.batch_id, start_mode: draft.start_mode, mode: draft.mode,
     ...(draft.mode === 'automatic' ? { threshold: draft.threshold } : {}),
-    ...(draft.start_mode === 'collect' ? { collection_config: { ...modelOptions(draft.agent_type, models), agent_type: draft.agent_type, phone_id: draft.phone_id, app: draft.app, vla: draft.vla.trim(), config: { sampling_enabled: draft.sampling_enabled, temperature: draft.temperature, top_p: draft.top_p, use_experience_lib: draft.use_experience_lib, capture_logprobs: draft.capture_logprobs } } } : {}),
+    ...(draft.start_mode === 'collect' ? { collection_config: { ...modelOptions(draft.agent_type, models), agent_type: draft.agent_type, repeat_times: draft.repeat_times, phone_id: draft.phone_id, app: draft.app, vla: draft.vla.trim(), config: { sampling_enabled: draft.sampling_enabled, temperature: draft.temperature, top_p: draft.top_p, use_experience_lib: draft.use_experience_lib, capture_logprobs: draft.capture_logprobs } } } : {}),
   }
   const key = JSON.stringify(body), requestId = requests.get(key) || newRunRequestId(); requests.set(key, requestId)
   try {
@@ -276,7 +277,7 @@ onBeforeUnmount(() => { disposed = true; stopRetryClock(); listGeneration++; cho
           <el-alert v-if="collectionIssue" :title="collectionIssue" type="warning" :closable="false" />
           <div class="form-grid"><el-form-item label="手机"><el-select v-model="draft.phone_id" clearable placeholder="全部关联手机"><el-option v-for="phone in factory.phones" :key="phone" :label="phone" :value="phone" /></el-select></el-form-item><el-form-item label="App"><el-select v-model="draft.app" clearable placeholder="全部关联 App"><el-option v-for="app in apps" :key="app" :label="app" :value="app" /></el-select></el-form-item></div>
           <el-form-item label="执行接口（VLA）" required><el-select v-model="draft.vla" filterable allow-create default-first-option placeholder="host:port 或 http(s)://host:port/v1" style="width:100%"><el-option v-for="vla in factory.vla" :key="vla" :label="vla" :value="vla" /></el-select></el-form-item>
-          <PipelineModelFields v-if="draft.agent_type === 'pipelineagent'" :model-value="models" :disabled="submitting" @update:model-value="Object.assign(models, $event)" />
+          <label>每任务采集次数<el-input-number v-model="draft.repeat_times" :min="1" :max="100" :step="1" :precision="0" data-testid="pipeline-repeat-times" :disabled="submitting" /></label><PipelineModelFields v-if="draft.agent_type === 'pipelineagent'" :model-value="models" :disabled="submitting" @update:model-value="Object.assign(models, $event)" />
           <div class="form-grid"><el-form-item label="采集 Logprobs"><el-switch v-model="draft.capture_logprobs" /></el-form-item><el-form-item label="采样"><el-switch v-model="draft.sampling_enabled" /></el-form-item><el-form-item label="经验库"><el-switch v-model="draft.use_experience_lib" /></el-form-item><el-form-item label="temperature"><el-input-number v-model="draft.temperature" :min="0" :max="2" :step="0.1" /></el-form-item><el-form-item label="top_p"><el-input-number v-model="draft.top_p" :min="0" :max="1" :step="0.05" /></el-form-item></div>
         </template>
       </el-form>

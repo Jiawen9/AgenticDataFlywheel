@@ -109,9 +109,15 @@ class PipelineRuntime:
             snapshot.update(batch_role="collection_result", task_source_batch_id=collection["task_source_batch_id"])
         return snapshot
 
-    def collection_options(self, config):
-        options = self.factory.runtime._options(config or {}, "generate")
-        return {key: options[key] for key in ("agent_type", "phone_id", "app", "vla", "config", "phone_apps", "phone_ids", "execution_model", "planner_config") if key in options}
+    def collection_options(self, config, *, new_run=True):
+        config = dict(config or {})
+        if new_run:
+            config.setdefault("repeat_times", self.factory.config("generate").get("repeat_times", 1))
+            config["collection_artifacts_version"] = 1
+        options = self.factory.runtime._options(config, "generate")
+        if not new_run and "repeat_times" not in config:
+            options.pop("repeat_times", None)
+        return {key: options[key] for key in ("agent_type", "phone_id", "app", "vla", "config", "phone_apps", "phone_ids", "execution_model", "planner_config", "repeat_times", "collection_artifacts_version") if key in options}
 
     def collection_runs(self, batch_id):
         return self.factory.collection_runs.list_runs(batch_id)
@@ -137,7 +143,7 @@ class PipelineRuntime:
         # Frozen pre-logprob pipelines keep their original default, regardless
         # of the factory settings now in effect. Do not rewrite their snapshot.
         options = {"agent_type": "newagent", **options, "config": {"capture_logprobs": False, **options["config"]}}
-        current = self.collection_options(options)
+        current = self.collection_options(options, new_run=False)
         if current != options:
             raise PipelineError("手机或 App 关联已变化，请结束流程后重新创建")
         request = {**options, "filename": batch["filename"],

@@ -3,6 +3,9 @@ import { computed, reactive, ref, watch, type ComputedRef } from 'vue'
 import type { FactoryRun, ReportFolder, ReportFile } from '@/phoneFactoryApi'
 import type { EvaluationProgress } from '@/composables/useEvaluationProgress'
 import DisplayId from './DisplayId.vue'
+import CollectionRunProgress from './CollectionRunProgress.vue'
+import CollectionArtifactDetails from './CollectionArtifactDetails.vue'
+import { runStatus, collectionProgressText, hasCollectionProgress } from '@/utils/phoneFactoryRuns'
 import { useDisplayIdentifiers } from '@/composables/useDisplayIdentifiers'
 import { agentLabel } from '@/utils/collectionAgents'
 import { runDisplayStatus, runMessage } from '@/utils/phoneFactoryRuns'
@@ -32,7 +35,7 @@ const results = computed(() => props.progress?.results.value)
 const progressBusy = computed(() => props.progress?.busy.value || false)
 const filteredRuns = computed(() => orderedRuns.value.filter(run =>
   (runControls.status === 'all' || (runControls.status === 'active' ? factoryRunActive(run) : factoryRunAbnormal(run)))
-  && (matches(runControls.query, 'run', factoryRunId(run), '', run.filename || '', runDisplayStatus(run), agentLabel(run.agent_type), runMessage(run))
+  && (matches(runControls.query, 'run', factoryRunId(run), '', run.filename || '', runDisplayStatus(run), agentLabel(run.agent_type), runMessage(run), collectionProgressText(run))
     || matches(runControls.query, 'batch', run.batch_id) || matches(runControls.query, 'batch', collectionTaskSource(run)))))
 const filteredCases = computed(() => (results.value?.cases || []).filter(row =>
   (caseControls.status === 'all' || (caseControls.status === 'active' ? evaluationCaseActive(row) : caseControls.status === 'abnormal' ? evaluationCaseAbnormal(row) : row.evaluation_status === 'completed'))
@@ -75,15 +78,16 @@ function showCases(runId: string) {
       <div class="detail-toolbar"><el-input v-model="runControls.query" clearable placeholder="搜索编号、文件名或结果" aria-label="搜索运行" /><el-select v-model="runControls.status" aria-label="运行状态筛选"><el-option label="全部状态" value="all" /><el-option label="活动运行" value="active" /><el-option label="异常运行" value="abnormal" /></el-select></div>
       <el-alert v-if="runError" :title="runError" type="warning" :closable="false" />
       <el-table :data="pagedRuns" :row-key="factoryRunId" :expand-row-keys="expandedRuns" border data-testid="factory-runs" @expand-change="(_row: FactoryRun, expanded: FactoryRun[]) => expandedRuns = expanded.map(factoryRunId)">
-        <el-table-column type="expand"><template #default="{ row }"><div class="expanded-record"><p v-if="row.filename">文件：{{ row.filename }}</p><p v-for="message in factoryRunErrors(row)" :key="message" class="error-text">{{ message }}</p><p v-if="!factoryRunErrors(row).length">{{ runMessage(row) || '暂无错误记录' }}</p><p v-if="evaluation">{{ evaluationModeLabel(row.execution_mode) }} · {{ row.evaluation_profile_id || '历史配置' }} · {{ evaluationSourceLabel(row) }}</p><template v-if="row.agent_type === 'pipelineagent'"><p>执行模型：{{ row.execution_model || '沿用采集端配置' }} · VLA 接口：{{ row.vla || '沿用采集端配置' }}</p><p>规划模型：{{ row.planner_config?.model || '沿用采集端配置' }} · 规划接口：{{ row.planner_config?.base_url || '沿用采集端配置' }}</p></template></div></template></el-table-column>
+        <el-table-column type="expand"><template #default="{ row }"><div class="expanded-record"><CollectionRunProgress :run="row" /><CollectionArtifactDetails :run="row" /><p v-if="!evaluation">每任务采集次数：{{ row.repeat_times ?? 1 }}</p><p v-if="row.filename">文件：{{ row.filename }}</p><p v-for="message in factoryRunErrors(row)" :key="message" class="error-text">{{ message }}</p><p v-if="!factoryRunErrors(row).length">{{ runMessage(row) || '暂无错误记录' }}</p><p v-if="evaluation">{{ evaluationModeLabel(row.execution_mode) }} · {{ row.evaluation_profile_id || '历史配置' }} · {{ evaluationSourceLabel(row) }}</p><template v-if="row.agent_type === 'pipelineagent'"><p>执行模型：{{ row.execution_model || '沿用采集端配置' }} · VLA 接口：{{ row.vla || '沿用采集端配置' }}</p><p>规划模型：{{ row.planner_config?.model || '沿用采集端配置' }} · 规划接口：{{ row.planner_config?.base_url || '沿用采集端配置' }}</p></template></div></template></el-table-column>
         <el-table-column v-if="!evaluation" label="任务来源" min-width="150"><template #default="{ row }"><DisplayId kind="batch" :id="collectionTaskSource(row)" /></template></el-table-column>
-        <el-table-column v-if="!evaluation" label="结果批次" min-width="150"><template #default="{ row }"><DisplayId kind="batch" :id="row.batch_id" /><small v-if="row.batch_status === 'published'"> · 已发布</small></template></el-table-column>
+        <el-table-column label="结果批次" min-width="150"><template #default="{ row }"><DisplayId kind="batch" :id="row.batch_id" /><small v-if="row.batch_status === 'published'"> · 已发布</small></template></el-table-column>
         <el-table-column label="运行编号" min-width="150"><template #default="{ row }"><DisplayId kind="run" :id="factoryRunId(row)" /></template></el-table-column>
         <el-table-column label="采集引擎" min-width="110"><template #default="{ row }">{{ row.execution_mode === 'evaluate_only' ? (row.source?.agent_type ? agentLabel(row.source.agent_type) : '已有轨迹') : agentLabel(row.agent_type) }}</template></el-table-column>
         <el-table-column label="时间" min-width="155"><template #default="{ row }">{{ row.created_at?.slice(0, 19).replace('T', ' ') || '—' }}</template></el-table-column>
         <el-table-column label="状态" width="105"><template #default="{ row }">{{ runDisplayStatus(row) }}</template></el-table-column>
+        <el-table-column label="采集 / 回传" min-width="150"><template #default="{ row }"><template v-if="row.collection_summary && hasCollectionProgress(row)">{{ runStatus(row.collection_status || 'pending') }} / {{ runStatus(row.transfer_status || 'waiting') }}<small class="transfer-count">已回传 {{ row.collection_summary.transferred_trajectory_count ?? 0 }}/{{ row.collection_summary.sealed_trajectory_count }} 条</small></template><template v-else>—</template></template></el-table-column>
         <el-table-column label="结果" min-width="170" show-overflow-tooltip><template #default="{ row }">{{ runMessage(row) }}</template></el-table-column>
-        <el-table-column label="操作" min-width="200"><template #default="{ row }"><el-button v-if="evaluation" link :disabled="progressBusy" @click="showCases(row.run_id)">查看用例</el-button><slot v-else name="run-actions" :run="row" /></template></el-table-column>
+        <el-table-column label="操作" min-width="200"><template #default="{ row }"><el-button v-if="evaluation" link :disabled="progressBusy" @click="showCases(row.run_id)">查看用例</el-button><slot name="run-actions" :run="row" /></template></el-table-column>
       </el-table>
       <el-pagination v-model:current-page="runControls.page" v-model:page-size="runControls.size" :page-sizes="[10, 20, 50]" :total="filteredRuns.length" layout="total, sizes, prev, pager, next" />
     </section>
@@ -123,5 +127,6 @@ function showCases(runId: string) {
 </template>
 
 <style scoped>
+.transfer-count{display:block;margin-top:4px;color:var(--muted);font-size:12px}
 .detail-tabs{position:sticky;top:0;z-index:2;display:flex;gap:6px;padding:0 0 14px;background:white;border-bottom:1px solid var(--line);margin-bottom:18px}.detail-tabs button{padding:9px 16px;background:transparent;border:0;border-radius:7px;color:var(--muted);cursor:pointer;font:inherit}.detail-tabs button.active{background:#e6f6f0;color:var(--accent-deep);font-weight:600}.detail-toolbar{display:flex;gap:12px;margin-bottom:14px;align-items:center}.detail-toolbar>.el-input{flex:1}.detail-toolbar>.el-select{width:230px}.detail-toolbar>.el-button{flex-shrink:0}.expanded-record{padding:10px 22px;white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px}.error-text{color:#b45309}.detail-hint{color:var(--muted);font-size:12px}.el-pagination{margin-top:18px;justify-content:flex-end;flex-wrap:wrap;gap:6px}.el-alert{margin-bottom:14px}:global(.factory-details-drawer .el-drawer__header){margin-bottom:0;padding-bottom:14px;border-bottom:1px solid var(--line)}@media(max-width:760px){:global(.factory-details-drawer){width:100vw!important}.detail-toolbar{flex-wrap:wrap}.detail-toolbar>.el-select{width:100%}.detail-tabs button{padding:9px 12px}.el-pagination{justify-content:flex-start}:global(.factory-details-drawer .el-drawer__body){padding:14px}}
 </style>

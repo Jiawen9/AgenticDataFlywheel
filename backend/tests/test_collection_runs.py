@@ -21,6 +21,11 @@ from backend.phonefactory_client import build_parser, cmd_start_run
 from backend.task_generation.collection_batches import collection_batch_payload, payload_digest, workbook_digest, write_collection_workbook
 from backend.task_generation.collection_input import build_collection_input
 
+STREAM_CAPABILITIES = json.dumps({"protocol_version": 1, "batch_results": True,
+    "collection_artifacts_version": 1, "agent_types": {"newagent": {"available": True,
+        "collection": True, "capture_logprobs": True, "collection_artifacts_version": 1,
+        "repeat_times": True, "max_repeat_times": 100}}})
+
 
 def seed_batch(root: Path, batch_id="batch-one", kind="task_generation"):
     rows = [{"result_id": "result-one", "task_uuid": "task-one", "task": "Open settings", "app": "Demo", "用例编号": "CASE-01"},
@@ -262,7 +267,7 @@ class CollectionRunTests(unittest.TestCase):
             if args[0] == "run":
                 return {"ok": False, "output": "unknown remote run"}
             if args[0] == "capabilities":
-                return {"ok": True, "output": '{"protocol_version":1,"batch_results":true}'}
+                return {"ok": True, "output": STREAM_CAPABILITIES}
             calls.append(args)
             return {"ok": True, "output": '{"ok":true}'}
         factory = PhoneFactoryStore(self.root, run_client_fn=remote)
@@ -288,8 +293,8 @@ class CollectionRunTests(unittest.TestCase):
             self.assertNotEqual(run["batch_id"], "batch-one")
             self.assertEqual(run["task_source_batch_id"], "batch-one")
             done = client.post(f"/api/phone-factory/collection-runs/{run_id}/complete", json={"batch_id": run["batch_id"], "trajectories": [entry]})
-            self.assertEqual(done.status_code, 200, done.text)
-            self.assertEqual(done.json()["status"], "completed")
+            self.assertEqual(done.status_code, 409, done.text)
+            self.assertIn("最终清单对账", done.text)
             self.assertEqual(client.get("/api/phone-factory/collection-runs?task_source_batch_id=batch-one").json()["runs"][0]["collection_run_id"], run_id)
             self.assertEqual(client.get("/api/phone-factory/collection-runs?batch_id=batch-one").json()["runs"], [])
             self.assertEqual(client.post("/api/phone-factory/collection-runs/missing/complete", json={}).status_code, 404)
@@ -301,13 +306,18 @@ class CollectionRunTests(unittest.TestCase):
             if args[0] == "run":
                 return {"ok": False, "output": "unknown remote run"}
             if args[0] == "capabilities":
-                return {"ok": True, "output": '{"protocol_version":1,"batch_results":true}'}
+                return {"ok": True, "output": STREAM_CAPABILITIES}
             calls.append(args)
             if len(calls) == 1:
                 return {"ok": False, "output": "mock timeout"}
             run_id = args[args.index("--collection-run-id") + 1]
             run = self.store.get(run_id)
-            self.complete(run)
+            entry = raw_trajectory(run)
+            entry.update(repeat_times=1, repeat_index=1, expanded_case_id="task-one-001")
+            manifest = {"batch_id": run["batch_id"], "trajectories": [entry]}
+            self.store.records.put("collection_artifact_transfers", run_id,
+                                   {"final_digest": payload_digest(manifest), "items": {}})
+            self.store.complete(run_id, manifest)
             return {"ok": True, "output": '{"ok":true}'}
         factory = PhoneFactoryStore(self.root, run_client_fn=remote)
         factory.dispatch("phone-apps", "POST", {"phone_id": "phone", "app": "Demo"})
@@ -340,7 +350,7 @@ class CollectionRunTests(unittest.TestCase):
             if args[0] == "run":
                 return {"ok": False, "output": "unknown remote run"}
             if args[0] == "capabilities":
-                return {"ok": True, "output": '{"protocol_version":1,"batch_results":true}'}
+                return {"ok": True, "output": STREAM_CAPABILITIES}
             calls.append(args)
             entered.set()
             release.wait(5)

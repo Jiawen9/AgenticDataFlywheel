@@ -12,13 +12,16 @@ export function factoryRunErrors(run: FactoryRun): string[] {
 
 export function factoryRunActive(run: FactoryRun): boolean {
   return ['dispatching', 'queued', 'starting', 'running'].includes(run.status)
-    || (['waiting', 'syncing', 'pending'].includes(run.transfer_status || '') && !['failed', 'cancelled', 'interrupted'].includes(run.status))
+    || ['waiting', 'syncing', 'pending', 'downloading', 'retry_wait'].includes(run.transfer_status || '')
+    || ['queued', 'starting', 'running'].includes(run.collection_status || '')
     || !!(run.evaluation_summary?.evaluation_running || run.evaluation_summary?.evaluation_pending)
 }
 
 export function factoryRunAbnormal(run: FactoryRun): boolean {
   return ['failed', 'interrupted', 'partial'].includes(run.status) || run.remote_status === 'partial'
-    || run.transfer_status === 'failed' || factoryRunErrors(run).length > 0
+    || ['failed', 'remote_failed'].includes(run.transfer_status || '') || factoryRunErrors(run).length > 0
+    || ['failed', 'partial', 'interrupted'].includes(run.collection_status || '')
+    || !!run.collection_summary?.collection_failed_count
     || !!(run.evaluation_summary?.evaluation_failed || run.evaluation_summary?.collection_failed)
 }
 

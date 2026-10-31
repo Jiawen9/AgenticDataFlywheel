@@ -39,6 +39,10 @@ def matches_legacy_logprobs_request(existing: dict, request: dict, *, nested_met
     options = request.get("metadata", {}) if nested_metadata else request
     frozen_options = frozen.get("metadata", {}) if nested_metadata else frozen
     legacy_options = dict(options)
+    if "repeat_times" not in frozen_options:
+        if type(legacy_options.get("repeat_times", 1)) is not int or legacy_options.get("repeat_times", 1) != 1:
+            return False
+        legacy_options.pop("repeat_times", None)
     if "agent_type" not in frozen_options:
         if legacy_options.get("agent_type", "newagent") != "newagent":
             return False
@@ -195,7 +199,8 @@ class CollectionRunStore:
         """New collection owns a child batch; a historical request keeps its identity."""
         _identifier(source_batch_id, "任务来源批次编号")
         _identifier(dispatch_key, "request_id")
-        legacy = self.get("cr_" + payload_digest([source_batch_id, dispatch_key]))
+        legacy = (self.get("cr_" + payload_digest([source_batch_id, dispatch_key]))
+                  if metadata.get("run_mode", "generate") == "generate" else None)
         if legacy is not None:
             request = {"batch_id": source_batch_id, "metadata": metadata,
                        "workbook_sha256": workbook_sha256 or legacy["request"].get("workbook_sha256")}
@@ -256,7 +261,9 @@ class CollectionRunStore:
             if not by_case:
                 raise CollectionRunError("采集批次没有任务")
             request = {"batch_id": batch_id, "metadata": metadata or {}, "workbook_sha256": workbook_sha256 or batch.get("workbook_sha256")}
-            run_id = "cr_" + (payload_digest([batch_id, dispatch_key]) if dispatch_key else uuid.uuid4().hex)
+            run_id = (batch["collection_run_id"] if batch.get("batch_role") == "collection_result" else
+                      "cr_" + (payload_digest([batch_id, dispatch_key]) if dispatch_key else uuid.uuid4().hex))
+            _identifier(run_id, "采集运行编号")
             root = self.run_root(batch_id, run_id)
             payload = {
                 "schema_version": 1, "batch_id": batch_id, "collection_run_id": run_id, "run_id": run_id,
@@ -388,8 +395,22 @@ class CollectionRunStore:
             for key, value in entry_provenance.items():
                 if not isinstance(value, str) or not value or len(value) > 256:
                     raise CollectionRunError(f"轨迹 {key} 无效")
+            instance = {}
+            if options.get("collection_artifacts_version") == 1 or any(key in entry for key in ("repeat_index", "repeat_times")):
+                repeat, index = entry.get("repeat_times"), entry.get("repeat_index")
+                if (type(repeat) is not int or not 1 <= repeat <= 100 or type(index) is not int
+                        or not 1 <= index <= repeat or repeat != options.get("repeat_times", 1)):
+                    raise CollectionRunError("轨迹重复次数或序号与冻结请求不匹配")
+                instance.update(repeat_times=repeat, repeat_index=index,
+                                expanded_case_id=_component(entry.get("expanded_case_id"), "扩展用例编号"))
+            if "execution_status" in entry:
+                value = entry["execution_status"]
+                if value not in {"completed", "failed", "cancelled", "interrupted", "timeout"}:
+                    raise CollectionRunError("轨迹执行状态无效")
+                instance["execution_status"] = value
             trajectories.append({
                 **entry_provenance,
+                **instance,
                 "collection_run_id": run["collection_run_id"], "collection_case_id": case_id,
                 "task_id": source_task["task_id"], "source_result_id": source_task["source_result_id"],
                 "task": source_task.get("task"), "app": source_task.get("app"),
@@ -407,7 +428,18 @@ class CollectionRunStore:
             case_id = item.get("collection_case_id")
             if case_id is not None and case_id not in run["batch_tasks"]:
                 raise CollectionRunError("失败用例不属于本采集批次")
-            normalized_errors.append({"collection_case_id": case_id, "error": item.get("error", item.get("message"))})
+            detail = {}
+            if options.get("collection_artifacts_version") == 1:
+                for key in ("phone_id", "source_trajectory_id", "expanded_case_id"):
+                    if key in item:
+                        if not isinstance(item[key], str) or len(item[key]) > 256:
+                            raise CollectionRunError("失败用例身份无效")
+                        detail[key] = item[key]
+                if "repeat_index" in item:
+                    if type(item["repeat_index"]) is not int or not 1 <= item["repeat_index"] <= options.get("repeat_times", 1):
+                        raise CollectionRunError("失败用例重复序号无效")
+                    detail["repeat_index"] = item["repeat_index"]
+            normalized_errors.append({"collection_case_id": case_id, "error": item.get("error", item.get("message")), **detail})
         return {**provenance, "batch_id": run["batch_id"], "collection_run_id": run["collection_run_id"],
                 "trajectories": sorted(trajectories, key=lambda item: item["relative_dir"]),
                 "errors": normalized_errors}
@@ -500,6 +532,11 @@ class CollectionRunStore:
                     raise CollectionRunError("采集运行不存在", 404)
                 if run["status"] == "interrupted":
                     raise CollectionRunError("采集运行已中断，不能回写迟到结果")
+                if run.get("request", {}).get("metadata", {}).get("collection_artifacts_version") == 1:
+                    journal = self.records.get("collection_artifact_transfers", run_id)
+                    if (not journal or journal.get("final_digest") != payload_digest(manifest)
+                            or any(item.get("status") != "completed" for item in journal.get("items", {}).values())):
+                        raise CollectionRunError("逐条回传运行必须先完成最终清单对账，不能提前登记完成")
                 completed_at = run.get("completed_at") or _now()
                 normalized = self._normalize(run, manifest, completed_at)
                 self._validate_sources(run, normalized)

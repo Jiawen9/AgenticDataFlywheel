@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createSSRApp, defineComponent, h, ref } from 'vue'
 import { renderToString } from '@vue/server-renderer'
 import { createMemoryHistory, createRouter } from 'vue-router'
-import { phoneFactoryApi, type FactoryBatchSummary } from '@/phoneFactoryApi'
+import { phoneFactoryApi, modelIterationApi, type FactoryBatchSummary } from '@/phoneFactoryApi'
 import { ElMessage } from 'element-plus'
 import { notifyBatchesPublished } from '@/utils/batchLifecycle'
 import PhoneFactoryCollectionView from './PhoneFactoryCollectionView.vue'
@@ -82,6 +82,29 @@ async function render(mode: 'generate' | 'modeliter' = 'generate', capture?: (vi
 }
 
 describe('phone collection batch picker', () => {
+  it('shows repeat controls only for production collection', async () => {
+    expect(await render('generate')).toContain('data-testid="repeat-times"')
+    expect(await render('modeliter')).not.toContain('data-testid="repeat-times"')
+    expect(await render('modeliter')).not.toContain('data-testid="custom-run-repeat-times"')
+  })
+
+  it('retries only linked collection transfers from evaluation without changing the selected run', async () => {
+    let view: any
+    await render('modeliter', value => { view = value })
+    const run = { run_id: 'eval-transfer', collection_run_id: 'eval-transfer', batch_id: 'eval-result', execution_mode: 'collect_and_evaluate', status: 'running', transfer_status: 'failed' }
+    view.runs = [run]; view.evaluationProgress.selectRun(run.run_id)
+    const retry = vi.spyOn(modelIterationApi, 'retryTransfer').mockResolvedValue({ ...run, transfer_status: 'waiting' } as never)
+    const sync = vi.spyOn(modelIterationApi, 'syncRun')
+    await view.syncRun(run)
+    expect(retry).toHaveBeenCalledWith('eval-transfer'); expect(sync).not.toHaveBeenCalled()
+    expect(view.runs[0].transfer_status).toBe('waiting')
+    expect(view.evaluationProgress.selectedRun.value).toBe('eval-transfer')
+    await view.syncRun({ ...run, execution_mode: 'evaluate_only' })
+    await view.syncRun({ ...run, batch_id: undefined })
+    await view.syncRun({ ...run, batch_status: 'published' })
+    expect(retry).toHaveBeenCalledTimes(1)
+  })
+
   it('uses server publication state after reload and keeps the release link while blocking mutations', async () => {
     let view: any
     await render('generate', value => { view = value })

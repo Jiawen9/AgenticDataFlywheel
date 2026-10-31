@@ -36,6 +36,8 @@ class HandoffLegacyCompatibilityTests(unittest.TestCase):
             if self.protocol == "legacy":
                 return {"ok": False, "output": "404: legacy collector has no capabilities endpoint"}
             value.update(protocol_version=1, batch_results=True, model_iteration_evaluation=1)
+            from backend.tests.collector_protocol_support import current_capabilities
+            current_capabilities(value)
         elif args[0] == "start-run":
             captured = {"args": list(args), "apps": json.loads(Path(args[2]).read_text(encoding="utf-8"))}
             if "--task-manifest" in args:
@@ -95,9 +97,9 @@ class HandoffLegacyCompatibilityTests(unittest.TestCase):
                     self.protocol = protocol
                     store = self.make_store(protocol + "-" + mode)
                     self.upload(store, mode)
-                    if protocol == "legacy" and mode == "modeliter":
+                    if protocol == "legacy":
                         count = len(self.dispatched)
-                        with self.assertRaisesRegex(PhoneFactoryError, "能力检查失败"):
+                        with self.assertRaises(PhoneFactoryError):
                             store.remote_start(self.request(run_mode=mode), mode=mode)
                         self.assertEqual(len(self.dispatched), count)
                         continue
@@ -115,7 +117,7 @@ class HandoffLegacyCompatibilityTests(unittest.TestCase):
                     for flag in ("--collection-run-id", "--task-manifest"):
                         self.assertEqual(flag in args, protocol == "http")
                     for flag in ("--batch-id", "--output-dir"):
-                        self.assertEqual(flag in args, protocol == "http" and mode == "generate")
+                        self.assertEqual(flag in args, protocol == "http")
                     if protocol == "http":
                         self.assertEqual(args[args.index("--collection-run-id") + 1], run["collection_run_id"])
                         self.assertEqual(len(dispatch["tasks"]), 1)
@@ -128,9 +130,8 @@ class HandoffLegacyCompatibilityTests(unittest.TestCase):
                     self.assertEqual(repeated["collection_run_id"], run["collection_run_id"])
                     self.assertEqual(len(self.dispatched), start_count)
                     if mode == "modeliter":
-                        self.assertEqual(store.collection_runs.list_runs(), [])
-                        self.assertEqual(store.runtime.batches(), [])
-                        self.assertFalse((store.root / "batches").exists())
+                        self.assertEqual(store.collection_runs.get(run["run_id"])["batch_id"], run["batch_id"])
+                        self.assertTrue((store.root / "batches").exists())
                     else:
                         self.assertEqual(store.records.list("model_iter_runs"), [])
 
@@ -158,12 +159,12 @@ class HandoffLegacyCompatibilityTests(unittest.TestCase):
         for identifier, saved in before.items():
             self.assertEqual(store.records.get("model_iter_runs", identifier), saved)
             self.assertEqual(saved["status"], "running")
-        self.assertEqual(store.collection_runs.list_runs(), [])
+        self.assertEqual([run["run_id"] for run in store.collection_runs.list_runs()], [modern["run_id"]])
 
     def test_production_recovery_skips_legacy_even_with_old_transfer_state(self):
         store = self.make_store()
         self.upload(store, "generate")
-        legacy = store.remote_start(self.request("legacy"))
+        legacy = store.runtime.remote_start(self.request("legacy"), "generate", legacy_batch=True)
         store.records.update("collection_runs", legacy["collection_run_id"],
             lambda item: item.update(transfer_status="waiting"))
         self.protocol = "http"

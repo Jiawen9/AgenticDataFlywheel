@@ -48,6 +48,8 @@ class OfflineEvaluationTests(unittest.TestCase):
             value.update(protocol_version=1, batch_results=True, model_iteration_evaluation=self.online,
                          offline_evaluation=self.offline, evaluation_profiles=self.profiles,
                          checklist_policies=["llm", "auto"])
+            from backend.tests.collector_protocol_support import current_capabilities
+            current_capabilities(value)
         elif command == "evaluation-profiles":
             value = {"profiles": [self.profile], "errors": []}
         elif command == "evaluation-sources":

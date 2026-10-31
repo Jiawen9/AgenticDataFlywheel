@@ -133,6 +133,9 @@ def cmd_start_run(args):
     for key in ("execution_model", "planner_config"):
         if getattr(args, key, None):
             fields[key] = getattr(args, key)
+    for key in ("repeat_times", "collection_artifacts_version"):
+        if getattr(args, key, None) is not None:
+            fields[key] = str(getattr(args, key))
     evaluator_config = getattr(args, "evaluator_config", None)
     if fields["runmode"] == "modeliter" and evaluator_config:
         fields.update(evaluator_config=evaluator_config, checklist_source=args.checklist_source,
@@ -177,6 +180,8 @@ def build_parser():
     run.add_argument("--vla", default="")
     run.add_argument("--execution-model", default="")
     run.add_argument("--planner-config")
+    run.add_argument("--repeat-times", type=int)
+    run.add_argument("--collection-artifacts-version", type=int, choices=[1])
     run.add_argument("--runmode", choices=["generate", "modeliter"], default="generate")
     run.add_argument("--batch-id")
     run.add_argument("--collection-run-id")
@@ -200,6 +205,17 @@ def build_parser():
     archive = sub.add_parser("run-archive")
     archive.add_argument("run_id")
     archive.add_argument("--out", required=True)
+    for command in ("collection-artifacts", "collection-artifact", "collection-artifact-archive",
+                    "collection-manifest", "collection-archive"):
+        item = sub.add_parser(command)
+        item.add_argument("run_id")
+        if command == "collection-artifacts":
+            item.add_argument("--cursor", type=int, default=0)
+            item.add_argument("--limit", type=int, default=100)
+        if command in {"collection-artifact", "collection-artifact-archive"}:
+            item.add_argument("artifact_id")
+        if command.endswith("archive"):
+            item.add_argument("--out", required=True)
     reports = sub.add_parser("reports")
     reports.add_argument("--runmode", choices=["generate", "modeliter"], default="modeliter")
     download = sub.add_parser("report-download")
@@ -248,6 +264,16 @@ def main():
         result = post_json("/runs/" + urllib.parse.quote(args.run_id, safe="") + "/cancel", {})
     elif args.cmd == "run-archive":
         result = download_file("/runs/" + urllib.parse.quote(args.run_id, safe="") + "/archive", args.out)
+    elif args.cmd.startswith("collection-"):
+        base = "/runs/" + urllib.parse.quote(args.run_id, safe="") + "/"
+        if args.cmd == "collection-artifacts":
+            result = get_json(base + "collection-artifacts?" + urllib.parse.urlencode(
+                {"cursor": args.cursor, "limit": args.limit}))
+        elif args.cmd in {"collection-artifact", "collection-artifact-archive"}:
+            path = base + "collection-artifacts/" + urllib.parse.quote(args.artifact_id, safe="")
+            result = download_file(path + "/archive", args.out) if args.cmd.endswith("archive") else get_json(path)
+        else:
+            result = download_file(base + args.cmd, args.out) if args.cmd.endswith("archive") else get_json(base + args.cmd)
     elif args.cmd == "reports":
         result = get_json("/reports?" + urllib.parse.urlencode({"runmode": args.runmode}))
     else:

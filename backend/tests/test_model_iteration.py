@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 from backend import model_iteration, phonefactory_client
 from backend.phone_factory import PhoneFactoryStore, PhoneFactoryError, create_router
 from backend.tests.test_phone_factory_runtime import workbook_bytes
+from backend.tests.collector_protocol_support import current_capabilities
 
 
 def evaluator_config():
@@ -48,6 +49,7 @@ class ModelIterationTests(unittest.TestCase):
         value = {"ok": True}
         if args[0] == "capabilities":
             value.update(protocol_version=1, batch_results=True, model_iteration_evaluation=int(self.supported))
+            current_capabilities(value)
         elif args[0] == "start-run":
             run_id = args[args.index("--collection-run-id") + 1]
             mode = args[args.index("--runmode") + 1]
@@ -101,14 +103,14 @@ class ModelIterationTests(unittest.TestCase):
         self.assertEqual(run["request"]["evaluation_mode"], "checklist")
         args = next(args for args in self.calls if args[0] == "start-run")
         self.assertEqual(json.loads(args[args.index("--evaluator-config") + 1]), custom)
-        self.assertNotIn("--batch-id", args)
+        self.assertEqual(args[args.index("--batch-id") + 1], run["batch_id"])
         self.assertEqual(model_iteration.get_config(self.store), evaluator_config())
         changed = evaluator_config(); changed["text"]["model"] = "text-new-default"
         model_iteration.save_config(self.store, changed)
         self.assertTrue(self.start(evaluator_config=custom)["reused"])
         self.assertEqual(self.store.records.get("model_iter_runs", run["run_id"])["request"]["evaluator_config"], custom)
         with self.assertRaisesRegex(PhoneFactoryError, "request_id"): self.start()
-        self.assertEqual(self.store.records.list("collection_runs"), [])
+        self.assertEqual(self.store.collection_runs.get(run["run_id"])["batch_id"], run["batch_id"])
 
     def test_evaluator_upgrade_is_detected_without_reusing_old_protocol_cache(self):
         self.store.runtime._protocol_cache = "unsupported"
