@@ -65,7 +65,7 @@ def _client_failure(output: str) -> dict:
             metadata = json.loads(first[len(CLIENT_ERROR_PREFIX):])
             kind = metadata.get("remote_kind") if isinstance(metadata, dict) else None
             code = metadata.get("remote_status") if isinstance(metadata, dict) else None
-            if kind in {"http", "timeout", "connection", "protocol", "client"}:
+            if kind in {"http", "timeout", "connection", "protocol", "client", "storage"}:
                 details["remote_kind"] = kind
                 if kind == "http" and type(code) is int and 100 <= code <= 599:
                     details["remote_status"] = code
@@ -361,8 +361,8 @@ class PhoneFactoryStore:
             not_sent = result.get("dispatch_not_sent", failure.get("dispatch_not_sent")) is True
             command = args[0] if args else None
             # Other remote commands retain the established gateway error contract.
-            rejected = command == "start-run" and kind == "http" and status == 413 and not not_sent
-            raise PhoneFactoryError(failure["output"], 413 if rejected else 502,
+            rejected = command == "start-run" and kind == "http" and status in {400, 409, 413, 422} and not not_sent
+            raise PhoneFactoryError(failure["output"], status if rejected else 502,
                 remote_kind=kind, remote_status=status, remote_command=command,
                 dispatch_not_sent=not_sent)
         try:

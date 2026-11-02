@@ -177,36 +177,9 @@ def preview_source(store, data):
     if len(source) != 1:
         raise PhoneFactoryError("请选择一个已有采集运行，或填写一个服务器轨迹目录")
     value = store._remote_result(["evaluation-preview", "--payload", json.dumps(source, ensure_ascii=False)])
-    if (not isinstance(value, dict) or type(value.get("valid")) is not bool
-            or not isinstance(value.get("errors"), list) or not isinstance(value.get("cases"), list)
-            or type(value.get("trajectory_count")) is not int or value["trajectory_count"] < 0):
-        raise PhoneFactoryError("远端轨迹预览格式无效", 502)
-    if not value["valid"]:
-        return value
-    try:
-        preview_id = _identifier(value.get("preview_id"), "预览编号")
-    except Exception as exc:
-        raise PhoneFactoryError("远端预览编号无效", 502) from exc
-    if (not isinstance(value.get("source"), dict) or not isinstance(value.get("source_digest"), str)
-            or not re.fullmatch(r"[0-9a-f]{64}", value["source_digest"])
-            or value["trajectory_count"] != len(value["cases"]) or not value["cases"] or value["errors"]):
-        raise PhoneFactoryError("远端轨迹预览身份或数量无效", 502)
-    seen = set()
-    for row in value["cases"]:
-        if (not isinstance(row, dict) or any(not isinstance(row.get(key), str) or not row[key].strip()
-                for key in ("source_trajectory_id", "case_id", "task"))
-                or row["source_trajectory_id"] in seen or not isinstance(row.get("phone_id", ""), str)):
-            raise PhoneFactoryError("远端轨迹预览存在缺失或重复的轨迹身份", 502)
-        seen.add(row["source_trajectory_id"])
-    # A server preview is an immutable manifest. Keep it locally so later result
-    # rows are checked against source identities, not against selected phones.
-    existing = store.records.get("model_iter_previews", preview_id)
-    record = {"preview_id": preview_id, "request": source, "preview": value, "created_at": utc_now()}
-    if existing and existing["preview"] != value:
-        raise PhoneFactoryError("远端复用了不同内容的预览编号", 502)
-    if not existing:
-        store.records.put("model_iter_previews", preview_id, record, expected_revision=0)
-    return value
+    from .evaluation_previews import accept
+    return accept(store, source, value)
+
 
 
 def validate_results(value, run_id, expected_phones, *, expected_sources=None, metadata=None):
@@ -219,7 +192,7 @@ def validate_results(value, run_id, expected_phones, *, expected_sources=None, m
     summary = value["summary"]
     if any(type(summary.get(key)) is not int or summary[key] < 0 for key in COUNTS):
         raise PhoneFactoryError("远端评测计数无效", 502)
-    cases, seen = [], set()
+    cases, seen, source_seen = [], set(), set()
     for row in value["cases"]:
         if (not isinstance(row, dict) or not isinstance(row.get("case_key"), str)
                 or not row["case_key"] or row["case_key"] in seen
@@ -235,8 +208,9 @@ def validate_results(value, run_id, expected_phones, *, expected_sources=None, m
             if (not expected or row.get("case_id") != expected["case_id"]
                     or row.get("phone_id", "") != expected.get("phone_id", "")):
                 raise PhoneFactoryError("远端独立评测结果与输入轨迹身份不匹配", 502)
-            if any(case.get("source_trajectory_id") == source_id for case in cases):
+            if source_id in source_seen:
                 raise PhoneFactoryError("远端独立评测重复返回同一条输入轨迹", 502)
+            source_seen.add(source_id)
         if row["evaluation_status"] == "completed" and (
                 row["collection_status"] != "completed" or row.get("verdict") not in VERDICTS):
             raise PhoneFactoryError("已评测用例必须采集完成并包含有效结论", 502)
@@ -246,8 +220,19 @@ def validate_results(value, run_id, expected_phones, *, expected_sources=None, m
         cases.append(row)
     if summary["total"] != len(cases):
         raise PhoneFactoryError("远端评测总数与用例明细不一致", 502)
-    if expected_sources is not None and len(cases) != len(expected_sources):
-        raise PhoneFactoryError("远端独立评测用例总数与输入快照不一致", 502)
+    excluded = value.get("excluded", [])
+    if not isinstance(excluded, list) or any(not isinstance(row, dict) or not isinstance(row.get("error"), str) for row in excluded):
+        raise PhoneFactoryError("远端评测排除清单格式无效", 502)
+    if expected_sources is not None:
+        missing = set(expected_sources) - source_seen
+        accounted = {row.get("source_trajectory_id") for row in excluded if row.get("error")}
+        if not missing.issubset(accounted):
+            raise PhoneFactoryError("远端独立评测遗漏输入轨迹，且未提供排除原因", 502)
+    coverage = value.get("coverage")
+    if coverage is not None and (not isinstance(coverage, dict)
+            or any(type(coverage.get(k)) is not int or coverage[k] < 0 for k in ("total", "included", "excluded"))
+            or coverage["included"] != len(cases) or coverage["total"] != coverage["included"] + coverage["excluded"]):
+        raise PhoneFactoryError("远端评测覆盖统计无效", 502)
     # Derive every count from validated identities, never trust a stale aggregate.
     summary = {key: 0 for key in COUNTS}
     summary["total"] = len(cases)
@@ -266,7 +251,7 @@ def validate_results(value, run_id, expected_phones, *, expected_sources=None, m
             summary["evaluation_pending"] += 1
     denominator = sum(summary[key] for key in VERDICTS)
     summary["success_rate"] = summary["success"] / denominator if denominator else None
-    return {**{key: value[key] for key in PROVENANCE_FIELDS if key in value}, "run_id": run_id, "run_mode": "modeliter", "summary": summary, "cases": cases, **(metadata or {})}
+    return {**{key: value[key] for key in (*PROVENANCE_FIELDS, "coverage", "excluded", "evidence_warnings") if key in value}, "run_id": run_id, "run_mode": "modeliter", "summary": summary, "cases": cases, **(metadata or {})}
 
 
 def capture_results(runtime, run, *, final=False, remote_status=None):

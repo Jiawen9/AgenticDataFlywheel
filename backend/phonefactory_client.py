@@ -135,10 +135,20 @@ def download_file(path, destination):
     temporary = output.with_name(output.name + "." + uuid.uuid4().hex + ".part")
     try:
         output.parent.mkdir(parents=True, exist_ok=True)
-        with urllib.request.urlopen(urllib.request.Request(SERVER + path, headers=_headers()),
-                                    timeout=TRANSFER_TIMEOUT) as response, temporary.open("xb") as stream:
+        try:
+            response = urllib.request.urlopen(urllib.request.Request(SERVER + path, headers=_headers()),
+                                              timeout=TRANSFER_TIMEOUT)
+        except OSError as exc:
+            _error(exc)
+        with response, temporary.open("xb") as stream:
             total = 0
-            while chunk := response.read(1024 * 1024):
+            while True:
+                try:
+                    chunk = response.read(1024 * 1024)
+                except OSError as exc:
+                    _error(exc)
+                if not chunk:
+                    break
                 total += len(chunk)
                 if total > MAX_DOWNLOAD:
                     raise ValueError("采集归档超过配置的下载上限")
@@ -147,10 +157,15 @@ def download_file(path, destination):
             os.fsync(stream.fileno())
         temporary.replace(output)
         return {"ok": True, "local_file": str(output), "size": total}
-    except (OSError, ValueError) as exc:
+    except OSError as exc:
+        _exit_error(f"错误：平台存储不可写，回传保留为待恢复（{type(exc).__name__}）", "storage")
+    except ValueError as exc:
         _error(exc)
     finally:
-        temporary.unlink(missing_ok=True)
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass  # Preserve the original storage failure, including its category.
 
 
 def cmd_add_phone(phoneid):
@@ -239,7 +254,7 @@ def build_parser():
     run.add_argument("--execution-model", default="")
     run.add_argument("--planner-config")
     run.add_argument("--repeat-times", type=int)
-    run.add_argument("--collection-artifacts-version", type=int, choices=[1])
+    run.add_argument("--collection-artifacts-version", type=int, choices=[1, 2])
     run.add_argument("--runmode", choices=["generate", "modeliter"], default="generate")
     run.add_argument("--batch-id")
     run.add_argument("--collection-run-id")
@@ -257,9 +272,17 @@ def build_parser():
     sub.add_parser("evaluation-sources")
     for command in ("evaluation-preview", "start-evaluation"):
         sub.add_parser(command).add_argument("--payload", required=True)
+    preview = sub.add_parser("evaluation-preview-status")
+    preview.add_argument("preview_id")
+    preview.add_argument("--offset", type=int, default=0)
+    preview.add_argument("--limit", type=int, default=50)
     sub.add_parser("run").add_argument("run_id")
     sub.add_parser("run-evaluations").add_argument("run_id")
     sub.add_parser("cancel-run").add_argument("run_id")
+    sub.add_parser("retry-collection-artifacts").add_argument("run_id")
+    pressure = sub.add_parser("receipt-storage")
+    pressure.add_argument("run_id")
+    pressure.add_argument("--payload", required=True)
     archive = sub.add_parser("run-archive")
     archive.add_argument("run_id")
     archive.add_argument("--out", required=True)
@@ -304,6 +327,16 @@ def main():
         result = post_json("/adb_devices", {})
     elif args.cmd == "capabilities":
         result = get_json("/capabilities")
+    elif args.cmd == "retry-collection-artifacts":
+        result = post_json("/runs/" + urllib.parse.quote(args.run_id, safe="") + "/collection-artifacts/retry", {})
+    elif args.cmd == "receipt-storage":
+        payload = json.loads(args.payload)
+        if not isinstance(payload, dict) or type(payload.get("paused")) is not bool:
+            sys.exit("错误：存储背压请求必须包含 paused 布尔值")
+        result = post_json("/runs/" + urllib.parse.quote(args.run_id, safe="") + "/receipt-storage", payload)
+    elif args.cmd == "evaluation-preview-status":
+        result = get_json("/evaluation_previews/" + urllib.parse.quote(args.preview_id, safe="") + "?" +
+                          urllib.parse.urlencode({"offset": args.offset, "limit": args.limit}))
     elif args.cmd in {"evaluation-profiles", "evaluation-sources"}:
         result = get_json("/" + args.cmd.replace("-", "_"))
     elif args.cmd in {"evaluation-preview", "start-evaluation"}:

@@ -7,6 +7,7 @@ import io
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -37,6 +38,7 @@ class OfflineEvaluationTests(unittest.TestCase):
                         "allowed_roots": ["D:/collector/archive"]}
         self.lose_ack = False
         self.store = PhoneFactoryStore(Path(temporary.name), run_client_fn=self.client)
+        self.addCleanup(self.store.runtime.close)
         # Deliberately omit all phone, APP, workbook and target VLA settings.
         model_iteration.save_config(self.store, evaluator_config())
 
@@ -83,6 +85,7 @@ class OfflineEvaluationTests(unittest.TestCase):
             value = self.snapshots[args[1]]
         elif command == "cancel-run":
             self.runs[args[1]]["status"] = "cancelled"
+            value = {**self.runs[args[1]], "ok": True}
             for row in self.snapshots[args[1]]["cases"]:
                 row.update(evaluation_status="needs_review", verdict=None)
         return {"ok": True, "output": json.dumps(value)}
@@ -215,7 +218,7 @@ class OfflineEvaluationTests(unittest.TestCase):
         self.preview.update(valid=False, errors=["missing screenshot"])
         result = self.make_preview()
         self.assertEqual(result["errors"], ["missing screenshot"])
-        with self.assertRaisesRegex(PhoneFactoryError, "先预览"):
+        with self.assertRaisesRegex(PhoneFactoryError, "预览尚未完成或没有可评测轨迹"):
             self.start()
 
     def test_previews_are_immutable_and_run_source_selection_supported(self):
@@ -253,7 +256,14 @@ class OfflineEvaluationTests(unittest.TestCase):
             run_id = response.json()["run_id"]
             cancelled = client.post(f"/api/model-iter/runs/{run_id}/cancel", json={})
             self.assertEqual(cancelled.status_code, 200, cancelled.text)
-            self.assertEqual(cancelled.json()["status"], "cancelled")
+            self.assertTrue(cancelled.json()["stop_accepted"])
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                state = self.store.records.get("model_iter_runs", run_id)
+                if state["status"] == "cancelled":
+                    break
+                time.sleep(.01)
+            self.assertEqual(state["status"], "cancelled")
 
     def test_old_llm_config_remains_valid_auto_requires_profile(self):
         self.assertEqual(model_iteration.evaluation_options(self.store, {})["checklist_source"], "llm")

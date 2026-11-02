@@ -5,22 +5,24 @@ export const newestFactoryRuns = (runs: FactoryRun[]) => [...runs].sort((a, b) =
   (b.created_at || '').localeCompare(a.created_at || '') || factoryRunId(b).localeCompare(factoryRunId(a)))
 
 export function factoryRunErrors(run: FactoryRun): string[] {
-  return [...new Set([run.transfer_error, run.dispatch_error, run.error,
+  return [...new Set([run.control_error, run.receipt_storage?.error, run.transfer_error, run.dispatch_error, run.error,
     ...(run.errors || []).map(item => item.error || item.message),
     ...(run.remote_errors || []).map(item => item.error || item.message)].filter((value): value is string => !!value))]
 }
 
 export function factoryRunActive(run: FactoryRun): boolean {
-  return ['dispatching', 'queued', 'starting', 'running'].includes(run.status)
+  return ['preparing', 'dispatching', 'queued', 'starting', 'running', 'stopping', 'needs_attention'].includes(run.status)
     || ['waiting', 'syncing', 'pending', 'downloading', 'retry_wait'].includes(run.transfer_status || '')
-    || ['queued', 'starting', 'running'].includes(run.collection_status || '')
+    || ['preparing', 'queued', 'starting', 'running', 'stopping', 'needs_attention'].includes(run.collection_status || '')
+    || run.archive_status === 'building'
     || !!(run.evaluation_summary?.evaluation_running || run.evaluation_summary?.evaluation_pending)
 }
 
 export function factoryRunAbnormal(run: FactoryRun): boolean {
   return ['failed', 'interrupted', 'partial'].includes(run.status) || run.remote_status === 'partial'
-    || ['failed', 'remote_failed'].includes(run.transfer_status || '') || factoryRunErrors(run).length > 0
+    || ['failed', 'remote_failed', 'partial'].includes(run.transfer_status || '') || factoryRunErrors(run).length > 0
     || ['failed', 'partial', 'interrupted'].includes(run.collection_status || '')
+    || run.collection_status === 'needs_attention' || !!run.collection_summary?.quarantined_count
     || !!run.collection_summary?.collection_failed_count
     || !!(run.evaluation_summary?.evaluation_failed || run.evaluation_summary?.collection_failed)
 }

@@ -186,7 +186,7 @@ class CollectionResultBatchStore:
             except RevisionConflict as exc:
                 raise CollectionRunError("相同 request_id 对应的采集配置或任务来源不同") from exc
             run_id = ("eval_" + payload_digest(dispatch_key)
-                      if metadata.get("run_mode") == "modeliter" and metadata.get("collection_artifacts_version") == 1
+                      if metadata.get("run_mode") == "modeliter" and metadata.get("collection_artifacts_version") in {1, 2}
                       else "cr_" + payload_digest([batch_id, dispatch_key]))
             filename = f"collection-batch-{batch_id}.xlsx"
             created = utc_now()

@@ -1,6 +1,7 @@
 """Frozen collection options; saved defaults never alter an accepted request."""
 
-COLLECTION_ARTIFACTS_VERSION = 1
+COLLECTION_ARTIFACTS_VERSION = 2
+SUPPORTED_ARTIFACT_VERSIONS = (1, 2)
 MAX_REPEAT_TIMES = 100
 
 

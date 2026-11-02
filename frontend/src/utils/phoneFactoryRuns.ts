@@ -1,6 +1,6 @@
 import type { FactoryRun } from '@/phoneFactoryApi'
 
-export const runStatus = (status: string) => ({ dispatching: '正在下发', queued: '排队中', starting: '启动中', running: '运行中', completed: '已完成', succeeded: '已完成', failed: '失败', cancelled: '已取消', interrupted: '已中断', partial: '部分完成', ready: '结果已就绪', waiting: '等待回传', syncing: '正在回传', downloading: '正在下载', verified: '已校验', timeout: '超时', retry_wait: '等待重试', remote_failed: '采集无有效轨迹', pending: '等待中' } as Record<string, string>)[status] || status
+export const runStatus = (status: string) => ({ preparing: '准备中', stopping: '正在停止', needs_attention: '等待对账', not_run: '未执行', quarantined: '已隔离', received: '已保存', building: '构建中', dispatching: '正在下发', queued: '排队中', starting: '启动中', running: '运行中', completed: '已完成', succeeded: '已完成', failed: '失败', cancelled: '已取消', interrupted: '已中断', partial: '部分完成', ready: '结果已就绪', waiting: '等待回传', syncing: '正在回传', downloading: '正在下载', verified: '已校验', timeout: '超时', retry_wait: '等待重试', remote_failed: '采集无有效轨迹', pending: '等待中' } as Record<string, string>)[status] || status
 
 export function collectionProgressText(run: Partial<FactoryRun>): string {
   const summary = run.collection_summary
@@ -18,20 +18,24 @@ export function hasCollectionProgress(run: Partial<FactoryRun>): boolean {
 
 export function canPreprocessCollection(run: FactoryRun): boolean {
   if (!run.batch_id || run.execution_mode === 'evaluate_only') return false
-  if (run.collection_artifacts_version === 1 || run.execution_mode === 'collect_and_evaluate') return run.transfer_status === 'completed' && (run.collection_summary?.transferred_trajectory_count ?? run.trajectory_count ?? 0) > 0
+  if (run.receipt_policy_version === 2) return run.receipt_closed === true && ['completed', 'partial'].includes(run.transfer_status || '') && (run.collection_summary?.preprocessing_eligible_count ?? 0) > 0
+  if ([1, 2].includes(run.collection_artifacts_version || 0) || run.execution_mode === 'collect_and_evaluate') return run.transfer_status === 'completed' && (run.collection_summary?.transferred_trajectory_count ?? run.trajectory_count ?? 0) > 0
   return run.status === 'completed'
 }
 
 export function runDisplayStatus(run: FactoryRun): string {
+  if (run.collection_status && run.execution_mode !== 'evaluate_only') return runStatus(run.collection_status)
   return runStatus(run.status === 'completed' && run.remote_status === 'partial' ? 'partial' : run.status)
 }
 
 export function runMessage(run: FactoryRun): string {
   const errors = [...new Set([...(run.errors || []), ...(run.remote_errors || [])]
-    .map(item => item.error || item.message).filter(Boolean))].join('；')
-  return run.transfer_error || run.dispatch_error || run.error || errors || collectionProgressText(run) || (run.trajectory_count != null ? `${run.trajectory_count} 条轨迹` : runStatus(run.transfer_status || ''))
+    .map(item => item.error || item.message).filter(Boolean))].slice(0, 3).join('；')
+  return run.control_error || run.transfer_error || run.dispatch_error || run.error || errors || collectionProgressText(run) || (run.trajectory_count != null ? `${run.trajectory_count} 条轨迹` : runStatus(run.transfer_status || ''))
 }
 
 export function canCancelCollectionRun(run: FactoryRun): boolean {
-  return ['dispatching', 'queued', 'starting', 'running'].includes(run.status)
+  if (run.can_cancel_collection != null) return run.can_cancel_collection
+  if (run.control_terminal) return false
+  return ['preparing', 'dispatching', 'queued', 'starting', 'running', 'stopping', 'needs_attention'].includes(run.collection_status || run.status)
 }

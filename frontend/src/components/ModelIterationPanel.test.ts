@@ -3,8 +3,8 @@ import { createRenderer, h, nextTick, ref, ssrContextKey } from 'vue'
 import ModelIterationPanel from './ModelIterationPanel.vue'
 import { useEvaluationProgress } from '@/composables/useEvaluationProgress'
 
-const mocks = vi.hoisted(() => ({ config: vi.fn(), capability: vi.fn(), profiles: vi.fn(), sources: vi.fn(), preview: vi.fn(), start: vi.fn(), cancel: vi.fn(), confirm: vi.fn(), requestId: vi.fn(), save: vi.fn(), evaluations: vi.fn(), poll: undefined as undefined | ((signal: AbortSignal, current: () => boolean) => Promise<void>) }))
-vi.mock('@/phoneFactoryApi', () => ({ newRunRequestId: mocks.requestId, modelIterationApi: { evaluationConfig: mocks.config, evaluationCapabilities: mocks.capability, evaluationProfiles: mocks.profiles, evaluationSources: mocks.sources, evaluationPreview: mocks.preview, remoteStartEvaluation: mocks.start, cancelEvaluation: mocks.cancel, saveEvaluationConfig: mocks.save, evaluations: mocks.evaluations } }))
+const mocks = vi.hoisted(() => ({ config: vi.fn(), capability: vi.fn(), profiles: vi.fn(), sources: vi.fn(), preview: vi.fn(), previewState: vi.fn(), start: vi.fn(), cancel: vi.fn(), confirm: vi.fn(), requestId: vi.fn(), save: vi.fn(), evaluations: vi.fn(), poll: undefined as undefined | ((signal: AbortSignal, current: () => boolean) => Promise<void>) }))
+vi.mock('@/phoneFactoryApi', () => ({ newRunRequestId: mocks.requestId, modelIterationApi: { evaluationConfig: mocks.config, evaluationCapabilities: mocks.capability, evaluationProfiles: mocks.profiles, evaluationSources: mocks.sources, evaluationPreview: mocks.preview, evaluationPreviewState: mocks.previewState, remoteStartEvaluation: mocks.start, cancelEvaluation: mocks.cancel, saveEvaluationConfig: mocks.save, evaluations: mocks.evaluations } }))
 vi.mock('element-plus', () => ({ ElMessageBox: { confirm: mocks.confirm } }))
 vi.mock('@/composables/useFactoryPolling', () => ({ useFactoryPolling: (work: typeof mocks.poll) => { mocks.poll = work; return { start() {} } } }))
 const config = () => ({ text: { base_url: 'http://text/v1/', model: 'text', api_key_env: 'TEXT_KEY' }, vision: { base_url: 'http://vision/v1/', model: 'vision', api_key_env: 'VISION_KEY' } })
@@ -139,4 +139,25 @@ describe('model iteration interactions', () => {
     expect(mocks.cancel).toHaveBeenCalledWith('offline-a'); expect(view.events.changed).toEqual(['offline-a'])
     view.app.unmount()
   })
+})
+
+it('polls asynchronous previews and drops a late page after source selection changes', async () => {
+  vi.useFakeTimers()
+  const view = mount()
+  try {
+    await flush()
+    view.state.executionMode = 'evaluate_only'; view.state.sourceRunId = 'source-a'; await flush()
+    mocks.preview.mockResolvedValue({ ...preview('prepare'), valid: false, status: 'preparing', trajectory_count: 0, cases: [] })
+    await view.state.previewSource(); await flush()
+    expect(view.state.canStartOffline).toBe(false)
+    mocks.previewState.mockResolvedValue({ ...preview('prepare'), status: 'completed', coverage: { total: 2, included: 1, excluded: 1 }, errors: [{ error: 'missing image' }] })
+    await vi.advanceTimersByTimeAsync(2000); await flush()
+    expect(view.state.canStartOffline).toBe(true)
+    expect(view.state.preview.coverage.excluded).toBe(1)
+    const old = deferred<any>(); mocks.previewState.mockReturnValueOnce(old.promise)
+    const page = view.state.loadPreviewPage(); await flush()
+    view.state.sourceRunId = 'source-b'; await flush()
+    old.resolve(preview('prepare')); await page; await flush()
+    expect(view.state.preview).toBeNull()
+  } finally { view.app.unmount(); vi.useRealTimers() }
 })

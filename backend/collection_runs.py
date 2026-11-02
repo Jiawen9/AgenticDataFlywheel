@@ -401,7 +401,7 @@ class CollectionRunStore:
                 if not isinstance(value, str) or not value or len(value) > 256:
                     raise CollectionRunError(f"轨迹 {key} 无效")
             instance = {}
-            if options.get("collection_artifacts_version") == 1 or any(key in entry for key in ("repeat_index", "repeat_times")):
+            if options.get("collection_artifacts_version") in {1, 2} or any(key in entry for key in ("repeat_index", "repeat_times")):
                 repeat, index = entry.get("repeat_times"), entry.get("repeat_index")
                 if (type(repeat) is not int or not 1 <= repeat <= 100 or type(index) is not int
                         or not 1 <= index <= repeat or repeat != options.get("repeat_times", 1)):
@@ -434,7 +434,7 @@ class CollectionRunStore:
             if case_id is not None and case_id not in run["batch_tasks"]:
                 raise CollectionRunError("失败用例不属于本采集批次")
             detail = {}
-            if options.get("collection_artifacts_version") == 1:
+            if options.get("collection_artifacts_version") in {1, 2}:
                 for key in ("phone_id", "source_trajectory_id", "expanded_case_id"):
                     if key in item:
                         if not isinstance(item[key], str) or len(item[key]) > 256:
@@ -537,9 +537,9 @@ class CollectionRunStore:
                     raise CollectionRunError("采集运行不存在", 404)
                 if run["status"] == "interrupted":
                     raise CollectionRunError("采集运行已中断，不能回写迟到结果")
-                if run.get("request", {}).get("metadata", {}).get("collection_artifacts_version") == 1:
+                if run.get("request", {}).get("metadata", {}).get("collection_artifacts_version") in {1, 2}:
                     journal = self.records.get("collection_artifact_transfers", run_id)
-                    if (not journal or journal.get("final_digest") != payload_digest(manifest)
+                    if (not journal or journal.get("receipt_policy_version") == 2 or journal.get("final_digest") != payload_digest(manifest)
                             or any(item.get("status") != "completed" for item in journal.get("items", {}).values())):
                         raise CollectionRunError("逐条回传运行必须先完成最终清单对账，不能提前登记完成")
                 completed_at = run.get("completed_at") or _now()
@@ -556,6 +556,41 @@ class CollectionRunStore:
                     return self.records.put("collection_runs", run_id, updated, expected_revision=run["storage_revision"]), True
                 except RevisionConflict:
                     continue
+
+    def complete_received(self, run_id, manifest, normalized, receipt):
+        """Commit a derived training manifest after independent raw reconciliation.
+
+        This is internal admission, never the public complete endpoint. File
+        verification occurs before the short publication lock; the digest of
+        every admitted source remains part of the unchanged training contract.
+        """
+        current = self.get(run_id)
+        if current is None:
+            raise CollectionRunError("采集运行不存在", 404)
+        with active_batch_lock(current["batch_id"], self.root):
+            header = self.records.get("collection_artifact_transfers", run_id) or {}
+            source = self.records.get("collection_source_final_manifests", run_id) or {}
+            if (header.get("receipt_policy_version") != 2 or not header.get("reconciled")
+                    or header.get("final_digest") != payload_digest(manifest)
+                    or header.get("original_final_digest") != source.get("manifest_sha256")
+                    or source.get("manifest_sha256") != payload_digest(source.get("manifest"))):
+                raise CollectionRunError("逐条回传必须先完成不可变最终清单对账")
+            current = self.get(run_id)
+            expected = self._normalize(current, manifest, current.get("completed_at") or receipt["completed_at"])
+            if expected != normalized:
+                raise CollectionRunError("派生采集资格清单与本次验证不一致")
+            signature = payload_digest(normalized)
+            if current.get("receipt_closed"):
+                if current.get("manifest_sha256") != signature:
+                    raise CollectionRunError("已完成采集运行的清单不可修改；请创建新的采集运行")
+                return current
+            return self.records.put("collection_runs", run_id, {**current, **normalized,
+                "status": "completed" if normalized["trajectories"] else "failed",
+                "completed_at": current.get("completed_at") or receipt["completed_at"],
+                "manifest_sha256": signature, "trajectory_count": len(normalized["trajectories"]),
+                "receipt_policy_version": 2, "receipt_closed": True,
+                "original_final_digest": header["original_final_digest"]},
+                expected_revision=current["storage_revision"])
 
     def ready_input(self, batch_id: str) -> dict:
         batch = self.batch(batch_id)

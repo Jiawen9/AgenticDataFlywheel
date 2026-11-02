@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { runDisplayStatus, runMessage, canCancelCollectionRun } from './phoneFactoryRuns'
+import { runDisplayStatus, runMessage, canCancelCollectionRun, canPreprocessCollection } from './phoneFactoryRuns'
 
 describe('factory run status and warnings', () => {
   it('only offers stop for active collection states including durable starting', () => {
@@ -23,4 +23,16 @@ describe('factory run status and warnings', () => {
     expect(runMessage({ status: 'running', transfer_error: 'download failed', remote_errors: [warning] })).toBe('download failed')
     expect(runMessage({ status: 'completed', trajectory_count: 2 })).toBe('2 条轨迹')
   })
+})
+
+it('uses execution reconciliation rather than local failure or transfer status for stop', () => {
+  expect(canCancelCollectionRun({ status: 'failed', can_cancel_collection: true })).toBe(true)
+  expect(canCancelCollectionRun({ status: 'running', collection_status: 'cancelled', can_cancel_collection: false })).toBe(false)
+  expect(runDisplayStatus({ status: 'running', collection_status: 'cancelled', transfer_status: 'downloading' })).toBe('已取消')
+})
+it('requires settled qualified input while allowing a stable partial receipt', () => {
+  const run = { status: 'completed', batch_id: 'b', receipt_policy_version: 2, receipt_closed: true, transfer_status: 'partial', collection_summary: { preprocessing_eligible_count: 1 } } as any
+  expect(canPreprocessCollection(run)).toBe(true)
+  expect(canPreprocessCollection({ ...run, receipt_closed: false })).toBe(false)
+  expect(canPreprocessCollection({ ...run, collection_summary: { preprocessing_eligible_count: 0 } })).toBe(false)
 })

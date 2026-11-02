@@ -5,6 +5,7 @@ import base64
 import io
 import json
 import unittest
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,13 +19,13 @@ from backend.tests import test_phone_factory_runtime as fixtures
 
 
 def streaming_capabilities(value):
-    value.update(collection_artifacts_version=1)
+    value.update(collection_artifacts_version=1, collection_artifacts_versions=[1, 2])
     value.setdefault("agent_types", {})
     for engine in ("newagent", "pipelineagent"):
         value["agent_types"].setdefault(engine, {})
         value["agent_types"][engine].update(available=True, collection=True,
             model_iteration_evaluation=True, capture_logprobs=True,
-            collection_artifacts_version=1, repeat_times=True, max_repeat_times=100)
+            collection_artifacts_version=1, collection_artifacts_versions=[1, 2], repeat_times=True, max_repeat_times=100)
     return value
 
 
@@ -64,11 +65,11 @@ class CollectionProtocolRuntimeTests(unittest.TestCase):
             request = self.request(request_id=engine, agent_type=engine, repeat_times=3)
             first = self.store.remote_start(request)
             metadata = first["request"]["metadata"]
-            self.assertEqual((metadata["repeat_times"], metadata["collection_artifacts_version"]), (3, 1))
+            self.assertEqual((metadata["repeat_times"], metadata["collection_artifacts_version"]), (3, 2))
             self.assertNotIn("repeat_times", metadata["config"])
             args = [call for call in self.calls if call[0] == "start-run"][-1]
             self.assertEqual(args[args.index("--repeat-times") + 1], "3")
-            self.assertEqual(args[args.index("--collection-artifacts-version") + 1], "1")
+            self.assertEqual(args[args.index("--collection-artifacts-version") + 1], "2")
             self.store.dispatch("config", "POST", {**DEFAULT_CONFIG, "repeat_times": 9})
             replay = self.store.remote_start(request)
             self.assertTrue(replay["reused"])
@@ -86,6 +87,8 @@ class CollectionProtocolRuntimeTests(unittest.TestCase):
         content = output.getvalue()
         self.store.add_task({**self.upload, "content_base64": base64.b64encode(content).decode()}, mode="modeliter")
         run = self.store.remote_start(self.request(repeat_times=1), mode="modeliter")
+        self.assertTrue(run["run_id"].startswith("eval_"))
+        self.assertEqual(run["request"]["collection_artifacts_version"], 2)
         collection = self.store.collection_runs.get(run["run_id"])
         self.assertEqual(run["batch_id"], collection["batch_id"])
         batch = self.store.collection_runs.batch(run["batch_id"], require_workbook=True)
@@ -109,7 +112,7 @@ class CollectionProtocolRuntimeTests(unittest.TestCase):
         self.store.add_task(self.upload)
         self.store.run_client = lambda args: {"ok": True, "output": json.dumps(
             {"protocol_version": 1, "batch_results": True, "agent_types": {"newagent": {"available": True, "collection": True}}})}
-        with self.assertRaisesRegex(PhoneFactoryError, "逐条轨迹回传"):
+        with self.assertRaisesRegex(PhoneFactoryError, "逐条回传协议"):
             self.store.remote_start(self.request())
         self.assertEqual(self.store.collection_runs.list_runs(), [])
         self.assertEqual(self.store.collection_runs.result_batches.list(), [])
@@ -165,9 +168,16 @@ class CollectionProtocolRuntimeTests(unittest.TestCase):
         self.store.add_task(self.upload)
         run = self.store.remote_start(self.request())
         stopped = self.store.runtime.cancel_collection(run["run_id"])
-        self.assertEqual((stopped["status"], stopped["collection_status"]), ("running", "cancelled"))
+        self.assertEqual(stopped["status"], "running")
+        self.assertIn(stopped["collection_status"], {"stopping", "cancelled"})
         self.assertNotEqual(self.store.runtime.sync_policy.view("collection", run["run_id"])["state"], "completed")
         self.assertEqual(self.store.runtime.cancel_collection(run["run_id"])["stop_requested_at"], stopped["stop_requested_at"])
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and self.store.collection_runs.get(run["run_id"])["collection_status"] != "cancelled":
+            time.sleep(.01)
+        final = self.store.collection_runs.get(run["run_id"])
+        self.assertEqual(final["collection_status"], "cancelled")
+        self.assertEqual(final["stop_requested_at"], stopped["stop_requested_at"])
 
     def test_modeliter_retry_transfer_and_listing_do_not_overwrite_evaluation(self):
         self.store.add_task(self.upload, mode="modeliter")
@@ -185,9 +195,14 @@ class CollectionProtocolRuntimeTests(unittest.TestCase):
     def test_modeliter_cancel_does_not_cancel_transfer_and_list_retains_published_permissions(self):
         self.store.add_task(self.upload, mode="modeliter")
         run = self.store.remote_start(self.request(), mode="modeliter")
-        self.store.dispatch("runs/" + run["run_id"] + "/cancel", "POST", {}, mode="modeliter")
+        accepted = self.store.dispatch("runs/" + run["run_id"] + "/cancel", "POST", {}, mode="modeliter")
+        self.assertTrue(accepted["stop_accepted"])
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and self.store.records.get("model_iter_runs", run["run_id"])["status"] != "cancelled":
+            time.sleep(.01)
         collection = self.store.collection_runs.get(run["run_id"])
         self.assertEqual((collection["status"], collection["collection_status"]), ("running", "cancelled"))
+        self.assertEqual(self.store.records.get("model_iter_runs", run["run_id"])["status"], "cancelled")
         self.store.records.put("batch_lifecycle", run["batch_id"], {
             "batch_id": run["batch_id"], "status": "published", "release_id": "release-one", "published_at": "yesterday"})
         view = self.store.runtime.run_views("modeliter")[0]
@@ -198,7 +213,7 @@ class CollectionProtocolRuntimeTests(unittest.TestCase):
                                   cot=None, factory=self.store, overview=None)
         self.store.dispatch("config", "POST", {**DEFAULT_CONFIG, "repeat_times": 4})
         options = runtime.collection_options({"vla": "http://mock.invalid/vla"})
-        self.assertEqual((options["repeat_times"], options["collection_artifacts_version"]), (4, 1))
+        self.assertEqual((options["repeat_times"], options["collection_artifacts_version"]), (4, 2))
         self.store.dispatch("config", "POST", {**DEFAULT_CONFIG, "repeat_times": 8})
         self.assertEqual(runtime.collection_options(options, new_run=False), options)
         legacy = {key: value for key, value in options.items() if key not in {"repeat_times", "collection_artifacts_version"}}

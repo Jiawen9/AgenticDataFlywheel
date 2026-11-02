@@ -32,6 +32,7 @@ class FactoryRuntimeTests(unittest.TestCase):
         self.root = Path(self.temporary.name) / 'platform'
         self.calls, self.remote = [], {}
         self.store = PhoneFactoryStore(self.root, run_client_fn=self.client)
+        self.addCleanup(self.store.runtime.close)
         self.store.initialize_settings({'phones': ['phone-1'], 'apps': ['App'], 'phoneApps': [{'phone_id': 'phone-1', 'app': 'App'}], 'vla': ['http://mock.invalid/vla']})
         from backend.model_iteration import save_config
         from backend.tests.test_model_iteration import evaluator_config

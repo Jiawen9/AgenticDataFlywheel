@@ -4,6 +4,9 @@ import io
 import json
 import os
 import socket
+import errno
+import tempfile
+from pathlib import Path
 import subprocess
 import unittest
 import urllib.error
@@ -143,3 +146,17 @@ class PhoneFactoryErrorMetadataTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class DownloadStorageMetadataTests(unittest.TestCase):
+    def test_local_disk_error_is_storage_and_network_error_is_not(self):
+        for failure, expected in ((OSError(errno.ENOSPC, 'disk full'), 'storage'), (urllib.error.URLError('offline'), 'connection')):
+            with tempfile.TemporaryDirectory() as root, self.subTest(expected=expected):
+                stderr = io.StringIO()
+                target = 'backend.phonefactory_client.Path.mkdir' if expected == 'storage' else 'backend.phonefactory_client.urllib.request.urlopen'
+                with patch.dict(os.environ, {'PHONE_FACTORY_CLIENT_ERROR_METADATA': '1'}), patch(target, side_effect=failure), redirect_stderr(stderr), self.assertRaises(SystemExit) as stopped:
+                    client.download_file('/runs/id/collection-archive', Path(root)/'archive.zip')
+                envelope = json.loads(stderr.getvalue().removeprefix(CLIENT_ERROR_PREFIX))
+                self.assertEqual(envelope['remote_kind'], expected)
+                with patch('backend.phone_factory.subprocess.run') as runner:
+                    runner.return_value = subprocess.CompletedProcess([], 1, '', stderr.getvalue()+'\n'+str(stopped.exception.code))
+                    self.assertEqual(run_client(['collection-artifact-archive','id','artifact','--out','out'])['remote_kind'], expected)

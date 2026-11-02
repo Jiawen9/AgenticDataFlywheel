@@ -31,3 +31,11 @@ describe('factory history summaries', () => {
     expect(new Set(files.map(item => item.key)).size).toBe(3)
   })
 })
+
+it('counts new preparation/stop/reconcile phases without hiding archive or quarantine work', () => {
+  expect(factoryRunActive({ status: 'preparing' })).toBe(true)
+  expect(factoryRunActive({ status: 'stopping' })).toBe(true)
+  expect(factoryRunActive({ status: 'completed', archive_status: 'building' })).toBe(true)
+  expect(factoryRunAbnormal({ status: 'completed', transfer_status: 'partial' })).toBe(true)
+  expect(factoryRunAbnormal({ status: 'running', collection_status: 'needs_attention' })).toBe(true)
+})
