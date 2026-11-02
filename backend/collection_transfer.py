@@ -11,7 +11,7 @@ import threading
 import zipfile
 from pathlib import Path
 
-from .batch_lifecycle import is_batch_active
+from .batch_lifecycle import is_batch_active, ensure_batch_active
 from .batch_operations import active_batch_lock
 from .collection_runs import CollectionRunError, CollectionRunStore, _identifier, _relative
 from .data_store import DATA_ROOT, RecordStore
@@ -22,6 +22,7 @@ from .task_generation.collection_batches import payload_digest, workbook_digest
 from . import pipeline_diagnostics as diagnostics
 from .remote_sync import BoundedSyncPool, RemoteSyncPolicy, SyncDeferred
 from .collection_artifact_transfer import ArtifactTransfer, stream_enabled
+from .collection_receipts import ReceiptStore
 
 LOG = logging.getLogger(__name__)
 TERMINAL = {"completed", "succeeded", "partial", "failed", "interrupted", "cancelled"}
@@ -40,6 +41,9 @@ class CollectionTransferManager:
         self._stop = threading.Event()
         self._thread = None
         self._guard = threading.Lock()
+        self._receipt_storage_guard = threading.RLock()
+        self._receipt_storage_states = {}
+        self._receipt_storage_locks = {}
         self.sync_policy = sync_policy or RemoteSyncPolicy(self.records)
         self._sync_pool = BoundedSyncPool("collection-result-sync", max_workers=2)
 
@@ -57,6 +61,27 @@ class CollectionTransferManager:
             self._thread.join(timeout=5)
         self._sync_pool.close()
 
+    def artifact_page(self, run_id, offset=0, limit=10, search="", status=""):
+        _identifier(run_id, "采集运行编号")
+        return ReceiptStore(self.records, run_id).page(offset, limit, search, status)
+
+    def artifact_rows(self, run_id, offset=0, limit=100):
+        return self.artifact_page(run_id, offset, limit)["items"]
+
+    def artifact_source(self, run_id, artifact_id):
+        """Validated receipt descriptor for read-only evidence download routes."""
+        _identifier(run_id, "采集运行编号")
+        _identifier(artifact_id, "采集产物编号")
+        ledger = ReceiptStore(self.records, run_id)
+        row, run = ledger.get(artifact_id), self.runs.get(run_id)
+        if not run or not row or row["status"] != "received":
+            raise CollectionRunError("采集产物尚未校验接收", 404)
+        manifest = ledger.manifest(artifact_id)
+        transfer = ArtifactTransfer(self)
+        entry, descriptors = transfer._entry(run, manifest, row["item"])
+        return {"receipt": ReceiptStore.public(row), "manifest": manifest,
+                "root": transfer._base(run, row["item"]["kind"]), "files": descriptors}
+
     def _poll(self):
         while not self._stop.is_set():
             try:
@@ -70,8 +95,10 @@ class CollectionTransferManager:
         for run in self.runs.list_runs():
             if self._stop.is_set():
                 break
-            if (run["status"] == "interrupted" and not stream_enabled(run)) or (run["status"] == "completed" and run.get("transfer_status") == "completed") or not is_batch_active(run["batch_id"], self.root):
+            if run.get("receipt_closed") or (run["status"] == "interrupted" and not stream_enabled(run)) or (run["status"] == "completed" and run.get("transfer_status") == "completed") or not is_batch_active(run["batch_id"], self.root):
                 continue
+            if stream_enabled(run) and run["status"] == "completed" and run.get("manifest_sha256") and run.get("receipt_policy_version") != 2:
+                continue  # Finished historical source manifests are immutable.
             metadata = run.get("request", {}).get("metadata", {})
             if metadata.get("run_mode", "generate") != "generate" and not stream_enabled(run):
                 continue
@@ -288,7 +315,11 @@ class CollectionTransferManager:
                 diagnostics.job_context({**run, "pipeline_id": owner}, "collection", self.root):
             if not run:
                 raise CollectionRunError("采集运行不存在", 404)
-            if (run.get("source_kind") == "rollout_import" or (run.get("status") == "interrupted" and not stream_enabled(run))
+            ensure_batch_active(run["batch_id"], self.root)
+            if stream_enabled(run) and run["status"] == "completed" and run.get("manifest_sha256") and run.get("receipt_policy_version") != 2:
+                return run
+            if (run.get("receipt_closed")
+                    or run.get("source_kind") == "rollout_import" or (run.get("status") == "interrupted" and not stream_enabled(run))
                     or (run.get("status") == "completed" and run.get("transfer_status") == "completed")):
                 return run
             try:
@@ -296,7 +327,7 @@ class CollectionTransferManager:
                     lambda: self._sync_with_diagnostics(run_id, force=force), force=force)
             except SyncDeferred as exc:
                 raise CollectionRunError(str(exc), exc.status) from exc
-            if result.get("transfer_status") in {"completed", "remote_failed"}:
+            if result.get("receipt_closed") or result.get("transfer_status") in {"completed", "remote_failed"}:
                 self.sync_policy.complete("collection", run_id)
             return result
 
@@ -307,15 +338,14 @@ class CollectionTransferManager:
         if run.get("source_kind") == "rollout_import":
             return run  # Local imports have no remote execution to synchronize.
         if stream_enabled(run):
-            with active_batch_lock(run["batch_id"], self.root):
-                run = self.runs.get(run_id)
-                if run["status"] == "completed" and run.get("transfer_status") == "completed":
-                    return run
-                try:
-                    return ArtifactTransfer(self).sync(run, force=force)
-                except Exception as exc:
+            if run.get("receipt_closed") or (run["status"] == "completed" and run.get("transfer_status") == "completed"):
+                return run
+            try:
+                return ArtifactTransfer(self).sync(run, force=force)
+            except Exception as exc:
+                if is_batch_active(run["batch_id"], self.root):
                     self._update(run_id, transfer_status="failed", transfer_error=str(exc))
-                    raise
+                raise
         if run["status"] == "interrupted":
             return run
         if run["status"] == "completed" and (run.get("transfer_status") == "completed" or not is_batch_active(run["batch_id"], self.root)):

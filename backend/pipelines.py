@@ -113,7 +113,7 @@ class PipelineRuntime:
         config = dict(config or {})
         if new_run:
             config.setdefault("repeat_times", self.factory.config("generate").get("repeat_times", 1))
-            config["collection_artifacts_version"] = 1
+            config["collection_artifacts_version"] = 2
         options = self.factory.runtime._options(config, "generate")
         if not new_run and "repeat_times" not in config:
             options.pop("repeat_times", None)

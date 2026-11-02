@@ -172,7 +172,7 @@ class ArtifactTransferTests(unittest.TestCase):
         first, second = self.remote.add(), self.remote.add(index=2)
         self.remote.fail.add(first)
         result = self.manager.sync(self.run_id)
-        self.assertEqual(result["transfer_status"], "failed")
+        self.assertEqual(result["transfer_status"], "retry_wait")
         self.assertEqual(self.runs.get(self.run_id)["transferred_trajectory_count"], 1)
         self.remote.fail.clear()
         self.remote.finish()
@@ -182,15 +182,15 @@ class ArtifactTransferTests(unittest.TestCase):
 
     def test_acknowledgement_loss_after_rename_does_not_redownload(self):
         artifact = self.remote.add()
-        original = self.manager.records.put
+        from backend.collection_receipts import ReceiptStore
+        original = ReceiptStore.update
         lost = [False]
-        def write(namespace, key, payload, **kwargs):
-            if (namespace == "collection_artifact_transfers" and not lost[0]
-                    and payload["items"].get(artifact, {}).get("status") == "completed"):
+        def write(ledger, key, **kwargs):
+            if key == artifact and not lost[0] and kwargs.get("status") == "received":
                 lost[0] = True
                 raise OSError("lost acknowledgement")
-            return original(namespace, key, payload, **kwargs)
-        with patch.object(self.manager.records, "put", side_effect=write):
+            return original(ledger, key, **kwargs)
+        with patch.object(ReceiptStore, "update", write):
             self.manager.sync(self.run_id)
         self.remote.finish()
         self.assertEqual(self.drain(self.make_manager())["status"], "completed")
@@ -234,7 +234,7 @@ class ArtifactTransferTests(unittest.TestCase):
         first = self.remote.add()
         self.remote.manifests[first]["trajectory"]["phone_id"] = "foreign-phone"
         result = self.manager.sync(self.run_id)
-        self.assertEqual(result["transfer_status"], "failed")
+        self.assertEqual(result["transfer_status"], "partial")
         self.assertEqual(self.remote.downloads, [])
 
     def test_final_inventory_cannot_omit_frozen_repeat_instances(self):
@@ -261,9 +261,13 @@ class ArtifactTransferTests(unittest.TestCase):
         self.remote.manifests[second]["trajectory"]["source_trajectory_id"] = first
         self.remote.items[-1]["manifest_sha256"] = digest(self.remote.manifests[second])
         result = self.manager.sync(self.run_id)
-        self.assertEqual(result["transfer_status"], "failed")
+        self.assertEqual(result["transfer_status"], "partial")
         self.assertEqual(result["transferred_trajectory_count"], 1)
-        self.assertEqual(self.remote.downloads, [first])
+        self.assertEqual(len(self.remote.downloads), 1)
+        self.assertIn(self.remote.downloads[0], {first, second})
+        rows = self.manager.artifact_rows(self.run_id)
+        self.assertEqual(sorted(row["receipt_status"] for row in rows), ["quarantined", "received"])
+        self.assertEqual(next(row["artifact_id"] for row in rows if row["receipt_status"] == "received"), self.remote.downloads[0])
         self.assertIn("重复", result["transfer_error"])
 
     def test_failed_item_backoff_does_not_delay_new_items_and_force_retries_immediately(self):

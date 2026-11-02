@@ -87,6 +87,16 @@ class CollectionResultBatchTests(unittest.TestCase):
         finally:
             book.close()
 
+    def test_streaming_model_iteration_versions_share_evaluation_run_identity(self):
+        for version in (1, 2):
+            with self.subTest(version=version):
+                metadata = {**self.metadata, "run_mode": "modeliter", "collection_artifacts_version": version}
+                run, created = self.create("evaluation-v" + str(version), metadata)
+                self.assertTrue(created)
+                self.assertTrue(run["collection_run_id"].startswith("eval_"))
+                self.assertEqual(run["request"]["metadata"]["collection_artifacts_version"], version)
+                self.assertEqual(self.create("evaluation-v" + str(version), metadata), (run, False))
+
     def test_same_app_multiple_phones_share_one_selected_task_without_changing_associations(self):
         metadata = {**self.metadata, "phone_ids": ["phone-a", "phone-b"], "phone_apps": [
             {"phone_id": phone, "app": "App A"} for phone in ("phone-a", "phone-b")]}

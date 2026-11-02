@@ -22,8 +22,8 @@ from backend.task_generation.collection_batches import collection_batch_payload,
 from backend.task_generation.collection_input import build_collection_input
 
 STREAM_CAPABILITIES = json.dumps({"protocol_version": 1, "batch_results": True,
-    "collection_artifacts_version": 1, "agent_types": {"newagent": {"available": True,
-        "collection": True, "capture_logprobs": True, "collection_artifacts_version": 1,
+    "collection_artifacts_version": 1, "collection_artifacts_versions": [1, 2], "agent_types": {"newagent": {"available": True,
+        "collection": True, "capture_logprobs": True, "collection_artifacts_version": 1, "collection_artifacts_versions": [1, 2],
         "repeat_times": True, "max_repeat_times": 100}}})
 
 

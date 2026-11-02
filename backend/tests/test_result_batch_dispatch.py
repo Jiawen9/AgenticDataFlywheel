@@ -14,6 +14,7 @@ from backend.batch_lifecycle import BatchPublishedError
 from backend.phone_factory import create_router
 from backend.tests import test_phone_factory_runtime as fixtures
 from backend.tests.test_manual_collection import workbook_bytes
+from backend.tests.collector_protocol_support import current_capabilities
 
 
 class ResultDispatchTests(unittest.TestCase):
@@ -29,6 +30,7 @@ class ResultDispatchTests(unittest.TestCase):
             value["agent_types"] = {name: {"available": True, "collection": True,
                 "capture_logprobs": True, "model_iteration_evaluation": 1}
                 for name in ("newagent", "pipelineagent")}
+            current_capabilities(value)
         if args[0] == "start-run":
             value["agent_type"] = args[args.index("--agent-type") + 1]
             self.remote[value["run_id"]]["agent_type"] = value["agent_type"]
@@ -167,14 +169,16 @@ class ResultDispatchTests(unittest.TestCase):
         self.store.run_client = lambda args: {"ok": False, "output": "temporary capability outage"}
         with self.assertRaisesRegex(ValueError, "capability outage"):
             self.store.remote_start(self.request())
-        frozen = self.store.collection_runs.list_runs()[0]
-        self.assertEqual(frozen["request"]["metadata"]["result_transport"], "http")
+        self.assertEqual(self.store.collection_runs.list_runs(), [])
         self.assertFalse(any(call[0] == "start-run" for call in self.calls))
         self.store.run_client = lambda args: {"ok": True, "output": '{"ok":true}'}
         with self.assertRaisesRegex(ValueError, "升级"):
             self.store.remote_start(self.request())
+        self.assertEqual(self.store.collection_runs.list_runs(), [])
         self.store.run_client = real
         recovered = self.store.remote_start(self.request())
+        frozen = self.store.collection_runs.list_runs()[0]
+        self.assertEqual(frozen["request"]["metadata"]["result_transport"], "http")
         self.assertEqual(recovered["batch_id"], frozen["batch_id"])
         starts = [call for call in self.calls if call[0] == "start-run"]
         self.assertEqual(len(starts), 1)

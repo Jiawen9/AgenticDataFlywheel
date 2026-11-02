@@ -47,13 +47,16 @@
       <el-button :loading="previewLoading" :disabled="!canPreview" @click="previewSource">检查轨迹并预览</el-button>
       <el-alert v-if="sourceError" :title="sourceError" type="error" :closable="false" />
       <template v-if="preview">
-        <p>已识别 {{ preview.trajectory_count }} 条轨迹。{{ preview.valid ? '轨迹检查通过，可以创建新的评测运行。' : '请处理以下问题后重新预览。' }}</p>
-        <el-alert v-for="(issue, index) in preview.errors" :key="index" :title="evaluationIssueText(issue)" type="error" :closable="false" />
-        <el-table :data="preview.cases" row-key="source_trajectory_id" border max-height="320" data-testid="evaluation-preview">
+        <p v-if="preview.status === 'preparing'">正在后台检查轨迹并冻结可评测集合，手机采集和其他运行不受影响。</p>
+        <p v-else>可评测 {{ preview.trajectory_count }} 条<template v-if="preview.coverage"> / 共 {{ preview.coverage.total }} 条，排除 {{ preview.coverage.excluded }} 条</template>。{{ preview.valid ? '将评测全部可用轨迹，报告保留排除原因。' : '没有可评测轨迹，请查看排除原因。' }}</p>
+        <details v-if="preview.errors.length"><summary>查看排除原因（摘要最多 100 条）</summary><el-alert v-for="(issue, index) in preview.errors" :key="index" :title="evaluationIssueText(issue)" type="warning" :closable="false" /></details>
+        <p v-if="preview.sync_error" class="hint">{{ preview.sync_error }}，正在重试同步。</p>
+        <el-table :data="preview.cases.slice(0, previewPageSize)" row-key="source_trajectory_id" border max-height="320" data-testid="evaluation-preview">
           <el-table-column prop="case_id" label="用例编号" min-width="130" />
           <el-table-column prop="task" label="任务目标" min-width="240" show-overflow-tooltip />
           <el-table-column prop="phone_id" label="来源手机" min-width="140" />
         </el-table>
+        <el-pagination v-if="preview.valid" v-model:current-page="previewPage" v-model:page-size="previewPageSize" :page-sizes="[10, 20, 50]" :total="preview.trajectory_count" layout="total, sizes, prev, pager, next" @current-change="loadPreviewPage" @size-change="resetPreviewPage" />
       </template>
       <el-button type="primary" :loading="starting" :disabled="!canStartOffline" class="start-offline" @click="startOffline">创建新的评测运行</el-button>
       <el-alert v-if="startMessage" :title="startMessage" type="success" :closable="false" />
@@ -81,6 +84,8 @@
         <span>评测异常 {{ results.summary.evaluation_failed }}</span>
         <strong>成功率 {{ formatSuccessRate(results.summary.success_rate) }}</strong>
       </div>
+      <p v-if="results.coverage" class="hint">评测覆盖 {{ results.coverage.included }}/{{ results.coverage.total }}，排除 {{ results.coverage.excluded }} 条。排除项与证据警告随本次报告保存。</p>
+      <details v-if="results.excluded?.length"><summary>查看排除原因</summary><p v-for="(issue, index) in results.excluded" :key="index" class="hint">{{ evaluationIssueText(issue) }}</p></details>
       <p class="hint">成功率 = success /（success + partial_success + fail）；待评测和技术异常不计入分母。</p>
     </template>
   </section>
@@ -122,12 +127,14 @@ const sourceInput = computed<EvaluationSourceInput>(() => sourceKind.value === '
 const sourceKey = computed(() => JSON.stringify(sourceInput.value))
 const canPreview = computed(() => offlineSupported.value && !loading.value && !starting.value && !previewLoading.value && !!(sourceKind.value === 'run' ? sourceRunId.value : sourcePath.value.trim()))
 const canStartOffline = computed(() => executionMode.value === 'evaluate_only' && ready.value && offlineSupported.value && !!preview.value?.valid && preview.value.trajectory_count > 0 && !previewLoading.value)
+const previewPage = ref(1), previewPageSize = ref(10)
+let previewPageEpoch = 0
 let disposed = false, previewEpoch = 0
 let previewController: AbortController | undefined
 watch(ready, value => emit('ready', value), { immediate: true })
 watch(executionMode, value => emit('mode', value), { immediate: true })
 watch(selectedProfile, value => emit('profile', value), { immediate: true })
-watch(sourceKey, () => { previewEpoch++; previewController?.abort(); preview.value = null; previewLoading.value = false; sourceError.value = ''; startError.value = ''; startMessage.value = '' }, { flush: 'sync' })
+watch(sourceKey, () => { previewPageEpoch++; previewPage.value = 1; previewEpoch++; previewController?.abort(); preview.value = null; previewLoading.value = false; sourceError.value = ''; startError.value = ''; startMessage.value = '' }, { flush: 'sync' })
 
 async function loadSources() {
   if (sourcesLoading.value || starting.value || !offlineSupported.value) return
@@ -177,10 +184,40 @@ async function previewSource() {
   previewLoading.value = true; preview.value = null; sourceError.value = ''; startError.value = ''; startMessage.value = ''
   try {
     const value = await modelIterationApi.evaluationPreview(sourceInput.value, previewController.signal)
-    if (!disposed && epoch === previewEpoch && key === sourceKey.value) preview.value = value
+    if (!disposed && epoch === previewEpoch && key === sourceKey.value) {
+      preview.value = value
+      if (value.status === 'preparing') schedulePreview(epoch, key, value.preview_id)
+    }
   } catch (cause) { if (!disposed && epoch === previewEpoch) sourceError.value = (cause as Error).message }
-  finally { if (!disposed && epoch === previewEpoch) previewLoading.value = false }
+  finally { if (!disposed && epoch === previewEpoch) previewLoading.value = preview.value?.status === 'preparing' }
 }
+let previewTimer: ReturnType<typeof setTimeout> | undefined
+function schedulePreview(epoch: number, key: string, id: string) {
+  clearTimeout(previewTimer)
+  previewTimer = setTimeout(async () => {
+    if (disposed || epoch !== previewEpoch || key !== sourceKey.value) return
+    try {
+      const value = await modelIterationApi.evaluationPreviewState(id, previewController?.signal)
+      if (disposed || epoch !== previewEpoch || key !== sourceKey.value) return
+      preview.value = value
+      previewLoading.value = value.status === 'preparing'
+      if (value.status === 'preparing') schedulePreview(epoch, key, id)
+    } catch (cause) {
+      if (disposed || epoch !== previewEpoch || key !== sourceKey.value) return
+      sourceError.value = (cause as Error).message
+      schedulePreview(epoch, key, id)
+    }
+  }, 2000)
+}
+async function loadPreviewPage() {
+  if (!preview.value?.valid) return
+  const id = preview.value.preview_id, epoch = ++previewPageEpoch, sourceEpoch = previewEpoch
+  try {
+    const value = await modelIterationApi.evaluationPreviewState(id, previewController?.signal, (previewPage.value - 1) * previewPageSize.value, previewPageSize.value)
+    if (!disposed && epoch === previewPageEpoch && sourceEpoch === previewEpoch && preview.value?.preview_id === id) preview.value = value
+  } catch (cause) { if (!disposed && epoch === previewPageEpoch && sourceEpoch === previewEpoch) sourceError.value = (cause as Error).message }
+}
+function resetPreviewPage() { previewPage.value = 1; void loadPreviewPage() }
 async function startOffline() {
   if (!canStartOffline.value || !preview.value || !selectedProfile.value) return
   const parameters = { preview_id: preview.value.preview_id, evaluator_config: JSON.parse(JSON.stringify(draft)) as EvaluatorConfig,
@@ -199,7 +236,7 @@ async function startOffline() {
   finally { if (!disposed) starting.value = false }
 }
 onMounted(load)
-onBeforeUnmount(() => { disposed = true; previewEpoch++; previewController?.abort() })
+onBeforeUnmount(() => { clearTimeout(previewTimer); disposed = true; previewEpoch++; previewController?.abort() })
 </script>
 
 <style scoped>
