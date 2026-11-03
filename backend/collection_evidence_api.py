@@ -19,7 +19,15 @@ def dispatch(runtime, parts, data, mode):
         except (TypeError, ValueError) as exc:
             raise PhoneFactoryError(str(exc)) from exc
     artifact_id = _identifier(parts[3], "采集产物编号")
-    source = runtime.transfer.artifact_source(run_id, artifact_id)
+    execution_id = data.get("execution_id")
+    if execution_id and execution_id != run_id:
+        execution_id = _identifier(execution_id,"执行分段编号")
+        execution = runtime.records.get("collection_executions",execution_id)
+        if not execution or execution.get("root_run_id") != run_id or execution.get("batch_id") != run["batch_id"]:
+            raise PhoneFactoryError("执行分段不属于此采集运行",404)
+        source = runtime.resume_service.executions.artifact_source(execution_id,artifact_id)
+    else:
+        source = runtime.transfer.artifact_source(run_id, artifact_id)
     files = [{"path": path, "size": size, "sha256": sha}
              for path, (size, sha) in sorted(source["files"].items())]
     if len(parts) == 4:

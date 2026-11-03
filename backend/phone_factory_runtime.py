@@ -7,6 +7,7 @@ import logging
 import math
 import tempfile
 import threading
+import sqlite3
 import time
 import uuid
 import mimetypes
@@ -47,6 +48,15 @@ class FactoryRuntime:
         self._archive_pool = BoundedSyncPool("collection-archive-status", max_workers=2)
         self._preview_pool = BoundedSyncPool("evaluation-previews", max_workers=2)
         self._control_pool = BoundedSyncPool("collection-control", max_workers=4)
+        self._control_memory = {}
+        self._resume_service = None
+
+    @property
+    def resume_service(self):
+        if self._resume_service is None:
+            from .collection_resume import ResumeService
+            self._resume_service = ResumeService(self)
+        return self._resume_service
 
     @property
     def transfer(self):
@@ -122,6 +132,8 @@ class FactoryRuntime:
 
     def close(self):
         self._stop.set()
+        if self._resume_service is not None:
+            self._resume_service.close()
         if self._transfer is not None:
             self._transfer.close()
         if self._thread:
@@ -132,13 +144,13 @@ class FactoryRuntime:
         self._control_pool.close()
 
     def _poll_evaluations(self):
-        while not self._stop.wait(10):
-            try:
-                self._schedule_archives()
-                self._schedule_controls()
-                self._schedule_evaluations()
-            except Exception:
-                logging.getLogger(__name__).exception("评估同步调度失败")
+        while not self._stop.wait(5):
+            for schedule in (self._schedule_controls,self._schedule_archives,self._schedule_evaluations,
+                             lambda:self.resume_service.schedule()):
+                try:
+                    schedule()
+                except Exception:
+                    logging.getLogger(__name__).exception("后台同步调度失败")
 
     def _schedule_archives(self):
         for run in self.store.collection_runs.list_runs():
@@ -869,7 +881,9 @@ class FactoryRuntime:
                 "published_at": batch_state["published_at"], "collection_artifacts": artifacts,
                 **({"collection_artifacts_version": metadata["collection_artifacts_version"]}
                    if "collection_artifacts_version" in metadata else {}),
-                "receipt_storage": self.records.get("collection_receipt_storage", run_id),
+                "receipt_storage": (self.transfer._receipt_storage_states.get(run_id)
+                    or self.records.get("collection_receipt_storage", run_id)),
+                **(self._resume_service.view(run_id) if self._resume_service is not None else {}),
                 "collection_summary": summary, "collection_sync": self.sync_policy.view("collection", run_id)}
 
     @staticmethod
@@ -883,19 +897,26 @@ class FactoryRuntime:
             view["request"] = request
         for key in ("errors", "remote_errors"):
             if isinstance(view.get(key), list):
-                view[key + "_count"] = len(view[key])
+                count=view.get(key+"_count")
+                view[key + "_count"] = max(count,len(view[key])) if type(count) is int else len(view[key])
                 view[key] = view[key][:100]
         return view
+
+    def _evaluation_snapshot_label(self,run):
+        from .collection_resume_snapshots import evaluation_snapshot_status
+        request=(run or {}).get("request",{})
+        return evaluation_snapshot_status(self.records,{**request.get("source_request",{}),**request.get("source",{})})
 
     def run_views(self, mode):
         if mode == "modeliter":
             runs = []
             for run in self.records.list("model_iter_runs"):
                 request = run.get("request", {})
+                snapshot_status=self._evaluation_snapshot_label(run)
                 metadata = {key: request[key] for key in ("source", "source_digest", "evaluation_profile_id",
                                                          "evaluation_profile_digest", "checklist_source", *MODEL_OVERRIDE_FIELDS) if key in request}
                 runs.append({**run, **metadata, **self._collection_progress(run["run_id"]), **({"agent_type": request.get("agent_type", "newagent")} if request.get("execution_mode") != "evaluate_only" else {}), "execution_mode": request.get("execution_mode", "collect_and_evaluate"),
-                             "sync": self.sync_policy.view("evaluation", run["run_id"])})
+                             "sync": self.sync_policy.view("evaluation", run["run_id"]),**snapshot_status})
             return [self._public_run(item) for item in sorted(runs, key=lambda item: (item["created_at"], item["run_id"]))]
         views = []
         for run in self.store.collection_runs.list_runs():
@@ -907,7 +928,8 @@ class FactoryRuntime:
             views.append({**run, **self._collection_progress(run["collection_run_id"]), "batch_status": batch_state["status"], "release_id": batch_state["release_id"],
                           "published_at": batch_state["published_at"], "filename": metadata.get("filename"), "vla": metadata.get("vla"), "agent_type": metadata.get("agent_type", "newagent"), **{key: metadata[key] for key in MODEL_OVERRIDE_FIELDS if key in metadata}, **{key: transfer[key] for key in ("remote_status", "transfer_status", "transfer_error", "remote_errors", "transfer_updated_at") if key in transfer}, "trajectory_count": len(run.get("trajectories", [])), "can_cancel_collection": can_cancel(run),
                           "sync": self.sync_policy.view("collection", run["collection_run_id"])})
-        return [self._public_run(item) for item in views]
+        return [self._public_run({**item, **(self._resume_service.view(item["collection_run_id"])
+                    if self._resume_service is not None else {})}) for item in views]
 
     def public_state(self, state, mode):
         statuses = {"dispatching": "下发中", "queued": "排队中", "starting": "启动中", "running": "运行中", "completed": "已回传", "succeeded": "已完成", "partial": "部分完成", "failed": "失败", "interrupted": "已中断", "cancelled": "已中断"}
@@ -1023,7 +1045,8 @@ class FactoryRuntime:
         for run in self.records.list("model_iter_runs"):
             if run.get("stop_requested_at") and not run.get("evaluation_control_terminal"):
                 delay = min(60, 2 ** min(run.get("stop_attempt_count", 0), 6))
-                if time.time() >= run.get("stop_last_attempt_epoch", 0) + delay:
+                memory = self._control_memory.get(run["run_id"], {})
+                if time.time() >= max(run.get("stop_last_attempt_epoch", 0), memory.get("last_attempt", 0)) + delay:
                     run_id = run["run_id"]
                     self._control_pool.submit("evaluation:" + run_id,
                         lambda run_id=run_id: self._cancel_evaluation_remote(run_id))
@@ -1035,17 +1058,38 @@ class FactoryRuntime:
             if not is_batch_active(run["batch_id"], self.root):
                 continue
             delay = min(60, 2 ** min(run.get("stop_attempt_count", 0), 6))
-            if time.time() < run.get("stop_last_attempt_epoch", 0) + delay:
+            memory = self._control_memory.get(run["collection_run_id"], {})
+            delay = max(delay, min(60, 2 ** min(memory.get("attempts", 0), 6)))
+            if time.time() < max(run.get("stop_last_attempt_epoch", 0), memory.get("last_attempt", 0)) + delay:
                 continue
             run_id = run["collection_run_id"]
             self._control_pool.submit(run_id, lambda run_id=run_id: self._cancel_collection_remote(run_id))
+
+    def _control_attempt(self, namespace, run_id, run):
+        memory = self._control_memory.setdefault(run_id, {})
+        memory.update(run=run, last_attempt=time.time(), attempts=memory.get("attempts",0)+1)
+        try:
+            self.records.update(namespace, run_id, lambda row: row.update(
+                stop_last_attempt_epoch=memory["last_attempt"], stop_attempt_count=row.get("stop_attempt_count",0)+1))
+        except (OSError, sqlite3.Error) as exc:
+            # The stop intent is already durable. An accounting write must not
+            # prevent its delivery, nor cause an unbounded background retry loop.
+            memory["error"] = "停止请求已保存；平台存储暂不可写：" + type(exc).__name__
+
+    def _control_failure(self, namespace, run_id, exc):
+        self._control_memory.setdefault(run_id,{})["error"] = str(exc)[:500]
+        try:
+            self.records.update(namespace, run_id, lambda row: row.update(
+                control_error=str(exc)[:500], can_cancel_collection=True,
+                **({"collection_status":"needs_attention"} if namespace=="collection_runs" else {})))
+        except (OSError, sqlite3.Error):
+            pass
 
     def _cancel_evaluation_remote(self, run_id):
         run = self.records.get("model_iter_runs", run_id)
         if not run or not run.get("stop_requested_at"):
             return
-        self.records.update("model_iter_runs", run_id, lambda row: row.update(
-            stop_last_attempt_epoch=time.time(), stop_attempt_count=row.get("stop_attempt_count", 0) + 1))
+        self._control_attempt("model_iter_runs", run_id, run)
         try:
             remote = self.get_run(run_id)
             if remote.get("run_id", remote.get("collection_run_id")) != run_id or remote.get("run_mode") != "modeliter":
@@ -1063,8 +1107,9 @@ class FactoryRuntime:
                            evaluation_control_terminal=status in TERMINAL, updated_at=utc_now())
             self.records.update("model_iter_runs", run_id, update)
             self.sync_policy.reset("evaluation", run_id)
+            self.sync_policy.observe_remote("evaluation",run_id,result["status"])
         except Exception as exc:
-            self.records.update("model_iter_runs", run_id, lambda row: row.update(control_error=str(exc)))
+            self._control_failure("model_iter_runs", run_id, exc)
 
     def cancel_evaluation(self, run_id):
         run_id = _identifier(run_id, "评估运行编号")
@@ -1088,8 +1133,7 @@ class FactoryRuntime:
         if not run or not run.get("stop_requested_at"):
             return
         metadata = run.get("request", {}).get("metadata", {})
-        self.records.update("collection_runs", run_id, lambda current: current.update(
-            stop_last_attempt_epoch=time.time(), stop_attempt_count=current.get("stop_attempt_count", 0) + 1))
+        self._control_attempt("collection_runs", run_id, run)
         try:
             remote = self.get_run(run_id)
             if (not isinstance(remote, dict) or remote.get("run_id", remote.get("collection_run_id")) != run_id
@@ -1107,15 +1151,15 @@ class FactoryRuntime:
         except Exception as exc:
             # A 404 is not proof of absence after uncertain dispatch. Keep the
             # durable stop intent so a late accepted request is also cancelled.
-            self.records.update("collection_runs", run_id, lambda current: current.update(
-                control_error=str(exc), can_cancel_collection=True,
-                collection_status="needs_attention", updated_at=utc_now()))
+            self._control_failure("collection_runs", run_id, exc)
 
     def cancel_collection(self, run_id):
         run_id = _identifier(run_id, "采集运行编号")
         run = self.store.collection_runs.get(run_id)
         if run is None:
             raise PhoneFactoryError("采集运行不存在", 404)
+        if self.records.get("collection_resume_heads",run_id):
+            return self.resume_service.cancel(run_id)
         metadata = run.get("request", {}).get("metadata", {})
         if metadata.get("result_transport") == "legacy":
             raise PhoneFactoryError("旧采集服务不支持按运行停止，请升级采集电脑", 409)
@@ -1135,6 +1179,10 @@ class FactoryRuntime:
                 "agent_type": metadata.get("agent_type", "newagent")}
 
     def dispatch(self, action, method, data, mode):
+        parts = action.split("/")
+        if len(parts) >= 3 and parts[0] == "collection-runs" and parts[2] in {
+                "diagnostics", "cases", "resume-preview", "resume", "resume-operations"}:
+            return True, self.resume_service.dispatch(parts, method, data, mode)
         if method == "GET" and action == "agent-capabilities":
             return True, self.agent_capabilities()
         if mode == "modeliter" and action == "evaluation-config":
@@ -1199,20 +1247,21 @@ class FactoryRuntime:
                 if not run.get("request", {}).get("evaluator_config"):
                     raise PhoneFactoryError("历史运行不包含逐用例评测，请下载历史报告", 409)
                 snapshot = self.records.get("model_iter_results", run_id)
+                source_label=self._evaluation_snapshot_label(run)
                 if snapshot and snapshot.get("final"):
-                    return True, snapshot["result"]
+                    return True, {**snapshot["result"],**source_label}
                 try:
                     self.sync_evaluation(run_id, force=False)
                     current_snapshot = self.records.get("model_iter_results", run_id)
                     if not current_snapshot or not current_snapshot.get("result"):
                         raise PhoneFactoryError("评测结果正在等待同步，请稍后重试", 503)
-                    return True, current_snapshot["result"]
+                    return True, {**current_snapshot["result"],**source_label}
                 except PhoneFactoryError as exc:
                     snapshot = self.records.get("model_iter_results", run_id) or snapshot
                     if snapshot:
                         info = self.sync_policy.view("evaluation", run_id)
                         stale = bool(info.get("last_error") or info.get("state") == "paused")
-                        return True, {**snapshot["result"], **({"stale": True, "sync_error": str(exc)} if stale else {})}
+                        return True, {**snapshot["result"], **({"stale": True, "sync_error": str(exc)} if stale else {}),**source_label}
                     raise
         if action.startswith("collection-runs/") and mode == "modeliter":
             parts = action.split("/")
@@ -1261,7 +1310,14 @@ class FactoryRuntime:
             if command == "del-phone":
                 return True, self._delete_phone(_text(data.get("phone_id")), mode)
         if method == "GET" and action == "reports":
-            return True, self.store._remote_result(["reports", "--runmode", mode])
+            reports=self.store._remote_result(["reports", "--runmode", mode])
+            for folder in reports.get("folders",[]):
+                if folder.get("run_id"):
+                    try:
+                        folder.update(self._evaluation_snapshot_label(self.records.get("model_iter_runs",folder["run_id"])))
+                    except (OSError,sqlite3.Error):
+                        folder["collection_snapshot_status_unavailable"]=True
+            return True,reports
         if method == "GET" and action == "report-download":
             args = ["report-download", "--runmode", mode]
             for field, flag in (("run_id", "--run-id"), ("file_id", "--file-id"), ("name", "--name"), ("folder", "--folder")):

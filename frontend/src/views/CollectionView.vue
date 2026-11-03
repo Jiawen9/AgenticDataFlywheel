@@ -235,6 +235,7 @@ onBeforeUnmount(() => { disposed = true; flow.dispose(); window.removeEventListe
         <el-progress :percentage="collecting ? 100 : percentage(preprocessingJob.percent)" :indeterminate="collecting" :status="preprocessingJob.status === 'failed' || preprocessingJob.status === 'interrupted' ? 'exception' : preprocessingJob.status === 'succeeded' ? 'success' : undefined" :show-text="false" />
         <p><template v-if="!collecting">步骤 {{ preprocessingJob.completed_steps }} / {{ preprocessingJob.total_steps }}</template><template v-if="preprocessingJob.current_trajectory"> · <DisplayId kind="trajectory" :id="preprocessingJob.current_trajectory" :scope="batchId" /></template><template v-if="preprocessingJob.current_step"> · step {{ preprocessingJob.current_step }}</template></p>
         <p v-if="preprocessingJob.current_task">当前任务：<DisplayId kind="task" :id="preprocessingJob.current_task" :scope="batchId" /></p>
+        <p v-if="preprocessingJob.stale_collection_input" class="job-error" data-testid="stale-preprocessing">旧采集快照 · {{ preprocessingJob.collection_snapshot_id || '原始采集结果' }}。{{ preprocessingJob.message || '预处理结果保留为旧版本，未更新当前标框。' }}</p>
         <p v-if="preprocessingJob.error" class="job-error">{{ preprocessingJob.error }}</p>
         <small>作业 <DisplayId kind="job" :id="preprocessingJob.job_id" /></small>
       </div>

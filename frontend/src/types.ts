@@ -17,6 +17,9 @@ export interface StageArtifact {
 }
 
 export interface PreprocessingJob {
+  stale_collection_input?: boolean
+  collection_snapshot_id?: string | null
+  message?: string
   job_id: string
   batch_id: string
   status: 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted'

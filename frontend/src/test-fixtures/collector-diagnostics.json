@@ -1,0 +1,76 @@
+{
+  "generated_from": "phonefactory_diagnostics.DiagnosticService._phone + RuntimeTelemetry (no device or model requests)",
+  "supported": true,
+  "collection_run_id": "run-contract",
+  "observed_at": "2026-11-03T08:00:00+00:00",
+  "phones": [
+    {
+      "phone_id": "phone-a",
+      "execution_id": "run-contract",
+      "collection_run_id": "run-contract",
+      "status": "failed",
+      "phase": "model_error",
+      "reason_code": "model_http",
+      "reason": "模型请求失败",
+      "confidence": "confirmed",
+      "evidence": [
+        {
+          "source": "phone_state",
+          "detail": "model_http"
+        }
+      ],
+      "model_call": {
+        "call_id": "e57119be70294c658890c1c5b65bf531",
+        "role": "planner",
+        "model": "qwen3-8b",
+        "started_at": "2026-11-03T08:00:00Z",
+        "status": "failed",
+        "attempt": 1,
+        "timeout_seconds": 30,
+        "error_kind": "model_http",
+        "error": "HTTP 502",
+        "endpoint": "http://model.invalid/v1/chat/completions",
+        "status_code": 502,
+        "finished_at": "2026-11-03T08:00:00Z",
+        "elapsed_ms": 0,
+        "retry_count": 0
+      },
+      "observed_at": "2026-11-03T08:00:00Z",
+      "phase_started_at": "2026-11-03T08:00:00Z",
+      "last_activity_at": "2026-11-03T08:00:00Z",
+      "case_id": "case-7",
+      "expanded_case_id": "case-7-repeat-3",
+      "repeat_index": 3,
+      "repeat_times": 10,
+      "app": "Example App",
+      "process_exit_confirmed": true,
+      "error_kind": null,
+      "persistence_error": null,
+      "suggestion": "检查模型服务状态和当前冻结模型 ID，恢复后点击继续。"
+    },
+    {
+      "phone_id": "phone-b",
+      "execution_id": "run-contract",
+      "collection_run_id": "run-contract",
+      "status": "unknown",
+      "phase": "unknown",
+      "reason_code": "unknown",
+      "reason": "等待新的执行观察",
+      "confidence": "needs_confirmation",
+      "evidence": [],
+      "model_call": null,
+      "observed_at": null,
+      "phase_started_at": null,
+      "last_activity_at": null,
+      "case_id": null,
+      "expanded_case_id": null,
+      "repeat_index": null,
+      "repeat_times": null,
+      "app": null,
+      "process_exit_confirmed": null,
+      "error_kind": null,
+      "persistence_error": null,
+      "suggestion": "查看依据；未知原因需人工确认，不按屏幕静止判断失败。"
+    }
+  ]
+}

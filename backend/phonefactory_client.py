@@ -279,6 +279,14 @@ def build_parser():
     sub.add_parser("run").add_argument("run_id")
     sub.add_parser("run-evaluations").add_argument("run_id")
     sub.add_parser("cancel-run").add_argument("run_id")
+    for command in ("run-diagnostics", "collection-executions", "resume-preview", "resume-collection", "executions-cancel",
+                    "resume-operation", "collection-snapshot"):
+        item = sub.add_parser(command)
+        item.add_argument("run_id")
+        if command in {"resume-preview", "resume-collection", "executions-cancel"}:
+            item.add_argument("--payload", required=True)
+        elif command in {"resume-operation", "collection-snapshot"}:
+            item.add_argument("identifier")
     sub.add_parser("retry-collection-artifacts").add_argument("run_id")
     pressure = sub.add_parser("receipt-storage")
     pressure.add_argument("run_id")
@@ -327,6 +335,22 @@ def main():
         result = post_json("/adb_devices", {})
     elif args.cmd == "capabilities":
         result = get_json("/capabilities")
+    elif args.cmd in {"run-diagnostics", "collection-executions", "resume-preview", "resume-collection", "executions-cancel",
+                      "resume-operation", "collection-snapshot"}:
+        suffix = {"run-diagnostics": "diagnostics", "collection-executions": "executions",
+                  "resume-preview": "resume-preview", "resume-collection": "resume",
+                  "resume-operation": "resume-operations", "collection-snapshot": "collection-snapshots",
+                  "executions-cancel":"executions/cancel"}[args.cmd]
+        path = "/runs/" + urllib.parse.quote(args.run_id, safe="") + "/" + suffix
+        if args.cmd in {"resume-operation", "collection-snapshot"}:
+            path += "/" + urllib.parse.quote(args.identifier, safe="")
+        if args.cmd in {"resume-preview", "resume-collection", "executions-cancel"}:
+            payload = json.loads(args.payload)
+            if not isinstance(payload, dict):
+                sys.exit("错误：续采请求必须为 JSON 对象")
+            result = post_json(path, payload)
+        else:
+            result = get_json(path)
     elif args.cmd == "retry-collection-artifacts":
         result = post_json("/runs/" + urllib.parse.quote(args.run_id, safe="") + "/collection-artifacts/retry", {})
     elif args.cmd == "receipt-storage":

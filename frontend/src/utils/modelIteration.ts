@@ -1,4 +1,7 @@
-import type { EvaluatorConfig, EvaluationIssue, EvaluationRunMetadata } from '@/phoneFactoryApi'
+import type { EvaluatorConfig, EvaluationIssue, EvaluationRunMetadata, CollectionSnapshotMetadata } from '@/phoneFactoryApi'
+
+export const collectionSnapshotLabel = (value?: CollectionSnapshotMetadata) => value?.stale_collection_snapshot
+  ? `旧采集快照 · ${value.source_collection_snapshot_id || '原始采集结果'}${value.collection_snapshot_pending ? ' · 续采中' : ''}` : ''
 
 export function defaultEvaluatorConfig(): EvaluatorConfig {
   return { text: { base_url: '', model: '', api_key_env: 'PHONE_FACTORY_EVALUATOR_TEXT_API_KEY' }, vision: { base_url: '', model: '', api_key_env: 'PHONE_FACTORY_EVALUATOR_VISION_API_KEY' } }

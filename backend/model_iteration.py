@@ -165,7 +165,7 @@ def get_sources(store):
 def preview_source(store, data):
     from .collection_runs import _identifier
     require_capability(store, offline=True)
-    if set(data) - {"source_run_id", "source_path"}:
+    if set(data) - {"source_run_id", "source_path", "snapshot_id"}:
         raise PhoneFactoryError("预览只接受已有运行编号或服务器轨迹目录")
     source = {}
     for key in ("source_run_id", "source_path"):
@@ -176,9 +176,25 @@ def preview_source(store, data):
             source[key] = raw.strip()
     if len(source) != 1:
         raise PhoneFactoryError("请选择一个已有采集运行，或填写一个服务器轨迹目录")
+    if data.get("snapshot_id") and not source.get("source_run_id"):
+        raise PhoneFactoryError("采集快照必须关联已有运行编号")
+    if source.get("source_run_id"):
+        head = store.records.get("collection_resume_heads", source["source_run_id"])
+        requested = data.get("snapshot_id")
+        if head:
+            if not requested and head.get("active"):
+                raise PhoneFactoryError("当前续采尚未结算，请等待稳定快照后评测",409)
+            snapshot_id = _identifier(requested or head.get("current_snapshot_id"), "采集快照编号")
+            snapshot = store.records.get("collection_resume_snapshots",snapshot_id)
+            if not snapshot or snapshot.get("logical_run_id") != source["source_run_id"]:
+                raise PhoneFactoryError("采集快照尚未完整回传或不属于此运行",409)
+            source["snapshot_id"] = snapshot_id
+        elif requested:
+            raise PhoneFactoryError("此运行没有已登记的续采快照",409)
     value = store._remote_result(["evaluation-preview", "--payload", json.dumps(source, ensure_ascii=False)])
     from .evaluation_previews import accept
-    return accept(store, source, value)
+    from .collection_resume_snapshots import evaluation_snapshot_status
+    return {**accept(store, source, value),**evaluation_snapshot_status(store.records,source)}
 
 
 

@@ -252,18 +252,29 @@ class EvaluationSyncPolicyTests(unittest.TestCase):
     def test_cancel_acknowledgement_is_preserved_when_final_refresh_times_out(self):
         run_id = self.old_run()["run_id"]
         original = self.store.run_client
+        probes = []
         def cancel_then_timeout(args):
             if args[0] == "cancel-run":
                 import json
                 return {"ok": True, "output": json.dumps({"run_id": run_id, "status": "cancelled"})}
             if args[0] == "run":
+                probes.append(True)
+                if len(probes)==1:
+                    import json
+                    return {"ok":True,"output":json.dumps({"run_id":run_id,"run_mode":"modeliter","status":"running"})}
                 return {"ok": False, "output": "timeout", "remote_kind": "timeout"}
             return original(args)
         self.store.run_client = cancel_then_timeout
         cancelled = self.store.dispatch(f"runs/{run_id}/cancel", "POST", {}, mode="modeliter")
-        self.assertEqual(cancelled["status"], "cancelled")
-        self.assertEqual(cancelled["sync"]["state"], "backoff")
-        self.assertEqual(cancelled["sync"]["remote_status"], "cancelled")
+        self.assertTrue(cancelled["stop_accepted"])
+        self.store.runtime._control_pool.close()  # Wait for the asynchronous acknowledgement.
+        self.assertEqual(self.store.records.get("model_iter_runs",run_id)["status"],"cancelled")
+        with self.assertRaises(PhoneFactoryError):
+            self.store.runtime.sync_evaluation(run_id,force=True)
+        self.assertEqual(self.store.records.get("model_iter_runs",run_id)["status"],"cancelled")
+        state=self.store.runtime.sync_policy.view("evaluation",run_id)
+        self.assertEqual(state["state"],"backoff")
+        self.assertEqual(state["remote_status"],"cancelled")
 
 
 if __name__ == "__main__":

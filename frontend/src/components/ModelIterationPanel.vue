@@ -47,6 +47,7 @@
       <el-button :loading="previewLoading" :disabled="!canPreview" @click="previewSource">检查轨迹并预览</el-button>
       <el-alert v-if="sourceError" :title="sourceError" type="error" :closable="false" />
       <template v-if="preview">
+        <p v-if="collectionSnapshotLabel(preview)" class="hint" data-testid="stale-evaluation-preview">{{ collectionSnapshotLabel(preview) }}。此预览使用旧采集快照；重新检查可获取当前结果。</p>
         <p v-if="preview.status === 'preparing'">正在后台检查轨迹并冻结可评测集合，手机采集和其他运行不受影响。</p>
         <p v-else>可评测 {{ preview.trajectory_count }} 条<template v-if="preview.coverage"> / 共 {{ preview.coverage.total }} 条，排除 {{ preview.coverage.excluded }} 条</template>。{{ preview.valid ? '将评测全部可用轨迹，报告保留排除原因。' : '没有可评测轨迹，请查看排除原因。' }}</p>
         <details v-if="preview.errors.length"><summary>查看排除原因（摘要最多 100 条）</summary><el-alert v-for="(issue, index) in preview.errors" :key="index" :title="evaluationIssueText(issue)" type="warning" :closable="false" /></details>
@@ -65,9 +66,10 @@
 
     <div class="heading"><h2>用例评测进度</h2><el-button :disabled="!selectedRun" @click="emit('details')">查看用例明细</el-button></div>
     <el-select :model-value="selectedRun" filterable :filter-method="filterRuns" placeholder="选择评估运行" class="run-picker" :disabled="progressBusy" @update:model-value="selectRun">
-      <el-option v-for="run in filteredRuns" :key="run.run_id" :label="`${displayId('run', run.run_id)} · ${evaluationModeLabel(run.execution_mode)} · ${run.evaluation_profile_id || '历史规则'}`" :value="run.run_id" />
+      <el-option v-for="run in filteredRuns" :key="run.run_id" :label="`${displayId('run', run.run_id)} · ${evaluationModeLabel(run.execution_mode)} · ${run.evaluation_profile_id || '历史规则'}${run.stale_collection_snapshot ? ' · 旧采集快照' : ''}`" :value="run.run_id" />
     </el-select>
     <p v-if="selectedRun" class="hint">运行：<DisplayId kind="run" :id="selectedRun" /></p>
+    <p v-if="collectionSnapshotLabel(resultMetadata)" class="hint" data-testid="stale-evaluation-run">{{ collectionSnapshotLabel(resultMetadata) }}。此评测使用旧采集快照，结果与报告保持原样。</p>
     <CollectionRunProgress :run="resultMetadata" />
     <p v-if="resultMetadata.batch_id && resultMetadata.execution_mode !== 'evaluate_only'" class="hint">采集结果批次：<DisplayId kind="batch" :id="resultMetadata.batch_id" /> · 采集、回传和评测分别更新。</p>
     <el-button v-if="canCancel" type="danger" plain :loading="cancelling" class="cancel-run" @click="cancelRun">停止本次运行</el-button>
@@ -98,7 +100,7 @@ import type { EvaluationProgress } from '@/composables/useEvaluationProgress'
 import DisplayId from '@/components/DisplayId.vue'
 import CollectionRunProgress from '@/components/CollectionRunProgress.vue'
 import { useDisplayIdentifiers } from '@/composables/useDisplayIdentifiers'
-import { defaultEvaluatorConfig, formatSuccessRate, evaluationIssueText, evaluationModeLabel, evaluationSourceLabel } from '@/utils/modelIteration'
+import { defaultEvaluatorConfig, formatSuccessRate, evaluationIssueText, evaluationModeLabel, evaluationSourceLabel, collectionSnapshotLabel } from '@/utils/modelIteration'
 
 const props = defineProps<{ runs: FactoryRun[]; progress: EvaluationProgress }>()
 const { displayId, matches, resolve } = useDisplayIdentifiers()
