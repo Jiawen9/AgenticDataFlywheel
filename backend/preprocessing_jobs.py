@@ -6,6 +6,7 @@ from . import pipeline_diagnostics as diagnostics
 from .pipeline_diagnostic_http import install_box_reviewer_logging
 
 import copy
+import hashlib
 import json
 import threading
 from concurrent.futures import Executor, ThreadPoolExecutor
@@ -243,14 +244,22 @@ class PreprocessingJobManager:
                             "input_snapshot_ref": {"path": job["input_path"], "sha256": job["input_sha256"]}})
                     # On an established batch, preserve the complete old chain until
                     # the replacement annotation is ready. A failed retry changes nothing.
-                    if self.artifacts.get(job["batch_id"], "02_annotation") is None:
+                    from .collection_resume_snapshots import is_current_collection_snapshot
+                    with active_batch_lock(job["batch_id"], self.root):
+                        current_input = is_current_collection_snapshot(self.records, job["batch_id"], snapshot)
+                    if self.artifacts.get(job["batch_id"], "02_annotation") is None and current_input:
                         from .display_identifiers import DisplayIdentifierStore
                         display_entries = DisplayIdentifierStore(self.root).conversion_entries(job["batch_id"], payload)
-                        conversion = self.artifacts.publish_many(job["batch_id"], [pending_conversion],
-                                                                 record_entries=display_entries)[0]
-                        pending_conversion = None
-                        saved = [conversion]
-                        self._update(job_id, artifacts=saved)
+                        with active_batch_lock(job["batch_id"], self.root):
+                            if is_current_collection_snapshot(self.records, job["batch_id"], snapshot):
+                                conversion = self.artifacts.publish_many(job["batch_id"], [pending_conversion],
+                                                                         record_entries=display_entries)[0]
+                                pending_conversion = None
+                                saved = [conversion]
+                                self._update(job_id, artifacts=saved)
+                            else:
+                                json_path = work / "trajectories_to_excel.json"
+                                io_path(json_path).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
                     else:
                         json_path = work / "trajectories_to_excel.json"
                         io_path(json_path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -297,6 +306,21 @@ class PreprocessingJobManager:
                     self._update(job_id, stage="publishing")
                     from .batch_results import annotation_task_fingerprints, invalidation_record_entry, drain_batch_invalidations
                     with active_batch_lock(job["batch_id"], self.root):
+                        from .collection_resume_snapshots import is_current_collection_snapshot
+                        if not is_current_collection_snapshot(self.records, job["batch_id"], snapshot):
+                            # The frozen job may finish and retain output, but its
+                            # late completion must not promote an obsolete input.
+                            history = []
+                            for name in ("trajectories_to_excel.xlsx", "trajectories_to_excel.json", "annotated_trajectories.xlsx"):
+                                path = io_path(work / name)
+                                if path.is_file():
+                                    history.append({"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                                                    "size": path.stat().st_size})
+                            self._update(job_id, status="succeeded", stage="succeeded", completed_at=utc_now(),
+                                artifacts=saved, percent=100, error=None, stale_collection_input=True,
+                                historical_outputs=history, collection_snapshot_id=snapshot.get("collection_snapshot_id"),
+                                message="原快照预处理已完成；采集已续采，结果保留为旧版本，未更新当前标框。")
+                            return
                         current = self.artifacts.get(job["batch_id"], "02_annotation")
                         if (current or {}).get("version") != job.get("base_annotation_version"):
                             raise PreprocessingError("预处理期间标框已变化，已保留人工结果；请刷新后重新开始")

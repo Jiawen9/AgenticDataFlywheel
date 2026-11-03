@@ -121,5 +121,7 @@ def state(store, preview_id, offset=0, limit=50):
         raise PhoneFactoryError("预览不存在", 404)
     if saved["preview"].get("status") == "preparing":
         schedule(store, preview_id)
+    from .collection_resume_snapshots import evaluation_snapshot_status
     return {**public(saved["preview"], offset, limit),
+            **evaluation_snapshot_status(store.records,saved.get("request",{})),
             **({"sync_error": saved["sync_error"]} if saved.get("sync_error") else {})}

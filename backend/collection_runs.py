@@ -594,6 +594,18 @@ class CollectionRunStore:
 
     def ready_input(self, batch_id: str) -> dict:
         batch = self.batch(batch_id)
+        if batch.get("collection_run_id"):
+            from .collection_resume_snapshots import current_input
+            resumed = current_input(self.records, batch["collection_run_id"])
+            if resumed is not None:
+                return resumed
+        else:
+            heads = [h for h in self.records.list("collection_resume_heads") if h.get("batch_id") == batch_id]
+            if heads:
+                if len(heads) != 1:
+                    raise CollectionRunError("旧批次包含多个续采根运行，不能猜测合并输入")
+                from .collection_resume_snapshots import current_input
+                return current_input(self.records,heads[0]["run_id"])
         runs, trajectories, errors = [], [], []
         for run in self.list_runs(batch_id):
             if batch.get("batch_role") == "collection_result" and run["collection_run_id"] != batch["collection_run_id"]:

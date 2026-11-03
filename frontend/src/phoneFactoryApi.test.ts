@@ -3,6 +3,35 @@ import { factoryBatchesApi, modelIterationApi, phoneFactoryApi } from './phoneFa
 import { notifyBatchesPublished } from '@/utils/batchLifecycle'
 afterEach(() => vi.unstubAllGlobals())
 describe('phone factory transport contracts', () => {
+  it('uses encoded diagnostic and grouped-case endpoints and preserves the resume identity across requests', async () => {
+    const fetcher = vi.fn(async () => new Response('{"ok":true,"operation_id":"stable/request","status":"accepted"}')); vi.stubGlobal('fetch', fetcher)
+    const signal = new AbortController().signal
+    await phoneFactoryApi.diagnostics('run/a', signal)
+    await phoneFactoryApi.casePage('run/a', { app: 'App A', phone_id: 'p/1', status: 'failed', q: '搜索', offset: 20, limit: 10 }, signal)
+    await phoneFactoryApi.caseInstances('run/a', 'case/a', 'p/1', signal)
+    await phoneFactoryApi.resumePreview('run/a', ['p/1'], signal)
+    const body = { request_id: 'stable/request', preview_id: 'preview', selection_digest: 'digest', expected_revision: 4, confirm_unknown_phone_ids: ['p/1'] }
+    await phoneFactoryApi.resumeCollection('run/a', body, signal)
+    await phoneFactoryApi.resumeOperation('run/a', body.request_id, signal)
+    expect(fetcher.mock.calls[0]?.[0]).toBe('/api/phone-factory/collection-runs/run%2Fa/diagnostics')
+    expect(fetcher.mock.calls[1]?.[0]).toContain('offset=20&limit=10&app=App+A&phone_id=p%2F1&status=failed&q=')
+    expect(fetcher.mock.calls[2]?.[0]).toBe('/api/phone-factory/collection-runs/run%2Fa/cases/case%2Fa/instances?phone_id=p%2F1')
+    expect(JSON.parse(String(fetcher.mock.calls[4]?.[1]?.body))).toEqual(body)
+    expect(fetcher.mock.calls[5]?.[0]).toBe('/api/phone-factory/collection-runs/run%2Fa/resume-operations/stable%2Frequest')
+    for (const call of fetcher.mock.calls) expect(call[1]?.signal).toBe(signal)
+  })
+  it('binds resumed instance evidence to its physical execution without changing old artifact URLs', async () => {
+    const fetcher = vi.fn(async () => new Response('{"ok":true}')); vi.stubGlobal('fetch', fetcher)
+    await phoneFactoryApi.artifactDetail('root', 'artifact', undefined, 'cx/new')
+    expect(fetcher.mock.calls[0]?.[0]).toBe('/api/phone-factory/collection-runs/root/artifacts/artifact?execution_id=cx%2Fnew')
+    expect(phoneFactoryApi.artifactFileUrl('root', 'artifact', 'case/shot.jpg', 'cx/new')).toBe('/api/phone-factory/collection-runs/root/artifacts/artifact/file?path=case%2Fshot.jpg&execution_id=cx%2Fnew')
+    expect(phoneFactoryApi.artifactFileUrl('root', 'artifact', 'old.jpg')).toBe('/api/phone-factory/collection-runs/root/artifacts/artifact/file?path=old.jpg')
+  })
+  it('retains a durable uncertain operation even when its HTTP 200 snapshot contains an error', async () => {
+    const operation = { operation_id: 'stable', status: 'uncertain', error: 'collector timeout' }
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(operation))))
+    expect(await phoneFactoryApi.resumeOperation('run', 'stable')).toEqual(operation)
+  })
   it('requests production cancellation without mutating the evaluation endpoint', async () => {
     const fetcher = vi.fn(async () => new Response('{"status":"interrupted"}'))
     vi.stubGlobal('fetch', fetcher)

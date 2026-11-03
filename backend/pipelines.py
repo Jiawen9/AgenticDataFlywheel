@@ -160,6 +160,22 @@ class PipelineRuntime:
 
     def input_ready(self, pipeline):
         runs = self.collection_runs(pipeline["batch_id"])
+        heads = [head for head in self.records.list("collection_resume_heads")
+                 if head.get("batch_id") == pipeline["batch_id"]]
+        if heads:
+            if any(head.get("active") for head in heads):
+                return False
+            ready = self.factory.collection_runs.ready_input(pipeline["batch_id"])
+            summary = ready.get("collection_summary", {})
+            if (ready.get("errors") or summary.get("collection_failed_count") or summary.get("collection_not_run_count")
+                    or summary.get("collection_completed_count") != summary.get("planned_trajectory_count")):
+                raise PipelineError("本轮当前结果仍有失败或未执行实例，不能按全成功推进自动流程")
+            if summary.get("preprocessing_eligible_count") != summary.get("planned_trajectory_count"):
+                raise PipelineError("本轮轨迹尚未全部满足原有预处理资格，不能自动推进")
+            pipeline["input_digest"] = ready["input_digest"]
+            pipeline["collection_input_version"] = {key: ready.get(key) for key in
+                ("input_digest", "collection_snapshot_id", "collection_epoch")}
+            return True
         bound = set(pipeline.get("collection_run_ids", []))
         if pipeline["start_mode"] == "collect" and bound - {run["collection_run_id"] for run in runs}:
             raise PipelineError("本次采集运行记录缺失，不能改用其他历史运行继续")
@@ -178,6 +194,8 @@ class PipelineRuntime:
             if not set(pipeline["task_ids"]).issubset(present):
                 raise PipelineError("采集结果未覆盖整批任务，不能把缺失用例当成低分跳过")
             pipeline["input_digest"] = ready["input_digest"]
+            pipeline["collection_input_version"] = {key: ready.get(key) for key in
+                ("input_digest", "collection_snapshot_id", "collection_epoch")}
             return True
         return self.artifacts.get(pipeline["batch_id"], "02_annotation") is not None
 
@@ -265,7 +283,12 @@ class PipelineRuntime:
 
     def publish(self, pipeline):
         from .pipeline_release import publish_pipeline
-        return publish_pipeline(pipeline, root=self.root, registry=self.overview.registry)
+        from .collection_resume_snapshots import is_current_collection_snapshot
+        with self.artifacts.batch_lock(pipeline["batch_id"]):
+            frozen = pipeline.get("collection_input_version", {"input_digest": pipeline.get("input_digest")})
+            if not is_current_collection_snapshot(self.records, pipeline["batch_id"], frozen):
+                raise PipelineError("采集结果已续采，当前流程输入过期；等待新快照重新处理")
+            return publish_pipeline(pipeline, root=self.root, registry=self.overview.registry)
 
     def conversion(self, release_id, *, retry=False):
         value = self.records.get("training_overview_conversions", release_id)
@@ -439,6 +462,8 @@ class PipelineManager:
                     return self.get(pipeline_id)
             else:
                 raise PipelineError("当前状态不能执行该操作")
+            if p.get("collection_resume_wait") and action in {"pause", "resume"}:
+                p["collection_resume_wait"]["previous_status"] = "paused" if action == "pause" else "running"
             self._log(p, {"pause": "暂停后续派发", "resume": "继续执行", "retry": "重试当前阶段", "terminate": "等待已启动作业结束后终止"}.get(action, action))
             self._save(p)
             return self.get(pipeline_id)
@@ -596,10 +621,64 @@ class PipelineManager:
         with diagnostics.trace_context(root=self.root, pipeline_id=pipeline_id):
             return self._tick_with_diagnostics(pipeline_id)
 
+    def _collection_version_fence(self, pipeline):
+        """Pause on durable resume intent; late old jobs cannot advance new data."""
+        heads = [head for head in self.records.list("collection_resume_heads")
+                 if head.get("batch_id") == pipeline["batch_id"]]
+        if not heads or pipeline.get("release_id") or pipeline["status"] in {"terminating", "terminated"}:
+            return False
+        if len(heads) != 1:
+            message = "该旧批次关联多个续采根运行，不能确定唯一结果快照；请核对批次绑定后继续"
+            if pipeline.get("error") != message:
+                self._log(pipeline, message)
+            pipeline.update(status="failed", error=message)
+            return True
+        fingerprint = digest([{key: head.get(key) for key in
+                               ("run_id", "revision", "current_snapshot_id", "active")} for head in heads])
+        frozen = pipeline.get("collection_input_version", {"input_digest": pipeline.get("input_digest")})
+        from .collection_resume_snapshots import is_current_collection_snapshot
+        current = is_current_collection_snapshot(self.records, pipeline["batch_id"], frozen)
+        if current and not pipeline.get("collection_resume_wait"):
+            return False
+        if not pipeline.get("collection_resume_wait"):
+            pipeline["collection_resume_wait"] = {"previous_status": pipeline["status"], "at": utc_now()}
+            pipeline["previous_collection_input_version"] = frozen
+            self._log(pipeline, "采集已续采：等待新结果快照，旧作业结果保留且不推进当前流程")
+        wait = pipeline["collection_resume_wait"]
+        wait["head_fingerprint"] = fingerprint
+        if any(head.get("active") or not head.get("current_snapshot_id") for head in heads):
+            pipeline.update(status="paused", paused_from="running", error="正在续采或回传，等待稳定采集快照")
+            return True
+        if active_jobs(pipeline["batch_id"], self.root):
+            pipeline.update(status="paused", error="等待已启动的旧快照作业结束；结果将保留为旧版本")
+            return True
+        for step in pipeline["steps"]:
+            step.setdefault("previous_job_ids", []).extend(step.get("job_ids", []))
+            step.update(status="pending", job_ids=[], started_at=None, completed_at=None, error=None, message="等待新采集快照")
+            for key in ("retry", "retry_job_id", "retry_info"):
+                step.pop(key, None)
+        previous_status = wait.get("previous_status")
+        pipeline.pop("collection_resume_wait", None)
+        pipeline.pop("collection_input_version", None)
+        pipeline.update(input_digest=None, selection=None, confirmation=None, session_id=None,
+                        current_step="collection", status="paused" if previous_status == "paused" else "running",
+                        error=None, paused_from="running")
+        # Record the new stable version before processing collection on next tick;
+        # prevents resetting steps on every poll while preserving eligibility checks.
+        head = heads[0]
+        pipeline["collection_input_version"] = {"collection_snapshot_id": head.get("current_snapshot_id"),
+             "collection_epoch": head.get("revision"), "input_digest": head.get("current_snapshot_digest")}
+        self._log(pipeline, "续采快照已稳定，按现有资格规则重新处理；历史作业保留")
+        return True
+
     def _tick_with_diagnostics(self, pipeline_id):
         with self.artifacts.batch_lock("pipeline_" + pipeline_id), internal_pipeline(pipeline_id):
             p = self.get(pipeline_id, public=False)
             original = digest(p)
+            if p["status"] not in TERMINAL - {"failed"} and self._collection_version_fence(p):
+                if digest(p) != original:
+                    self._save(p)
+                return
             if p["status"] in TERMINAL - {"published_summary_failed"}:
                 return
             state = lifecycle(p["batch_id"], self.root)

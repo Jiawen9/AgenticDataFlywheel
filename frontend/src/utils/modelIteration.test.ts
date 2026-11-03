@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest'
-import { collectionStatus, evaluationStatus, formatSuccessRate, verdictLabel, checklistSourceLabel, evaluationSourceLabel } from './modelIteration'
+import { collectionStatus, evaluationStatus, formatSuccessRate, verdictLabel, checklistSourceLabel, evaluationSourceLabel, collectionSnapshotLabel } from './modelIteration'
 
 describe('evaluation presentation', () => {
+  it('labels only server-confirmed stale snapshots, preserving original versus latest identity', () => {
+    expect(collectionSnapshotLabel({ source_collection_snapshot_id: 'cs_old' })).toBe('')
+    expect(collectionSnapshotLabel({ stale_collection_snapshot: false })).toBe('')
+    expect(collectionSnapshotLabel({ stale_collection_snapshot: true, source_collection_snapshot_id: 'cs_old', current_collection_snapshot_id: 'cs_new' })).toBe('旧采集快照 · cs_old')
+    expect(collectionSnapshotLabel({ stale_collection_snapshot: true, source_collection_snapshot_id: null, collection_snapshot_pending: true })).toBe('旧采集快照 · 原始采集结果 · 续采中')
+  })
   it('does not display an unscored run as zero success', () => {
     expect(formatSuccessRate(null)).toBe('—')
     expect(formatSuccessRate(0)).toBe('0.0%')

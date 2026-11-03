@@ -11,6 +11,7 @@
       </div>
     </header>
     <ModelIterationPanel v-if="evaluationProgress" :runs="runs" :progress="evaluationProgress" @ready="evaluationReady = $event" @config="evaluatorConfig = $event" @mode="evaluationMode = $event" @profile="evaluationProfile = $event" @started="onEvaluationStarted" @details="openDetails('cases')" />
+    <PhoneRunDiagnostics v-if="!showCollectionControls" :state="diagnostics" :runs="filteredRuns" :allow-resume="false" @details="openPhoneDiagnostics" />
 
     <div class="factory-layout" :class="{ 'offline-layout': !showCollectionControls }">
       <!-- ============ 左列：新增手机（含手机列表） ============ -->
@@ -69,6 +70,7 @@
           </el-table-column>
         </el-table>
         <p v-if="!phoneApps.length" class="empty-hint">暂无手机关联，请在上方新增。</p>
+        <PhoneRunDiagnostics :state="diagnostics" :runs="filteredRuns" :allow-resume="diagnosticResumeAllowed" @details="openPhoneDiagnostics" />
       </section>
 
       <!-- ============ 右列：轨迹生产（含任务列表） ============ -->
@@ -201,8 +203,8 @@
         <p v-if="!tasks.length" class="empty-hint">暂无任务，请在上方新增。</p>
         </template>
 
+        <div v-if="!isEvaluation && !pipelineContext.isPipelineRoute.value" class="history-scope"><label for="history-source">历史运行范围</label><el-select id="history-source" v-model="historySourceId" clearable filterable placeholder="全部任务来源" aria-label="历史运行范围"><el-option v-for="batch in collectionBatches" :key="batch.batch_id" :value="batch.batch_id" :label="collectionBatchOptionLabel(batch)" /></el-select><small>独立于上方的新任务配置</small></div>
         <FactoryRunSummary :runs="filteredRuns" :evaluation="isEvaluation" :error="runError || (isEvaluation ? reportError : '')" @open="openRunDetails" @reports="openDetails('reports')" />
-        <p v-if="!isEvaluation && selectedBatchId" class="empty-hint">当前仅展示所选任务来源的各次采集；清空任务来源可查看全部运行。</p>
         <!-- 定制运行只覆盖此次运行的配置 -->
         <el-dialog v-if="showCollectionControls" v-model="runDialogVisible" title="定制运行" width="480px" :close-on-click-modal="false" :close-on-press-escape="!confirmingRun" :show-close="!confirmingRun">
           <div class="row-form">
@@ -232,7 +234,7 @@
         </el-dialog>
       </section>
     </div>
-    <FactoryRunDetailsDrawer v-model="detailsVisible" v-model:tab="detailsTab" v-model:run-filter="detailsRunFilter" :focused-run="detailsFocusedRun" :scope-key="selectedBatchId" :evaluation="isEvaluation" :runs="filteredRuns" :progress="evaluationProgress" :folders="reportFolders" :run-error="runError" :report-error="reportError" :loading-reports="loadingReports" :downloading-report="downloadingReport" @refresh-reports="reportPoller.start()" @download-report="downloadReport">
+    <FactoryRunDetailsDrawer v-model="detailsVisible" v-model:tab="detailsTab" v-model:run-filter="detailsRunFilter" :focused-run="detailsFocusedRun" :scope-key="historySourceId" :evaluation="isEvaluation" :runs="filteredRuns" :progress="evaluationProgress" :diagnostics="diagnostics" :diagnostics-api="factoryApi" :allow-resume="diagnosticResumeAllowed" :focused-phone="detailsFocusedPhone" :folders="reportFolders" :run-error="runError" :report-error="reportError" :loading-reports="loadingReports" :downloading-report="downloadingReport" @refresh-reports="reportPoller.start()" @download-report="downloadReport">
       <template #run-actions="{ run: row }"><router-link v-if="isPublishedRun(row)" :to="publishedRunLocation(row)" class="preprocessing-link">查看发布记录</router-link><router-link v-if="canPreprocessCollection(row) && !isPublishedRun(row) && !pipelineContext.isPipelineRoute.value && !managedBatchIds.includes(row.batch_id)" :to="collectionResultLocation(row)" class="preprocessing-link">前往预处理</router-link><el-button v-if="!isEvaluation || (row.batch_id && row.execution_mode !== 'evaluate_only')" link :loading="syncingRun === (row.collection_run_id || row.run_id)" :disabled="pipelineContext.isPipelineRoute.value || managedBatchIds.includes(row.batch_id) || isPublishedRun(row)" @click="syncRun(row)">重试回传</el-button><el-button v-if="!isEvaluation && canCancelCollectionRun(row) && !isPublishedRun(row)" link type="danger" :loading="cancellingRun === (row.collection_run_id || row.run_id)" :disabled="pipelineContext.isPipelineRoute.value || managedBatchIds.includes(row.batch_id)" @click="cancelCollectionRun(row)">停止</el-button></template>
     </FactoryRunDetailsDrawer>
     </template>
@@ -262,6 +264,8 @@ import ModelIterationPanel from '@/components/ModelIterationPanel.vue'
 import FactoryRunSummary from '@/components/FactoryRunSummary.vue'
 import FactoryRunDetailsDrawer, { type FactoryDetailsTab } from '@/components/FactoryRunDetailsDrawer.vue'
 import { useEvaluationProgress } from '@/composables/useEvaluationProgress'
+import { useCollectionDiagnostics } from '@/composables/useCollectionDiagnostics'
+import PhoneRunDiagnostics from '@/components/PhoneRunDiagnostics.vue'
 import DisplayId from '@/components/DisplayId.vue'
 import { useDisplayIdentifiers } from '@/composables/useDisplayIdentifiers'
 import { useFactoryPolling } from '@/composables/useFactoryPolling'
@@ -351,14 +355,18 @@ const devices = ref<AdbDevice[]>([])
 const deviceError = ref('')
 const runError = ref('')
 const runs = ref<FactoryRun[]>([])
-const filteredRuns = computed(() => runs.value.filter(run => isEvaluation || pipelineContext.isPipelineRoute.value || collectionRunBelongsToSource(run, selectedBatchId.value)))
+const historySourceId = ref('')
+const filteredRuns = computed(() => runs.value.filter(run => isEvaluation || pipelineContext.isPipelineRoute.value || collectionRunBelongsToSource(run, historySourceId.value)))
 const evaluationProgress = isEvaluation ? useEvaluationProgress(runs, refreshEvaluationRuns) : undefined
 const detailsVisible = ref(false), detailsTab = ref<FactoryDetailsTab>('runs')
 const detailsRunFilter = ref<'all' | 'active' | 'abnormal'>('all'), detailsFocusedRun = ref('')
+const detailsFocusedPhone = ref('')
 function openDetails(tab: FactoryDetailsTab) { detailsTab.value = tab; detailsVisible.value = true }
 function openRunDetails(filter: 'all' | 'active' | 'abnormal', runId = '') {
+  if (runId) diagnostics.selectRun(runId)
   detailsRunFilter.value = filter; detailsFocusedRun.value = runId; openDetails('runs')
 }
+function openPhoneDiagnostics(phoneId: string) { detailsFocusedPhone.value = phoneId; openDetails('diagnostics') }
 async function onEvaluationStarted(runId: string) {
   evaluationProgress?.selectRun(runId)
   await refreshEvaluationRuns()
@@ -393,6 +401,25 @@ const { batches: collectionBatches, selectedBatchId, selectedBatch, loadingBatch
 const filteredCollectionBatches = computed(() => collectionBatches.value.filter(batch => matches(batchQuery.value, 'batch', batch.batch_id, '', collectionBatchOptionLabel(batch), batch.filename, ...batch.apps)))
 const pipelineContext = usePipelineContext({ lookupByBatch: false, stepId: 'collection' })
 const managedBatchIds = ref<string[]>([])
+function mayResume(run: FactoryRun) {
+  return !isEvaluation && run.execution_mode !== 'evaluate_only' && !isPublishedRun(run)
+    && !pipelineContext.isPipelineRoute.value && !managedBatchIds.value.includes(run.batch_id || '')
+}
+const diagnostics = useCollectionDiagnostics(filteredRuns, factoryApi, {
+  canResume: mayResume,
+  async confirmUnknown(phones) {
+    try {
+      await ElMessageBox.confirm(`以下手机的原执行状态仍不确定：${phones.join('、')}。确认这些手机上的原采集已停止后，才会继续未完成实例；运行和批次编号保持不变。`, '确认手机组状态', { type: 'warning', confirmButtonText: '确认原执行已停止并继续', cancelButtonText: '暂不继续' })
+      return true
+    } catch { return false }
+  },
+})
+const diagnosticResumeAllowed = computed(() => !!diagnostics.selectedRun.value && mayResume(diagnostics.selectedRun.value))
+watch(historySourceId, () => { diagnostics.selectRun(''); detailsFocusedRun.value = ''; detailsFocusedPhone.value = '' })
+if (evaluationProgress) {
+  watch(evaluationProgress.selectedRun, id => { if (id && id !== diagnostics.selectedRunId.value) diagnostics.selectRun(id) })
+  watch(diagnostics.selectedRunId, id => { if (id && id !== evaluationProgress.selectedRun.value) evaluationProgress.selectRun(id) })
+}
 const isManagedTask = (task: TaskRow) => Boolean(isCollectionResult(task) && task.source_batch_id && (managedBatchIds.value.includes(task.source_batch_id) || (pipelineContext.managed.value && pipelineContext.pipeline.value?.batch_id === task.source_batch_id)))
 async function loadManagedBatches() {
   if (isEvaluation || typeof api.listPipelines !== 'function') return
@@ -714,9 +741,9 @@ async function refreshEvaluationRuns() {
   try { const result = await factoryApi.runs(); if (!disposed) { runs.value = result.runs; runError.value = '' } }
   catch (error) { if (!disposed) runError.value = `运行状态暂不可用：${(error as Error).message}` }
 }
-const runsPoller = useFactoryPolling(async (signal, current) => {
+useFactoryPolling(async (signal, current) => {
   if (pipelineContext.historyOnly.value || (pipelineContext.isPipelineRoute.value && !pipelineContext.resolved.value)) return
-  const epoch = stateEpoch, pipelineId = pipelineContext.pipeline.value?.pipeline_id
+  const epoch = stateEpoch
   if (showCollectionControls.value) try {
     const state = await factoryApi.state(signal)
     if (!current()) return
@@ -729,7 +756,12 @@ const runsPoller = useFactoryPolling(async (signal, current) => {
       devices.value = adb.devices; deviceError.value = ''
     }
   } catch (error) { if (current()) deviceError.value = `设备状态暂不可用：${(error as Error).message}` }
-  if (!current()) return
+})
+// Collection snapshots have their own clock; a slow ADB/status probe cannot
+// hold back run progress, diagnostics, or return receipts.
+const runsPoller = useFactoryPolling(async (signal, current) => {
+  if (pipelineContext.historyOnly.value || (pipelineContext.isPipelineRoute.value && !pipelineContext.resolved.value)) return
+  const pipelineId = pipelineContext.pipeline.value?.pipeline_id
   try {
     const result = await factoryApi.runs(signal)
     if (current() && !pipelineContext.historyOnly.value && pipelineId === pipelineContext.pipeline.value?.pipeline_id) { runs.value = result.runs.filter(item => isEvaluation || !pipelineContext.isPipelineRoute.value || (pipelineContext.pipeline.value?.collection_run_ids || []).includes(item.collection_run_id || item.run_id || '')); runError.value = '' }
@@ -795,6 +827,7 @@ onBeforeUnmount(() => { document.body.classList.remove('factory-responsive'); di
 </script>
 
 <style scoped>
+.history-scope{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:20px;font-size:12px}.history-scope .el-select{width:min(360px,100%)}.history-scope small{color:var(--muted)}
 :global(body.factory-responsive) { min-width: 0; }
 .report-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }.report-folder p { overflow-wrap: anywhere; color: var(--muted); font-size: 13px; }.custom-config { display: grid; gap: 14px; margin-top: 20px; }.custom-config label { display: flex; align-items: center; justify-content: space-between; gap: 14px; }.custom-config .el-select { width: 240px; }.report-folder { margin-top: 14px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; }.report-file { display:flex; justify-content:space-between; gap:12px; margin-top:8px; overflow-wrap:anywhere; }
 .batch-select { width: min(480px, 100%); }.batch-summary { padding: 12px; border: 1px solid #dbe3ed; border-radius: 8px; background: #f8fffd; }.batch-summary p { margin: 0 0 9px; color: #64748b; font-size: 12px; overflow-wrap: anywhere; }.batch-alert { margin: 10px 0; }

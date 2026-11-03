@@ -56,6 +56,12 @@ class ArtifactTransfer:
     @staticmethod
     def _expected(run):
         options = run["request"]["metadata"]
+        if run.get("root_run_id") and isinstance(run.get("execution_instances"), list):
+            instances = {(row["phone_id"], row["collection_case_id"], row["repeat_index"])
+                         for row in run["execution_instances"]}
+            if not instances or len(instances) != len(run["execution_instances"]):
+                raise CollectionRunError("续采分段计划为空或重复")
+            return instances
         associations = options.get("phone_apps")
         phones = options.get("phone_ids") or ([options["phone_id"]] if options.get("phone_id") else [])
         expected = set()

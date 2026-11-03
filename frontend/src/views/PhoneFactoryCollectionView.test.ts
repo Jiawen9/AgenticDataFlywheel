@@ -130,9 +130,12 @@ describe('phone collection batch picker', () => {
     const second = { ...first, collection_run_id: 'cr-pipeline', batch_id: 'result-pipeline', agent_type: 'pipelineagent' }
     view.selectedBatchId = 'same-source'
     view.runs = [first, second, { ...first, batch_id: 'other-result', task_source_batch_id: 'other-source' }]
+    expect(view.filteredRuns).toHaveLength(3)
+    view.historySourceId = 'same-source'
     expect(view.filteredRuns.map((run: { batch_id: string }) => run.batch_id)).toEqual(['result-new', 'result-pipeline'])
     view.onPublished({ batch_ids: ['result-new', 'same-source'], release_id: 'release-one' })
     expect(view.selectedBatchId).toBe('same-source')
+    view.selectedBatchId = 'other-source'
     expect(view.filteredRuns.map((run: { batch_id: string }) => run.batch_id)).toEqual(['result-new', 'result-pipeline'])
     expect(view.collectionResultLocation(first).query.batch_id).toBe('result-new')
     expect(view.collectionResultLocation(second).query.batch_id).toBe('result-pipeline')
