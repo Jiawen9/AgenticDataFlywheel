@@ -11,7 +11,7 @@ export function useEvaluationProgress(runs: Ref<FactoryRun[]>, onChanged: (runId
   let disposed = false, mounted = false, selectionEpoch = 0
   const visible = () => typeof document === 'undefined' || !document.hidden
   const selectedRunRecord = computed(() => runs.value.find(run => run.run_id === selectedRun.value))
-  const canCancel = computed(() => !!selectedRunRecord.value && (selectedRunRecord.value.can_cancel_collection === true || !!selectedRunRecord.value.control_error || !['completed', 'succeeded', 'partial', 'failed', 'interrupted', 'cancelled'].includes(selectedRunRecord.value.status) || !!selectedRunRecord.value.dispatch_error))
+  const canCancel = computed(() => !!selectedRunRecord.value && (selectedRunRecord.value.can_cancel_collection === true || !!selectedRunRecord.value.control_error || !['completed', 'succeeded', 'partial', 'failed', 'interrupted', 'cancelled'].includes(selectedRunRecord.value.status) || !!selectedRunRecord.value.dispatch_error || (selectedRunRecord.value.execution_mode === 'evaluate_only' && ['queued', 'preparing', 'paused'].includes((results.value?.preparation || selectedRunRecord.value.preparation)?.status || ''))))
   const resultMetadata = computed(() => ({ ...selectedRunRecord.value, ...results.value }))
   const busy = computed(() => cancelling.value || !!downloading.value)
   const poller = useFactoryPolling(async (signal, current) => {

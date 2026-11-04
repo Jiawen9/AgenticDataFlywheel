@@ -78,6 +78,18 @@ describe('phone ownership and scoped controls', () => {
 })
 
 describe('page-owned collection diagnostics and resume', () => {
+  it('waits for run type metadata before diagnostics and never probes an independent evaluation', async () => {
+    const view = mount()
+    view.state.selectRun('offline-new')
+    await view.state.refresh()
+    expect(view.api.diagnostics).not.toHaveBeenCalled()
+    view.runs.value = [...view.runs.value, { run_id: 'offline-new', status: 'preparing', execution_mode: 'evaluate_only' }]
+    await flush(); await view.state.refresh()
+    expect(view.api.diagnostics).not.toHaveBeenCalled()
+    expect(view.state.snapshot.value?.phones).toEqual([])
+    view.state.selectRun('a'); await view.state.refresh()
+    expect(view.api.diagnostics).toHaveBeenCalledTimes(1)
+  })
   it('retains last data and selection through polling failures and marks snapshots older than 20 seconds', async () => {
     const view = mount(); await polling.work(new AbortController().signal, () => true)
     expect(polling.registrations).toBe(1); expect(view.state.snapshot.value?.phones[0]?.model_role).toBe('planner')

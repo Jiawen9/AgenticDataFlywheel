@@ -3,6 +3,21 @@ import { factoryBatchesApi, modelIterationApi, phoneFactoryApi } from './phoneFa
 import { notifyBatchesPublished } from '@/utils/batchLifecycle'
 afterEach(() => vi.unstubAllGlobals())
 describe('phone factory transport contracts', () => {
+  it('preserves failed preview snapshots and scopes async controls without touching phone endpoints', async () => {
+    const failed = { preview_id: 'preview/a', valid: false, status: 'failed', revision: 3, job_version: 1, retryable: true, error: 'disk full', cases: [], errors: [] }
+    const fetcher = vi.fn(async () => new Response(JSON.stringify(failed)))
+    vi.stubGlobal('fetch', fetcher)
+    expect(await modelIterationApi.evaluationPreview({ source_path: 'D:/轨迹', request_id: 'preview-request' })).toEqual(failed)
+    expect(await modelIterationApi.evaluationPreviewState('preview/a', undefined, 10, 10)).toEqual(failed)
+    const control = { request_id: 'control-request', expected_revision: 3 }
+    await modelIterationApi.evaluationPreviewControl('preview/a', 'retry', control)
+    fetcher.mockResolvedValueOnce(new Response('{"run_id":"eval/a","status":"preparing"}'))
+    await modelIterationApi.retryEvaluationPreparation('eval/a', control)
+    expect(fetcher.mock.calls.map(call => call[0])).toEqual(['/api/model-iter/evaluation-preview', '/api/model-iter/evaluation-previews/preview%2Fa?offset=10&limit=10', '/api/model-iter/evaluation-previews/preview%2Fa/retry', '/api/model-iter/runs/eval%2Fa/retry-preparation'])
+    expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({ source_path: 'D:/轨迹', request_id: 'preview-request' })
+    expect(JSON.parse(String(fetcher.mock.calls[2]?.[1]?.body))).toEqual(control)
+    expect(JSON.parse(String(fetcher.mock.calls[3]?.[1]?.body))).toEqual(control)
+  })
   it('uses encoded diagnostic and grouped-case endpoints and preserves the resume identity across requests', async () => {
     const fetcher = vi.fn(async () => new Response('{"ok":true,"operation_id":"stable/request","status":"accepted"}')); vi.stubGlobal('fetch', fetcher)
     const signal = new AbortController().signal
@@ -106,7 +121,7 @@ describe('phone factory transport contracts', () => {
     expect(fetcher.mock.calls[1]?.[1]?.signal).toBe(controller.signal)
   })
   it('previews a server source and starts an independent evaluation without a phone or VLA', async () => {
-    const fetcher = vi.fn(async () => new Response('{"ok":true}'))
+    const fetcher = vi.fn(async () => new Response('{"ok":true,"preview_id":"preview-a","valid":true}'))
     vi.stubGlobal('fetch', fetcher)
     const controller = new AbortController()
     await modelIterationApi.evaluationProfiles(); await modelIterationApi.evaluationSources()

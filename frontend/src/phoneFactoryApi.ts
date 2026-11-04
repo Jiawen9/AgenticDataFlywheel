@@ -21,11 +21,14 @@ export type EvaluationExecutionMode = 'collect_and_evaluate' | 'evaluate_only'
 export interface EvaluationProfile { id: string; name: string; digest: string }
 export type EvaluationIssue = string | { message?: string; error?: string; case_id?: string; path?: string }
 export interface EvaluationSource extends AgentProvenance { run_id?: string; source_run_id?: string; path?: string; source_path?: string; run_mode?: string; status?: string; created_at?: string; trajectory_count?: number }
-export type EvaluationSourceInput = { source_run_id: string; source_path?: never } | { source_path: string; source_run_id?: never }
+export type EvaluationSourceInput = ({ source_run_id: string; source_path?: never } | { source_path: string; source_run_id?: never }) & { request_id?: string }
 export interface EvaluationCoverage { total: number; included: number; excluded: number }
 export interface CollectionSnapshotMetadata { stale_collection_snapshot?: boolean; source_collection_snapshot_id?: string | null; current_collection_snapshot_id?: string | null; collection_snapshot_pending?: boolean }
-export interface EvaluationPreview extends CollectionSnapshotMetadata { status?: 'preparing' | 'completed' | 'failed'; coverage?: EvaluationCoverage; excluded?: EvaluationIssue[]; warnings?: EvaluationIssue[]; has_more?: boolean; case_offset?: number; sync_error?: string; preview_id: string; valid: boolean; trajectory_count: number; cases: Array<{ source_trajectory_id: string; case_id: string; task: string; phone_id?: string; key_elements?: string }>; errors: EvaluationIssue[]; source: EvaluationSource; source_digest: string }
-export interface EvaluationRunMetadata extends CollectionSnapshotMetadata { execution_mode?: EvaluationExecutionMode; evaluation_profile_id?: string; evaluation_profile_name?: string; evaluation_profile_digest?: string; source?: EvaluationSource }
+export interface EvaluationJobProgress { discovered?: number; checked?: number; eligible?: number; excluded?: number; prepared?: number; total?: number }
+export interface EvaluationPreparation { status: string; phase?: string; revision?: number; progress?: EvaluationJobProgress; error?: string; retryable?: boolean }
+export interface EvaluationJobControl { request_id: string; expected_revision: number }
+export interface EvaluationPreview extends CollectionSnapshotMetadata { control_error?: string; job_version?: number; revision?: number; phase?: string; progress?: EvaluationJobProgress; error?: string; retryable?: boolean; status?: 'preparing' | 'completed' | 'failed' | 'cancelled'; coverage?: EvaluationCoverage; excluded?: EvaluationIssue[]; warnings?: EvaluationIssue[]; has_more?: boolean; case_offset?: number; sync_error?: string; preview_id: string; valid: boolean; trajectory_count: number; cases: Array<{ source_trajectory_id: string; case_id: string; task: string; phone_id?: string; key_elements?: string }>; errors: EvaluationIssue[]; source: EvaluationSource; source_digest: string }
+export interface EvaluationRunMetadata extends CollectionSnapshotMetadata { preparation_control_error?: string; preparation_control_pending?: boolean; preparation?: EvaluationPreparation; execution_mode?: EvaluationExecutionMode; evaluation_profile_id?: string; evaluation_profile_name?: string; evaluation_profile_digest?: string; source?: EvaluationSource }
 export interface StartEvaluationOptions { request_id: string; evaluator_config: EvaluatorConfig; evaluation_profile_id: string; evaluation_profile_digest: string; preview_id: string; checklist_source: 'auto' }
 export interface EvaluationSummary { total: number; collection_completed: number; collection_failed: number; evaluation_completed: number; evaluation_failed: number; evaluation_running: number; evaluation_pending: number; success: number; partial_success: number; fail: number; success_rate: number | null }
 export interface EvaluationCase extends AgentProvenance { case_key: string; phone_id: string; case_id: string; session_id?: string; source_trajectory_id?: string; checklist_source?: string; collection_status: string; evaluation_status: string; verdict?: string | null; failure_reason?: string; attempt_count: number; report_file_id?: string | null; report_name?: string; errors: Array<{ error?: string; message?: string } | string> }
@@ -89,6 +92,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 export function createFactoryApi(base: '/api/phone-factory' | '/api/model-iter') {
   const req = <T>(path: string, init?: RequestInit) => request<T>(base + path, init)
+  async function previewSnapshot(path: string, init?: RequestInit): Promise<EvaluationPreview> {
+    const value = await (await checked(base + path, init)).json()
+    // A failed background job still has a queryable identity and retry action.
+    // Do not discard that snapshot merely because it carries an error message.
+    if (!value || typeof value.preview_id !== 'string' || typeof value.valid !== 'boolean') throw new Error(value?.error || value?.message || '预览状态响应无效')
+    return value
+  }
   async function operation(path: string, init?: RequestInit): Promise<ResumeOperation> {
     const value = await (await checked(base + path, init)).json()
     // A durable uncertain operation legitimately carries an error alongside its
@@ -113,11 +123,13 @@ export function createFactoryApi(base: '/api/phone-factory' | '/api/model-iter')
     resumeOperation: (id: string, operationId: string, signal?: AbortSignal) => operation(`/collection-runs/${encodeURIComponent(id)}/resume-operations/${encodeURIComponent(operationId)}`, { signal }),
     evaluationConfig: () => req<EvaluatorConfig>('/evaluation-config'),
     saveEvaluationConfig: (config: EvaluatorConfig) => req<EvaluatorConfig>('/evaluation-config', jsonInit('PUT', config)),
-    evaluationCapabilities: () => req<{ ok: boolean; supported: boolean; offline_supported?: boolean; profiles_supported?: boolean; message: string }>('/evaluation-capabilities'),
+    evaluationCapabilities: () => req<{ ok: boolean; supported: boolean; offline_supported?: boolean; profiles_supported?: boolean; offline_evaluation_jobs?: { version: number }; jobs_supported?: boolean; message: string }>('/evaluation-capabilities'),
     evaluationProfiles: () => req<{ profiles: EvaluationProfile[]; errors: EvaluationIssue[] }>('/evaluation-profiles'),
     evaluationSources: () => req<{ sources: EvaluationSource[]; allowed_roots: string[] }>('/evaluation-sources'),
-    evaluationPreview: (source: EvaluationSourceInput, signal?: AbortSignal) => req<EvaluationPreview>('/evaluation-preview', jsonInit('POST', source, signal)),
-    evaluationPreviewState: (id: string, signal?: AbortSignal, offset = 0, limit = 50) => req<EvaluationPreview>(`/evaluation-previews/${encodeURIComponent(id)}?offset=${offset}&limit=${limit}`, { signal }),
+    evaluationPreview: (source: EvaluationSourceInput, signal?: AbortSignal) => previewSnapshot('/evaluation-preview', jsonInit('POST', source, signal)),
+    evaluationPreviewState: (id: string, signal?: AbortSignal, offset = 0, limit = 50) => previewSnapshot(`/evaluation-previews/${encodeURIComponent(id)}?offset=${offset}&limit=${limit}`, { signal }),
+    evaluationPreviewControl: (id: string, action: 'cancel' | 'retry', body: EvaluationJobControl, signal?: AbortSignal) => previewSnapshot(`/evaluation-previews/${encodeURIComponent(id)}/${action}`, jsonInit('POST', body, signal)),
+    retryEvaluationPreparation: (id: string, body: EvaluationJobControl, signal?: AbortSignal) => req<FactoryRun>(`/runs/${encodeURIComponent(id)}/retry-preparation`, jsonInit('POST', body, signal)),
     artifactPage: (id: string, page: { offset: number; limit: number; search?: string; status?: string }, signal?: AbortSignal) => req<ArtifactPage>(`/collection-runs/${encodeURIComponent(id)}/artifacts?${new URLSearchParams({ offset: String(page.offset), limit: String(page.limit), search: page.search || '', status: page.status || '' })}`, { signal }),
     artifactDetail: (id: string, artifact: string, signal?: AbortSignal, executionId?: string) => req<ArtifactDetail>(`/collection-runs/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(artifact)}${executionId ? `?${new URLSearchParams({ execution_id: executionId })}` : ''}`, { signal }),
     artifactFileUrl: (id: string, artifact: string, path: string, executionId?: string) => `${base}/collection-runs/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(artifact)}/file?${new URLSearchParams({ path, ...(executionId ? { execution_id: executionId } : {}) })}`,

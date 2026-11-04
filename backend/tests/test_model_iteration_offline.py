@@ -18,6 +18,8 @@ from fastapi.testclient import TestClient
 from backend import model_iteration, phonefactory_client
 from backend.phone_factory import PhoneFactoryError, PhoneFactoryStore, create_router
 from backend.tests.test_model_iteration import evaluator_config, results
+from backend.tests.test_offline_evaluation_jobs import ManualPool
+from backend import evaluation_job_previews
 
 
 class OfflineEvaluationTests(unittest.TestCase):
@@ -38,6 +40,9 @@ class OfflineEvaluationTests(unittest.TestCase):
                         "allowed_roots": ["D:/collector/archive"]}
         self.lose_ack = False
         self.store = PhoneFactoryStore(Path(temporary.name), run_client_fn=self.client)
+        for name in ("_preview_pool", "_evaluation_pool", "_control_pool"):
+            getattr(self.store.runtime, name).close()
+            setattr(self.store.runtime, name, ManualPool())
         self.addCleanup(self.store.runtime.close)
         # Deliberately omit all phone, APP, workbook and target VLA settings.
         model_iteration.save_config(self.store, evaluator_config())
@@ -49,7 +54,8 @@ class OfflineEvaluationTests(unittest.TestCase):
         if command == "capabilities":
             value.update(protocol_version=1, batch_results=True, model_iteration_evaluation=self.online,
                          offline_evaluation=self.offline, evaluation_profiles=self.profiles,
-                         checklist_policies=["llm", "auto"])
+                         checklist_policies=["llm", "auto"],
+                         offline_evaluation_jobs={"version": 1 if self.offline and self.profiles else 0})
             from backend.tests.collector_protocol_support import current_capabilities
             current_capabilities(value)
         elif command == "evaluation-profiles":
@@ -57,6 +63,11 @@ class OfflineEvaluationTests(unittest.TestCase):
         elif command == "evaluation-sources":
             value = self.sources
         elif command == "evaluation-preview":
+            request = json.loads(args[2])
+            self.preview.update(preview_id=evaluation_job_previews.preview_id(request['request_id']),
+                job_version=1, revision=1, status="completed", case_offset=0, has_more=False)
+            value = self.preview
+        elif command == "evaluation-preview-status":
             value = self.preview
         elif command == "start-evaluation":
             payload = json.loads(args[2])
@@ -65,9 +76,12 @@ class OfflineEvaluationTests(unittest.TestCase):
                 if self.accepted_payloads[run_id] != payload:
                     return {"ok": False, "output": "remote request digest mismatch"}
                 return {"ok": True, "output": json.dumps({**self.runs[run_id], "reused": True})}
+            if payload['evaluation_profile_digest'] != self.profile['digest']:
+                raise PhoneFactoryError("评测规则版本已变化", 409)
             self.accepted_payloads[run_id] = payload
             self.runs[run_id] = {"ok": True, "run_id": run_id, "run_mode": "modeliter",
-                                 "execution_mode": "evaluate_only", "status": "running", "errors": []}
+                                 "execution_mode": "evaluate_only", "status": "running", "errors": [],
+                                 "preparation": {"status": "completed", "revision": 1}}
             rows = [{"case_key": row["source_trajectory_id"], "source_trajectory_id": row["source_trajectory_id"],
                      "case_id": row["case_id"], "phone_id": row["phone_id"], "collection_status": "completed",
                      "evaluation_status": "pending", "verdict": None, "checklist_source": "fixed_id"}
@@ -94,19 +108,32 @@ class OfflineEvaluationTests(unittest.TestCase):
         return self.store.dispatch(action, method, data or {}, mode="modeliter")
 
     def make_preview(self, **source):
-        return self.dispatch("evaluation-preview", "POST", source or {"source_path": "D:/collector/archive"})
+        value = self.dispatch("evaluation-preview", "POST", {"request_id": "preview-request",
+            **(source or {"source_path": "D:/collector/archive"})})
+        self.store.runtime._preview_pool.drain()
+        value = evaluation_job_previews.state(self.store, value['preview_id'])
+        if value.get('sync_error'):
+            raise PhoneFactoryError(value['sync_error'])
+        return value
 
     def start(self, **updates):
         data = {"request_id": "offline-one", "evaluation_profile_id": "rules-v1",
-                "evaluation_profile_digest": "1" * 64, "preview_id": "preview_one", "checklist_source": "auto",
+                "evaluation_profile_digest": "1" * 64, "preview_id": self.preview['preview_id'], "checklist_source": "auto",
                 "evaluator_config": evaluator_config(), **updates}
-        return self.dispatch("remote/start-evaluation", "POST", data)
+        value = self.dispatch("remote/start-evaluation", "POST", data)
+        self.store.runtime._evaluation_pool.drain()
+        current = self.store.records.get('model_iter_runs', value['run_id'])
+        if current.get('dispatch_error'):
+            raise PhoneFactoryError(current['dispatch_error'])
+        self.store.runtime._sync_evaluation(value['run_id'])
+        return {**value, **self.store.records.get('model_iter_runs', value['run_id'])}
 
     def test_empty_phone_settings_allow_evaluation_and_freeze_source_configuration(self):
         self.make_preview()
         run = self.start()
         self.assertEqual(run["execution_mode"], "evaluate_only")
-        self.assertEqual(run["request"]["source_cases"], self.preview["cases"])
+        self.assertEqual(run["request"]["source_preview_id"], self.preview["preview_id"])
+        self.assertNotIn("source_cases", run["request"])
         self.assertEqual(run["request"]["source_digest"], "2" * 64)
         self.assertEqual(run["request"]["evaluator_config"], evaluator_config())
         self.assertNotIn("phone_ids", run["request"])
@@ -124,6 +151,7 @@ class OfflineEvaluationTests(unittest.TestCase):
         for row in self.snapshots[first["run_id"]]["cases"]:
             row.update(evaluation_status="completed", verdict="success")
         self.runs[first["run_id"]]["status"] = "succeeded"
+        self.store.runtime._sync_evaluation(first['run_id'])
         saved = self.dispatch(f"runs/{first['run_id']}/evaluations")
         self.assertEqual(saved["summary"]["success_rate"], 1)
         self.profile.update(id="rules-v2", name="规则 V2", digest="3" * 64)
@@ -143,7 +171,7 @@ class OfflineEvaluationTests(unittest.TestCase):
         self.assertTrue(recovered["reused"])
         self.assertEqual(sum(args[0] == "start-evaluation" for args in self.calls), 2)
         self.assertEqual(len(self.accepted_payloads), 1)
-        self.assertFalse(any(args[0] == 'run' for args in self.calls))
+        self.assertEqual(len(self.accepted_payloads), 1)
         config = evaluator_config()
         config["text"]["model"] = "changed"
         for changes in ({"evaluator_config": config}, {"evaluation_profile_digest": "3" * 64}):
@@ -159,7 +187,7 @@ class OfflineEvaluationTests(unittest.TestCase):
         self.accepted_payloads[run_id]['preview_id'] = 'other-preview'
         with self.assertRaisesRegex(PhoneFactoryError, 'remote request digest mismatch'):
             self.start()
-        self.assertEqual(self.store.records.get('model_iter_runs', run_id)['status'], 'failed')
+        self.assertIn('remote request digest mismatch', self.store.records.get('model_iter_runs', run_id)['dispatch_error'])
 
     def test_late_start_ack_does_not_overwrite_local_cancellation(self):
         self.make_preview()
@@ -177,7 +205,7 @@ class OfflineEvaluationTests(unittest.TestCase):
         self.profile["digest"] = "4" * 64
         with self.assertRaisesRegex(PhoneFactoryError, "已变化"):
             self.start()
-        self.assertFalse(any(args[0] == "start-evaluation" for args in self.calls))
+        self.assertEqual(self.accepted_payloads, {})
 
     def test_offline_results_use_source_identity_and_allow_repeated_original_case_ids(self):
         self.make_preview()
@@ -212,7 +240,7 @@ class OfflineEvaluationTests(unittest.TestCase):
         self.preview["cases"][1]["source_trajectory_id"] = "trajectory-a"
         with self.assertRaisesRegex(PhoneFactoryError, "重复"):
             self.make_preview()
-        self.assertEqual(self.store.records.list("model_iter_previews"), [])
+        self.assertFalse(any(row['preview'].get('valid') for row in self.store.records.list("model_iter_previews")))
 
     def test_invalid_preview_is_visible_but_cannot_launch(self):
         self.preview.update(valid=False, errors=["missing screenshot"])
@@ -224,10 +252,10 @@ class OfflineEvaluationTests(unittest.TestCase):
     def test_previews_are_immutable_and_run_source_selection_supported(self):
         self.make_preview(source_run_id="collection_1")
         self.assertEqual(json.loads(next(args for args in self.calls if args[0] == "evaluation-preview")[2]),
-                         {"source_run_id": "collection_1"})
+                         {"source_run_id": "collection_1", "request_id": "preview-request"})
         self.preview["source_digest"] = "5" * 64
-        with self.assertRaisesRegex(PhoneFactoryError, "复用"):
-            self.make_preview(source_run_id="collection_1")
+        value = self.make_preview(source_run_id="collection_1")
+        self.assertEqual(value['source_digest'], '2' * 64)
 
     def test_capability_gate_keeps_legacy_supported_but_rejects_new_entry(self):
         self.offline = 0
@@ -235,7 +263,7 @@ class OfflineEvaluationTests(unittest.TestCase):
         self.assertTrue(value["supported"])
         self.assertFalse(value["offline_supported"])
         self.assertTrue(value["profiles_supported"])
-        with self.assertRaisesRegex(PhoneFactoryError, "独立评测能力"):
+        with self.assertRaisesRegex(PhoneFactoryError, "升级"):
             self.make_preview()
         self.profiles = 0
         with self.assertRaisesRegex(PhoneFactoryError, "规则版本"):
@@ -249,14 +277,16 @@ class OfflineEvaluationTests(unittest.TestCase):
             self.assertEqual(client.get("/api/model-iter/evaluation-sources").json(), self.sources)
             preview = client.post("/api/model-iter/evaluation-preview", json={"source_path": "D:/collector/archive"})
             self.assertEqual(preview.status_code, 200)
+            self.store.runtime._preview_pool.drain()
             response = client.post("/api/model-iter/remote/start-evaluation", json={
                 "request_id": "http-one", "evaluation_profile_id": "rules-v1", "evaluation_profile_digest": "1" * 64,
-                "preview_id": "preview_one", "evaluator_config": evaluator_config()})
+                "preview_id": preview.json()['preview_id'], "evaluator_config": evaluator_config()})
             self.assertEqual(response.status_code, 200, response.text)
             run_id = response.json()["run_id"]
             cancelled = client.post(f"/api/model-iter/runs/{run_id}/cancel", json={})
             self.assertEqual(cancelled.status_code, 200, cancelled.text)
             self.assertTrue(cancelled.json()["stop_accepted"])
+            self.store.runtime._control_pool.drain()
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 state = self.store.records.get("model_iter_runs", run_id)

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from urllib.parse import urlsplit, urlunsplit
 
 from .data_store.registry import utc_now
@@ -81,7 +82,9 @@ def capabilities(store):
     offline = profiles and type(remote.get("offline_evaluation")) is int and remote["offline_evaluation"] == 1
     policies = remote.get("checklist_policies", ["llm"]) if supported else []
     policies = [item for item in policies if item in {"llm", "auto"}] if isinstance(policies, list) else []
+    jobs = offline and isinstance(remote.get("offline_evaluation_jobs"), dict) and remote["offline_evaluation_jobs"].get("version") == 1
     return {"ok": True, "supported": supported, "offline_evaluation": offline, "offline_supported": offline,
+            "offline_evaluation_jobs": {"version": 1} if jobs else None, "jobs_supported": jobs,
             "evaluation_profiles": profiles, "profiles_supported": profiles, "checklist_policies": policies,
             "message": "支持按用例异步评测" if supported else "采集服务尚未升级模型迭代评测，请先部署新版 9011 服务"}
 
@@ -164,8 +167,7 @@ def get_sources(store):
 
 def preview_source(store, data):
     from .collection_runs import _identifier
-    require_capability(store, offline=True)
-    if set(data) - {"source_run_id", "source_path", "snapshot_id"}:
+    if set(data) - {"source_run_id", "source_path", "snapshot_id", "request_id"}:
         raise PhoneFactoryError("预览只接受已有运行编号或服务器轨迹目录")
     source = {}
     for key in ("source_run_id", "source_path"):
@@ -178,6 +180,14 @@ def preview_source(store, data):
         raise PhoneFactoryError("请选择一个已有采集运行，或填写一个服务器轨迹目录")
     if data.get("snapshot_id") and not source.get("source_run_id"):
         raise PhoneFactoryError("采集快照必须关联已有运行编号")
+    original_source = dict(source)
+    if data.get("snapshot_id"):
+        original_source["snapshot_id"] = _identifier(data["snapshot_id"], "采集快照编号")
+    from .evaluation_job_previews import accept_request, preview_id
+    request_id = _identifier(data.get("request_id") or uuid.uuid4().hex, "预览请求编号")
+    old = store.records.get("model_iter_previews", preview_id(request_id))
+    if old:
+        return accept_request(store, old["request"], request_id, original_source=original_source)
     if source.get("source_run_id"):
         head = store.records.get("collection_resume_heads", source["source_run_id"])
         requested = data.get("snapshot_id")
@@ -191,10 +201,7 @@ def preview_source(store, data):
             source["snapshot_id"] = snapshot_id
         elif requested:
             raise PhoneFactoryError("此运行没有已登记的续采快照",409)
-    value = store._remote_result(["evaluation-preview", "--payload", json.dumps(source, ensure_ascii=False)])
-    from .evaluation_previews import accept
-    from .collection_resume_snapshots import evaluation_snapshot_status
-    return {**accept(store, source, value),**evaluation_snapshot_status(store.records,source)}
+    return accept_request(store, source, request_id, original_source=original_source)
 
 
 
@@ -267,7 +274,7 @@ def validate_results(value, run_id, expected_phones, *, expected_sources=None, m
             summary["evaluation_pending"] += 1
     denominator = sum(summary[key] for key in VERDICTS)
     summary["success_rate"] = summary["success"] / denominator if denominator else None
-    return {**{key: value[key] for key in (*PROVENANCE_FIELDS, "coverage", "excluded", "evidence_warnings") if key in value}, "run_id": run_id, "run_mode": "modeliter", "summary": summary, "cases": cases, **(metadata or {})}
+    return {**{key: value[key] for key in (*PROVENANCE_FIELDS, "coverage", "excluded", "evidence_warnings", "preparation") if key in value}, "run_id": run_id, "run_mode": "modeliter", "summary": summary, "cases": cases, **(metadata or {})}
 
 
 def capture_results(runtime, run, *, final=False, remote_status=None):
@@ -275,11 +282,22 @@ def capture_results(runtime, run, *, final=False, remote_status=None):
     if record and record.get("final"):
         return record["result"]
     request = run.get("request", {})
-    expected_sources = ({row["source_trajectory_id"]: row for row in request["source_cases"]}
-                        if request.get("execution_mode") == "evaluate_only" else None)
+    expected_sources = None
+    if request.get("execution_mode") == "evaluate_only":
+        if request.get("source_preview_id"):
+            from .evaluation_job_previews import SourceCases
+            expected_sources = SourceCases(runtime.records, request["source_preview_id"], request["source_digest"],
+                revision=request.get("source_preview_revision"), total=request.get("source_count"))
+        else:
+            expected_sources = {row["source_trajectory_id"]: row for row in request["source_cases"]}
     metadata = {key: request[key] for key in ("execution_mode", "source", "source_digest", "evaluation_profile_id",
                                              "evaluation_profile_digest", "checklist_source", "agent_type") if key in request}
-    value = validate_results(runtime.store._remote_result(["run-evaluations", run["run_id"]]),
+    if request.get("collector_server"):
+        from .evaluation_job_previews import remote
+        response = remote(runtime.store, ["run-evaluations", run["run_id"]], request["collector_server"])
+    else:
+        response = runtime.store._remote_result(["run-evaluations", run["run_id"]])
+    value = validate_results(response,
                              run["run_id"], request.get("phone_ids", []),
                              expected_sources=expected_sources, metadata=metadata)
     if final and any(row["evaluation_status"] not in TERMINAL_CASE_STATUSES
