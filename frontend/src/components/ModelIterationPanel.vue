@@ -44,11 +44,18 @@
       <label v-if="sourceKind === 'directory'">轨迹目录<el-input v-model="sourcePath" :disabled="starting || !offlineSupported" placeholder="9011 服务器上的完整轨迹目录" /></label>
       <p v-if="sourceKind === 'directory'" class="hint">目录位于采集服务器，而非当前浏览器所在电脑。{{ allowedRoots.length ? `允许范围：${allowedRoots.join('；')}` : '允许范围由采集服务器配置。' }}</p>
       <el-button :loading="sourcesLoading" :disabled="starting || loading || !offlineSupported" @click="loadSources">刷新可用采集结果</el-button>
-      <el-button :loading="previewLoading" :disabled="!canPreview" @click="previewSource">检查轨迹并预览</el-button>
+      <el-alert v-if="!loading && !jobsSupported" title="当前采集端尚未支持轨迹后台检查与输入准备，请升级采集端后重试。" type="warning" :closable="false" />
+      <el-button v-if="!preview" :loading="previewLoading" :disabled="!canPreview" @click="previewSource()">检查轨迹并预览</el-button>
+      <el-button v-if="preview?.status === 'preparing' && preview.job_version === 1" :loading="controllingPreview" :disabled="controllingPreview || previewControlPending || starting" @click="controlPreview('cancel')">取消检查</el-button>
+      <el-button v-if="preview?.status === 'failed' && preview.job_version === 1 && preview.retryable !== false" :loading="controllingPreview" :disabled="controllingPreview || previewControlPending || starting" @click="controlPreview('retry')">重试检查</el-button>
+      <el-button v-if="preview && preview.status !== 'preparing'" :disabled="!canPreview || controllingPreview || previewControlPending" @click="previewSource(true)">重新检查</el-button>
+      <el-alert v-if="preview?.control_error" :title="preview.control_error" type="warning" :closable="false" />
       <el-alert v-if="sourceError" :title="sourceError" type="error" :closable="false" />
       <template v-if="preview">
         <p v-if="collectionSnapshotLabel(preview)" class="hint" data-testid="stale-evaluation-preview">{{ collectionSnapshotLabel(preview) }}。此预览使用旧采集快照；重新检查可获取当前结果。</p>
-        <p v-if="preview.status === 'preparing'">正在后台检查轨迹并冻结可评测集合，手机采集和其他运行不受影响。</p>
+        <p v-if="previewPending(preview)" data-testid="preview-job-progress">{{ evaluationJobPhase(preview.phase, preview.status) }}<span v-if="evaluationJobCounts(preview.progress)"> · {{ evaluationJobCounts(preview.progress) }}</span>。检查在后台继续，不操作手机。</p>
+        <p v-else-if="preview.status === 'cancelled'">本次检查已取消，原始轨迹保留。</p>
+        <p v-else-if="preview.status === 'failed'">检查未完成：{{ preview.error || '请查看错误原因，修复后重试。' }}</p>
         <p v-else>可评测 {{ preview.trajectory_count }} 条<template v-if="preview.coverage"> / 共 {{ preview.coverage.total }} 条，排除 {{ preview.coverage.excluded }} 条</template>。{{ preview.valid ? '将评测全部可用轨迹，报告保留排除原因。' : '没有可评测轨迹，请查看排除原因。' }}</p>
         <details v-if="preview.errors.length"><summary>查看排除原因（摘要最多 100 条）</summary><el-alert v-for="(issue, index) in preview.errors" :key="index" :title="evaluationIssueText(issue)" type="warning" :closable="false" /></details>
         <p v-if="preview.sync_error" class="hint">{{ preview.sync_error }}，正在重试同步。</p>
@@ -60,6 +67,8 @@
         <el-pagination v-if="preview.valid" v-model:current-page="previewPage" v-model:page-size="previewPageSize" :page-sizes="[10, 20, 50]" :total="preview.trajectory_count" layout="total, sizes, prev, pager, next" @current-change="loadPreviewPage" @size-change="resetPreviewPage" />
       </template>
       <el-button type="primary" :loading="starting" :disabled="!canStartOffline" class="start-offline" @click="startOffline">创建新的评测运行</el-button>
+      <el-button v-if="pendingStart" :loading="starting" :disabled="starting || loading" @click="recoverStart">确认上次评测提交</el-button>
+      <p v-if="pendingStart" class="hint">上次提交尚未确认；将使用当时保存的模型、规则和请求编号查询或重放，不创建重复运行。</p>
       <el-alert v-if="startMessage" :title="startMessage" type="success" :closable="false" />
       <el-alert v-if="startError" :title="startError" type="error" :closable="false" />
     </section>
@@ -71,6 +80,11 @@
     <p v-if="selectedRun" class="hint">运行：<DisplayId kind="run" :id="selectedRun" /></p>
     <p v-if="collectionSnapshotLabel(resultMetadata)" class="hint" data-testid="stale-evaluation-run">{{ collectionSnapshotLabel(resultMetadata) }}。此评测使用旧采集快照，结果与报告保持原样。</p>
     <CollectionRunProgress :run="resultMetadata" />
+    <p v-if="resultMetadata.preparation" data-testid="evaluation-preparation-progress">{{ evaluationJobPhase(resultMetadata.preparation.phase, resultMetadata.preparation.status) }}<span v-if="evaluationJobCounts(resultMetadata.preparation.progress)"> · {{ evaluationJobCounts(resultMetadata.preparation.progress) }}</span></p>
+    <el-alert v-if="resultMetadata.preparation?.error" :title="resultMetadata.preparation.error" type="warning" :closable="false" />
+    <el-alert v-if="resultMetadata.preparation_control_error" :title="resultMetadata.preparation_control_error" type="warning" :closable="false" />
+    <p v-if="resultMetadata.preparation_control_pending" class="hint">输入准备重试请求已受理，正在同步后台状态。</p>
+    <el-button v-if="canRetryPreparation" :loading="retryingPreparation" :disabled="progressBusy" @click="retryPreparation">重试输入准备</el-button>
     <p v-if="resultMetadata.batch_id && resultMetadata.execution_mode !== 'evaluate_only'" class="hint">采集结果批次：<DisplayId kind="batch" :id="resultMetadata.batch_id" /> · 采集、回传和评测分别更新。</p>
     <el-button v-if="canCancel" type="danger" plain :loading="cancelling" class="cancel-run" @click="cancelRun">停止本次运行</el-button>
     <el-alert v-if="resultError" :title="resultError" type="warning" :closable="false" />
@@ -95,7 +109,8 @@
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { modelIterationApi, newRunRequestId, type EvaluatorConfig, type FactoryRun, type EvaluationExecutionMode, type EvaluationProfile, type EvaluationIssue, type EvaluationSource, type EvaluationSourceInput, type EvaluationPreview } from '@/phoneFactoryApi'
+import { modelIterationApi, newRunRequestId, type EvaluatorConfig, type FactoryRun, type EvaluationExecutionMode, type EvaluationProfile, type EvaluationIssue, type EvaluationSource, type EvaluationSourceInput, type EvaluationPreview, type StartEvaluationOptions } from '@/phoneFactoryApi'
+import { evaluationPreviewSession, evaluationSourceKey, evaluationJobPhase, evaluationJobCounts, type PreviewSessionEntry } from '@/utils/evaluationJobs'
 import type { EvaluationProgress } from '@/composables/useEvaluationProgress'
 import DisplayId from '@/components/DisplayId.vue'
 import CollectionRunProgress from '@/components/CollectionRunProgress.vue'
@@ -112,7 +127,7 @@ const filteredRuns = computed(() => props.runs.filter(run => matches(runQuery.va
 const emit = defineEmits<{ ready: [value: boolean]; config: [value: EvaluatorConfig]; mode: [value: EvaluationExecutionMode]; profile: [value: EvaluationProfile | undefined]; started: [runId: string]; details: [] }>()
 const roles = ['text', 'vision'] as const
 const draft = reactive<EvaluatorConfig>(defaultEvaluatorConfig())
-const saved = ref(''), supported = ref(false), profilesSupported = ref(false), offlineSupported = ref(false), loading = ref(false), saving = ref(false)
+const saved = ref(''), supported = ref(false), profilesSupported = ref(false), offlineSupported = ref(false), jobsSupported = ref(false), loading = ref(false), saving = ref(false)
 const capabilityMessage = ref('正在确认采集服务是否支持评测'), error = ref('')
 const executionMode = ref<EvaluationExecutionMode>('collect_and_evaluate')
 const profiles = ref<EvaluationProfile[]>([]), profileErrors = ref<EvaluationIssue[]>([]), selectedProfileId = ref('')
@@ -123,20 +138,41 @@ const sources = ref<EvaluationSource[]>([]), allowedRoots = ref<string[]>([]), s
 const filteredSources = computed(() => sources.value.filter(source => matches(sourceQuery.value, 'run', source.run_id, '', source.status || '', source.created_at || '')))
 const preview = ref<EvaluationPreview | null>(null), previewLoading = ref(false), starting = ref(false), startError = ref(''), startMessage = ref('')
 const requestIds = new Map<string, string>()
+const session = evaluationPreviewSession()
+const controllingPreview = ref(false), retryingPreparation = ref(false), sessionRevision = ref(0)
+const preparationRequestIds = new Map<string, string>()
 const dirty = computed(() => JSON.stringify(draft) !== saved.value)
 const ready = computed(() => supported.value && profilesSupported.value && !!selectedProfile.value && !dirty.value && !loading.value && !saving.value && !starting.value && roles.every(role => draft[role].base_url && draft[role].model))
 const sourceInput = computed<EvaluationSourceInput>(() => sourceKind.value === 'run' ? { source_run_id: sourceRunId.value } : { source_path: sourcePath.value.trim() })
-const sourceKey = computed(() => JSON.stringify(sourceInput.value))
-const canPreview = computed(() => offlineSupported.value && !loading.value && !starting.value && !previewLoading.value && !!(sourceKind.value === 'run' ? sourceRunId.value : sourcePath.value.trim()))
-const canStartOffline = computed(() => executionMode.value === 'evaluate_only' && ready.value && offlineSupported.value && !!preview.value?.valid && preview.value.trajectory_count > 0 && !previewLoading.value)
+const sourceKey = computed(() => evaluationSourceKey(sourceInput.value))
+const pendingStart = computed(() => { void sessionRevision.value; return session.get(sourceKey.value)?.start_request })
+const previewControlPending = computed(() => ['cancelling', 'retrying'].includes(preview.value?.phase || ''))
+const previewPending = (value: EvaluationPreview) => value.status === 'preparing' || ['cancelling', 'retrying'].includes(value.phase || '')
+const canRetryPreparation = computed(() => !resultMetadata.value.preparation_control_pending && resultMetadata.value.execution_mode === 'evaluate_only' && ['failed', 'paused'].includes(resultMetadata.value.preparation?.status || '') && resultMetadata.value.preparation?.retryable === true)
+const canPreview = computed(() => offlineSupported.value && jobsSupported.value && !pendingStart.value && !loading.value && !starting.value && !previewLoading.value && !!(sourceKind.value === 'run' ? sourceRunId.value : sourcePath.value.trim()))
+const canStartOffline = computed(() => executionMode.value === 'evaluate_only' && !pendingStart.value && ready.value && offlineSupported.value && !!preview.value?.valid && preview.value.trajectory_count > 0 && !previewLoading.value)
 const previewPage = ref(1), previewPageSize = ref(10)
 let previewPageEpoch = 0
 let disposed = false, previewEpoch = 0
 let previewController: AbortController | undefined
+const restored = session.selected()
+if (restored) {
+  executionMode.value = 'evaluate_only'
+  sourceKind.value = restored.source.source_path !== undefined ? 'directory' : 'run'
+  sourcePath.value = restored.source.source_path || ''
+  sourceRunId.value = restored.source.source_run_id || ''
+}
+function remember(key: string, entry: PreviewSessionEntry) { session.put(key, entry, key === sourceKey.value); sessionRevision.value++ }
+function acceptPreview(value: EvaluationPreview) {
+  const current = preview.value
+  if (current?.preview_id === value.preview_id && typeof current.revision === 'number' && typeof value.revision === 'number' && value.revision < current.revision) return false
+  preview.value = value
+  return true
+}
 watch(ready, value => emit('ready', value), { immediate: true })
 watch(executionMode, value => emit('mode', value), { immediate: true })
 watch(selectedProfile, value => emit('profile', value), { immediate: true })
-watch(sourceKey, () => { previewPageEpoch++; previewPage.value = 1; previewEpoch++; previewController?.abort(); preview.value = null; previewLoading.value = false; sourceError.value = ''; startError.value = ''; startMessage.value = '' }, { flush: 'sync' })
+watch(sourceKey, () => { previewPageEpoch++; previewPage.value = 1; previewEpoch++; clearTimeout(previewTimer); previewController?.abort(); preview.value = null; previewLoading.value = false; sourceError.value = ''; startError.value = ''; startMessage.value = '' }, { flush: 'sync' })
 
 async function loadSources() {
   if (sourcesLoading.value || starting.value || !offlineSupported.value) return
@@ -145,7 +181,7 @@ async function loadSources() {
     const value = await modelIterationApi.evaluationSources()
     if (disposed) return
     sources.value = value.sources; allowedRoots.value = value.allowed_roots
-    if (sourceRunId.value && !value.sources.some(item => item.run_id === sourceRunId.value)) sourceRunId.value = ''
+    if (sourceRunId.value && !session.get(sourceKey.value) && !value.sources.some(item => item.run_id === sourceRunId.value)) sourceRunId.value = ''
   } catch (cause) { if (!disposed) sourceError.value = (cause as Error).message }
   finally { if (!disposed) sourcesLoading.value = false }
 }
@@ -156,7 +192,7 @@ async function load() {
     const [config, capability] = await Promise.all([modelIterationApi.evaluationConfig(), modelIterationApi.evaluationCapabilities()])
     if (disposed) return
     Object.assign(draft, config); saved.value = JSON.stringify(draft)
-    supported.value = capability.supported; profilesSupported.value = !!capability.profiles_supported; offlineSupported.value = !!capability.offline_supported; capabilityMessage.value = capability.message
+    supported.value = capability.supported; profilesSupported.value = !!capability.profiles_supported; offlineSupported.value = !!capability.offline_supported; jobsSupported.value = capability.offline_evaluation_jobs?.version === 1 || capability.jobs_supported === true; capabilityMessage.value = capability.message
     emit('config', config)
     profiles.value = []; profileErrors.value = []
     if (profilesSupported.value) {
@@ -179,44 +215,92 @@ async function save() {
   } catch (cause) { if (!disposed) error.value = (cause as Error).message }
   finally { if (!disposed) saving.value = false }
 }
-async function previewSource() {
+async function previewSource(forceNew = false) {
   if (!canPreview.value) return
   const epoch = ++previewEpoch, key = sourceKey.value
+  previewPageEpoch++; previewPage.value = 1
+  clearTimeout(previewTimer)
   previewController?.abort(); previewController = new AbortController()
   previewLoading.value = true; preview.value = null; sourceError.value = ''; startError.value = ''; startMessage.value = ''
+  const old = session.get(key)
+  const entry: PreviewSessionEntry = !forceNew && old ? old : { source: { ...sourceInput.value }, request_id: newRunRequestId(), updated_at: Date.now() }
+  if (jobsSupported.value) remember(key, entry)
   try {
-    const value = await modelIterationApi.evaluationPreview(sourceInput.value, previewController.signal)
+    const value = await modelIterationApi.evaluationPreview({ ...entry.source, ...(jobsSupported.value ? { request_id: entry.request_id } : {}) }, previewController.signal)
+    const latest = session.get(key)
+    if (!disposed && jobsSupported.value && latest?.request_id === entry.request_id) remember(key, { ...latest, preview_id: value.preview_id })
     if (!disposed && epoch === previewEpoch && key === sourceKey.value) {
       preview.value = value
-      if (value.status === 'preparing') schedulePreview(epoch, key, value.preview_id)
+      if (previewPending(value)) schedulePreview(epoch, key, value.preview_id)
     }
-  } catch (cause) { if (!disposed && epoch === previewEpoch) sourceError.value = (cause as Error).message }
-  finally { if (!disposed && epoch === previewEpoch) previewLoading.value = preview.value?.status === 'preparing' }
+  } catch (cause) {
+    if (!disposed && epoch === previewEpoch) sourceError.value = `${(cause as Error).message}${jobsSupported.value ? '；再次检查会复用本次请求编号，确认后台受理结果。' : ''}`
+  } finally { if (!disposed && epoch === previewEpoch) previewLoading.value = !!preview.value && previewPending(preview.value) }
 }
 let previewTimer: ReturnType<typeof setTimeout> | undefined
 function schedulePreview(epoch: number, key: string, id: string) {
   clearTimeout(previewTimer)
-  previewTimer = setTimeout(async () => {
+  previewTimer = setTimeout(() => void refreshPreview(epoch, key, id), 2000)
+}
+async function refreshPreview(epoch: number, key: string, id: string) {
+  if (disposed || epoch !== previewEpoch || key !== sourceKey.value) return
+  try {
+    const value = await modelIterationApi.evaluationPreviewState(id, previewController?.signal, (previewPage.value - 1) * previewPageSize.value, previewPageSize.value)
     if (disposed || epoch !== previewEpoch || key !== sourceKey.value) return
-    try {
-      const value = await modelIterationApi.evaluationPreviewState(id, previewController?.signal)
-      if (disposed || epoch !== previewEpoch || key !== sourceKey.value) return
-      preview.value = value
-      previewLoading.value = value.status === 'preparing'
-      if (value.status === 'preparing') schedulePreview(epoch, key, id)
-    } catch (cause) {
-      if (disposed || epoch !== previewEpoch || key !== sourceKey.value) return
-      sourceError.value = (cause as Error).message
-      schedulePreview(epoch, key, id)
+    if (!acceptPreview(value)) {
+      if (preview.value && previewPending(preview.value)) schedulePreview(epoch, key, id)
+      return
     }
-  }, 2000)
+    sourceError.value = ''
+    previewLoading.value = previewPending(value)
+    if (previewPending(value)) schedulePreview(epoch, key, id)
+  } catch (cause) {
+    if (disposed || epoch !== previewEpoch || key !== sourceKey.value) return
+    sourceError.value = `预览同步暂不可用：${(cause as Error).message}；保留本次任务并继续查询。`
+    schedulePreview(epoch, key, id)
+  }
+}
+async function restorePreview() {
+  const entry = session.get(sourceKey.value)
+  if (!entry || !offlineSupported.value || (sourceKind.value === 'directory' && !jobsSupported.value)) return
+  if (!entry.preview_id) { await previewSource(); return }
+  previewController?.abort(); previewController = new AbortController()
+  previewLoading.value = true
+  await refreshPreview(++previewEpoch, sourceKey.value, entry.preview_id)
+}
+async function controlPreview(action: 'cancel' | 'retry') {
+  const current = preview.value, key = sourceKey.value, epoch = previewEpoch
+  if (!current || previewControlPending.value || current.job_version !== 1 || typeof current.revision !== 'number' || controllingPreview.value) return
+  const entry = session.get(key)
+  if (!entry) return
+  const request = entry.control?.action === action ? entry.control : { action, request_id: newRunRequestId(), expected_revision: current.revision }
+  remember(key, { ...entry, control: request }); controllingPreview.value = true
+  try {
+    const value = await modelIterationApi.evaluationPreviewControl(current.preview_id, action, { request_id: request.request_id, expected_revision: request.expected_revision })
+    const latest = session.get(key)
+    if (!disposed && latest?.control?.request_id === request.request_id) remember(key, { ...latest, control: undefined })
+    if (!disposed && epoch === previewEpoch && key === sourceKey.value) {
+      acceptPreview(value); previewLoading.value = !!preview.value && previewPending(preview.value); sourceError.value = ''
+      if (preview.value && previewPending(preview.value)) schedulePreview(epoch, key, current.preview_id)
+      else clearTimeout(previewTimer)
+    }
+  } catch (cause) {
+    if (!disposed && epoch === previewEpoch) {
+      sourceError.value = `${(cause as Error).message}；保留操作编号，请重试确认。`
+      if ((cause as Error & { status?: number }).status === 409) {
+        const latest = session.get(key)
+        if (latest?.control?.request_id === request.request_id) remember(key, { ...latest, control: undefined })
+        await refreshPreview(epoch, key, current.preview_id)
+      }
+    }
+  } finally { if (!disposed) controllingPreview.value = false }
 }
 async function loadPreviewPage() {
   if (!preview.value?.valid) return
   const id = preview.value.preview_id, epoch = ++previewPageEpoch, sourceEpoch = previewEpoch
   try {
     const value = await modelIterationApi.evaluationPreviewState(id, previewController?.signal, (previewPage.value - 1) * previewPageSize.value, previewPageSize.value)
-    if (!disposed && epoch === previewPageEpoch && sourceEpoch === previewEpoch && preview.value?.preview_id === id) preview.value = value
+    if (!disposed && epoch === previewPageEpoch && sourceEpoch === previewEpoch && preview.value?.preview_id === id) acceptPreview(value)
   } catch (cause) { if (!disposed && epoch === previewPageEpoch && sourceEpoch === previewEpoch) sourceError.value = (cause as Error).message }
 }
 function resetPreviewPage() { previewPage.value = 1; void loadPreviewPage() }
@@ -225,19 +309,42 @@ async function startOffline() {
   const parameters = { preview_id: preview.value.preview_id, evaluator_config: JSON.parse(JSON.stringify(draft)) as EvaluatorConfig,
     evaluation_profile_id: selectedProfile.value.id, evaluation_profile_digest: selectedProfile.value.digest, checklist_source: 'auto' as const }
   const key = JSON.stringify(parameters), requestId = requestIds.get(key) || newRunRequestId()
-  requestIds.set(key, requestId); starting.value = true; startError.value = ''; startMessage.value = ''
+  requestIds.set(key, requestId)
+  await submitEvaluation({ ...parameters, request_id: requestId })
+}
+async function recoverStart() {
+  if (!pendingStart.value || starting.value) return
+  await submitEvaluation(pendingStart.value)
+}
+async function submitEvaluation(parameters: StartEvaluationOptions) {
+  const key = sourceKey.value, entry = session.get(key)
+  if (entry) remember(key, { ...entry, start_request: parameters })
+  starting.value = true; startError.value = ''; startMessage.value = ''
   try {
-    const value = await modelIterationApi.remoteStartEvaluation({ ...parameters, request_id: requestId })
-    requestIds.delete(key)
+    const value = await modelIterationApi.remoteStartEvaluation(parameters)
+    const latest = session.get(key)
+    if (!disposed && latest?.start_request?.request_id === parameters.request_id) remember(key, { ...latest, start_request: undefined })
+    for (const [name, id] of requestIds) if (id === parameters.request_id) requestIds.delete(name)
     if (disposed) return
     if (value.run_id) await resolve([{ kind: 'run', id: value.run_id }])
     if (disposed) return
-    startMessage.value = `已创建评测运行 ${displayId('run', value.run_id)}。本次报告独立保存，原报告保留。`
+    startMessage.value = `已创建评测运行 ${displayId('run', value.run_id)}。输入准备在后台进行，本次报告独立保存。`
     if (value.run_id) emit('started', value.run_id)
   } catch (cause) { if (!disposed) startError.value = `${(cause as Error).message}；原参数重试会复用本次请求编号，避免重复创建。` }
   finally { if (!disposed) starting.value = false }
 }
-onMounted(load)
+async function retryPreparation() {
+  const id = selectedRun.value, preparation = resultMetadata.value.preparation
+  if (!id || !canRetryPreparation.value || typeof preparation?.revision !== 'number' || retryingPreparation.value) return
+  const key = `${id}:${preparation.revision}`, requestId = preparationRequestIds.get(key) || newRunRequestId()
+  preparationRequestIds.set(key, requestId); retryingPreparation.value = true
+  try {
+    await modelIterationApi.retryEvaluationPreparation(id, { request_id: requestId, expected_revision: preparation.revision })
+    if (!disposed) { preparationRequestIds.delete(key); if (id === selectedRun.value) resultError.value = ''; emit('started', id) }
+  } catch (cause) { if (!disposed && id === selectedRun.value) resultError.value = `输入准备重试尚未确认：${(cause as Error).message}` }
+  finally { if (!disposed) retryingPreparation.value = false }
+}
+onMounted(async () => { await load(); if (!disposed && restored) await restorePreview() })
 onBeforeUnmount(() => { clearTimeout(previewTimer); disposed = true; previewEpoch++; previewController?.abort() })
 </script>
 

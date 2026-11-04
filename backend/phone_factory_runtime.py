@@ -67,6 +67,10 @@ class FactoryRuntime:
         return self._transfer
 
     def get_run(self, run_id):
+        run = self.records.get("model_iter_runs", run_id)
+        if run and run.get("request", {}).get("collector_server"):
+            from .evaluation_job_previews import remote
+            return remote(self.store, ["run", run_id], run["request"]["collector_server"])
         return self.store._remote_result(["run", run_id])
 
     def _can_reject_dispatch(self, run, mode):
@@ -146,11 +150,15 @@ class FactoryRuntime:
     def _poll_evaluations(self):
         while not self._stop.wait(5):
             for schedule in (self._schedule_controls,self._schedule_archives,self._schedule_evaluations,
-                             lambda:self.resume_service.schedule()):
+                             self._schedule_previews, lambda:self.resume_service.schedule()):
                 try:
                     schedule()
                 except Exception:
                     logging.getLogger(__name__).exception("后台同步调度失败")
+
+    def _schedule_previews(self):
+        from .offline_evaluation_dispatch import schedule_previews
+        schedule_previews(self)
 
     def _schedule_archives(self):
         for run in self.store.collection_runs.list_runs():
@@ -183,6 +191,13 @@ class FactoryRuntime:
     def _schedule_evaluations(self):
         candidates = []
         for run in self.records.list("model_iter_runs"):
+            if run.get("request", {}).get("offline_evaluation_jobs_version") == 1:
+                if not run.get("dispatch_confirmed"):
+                    if (not run.get("dispatch_rejected") and not run.get("evaluation_control_terminal")
+                            and time.time() >= run.get("dispatch_checked_epoch", 0) + 5):
+                        from .offline_evaluation_dispatch import schedule
+                        schedule(self, run["run_id"])
+                    continue
             snapshot = self.records.get("model_iter_results", run["run_id"]) or {}
             if snapshot.get("final"):
                 self._restore_final_evaluation(run, snapshot)
@@ -237,7 +252,10 @@ class FactoryRuntime:
             raise PhoneFactoryError(str(exc), exc.status) from exc
         snapshot = self.records.get("model_iter_results", run_id) or {}
         if snapshot.get("final") or (not run.get("request", {}).get("evaluator_config")
-                                      and result["status"] in TERMINAL and not result.get("dispatch_error")):
+                                      and result["status"] in TERMINAL and not result.get("dispatch_error")) or (
+                run.get("request", {}).get("offline_evaluation_jobs_version") == 1
+                and result["status"] in TERMINAL
+                and result.get("preparation", {}).get("status") in {"failed", "cancelled"}):
             self.sync_policy.complete("evaluation", run_id)
         return result
 
@@ -259,9 +277,15 @@ class FactoryRuntime:
         remote_revision = remote.get("state_revision")
         if type(remote_revision) is int and remote_revision < run.get("evaluation_state_revision", -1):
             return run
+        if ("preparation" in remote and remote["preparation"].get("revision", 0)
+                < run.get("preparation", {}).get("revision", 0)):
+            return run
         self.sync_policy.observe_remote("evaluation", run_id, remote["status"])
         result = None
-        if run.get("request", {}).get("evaluator_config") and remote["status"] != "preparing":
+        preparation_pending = (run.get("request", {}).get("execution_mode") == "evaluate_only"
+                               and ("preparation" in remote or run.get("request", {}).get("offline_evaluation_jobs_version") == 1)
+                               and remote.get("preparation", {}).get("status") not in {"completed", "ready"})
+        if run.get("request", {}).get("evaluator_config") and remote["status"] != "preparing" and not preparation_pending:
             try:
                 result = model_iteration.capture_results(self, run, final=remote["status"] in TERMINAL,
                                                          remote_status=remote["status"])
@@ -270,6 +294,11 @@ class FactoryRuntime:
                     exc.remote_kind, exc.remote_command = "protocol", "run-evaluations"
                 raise
         def update(current):
+            if current.get("evaluation_control_epoch", 0) != run.get("evaluation_control_epoch", 0):
+                return
+            if ("preparation" in remote and remote["preparation"].get("revision", 0)
+                    < current.get("preparation", {}).get("revision", 0)):
+                return
             if current.get("dispatch_rejected") is True:
                 return  # A response from before the rejected submission is stale.
             if type(remote_revision) is int:
@@ -277,6 +306,8 @@ class FactoryRuntime:
                     return
                 current["evaluation_state_revision"] = remote_revision
             current.update({key: remote[key] for key in PROVENANCE_FIELDS if key in remote})
+            if "preparation" in remote:
+                current["preparation"] = remote["preparation"]
             if result is not None:
                 current["evaluation_summary"] = result["summary"]
             if current["status"] not in TERMINAL or (current["status"] == "failed" and current.get("dispatch_error")):
@@ -763,10 +794,29 @@ class FactoryRuntime:
 
     def remote_start_evaluation(self, data):
         """Submit a manifest-bound evaluation without touching phone or production state."""
+        candidate = self.records.get("model_iter_runs", "eval_" + payload_digest(data["request_id"])) if data.get("request_id") else None
+        preview_record = self.records.get("model_iter_previews", data["preview_id"]) if isinstance(data.get("preview_id"), str) and data["preview_id"] else None
+        if ((candidate or {}).get("request", {}).get("offline_evaluation_jobs_version") == 1
+                or preview_record and preview_record.get("paged")):
+            from .offline_evaluation_dispatch import accept
+            return accept(self, data)
         allowed = {"request_id", "evaluator_config", "evaluation_profile_id", "evaluation_profile_digest",
                    "profile_id", "profile_digest", "preview_id", "checklist_source", "evaluation_mode"}
         if set(data) - allowed:
             raise PhoneFactoryError("独立评测不接受手机、App、VLA 或采集参数")
+        if candidate and candidate.get("request", {}).get("execution_mode") == "evaluate_only":
+            frozen = candidate["request"]
+            options_data = {key: frozen[key] for key in allowed if key in frozen and key not in {"request_id", "preview_id"}}
+            options_data.update(data)
+            for alias, key in (("profile_id", "evaluation_profile_id"), ("profile_digest", "evaluation_profile_digest")):
+                if alias in data:
+                    options_data[key] = data[alias]
+            replay_options = model_iteration.evaluation_options(self.store, options_data, offline=True)
+            if frozen.get("preview_id") != data.get("preview_id") or any(frozen.get(k) != v for k, v in replay_options.items()):
+                raise PhoneFactoryError("相同 request_id 对应的运行参数不同", 409)
+            if candidate["status"] not in {"failed", "dispatching"} or candidate["status"] == "failed" and not candidate.get("dispatch_error"):
+                return {"ok": True, "reused": True, **self._public_run(candidate)}
+            data = options_data
         options = model_iteration.evaluation_options(self.store, data, offline=True)
         preview_id = _identifier(data.get("preview_id"), "预览编号")
         preview_record = self.records.get("model_iter_previews", preview_id)
@@ -824,6 +874,8 @@ class FactoryRuntime:
                     if item["status"] not in {"interrupted", "cancelled", "succeeded", "partial", "completed"}:
                         item.update(status="stopping" if item.get("stop_requested_at") and response["status"] not in TERMINAL else response["status"], dispatch_response=response,
                                     dispatch_error=None, updated_at=utc_now())
+                        if "preparation" in response:
+                            item["preparation"] = response["preparation"]
                 saved = self.records.update("model_iter_runs", run_id, accepted)
                 self.sync_policy.reset("evaluation", run_id)
                 return {**response, **saved, "ok": True}
@@ -888,8 +940,10 @@ class FactoryRuntime:
 
     @staticmethod
     def _public_run(run):
-        hidden = {"trajectories", "batch_tasks", "manifest", "dispatch_response", "cancel_response"}
+        hidden = {"trajectories", "batch_tasks", "manifest", "dispatch_response", "cancel_response", "pending_preparation_control"}
         view = {key: value for key, value in run.items() if key not in hidden}
+        if run.get("request", {}).get("offline_evaluation_jobs_version") == 1:
+            view["preparation_control_pending"] = bool(run.get("pending_preparation_control"))
         request = dict(view.get("request") or {})
         if request:
             request.pop("source_cases", None)
@@ -1089,12 +1143,26 @@ class FactoryRuntime:
         run = self.records.get("model_iter_runs", run_id)
         if not run or not run.get("stop_requested_at"):
             return
+        if run.get("request", {}).get("offline_evaluation_jobs_version") == 1 and run.get("evaluation_control_terminal"):
+            return
         self._control_attempt("model_iter_runs", run_id, run)
         try:
+            if run.get("request", {}).get("offline_evaluation_jobs_version") == 1 and not run.get("dispatch_confirmed"):
+                from .offline_evaluation_dispatch import dispatch
+                if run.get("dispatch_rejected") and run.get("dispatch_uncertain"):
+                    self.records.update("model_iter_runs", run_id, lambda row: row.update(dispatch_rejected=False))
+                dispatch(self, run_id)
+                run = self.records.get("model_iter_runs", run_id)
+                if run.get("evaluation_control_terminal") or not run.get("dispatch_confirmed"):
+                    return
             remote = self.get_run(run_id)
             if remote.get("run_id", remote.get("collection_run_id")) != run_id or remote.get("run_mode") != "modeliter":
                 raise PhoneFactoryError("远端评测身份不匹配，未请求停止", 502)
-            result = self.store._remote_result(["cancel-run", run_id])
+            if run.get("request", {}).get("collector_server"):
+                from .evaluation_job_previews import remote as invoke
+                result = invoke(self.store, ["cancel-run", run_id], run["request"]["collector_server"])
+            else:
+                result = self.store._remote_result(["cancel-run", run_id])
             if (result.get("ok") is False or result.get("run_id", result.get("collection_run_id")) != run_id
                     or result.get("status") not in TERMINAL | {"stopping", "needs_attention"}):
                 raise PhoneFactoryError("采集电脑尚未确认停止评测", 502)
@@ -1105,6 +1173,8 @@ class FactoryRuntime:
                     return
                 row.update(status=status, remote_status=status, control_error=None,
                            evaluation_control_terminal=status in TERMINAL, updated_at=utc_now())
+                if "preparation" in result:
+                    row["preparation"] = result["preparation"]
             self.records.update("model_iter_runs", run_id, update)
             self.sync_policy.reset("evaluation", run_id)
             self.sync_policy.observe_remote("evaluation",run_id,result["status"])
@@ -1117,7 +1187,15 @@ class FactoryRuntime:
         if not run:
             raise PhoneFactoryError("评估运行不存在", 404)
         def intent(row):
+            if row.get("request", {}).get("offline_evaluation_jobs_version") == 1 and not row.get("stop_requested_at"):
+                row["evaluation_control_epoch"] = row.get("evaluation_control_epoch", 0) + 1
+                row.pop("pending_preparation_control", None)
             row.update(stop_requested_at=row.get("stop_requested_at") or utc_now(), control_error=None)
+            if (row.get("request", {}).get("offline_evaluation_jobs_version") == 1
+                    and not row.get("dispatch_confirmed") and (not row.get("dispatch_attempted")
+                    or row.get("dispatch_rejected") and not row.get("dispatch_uncertain"))):
+                row.update(status="cancelled", evaluation_control_terminal=True,
+                           preparation={**row.get("preparation", {}), "status": "cancelled", "phase": "cancelled"})
             if not row.get("evaluation_control_terminal"):
                 row["status"] = "stopping"
         saved = self.records.update("model_iter_runs", run_id, intent)
@@ -1197,7 +1275,10 @@ class FactoryRuntime:
                 return True, model_iteration.get_profiles(self.store)
             if action == "evaluation-sources" and method == "GET":
                 return True, model_iteration.get_sources(self.store)
-            if action.startswith("evaluation-previews/") and method == "GET":
+            if len(parts) == 3 and parts[0] == "evaluation-previews" and method == "POST" and parts[2] in {"cancel", "retry"}:
+                from .evaluation_job_previews import control
+                return True, control(self.store, parts[1], parts[2], data)
+            if len(parts) == 2 and parts[0] == "evaluation-previews" and method == "GET":
                 from .evaluation_previews import state
                 return True, state(self.store, action.split("/")[1], data.get("offset", 0), data.get("limit", 50))
             if action == "evaluation-preview" and method == "POST":
@@ -1222,6 +1303,9 @@ class FactoryRuntime:
                 return True, dispatch(self, parts, data, mode)
         if action.startswith("runs/") and mode == "modeliter":
             parts = action.split("/")
+            if method == "POST" and len(parts) == 3 and parts[2] == "retry-preparation":
+                from .offline_evaluation_dispatch import retry
+                return True, retry(self, _identifier(parts[1], "评估运行编号"), data)
             if method == "GET" and len(parts) == 2:
                 run = next((run for run in self.run_views(mode) if run["run_id"] == parts[1]), None)
                 if run is None:
@@ -1248,6 +1332,21 @@ class FactoryRuntime:
                     raise PhoneFactoryError("历史运行不包含逐用例评测，请下载历史报告", 409)
                 snapshot = self.records.get("model_iter_results", run_id)
                 source_label=self._evaluation_snapshot_label(run)
+                if (run.get("request", {}).get("offline_evaluation_jobs_version") == 1
+                        or run.get("request", {}).get("execution_mode") == "evaluate_only" and run.get("preparation")):
+                    # GET reads cached state only. The background synchronizer
+                    # fetches progress/results without consuming proxy timeouts.
+                    from .offline_evaluation_dispatch import dispatch as dispatch_offline
+                    self._evaluation_pool.submit(run_id, lambda: self._background_evaluation(run_id)
+                        if run.get("dispatch_confirmed") or run.get("request", {}).get("offline_evaluation_jobs_version") != 1
+                        else dispatch_offline(self, run_id))
+                    result = (snapshot or {}).get("result") or {"run_id": run_id, "execution_mode": "evaluate_only",
+                        "status": run["status"], "cases": [], "reports": [],
+                        "summary": {**{key: 0 for key in model_iteration.COUNTS},
+                                    "total": run["request"].get("source_count", len(run["request"].get("source_cases", []))), "success_rate": None}}
+                    return True, {**result, "status": run["status"], "preparation": run.get("preparation"),
+                                  "preparation_control_error": run.get("preparation_control_error"),
+                                  "preparation_control_pending": bool(run.get("pending_preparation_control")), **source_label}
                 if snapshot and snapshot.get("final"):
                     return True, {**snapshot["result"],**source_label}
                 try:

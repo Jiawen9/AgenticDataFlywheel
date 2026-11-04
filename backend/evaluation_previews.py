@@ -42,6 +42,9 @@ def validate(value, *, complete=False):
 
 def accept(store, source, value):
     validate(value)
+    if value.get("job_version") == 1:
+        from .evaluation_job_previews import accept_remote
+        return accept_remote(store, source, value)
     preview_id = value["preview_id"]
     pending = value.get("status") == "preparing" or value.get("has_more") is True
     saved = {**value, "valid": False, "status": "preparing", "cases": []} if pending else value
@@ -82,6 +85,9 @@ def schedule(store, preview_id):
 
 def refresh(store, preview_id):
     saved = store.records.get("model_iter_previews", preview_id)
+    if saved and saved.get("paged"):
+        from .evaluation_job_previews import refresh as refresh_job
+        return refresh_job(store, preview_id)
     if not saved or saved["preview"].get("status") != "preparing":
         return
     try:
@@ -119,6 +125,9 @@ def state(store, preview_id, offset=0, limit=50):
     saved = store.records.get("model_iter_previews", preview_id)
     if not saved:
         raise PhoneFactoryError("预览不存在", 404)
+    if saved.get("paged"):
+        from .evaluation_job_previews import state as job_state
+        return job_state(store, preview_id, offset, limit)
     if saved["preview"].get("status") == "preparing":
         schedule(store, preview_id)
     from .collection_resume_snapshots import evaluation_snapshot_status

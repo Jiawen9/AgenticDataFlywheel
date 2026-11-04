@@ -16,6 +16,8 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import urllib.error
 from unittest.mock import patch
@@ -93,6 +95,10 @@ class ModelIterationFlaskTests(unittest.TestCase):
         self.stack.callback(self.dispatcher.close)
         self.remote = self.manager.app.test_client()
         self.factory = PhoneFactoryStore(self.base / 'platform', run_client_fn=self.client)
+        self.cli_lock = threading.RLock()
+        self.stack.callback(self.factory.runtime.close)
+        from phonefactory_offline_async import wait_idle
+        self.stack.callback(lambda: self.assertTrue(wait_idle(self.manager.HTTP_RUNS_DIR, timeout=30)))
         self.factory.initialize_settings({'phones':['phone-a'], 'apps':['App'],
             'phoneApps':[{'phone_id':'phone-a', 'app':'App'}], 'vla':['target.invalid:8000']})
         book = Workbook()
@@ -124,7 +130,7 @@ class ModelIterationFlaskTests(unittest.TestCase):
 
     def client(self, args):
         output = io.StringIO()
-        with patch.object(sys,'argv',['phonefactory_client',*args]), \
+        with self.cli_lock, patch.object(sys,'argv',['phonefactory_client',*args]), \
                 patch.object(phonefactory_client.urllib.request,'urlopen',self.urlopen), \
                 contextlib.redirect_stdout(output):
             try:
@@ -192,7 +198,18 @@ class ModelIterationFlaskTests(unittest.TestCase):
         job.code = 0
 
     def results(self, run_id):
+        record = self.factory.records.get('model_iter_runs', run_id)
+        if record.get('request', {}).get('offline_evaluation_jobs_version') == 1:
+            self.factory.runtime.sync_evaluation(run_id, fresh=True)
         return self.factory.dispatch(f'runs/{run_id}/evaluations','GET',{},mode='modeliter')
+
+    def wait_preview(self, value):
+        deadline = time.monotonic() + 30
+        while value.get('status') == 'preparing' and time.monotonic() < deadline:
+            time.sleep(.02)
+            value = self.factory.dispatch(f"evaluation-previews/{value['preview_id']}", 'GET', {}, mode='modeliter')
+        self.assertNotEqual(value.get('status'), 'preparing', value)
+        return value
 
     def archive_collected(self, record, folders):
         for folder in folders:
@@ -216,13 +233,25 @@ class ModelIterationFlaskTests(unittest.TestCase):
                 'actions_flat': [{'global_step': 1, 'action': {'action': 'wait', 'time': 1},
                                   'screenshot_before': r'Z:\old-server\step001_vla_input.jpg'}]}
             (folder / '_trajectory_for_evaluate.json').write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
-        return self.factory.dispatch('evaluation-preview', 'POST', {'source_path': str(self.inputs)}, mode='modeliter')
+        return self.wait_preview(self.factory.dispatch('evaluation-preview', 'POST', {'source_path': str(self.inputs)}, mode='modeliter'))
 
     def start_offline(self, profile, preview, request_id='offline'):
-        return self.factory.dispatch('remote/start-evaluation', 'POST', {
+        value = self.factory.dispatch('remote/start-evaluation', 'POST', {
             'request_id': request_id, 'evaluator_config': self.config,
             'evaluation_profile_id': profile['id'], 'evaluation_profile_digest': profile['digest'],
             'preview_id': preview['preview_id'], 'checklist_source': 'auto'}, mode='modeliter')
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            local = self.factory.records.get('model_iter_runs', value['run_id'])
+            if local.get('dispatch_confirmed'):
+                current = self.factory.runtime.sync_evaluation(value['run_id'], fresh=True)
+                if current.get('preparation', {}).get('status') != 'preparing':
+                    self.assertEqual(current.get('preparation', {}).get('status'), 'completed', current)
+                    return current
+            if local.get('dispatch_rejected'):
+                self.fail(local.get('dispatch_error'))
+            time.sleep(.02)
+        self.fail('input preparation did not finish')
 
     def test_offline_http_profile_preview_progress_cancel_without_phone_launch(self):
         profile = self.profile()
@@ -256,7 +285,12 @@ class ModelIterationFlaskTests(unittest.TestCase):
                          {row['source_trajectory_id'] for row in preview['cases']})
         with patch.object(self.dispatcher, '_stop_pid'), patch.object(self.manager, 'kill_processes_in') as phone_kill:
             cancelled = self.factory.dispatch(f"runs/{run['run_id']}/cancel", 'POST', {}, mode='modeliter')
-        self.assertEqual(cancelled['status'], 'cancelled')
+            deadline = time.monotonic() + 10
+            while cancelled['status'] != 'cancelled' and time.monotonic() < deadline:
+                time.sleep(.02)
+                self.factory.runtime._schedule_controls()
+                cancelled = self.factory.records.get('model_iter_runs', run['run_id'])
+        self.assertEqual(cancelled['status'], 'cancelled', cancelled.get('control_error'))
         phone_kill.assert_not_called()
         self.assertEqual(self.results(run['run_id'])['summary']['evaluation_failed'], 2)
         self.assertEqual(self.factory.records.list('collection_runs'), [])
@@ -286,7 +320,7 @@ class ModelIterationFlaskTests(unittest.TestCase):
             self.assertEqual(sum(name.endswith('_trajectory_for_evaluate.json') for name in names), 2)
         sources = self.factory.dispatch('evaluation-sources', 'GET', {}, mode='modeliter')
         self.assertTrue(any(source['run_id'] == run['run_id'] for source in sources['sources']))
-        archived_preview = self.factory.dispatch('evaluation-preview', 'POST', {'source_run_id': run['run_id']}, mode='modeliter')
+        archived_preview = self.wait_preview(self.factory.dispatch('evaluation-preview', 'POST', {'source_run_id': run['run_id']}, mode='modeliter'))
         self.assertTrue(archived_preview['valid'], archived_preview)
         self.assertEqual(archived_preview['trajectory_count'], 2)
         # Selecting a completed run creates new output/checkpoint directories.

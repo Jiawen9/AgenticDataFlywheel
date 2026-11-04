@@ -267,18 +267,27 @@ def build_parser():
     run.add_argument("--evaluation-profile-digest")
     sub.add_parser("status").add_argument("phones")
     sub.add_parser("adb-devices")
-    sub.add_parser("capabilities")
+    sub.add_parser("capabilities").add_argument("--server")
     sub.add_parser("evaluation-profiles")
     sub.add_parser("evaluation-sources")
     for command in ("evaluation-preview", "start-evaluation"):
-        sub.add_parser(command).add_argument("--payload", required=True)
+        item = sub.add_parser(command)
+        item.add_argument("--payload", required=True)
+        item.add_argument("--server")
     preview = sub.add_parser("evaluation-preview-status")
     preview.add_argument("preview_id")
     preview.add_argument("--offset", type=int, default=0)
     preview.add_argument("--limit", type=int, default=50)
-    sub.add_parser("run").add_argument("run_id")
-    sub.add_parser("run-evaluations").add_argument("run_id")
-    sub.add_parser("cancel-run").add_argument("run_id")
+    preview.add_argument("--server")
+    for command in ("evaluation-preview-cancel", "evaluation-preview-retry", "evaluation-preparation-retry"):
+        item = sub.add_parser(command)
+        item.add_argument("identifier")
+        item.add_argument("--payload", required=True)
+        item.add_argument("--server")
+    for command in ("run", "run-evaluations", "cancel-run"):
+        item = sub.add_parser(command)
+        item.add_argument("run_id")
+        item.add_argument("--server")
     for command in ("run-diagnostics", "collection-executions", "resume-preview", "resume-collection", "executions-cancel",
                     "resume-operation", "collection-snapshot"):
         item = sub.add_parser(command)
@@ -399,14 +408,20 @@ def main():
                           urllib.parse.urlencode({"offset": args.offset, "limit": args.limit}))
     elif args.cmd in {"evaluation-profiles", "evaluation-sources"}:
         result = get_json("/" + args.cmd.replace("-", "_"))
-    elif args.cmd in {"evaluation-preview", "start-evaluation"}:
+    elif args.cmd in {"evaluation-preview", "start-evaluation", "evaluation-preview-cancel", "evaluation-preview-retry", "evaluation-preparation-retry"}:
         try:
             payload = json.loads(args.payload)
         except (ValueError, TypeError):
             sys.exit("错误：评测请求必须为 JSON 对象")
         if not isinstance(payload, dict):
             sys.exit("错误：评测请求必须为 JSON 对象")
-        result = post_json("/" + args.cmd.replace("-", "_"), payload)
+        if args.cmd == "evaluation-preparation-retry":
+            path = "/runs/" + urllib.parse.quote(args.identifier, safe="") + "/evaluation-preparation/retry"
+        elif args.cmd in {"evaluation-preview-cancel", "evaluation-preview-retry"}:
+            path = "/evaluation_previews/" + urllib.parse.quote(args.identifier, safe="") + "/" + args.cmd.rsplit("-", 1)[1]
+        else:
+            path = "/" + args.cmd.replace("-", "_")
+        result = post_json(path, payload)
     elif args.cmd == "run":
         result = get_json("/runs/" + urllib.parse.quote(args.run_id, safe=""))
     elif args.cmd == "run-evaluations":

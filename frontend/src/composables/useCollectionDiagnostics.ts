@@ -117,8 +117,8 @@ export function useCollectionDiagnostics(runs: Ref<FactoryRun[]>, api: Diagnosti
 
   async function refresh(signal?: AbortSignal, current: () => boolean = () => true) {
     const id = selectedRunId.value, epoch = generation, sequence = ++requestSequence
-    if (!id) return
-    if (selectedRun.value?.execution_mode === 'evaluate_only') {
+    if (!id || !selectedRun.value) return
+    if (selectedRun.value.execution_mode === 'evaluate_only') {
       snapshots.value = { ...snapshots.value, [id]: { supported: false, run_id: id, phones: [], summary: { total: 0, healthy: 0, warning: 0, error: 0 }, message: '独立评测不占用手机；进度与异常请查看用例明细中的当前评测快照。' } }
       return
     }

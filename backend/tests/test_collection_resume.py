@@ -333,10 +333,11 @@ class ResumeTests(unittest.TestCase):
         preview={'preview_id':'pv_eval','valid':False,'status':'ready','trajectory_count':0,'cases':[],
             'errors':['No eligible input']}
         self.responses['evaluation-preview']=preview
-        with patch('backend.model_iteration.require_capability'):
+        with patch('backend.evaluation_previews.schedule'):
             result=preview_source(self.store,{'source_run_id':self.id})
             self.assertFalse(result['stale_collection_snapshot'])
-            self.assertEqual(json.loads(self.calls[-1][-1]),{'source_run_id':self.id,'snapshot_id':'cs_current'})
+            self.assertEqual(self.store.records.get('model_iter_previews',result['preview_id'])['request'],
+                             {'source_run_id':self.id,'snapshot_id':'cs_current'})
             self.store.records.update('collection_resume_heads',self.id,lambda v:v.update(active=True))
             with self.assertRaisesRegex(PhoneFactoryError,'等待稳定快照'):
                 preview_source(self.store,{'source_run_id':self.id})
