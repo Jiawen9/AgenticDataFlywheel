@@ -287,6 +287,22 @@ def build_parser():
             item.add_argument("--payload", required=True)
         elif command in {"resume-operation", "collection-snapshot"}:
             item.add_argument("identifier")
+    for command in ("phone-control-capabilities", "phone-ownership", "phone-reconcile", "phone-stop", "phone-control-operation"):
+        item = sub.add_parser(command)
+        item.add_argument("--server")
+        if command in {"phone-reconcile", "phone-stop"}:
+            item.add_argument("run_id")
+            item.add_argument("phone_id")
+            item.add_argument("--payload", required=True)
+        elif command == "phone-ownership":
+            item.add_argument("phone_id")
+        elif command == "phone-control-operation":
+            item.add_argument("request_id")
+    corrections = sub.add_parser("result-corrections")
+    corrections.add_argument("run_id")
+    corrections.add_argument("--server")
+    corrections.add_argument("--cursor", type=int, default=0)
+    corrections.add_argument("--limit", type=int, default=100)
     sub.add_parser("retry-collection-artifacts").add_argument("run_id")
     pressure = sub.add_parser("receipt-storage")
     pressure.add_argument("run_id")
@@ -316,11 +332,29 @@ def build_parser():
 
 
 def main():
+    global SERVER
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
     args = build_parser().parse_args()
-    if args.cmd == "start-run":
+    if getattr(args, "server", None):
+        parsed = urllib.parse.urlsplit(args.server)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            sys.exit("错误：采集服务地址无效")
+        SERVER = args.server.rstrip("/")
+    if args.cmd == "phone-control-capabilities":
+        result = get_json("/capabilities")
+    elif args.cmd == "phone-ownership":
+        result = get_json("/phones/" + urllib.parse.quote(args.phone_id, safe="") + "/ownership")
+    elif args.cmd == "phone-control-operation":
+        result = get_json("/phone-control-operations/" + urllib.parse.quote(args.request_id, safe=""))
+    elif args.cmd in {"phone-reconcile", "phone-stop"}:
+        payload = json.loads(args.payload)
+        if not isinstance(payload, dict):
+            sys.exit("错误：手机控制请求必须为 JSON 对象")
+        result = post_json("/runs/" + urllib.parse.quote(args.run_id, safe="") + "/phones/" +
+            urllib.parse.quote(args.phone_id, safe="") + "/" + args.cmd.removeprefix("phone-"), payload)
+    elif args.cmd == "start-run":
         result = cmd_start_run(args)
     elif args.cmd in {"add-phone", "del-phone"}:
         result = post_json("/" + args.cmd.replace("-", "_"), {"phoneid": args.phoneid})
@@ -351,6 +385,8 @@ def main():
             result = post_json(path, payload)
         else:
             result = get_json(path)
+    elif args.cmd == "result-corrections":
+        result = get_json("/runs/" + urllib.parse.quote(args.run_id, safe="") + "/result-corrections?" + urllib.parse.urlencode({"cursor": args.cursor, "limit": args.limit}))
     elif args.cmd == "retry-collection-artifacts":
         result = post_json("/runs/" + urllib.parse.quote(args.run_id, safe="") + "/collection-artifacts/retry", {})
     elif args.cmd == "receipt-storage":

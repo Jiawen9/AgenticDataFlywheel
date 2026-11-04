@@ -282,7 +282,7 @@ class ArtifactTransfer:
             delay = (30, 60, 120, 300)[min(failures - 1, 3)]
             ledger.update(artifact_id, status="quarantined" if quarantined else "retry_wait",
                 error=message[:2000], failure_count=failures,
-                storage_error=local_storage_failure or current.get("storage_error", False),
+                storage_error=False if quarantined else local_storage_failure or current.get("storage_error", False),
                 next_retry_at=(datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat().replace("+00:00", "Z"))
 
     def _progress(self, run, ledger, snapshot):

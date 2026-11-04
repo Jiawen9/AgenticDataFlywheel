@@ -478,7 +478,9 @@ def create_router(store: PhoneFactoryStore | None = None, *, prefix="/api/phone-
         try:
             body = dict(request.query_params) if request.method == "GET" else data or {}
             value = service.dispatch(action, request.method, body, mode=mode)
-            return value if isinstance(value, Response) else JSONResponse(value, headers={"Cache-Control": "no-store"})
+            accepted = (request.method == "POST" and re.fullmatch(r"collection-runs/[^/]+/phones/[^/]+/(?:stop|reconcile)",action)
+                        and isinstance(value,dict) and value.get("status") in {"accepted","running","uncertain"})
+            return value if isinstance(value, Response) else JSONResponse(value, status_code=202 if accepted else 200, headers={"Cache-Control": "no-store"})
         except (PhoneFactoryError, CollectionRunError) as exc:
             return JSONResponse({"error": str(exc)}, status_code=exc.status, headers={"Cache-Control": "no-store"})
         except (ValueError, OSError) as exc:

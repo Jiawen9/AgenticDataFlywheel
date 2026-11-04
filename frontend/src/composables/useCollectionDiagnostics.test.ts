@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createRenderer, defineComponent, h, nextTick, ref } from 'vue'
-import type { CollectionDiagnostics, FactoryRun } from '@/phoneFactoryApi'
+import type { CollectionDiagnostics, FactoryRun, PhoneOwner, PhoneOwnership } from '@/phoneFactoryApi'
 import { useCollectionDiagnostics, type CollectionDiagnosticsState } from './useCollectionDiagnostics'
 
 const polling = vi.hoisted(() => ({ registrations: 0, start: vi.fn(), work: undefined as any }))
@@ -21,6 +21,61 @@ function mount(allowed = true) {
 }
 beforeEach(() => { vi.useFakeTimers(); vi.clearAllMocks(); polling.registrations = 0 })
 afterEach(() => { mounted.splice(0).forEach(app => app.unmount()); vi.useRealTimers() })
+
+const owner: PhoneOwner = { execution_id: 'old-execution', state_revision: 10, ownership_token: 'proof', availability: 'free', supported_actions: ['reconcile', 'stop'] }
+const ownership: PhoneOwnership = { availability: 'free', stale: false, checked_at: '2026-11-04T00:00:00Z', owners: [owner] }
+function controls(view: ReturnType<typeof mount>) {
+  const api = Object.assign(view.api, {
+    phoneOwnership: vi.fn(async (_id: string, _phone: string, _signal?: AbortSignal) => ownership),
+    phoneControl: vi.fn(async (_id: string, phone: string, action: 'reconcile' | 'stop', body: any, _signal?: AbortSignal) => ({ operation_id: body.request_id, execution_id: body.execution_id, phone_id: phone, action, status: 'accepted' })),
+    phoneControlOperation: vi.fn(async (_id: string, request: string, _signal?: AbortSignal) => ({ operation_id: request, execution_id: owner.execution_id, phone_id: 'p1', action: 'reconcile' as const, status: 'completed' })),
+  })
+  api.diagnostics.mockResolvedValue({ ...snapshot(), phone_control: { version: 1 }, phones: [{ ...snapshot().phones[0]!, ownership }] })
+  return api
+}
+
+describe('phone ownership and scoped controls', () => {
+  it('keeps controls unavailable on an old collector and never stops on diagnostic refresh', async () => {
+    const view = mount(), api = controls(view)
+    api.diagnostics.mockResolvedValueOnce(snapshot())
+    await view.state.refresh(); await view.state.controlPhone('p1', 'stop', owner)
+    expect(api.phoneControl).not.toHaveBeenCalled()
+    await view.state.refresh(); expect(api.phoneControl).not.toHaveBeenCalled()
+  })
+  it('sends the exact owner and version once, then polls duplicate clicks', async () => {
+    const view = mount(), api = controls(view); await view.state.refresh()
+    await view.state.controlPhone('p1', 'reconcile', owner)
+    await view.state.controlPhone('p1', 'reconcile', owner)
+    expect(api.phoneControl).toHaveBeenCalledTimes(1)
+    expect(api.phoneControl.mock.calls[0]?.slice(0, 3)).toEqual(['a', 'p1', 'reconcile'])
+    expect(api.phoneControl.mock.calls[0]?.[3]).toMatchObject({ execution_id: 'old-execution', expected_state_revision: 10, ownership_token: 'proof' })
+    expect(api.phoneControlOperation).toHaveBeenCalledTimes(1)
+    expect(view.state.controlFor('p1')?.result?.status).toBe('completed')
+  })
+  it('discards a late ownership query after A to B to A selection', async () => {
+    const view = mount(), api = controls(view); await view.state.refresh()
+    const pending = deferred<PhoneOwnership>(); api.phoneOwnership.mockReturnValueOnce(pending.promise)
+    const work = view.state.checkOwnership('p1')
+    view.state.selectRun('b'); view.state.selectRun('a')
+    pending.resolve({ ...ownership, availability: 'busy', checked_at: '2099-01-01T00:00:00Z' }); await work
+    expect(view.state.ownershipFor('p1')?.availability).toBe('free')
+  })
+  it('retries a lost acknowledgement using the original request and no new target', async () => {
+    const view = mount(), api = controls(view); await view.state.refresh()
+    api.phoneControl.mockRejectedValueOnce(new Error('lost ack'))
+    api.phoneControlOperation.mockRejectedValueOnce(Object.assign(new Error('not yet accepted'), { status: 404 }))
+    await view.state.controlPhone('p1', 'reconcile', owner)
+    expect(api.phoneControl).toHaveBeenCalledTimes(2)
+    expect(api.phoneControl.mock.calls[0]?.slice(0, 4)).toEqual(api.phoneControl.mock.calls[1]?.slice(0, 4))
+    expect(api.resumeCollection).not.toHaveBeenCalled()
+  })
+  it('freezes an explicit device revision into continuation without replacing model configuration', async () => {
+    const view = mount(); await view.state.refresh()
+    await view.state.continuePhones(['p1'], { adb_path: 'D:/adb/adb.exe', app_list: { Demo: 'com.example.demo' } })
+    expect(view.api.resumeCollection.mock.calls[0]?.[1]).toMatchObject({ device_config_revision: { adb_path: 'D:/adb/adb.exe', app_list: { Demo: 'com.example.demo' } } })
+    expect(view.api.resumeCollection.mock.calls[0]?.[1]).not.toHaveProperty('planner_config')
+  })
+})
 
 describe('page-owned collection diagnostics and resume', () => {
   it('retains last data and selection through polling failures and marks snapshots older than 20 seconds', async () => {

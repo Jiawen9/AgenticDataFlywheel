@@ -700,6 +700,7 @@ async function dispatchTask(task: TaskRow, phoneId: string, app: string, vla: st
   const remote = await factoryApi.remoteStartRun({ ...parameters, request_id: requestId })
   requestIds.delete(key)
   if (disposed) return
+  if (remote.run_id || remote.collection_run_id) diagnostics.selectRun(remote.run_id || remote.collection_run_id!)
   if (remote.run_id) await resolve([{ kind: 'run', id: remote.run_id }])
   if (!disposed && isEvaluation && remote.run_id) await onEvaluationStarted(remote.run_id)
   if (!disposed) ElMessage.success(remote.run_id ? `运行 ${displayId('run', remote.run_id)} 已下发` : '任务已下发')
