@@ -1181,7 +1181,7 @@ class FactoryRuntime:
     def dispatch(self, action, method, data, mode):
         parts = action.split("/")
         if len(parts) >= 3 and parts[0] == "collection-runs" and parts[2] in {
-                "diagnostics", "cases", "resume-preview", "resume", "resume-operations"}:
+                "diagnostics", "cases", "resume-preview", "resume", "resume-operations", "phones", "phone-control-operations"}:
             return True, self.resume_service.dispatch(parts, method, data, mode)
         if method == "GET" and action == "agent-capabilities":
             return True, self.agent_capabilities()

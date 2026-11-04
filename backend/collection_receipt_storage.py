@@ -55,9 +55,9 @@ class ReceiptStorage:
             remote = result.get("receipt_storage")
             if isinstance(remote, dict) and remote.get("paused") is not state["paused"]:
                 raise ValueError("采集端回传存储状态不匹配")
-            state.update(pending=False, error=None, acknowledged_at=utc_now())
+            state.update(pending=False, notification_error=None, acknowledged_at=utc_now())
         except Exception as exc:
-            state.update(pending=True, error=str(exc)[:500])
+            state.update(pending=True, notification_error=str(exc)[:500])
         try:
             self._persist(state)
         except (OSError, sqlite3.Error):
@@ -73,7 +73,10 @@ class ReceiptStorage:
             except (OSError, sqlite3.Error):
                 state = self.owner._receipt_storage_states.setdefault(self.run_id, {})
             notify = not state.get("paused") or state.get("pending")
-            state.update(paused=True, reason="platform_storage_unavailable", updated_at=utc_now())
+            state.update(paused=True, reason="platform_storage_unavailable", updated_at=utc_now(),
+                         error=str(exc)[:500], error_type=type(exc).__name__,
+                         errno=getattr(exc,"errno",None), winerror=getattr(exc,"winerror",None),
+                         failed_at=utc_now())
             if notify:
                 self._send(state)
         return True
@@ -103,11 +106,14 @@ class ReceiptStorage:
                 return
             # Persist a successful local write before clearing collector pause.
             # A restart can replay this intent; remote revisions protect order.
-            state.update(paused=False, reason="", pending=True, updated_at=utc_now())
+            state.update(paused=False, reason="", pending=True, updated_at=utc_now(),
+                         last_error=state.get("error"), error=None, recovered_at=utc_now())
             try:
                 self._persist(state)
             except (OSError, sqlite3.Error) as exc:
-                state.update(paused=True, reason="platform_storage_unavailable")
+                state.update(paused=True, reason="platform_storage_unavailable", error=str(exc)[:500],
+                             error_type=type(exc).__name__, errno=getattr(exc,"errno",None),
+                             winerror=getattr(exc,"winerror",None))
                 self.failed.set()
                 self._send(state)
                 raise exc

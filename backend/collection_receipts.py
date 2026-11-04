@@ -122,7 +122,7 @@ class ReceiptStore:
         with self.records._connection() as connection:
             return connection.execute("""SELECT COUNT(*) FROM records WHERE namespace=?
                 AND json_extract(payload,'$.storage_error')=1
-                AND json_extract(payload,'$.status')!='received'""", (self.namespace,)).fetchone()[0]
+                AND json_extract(payload,'$.status') NOT IN ('received','quarantined')""", (self.namespace,)).fetchone()[0]
 
     @staticmethod
     def public(row):

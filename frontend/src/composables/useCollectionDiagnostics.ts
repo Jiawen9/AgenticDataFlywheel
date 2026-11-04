@@ -1,9 +1,10 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch, type Ref } from 'vue'
-import { newRunRequestId, type CollectionDiagnostics, type FactoryRun, type ResumeOperation, type ResumeRequest, type createFactoryApi } from '@/phoneFactoryApi'
+import { newRunRequestId, type CollectionDiagnostics, type PhoneOwner, type PhoneOwnership, type PhoneControlRequest, type PhoneControlOperation, type DeviceConfigRevision, type FactoryRun, type ResumeOperation, type ResumeRequest, type createFactoryApi } from '@/phoneFactoryApi'
 import { factoryRunActive, factoryRunId, newestFactoryRuns } from '@/utils/factoryHistory'
 import { useFactoryPolling } from './useFactoryPolling'
 
-type DiagnosticsApi = Pick<ReturnType<typeof createFactoryApi>, 'diagnostics' | 'resumePreview' | 'resumeCollection' | 'resumeOperation'>
+type DiagnosticsApi = Pick<ReturnType<typeof createFactoryApi>, 'diagnostics' | 'resumePreview' | 'resumeCollection' | 'resumeOperation'> & Partial<Pick<ReturnType<typeof createFactoryApi>, 'phoneOwnership' | 'phoneControl' | 'phoneControlOperation'>>
+export interface PhoneControlState { runId: string; phoneId: string; action: 'reconcile' | 'stop'; request: PhoneControlRequest; result?: PhoneControlOperation; sending: boolean; error: string }
 export interface PhoneResumeState {
   runId: string; phoneIds: string[]; requestId: string; request?: ResumeRequest; confirmedUnknown: boolean
   phase: 'previewing' | 'confirming' | 'submitting' | 'waiting' | 'settled' | 'cancelled'; error: string; result?: ResumeOperation
@@ -24,6 +25,68 @@ export function useCollectionDiagnostics(runs: Ref<FactoryRun[]>, api: Diagnosti
   const errors = ref<Record<string, string>>({}), loading = ref(false), now = ref(Date.now())
   const sampleSequence = ref(0)
   const operations = reactive<PhoneResumeState[]>([])
+  const phoneControls = reactive<PhoneControlState[]>([])
+  const ownershipSnapshots = ref<Record<string, PhoneOwnership>>({})
+  const phoneControlSupported = computed(() => snapshot.value?.phone_control?.version === 1 || snapshot.value?.phone_control_supported === true)
+  const controlTerminal = (status?: string) => ['completed', 'conflict', 'failed', 'rejected'].includes(status || '')
+  function ownershipFor(phone: string): PhoneOwnership | undefined {
+    const manual = ownershipSnapshots.value[`${selectedRunId.value}:${phone}`]
+    const observed = snapshot.value?.phones.find(item => item.phone_id === phone)?.ownership
+    if (!manual) return observed
+    if (!observed) return manual
+    const date = (value: PhoneOwnership) => Date.parse(value.checked_at || value.received_at || '') || 0
+    return date(observed) >= date(manual) ? observed : manual
+  }
+  function controlFor(phone: string) { return phoneControls.filter(item => item.runId === selectedRunId.value && item.phoneId === phone).at(-1) }
+  async function checkOwnership(phone: string) {
+    if (!api.phoneOwnership || !phoneControlSupported.value) return
+    const id = selectedRunId.value, epoch = generation
+    try {
+      const result = await bounded(signal => api.phoneOwnership!(id, phone, signal))
+      if (disposed || epoch !== generation || id !== selectedRunId.value) return
+      ownershipSnapshots.value = { ...ownershipSnapshots.value, [`${id}:${phone}`]: result }
+    } catch (cause) { if (!disposed && epoch === generation) errors.value = { ...errors.value, [id]: `占用暂未同步：${(cause as Error).message}` } }
+  }
+  async function pollControl(item: PhoneControlState, signal?: AbortSignal) {
+    if (!api.phoneControlOperation) return
+    try {
+      const result = await bounded(abort => api.phoneControlOperation!(item.runId, item.request.request_id, abort), signal)
+      if (disposed || signal?.aborted) return
+      item.result = result; item.error = result.error || ''
+      if (item.runId === selectedRunId.value && result.ownership) ownershipSnapshots.value = { ...ownershipSnapshots.value, [`${item.runId}:${item.phoneId}`]: result.ownership }
+    } catch (cause) {
+      if (disposed || signal?.aborted) return
+      item.error = `等待确认手机控制：${(cause as Error).message}`
+      if ((cause as Error & { status?: number }).status === 404 && api.phoneControl) {
+        try {
+          const result = await bounded(abort => api.phoneControl!(item.runId, item.phoneId, item.action, item.request, abort), signal)
+          if (!disposed && !signal?.aborted) { item.result = result; item.error = result.error || '' }
+        } catch (error) { if (!disposed && !signal?.aborted) item.error = `等待同一请求受理：${(error as Error).message}` }
+      }
+    }
+  }
+  async function controlPhone(phone: string, action: 'reconcile' | 'stop', owner: PhoneOwner) {
+    if (!api.phoneControl || !phoneControlSupported.value || !owner.supported_actions.includes(action) || ownershipFor(phone)?.stale) return
+    const id = selectedRunId.value
+    const pending = phoneControls.find(item => item.runId === id && item.phoneId === phone && !controlTerminal(item.result?.status))
+    if (pending) { if (!pending.sending) await pollControl(pending); return }
+    const item = reactive<PhoneControlState>({ runId: id, phoneId: phone, action, sending: true, error: '', request: { request_id: newRunRequestId(), execution_id: owner.execution_id, expected_state_revision: owner.state_revision, ownership_token: owner.ownership_token } })
+    phoneControls.push(item)
+    try {
+      const result = await bounded(signal => api.phoneControl!(id, phone, action, item.request, signal))
+      if (disposed) return
+      item.result = result; item.error = result.error || ''
+    } catch (cause) {
+      if (!disposed) {
+        const issue = cause as Error & { status?: number }
+        item.error = issue.message
+        if (issue.status && issue.status >= 400 && issue.status < 500 && ![408,429].includes(issue.status))
+          item.result = { operation_id: item.request.request_id, execution_id: item.request.execution_id, phone_id: phone, action, status: 'rejected', error: issue.message }
+        else await pollControl(item)
+      }
+    }
+    finally { item.sending = false }
+  }
   const selectedRun = computed(() => runs.value.find(run => factoryRunId(run) === selectedRunId.value))
   const snapshot = computed(() => snapshots.value[selectedRunId.value])
   const error = computed(() => errors.value[selectedRunId.value] || '')
@@ -88,7 +151,7 @@ export function useCollectionDiagnostics(runs: Ref<FactoryRun[]>, api: Diagnosti
     }
   }
   const poller = useFactoryPolling(async (signal, current) => {
-    await Promise.allSettled([refresh(signal, current), ...operations.filter(item => item.phase === 'waiting').map(item => lookupOperation(item, signal))])
+    await Promise.allSettled([refresh(signal, current), ...operations.filter(item => item.phase === 'waiting').map(item => lookupOperation(item, signal)), ...phoneControls.filter(item => !item.sending && !controlTerminal(item.result?.status)).map(item => pollControl(item, signal))])
   }, 5000)
   watch(selectedRunId, () => { generation++; diagnosticController?.abort(); loading.value = false; if (mounted) poller.start() }, { flush: 'sync' })
 
@@ -111,7 +174,7 @@ export function useCollectionDiagnostics(runs: Ref<FactoryRun[]>, api: Diagnosti
       await lookupOperation(item)
     }
   }
-  async function continuePhones(phoneIds: string[]) {
+  async function continuePhones(phoneIds: string[], deviceRevision?: DeviceConfigRevision) {
     const run = selectedRun.value, id = selectedRunId.value
     const phones = [...new Set(phoneIds)].sort()
     if (!run || !id || !phones.length || !options.canResume(run) || snapshot.value?.supported !== true) return
@@ -160,7 +223,7 @@ export function useCollectionDiagnostics(runs: Ref<FactoryRun[]>, api: Diagnosti
         .filter((phone): phone is string => typeof phone === 'string' && item.phoneIds.includes(phone)))].sort()
       if (selectedPhones.length) item.phoneIds = selectedPhones
       item.request = { request_id: item.requestId, preview_id: preview.preview_id, selection_digest: preview.selection_digest,
-        expected_revision: preview.expected_revision, ...(unknown.length ? { confirm_unknown_phone_ids: unknown } : {}) }
+        expected_revision: preview.expected_revision, ...(deviceRevision ? { device_config_revision: deviceRevision } : {}), ...(unknown.length ? { confirm_unknown_phone_ids: unknown } : {}) }
       await submit(item)
     } catch (cause) {
       if (!disposed) { item.phase = 'settled'; item.error = `无法准备续跑：${(cause as Error).message}` }
@@ -169,6 +232,6 @@ export function useCollectionDiagnostics(runs: Ref<FactoryRun[]>, api: Diagnosti
   function operationFor(phoneId: string) { return selectedOperations.value.filter(item => item.phoneIds.includes(phoneId)).at(-1) }
   onMounted(() => { mounted = true; clock = setInterval(() => { now.value = Date.now() }, 1000) })
   onBeforeUnmount(() => { disposed = true; generation++; clearInterval(clock); controls.forEach(controller => controller.abort()) })
-  return { selectedRunId, selectedRun, snapshot, error, loading, stale, now, sampleSequence, operations, selectedOperations, selectRun, refresh, continuePhones, operationFor }
+  return { phoneControlSupported, ownershipFor, controlFor, checkOwnership, controlPhone, phoneControls, selectedRunId, selectedRun, snapshot, error, loading, stale, now, sampleSequence, operations, selectedOperations, selectRun, refresh, continuePhones, operationFor }
 }
 export type CollectionDiagnosticsState = ReturnType<typeof useCollectionDiagnostics>

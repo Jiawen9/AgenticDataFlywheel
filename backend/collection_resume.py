@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import copy
 import json
+import re
+from pathlib import PureWindowsPath, PurePosixPath
 import sqlite3
 import threading
 import time
@@ -20,6 +22,8 @@ from .collection_execution_transfer import ExecutionTransfer
 from .collection_receipts import ReceiptStore
 from .collection_resume_projection import PlanProjection
 from .collection_runs import _identifier, CollectionRunError
+from .collection_phone_control import PhoneControlService
+from .collection_result_corrections import ResultCorrections
 from .data_store import RevisionConflict
 from .data_store.locking import batch_lock
 from .data_store.registry import utc_now
@@ -36,9 +40,12 @@ class ResumeService:
         self.cache, self.run_cache, self.errors, self.next_due = {}, {}, {}, {}
         self.persistence_errors = {}
         self.execution_roots = {}
+        self.phone_control = PhoneControlService(self)
+        self.result_corrections = ResultCorrections(self)
         self.guard = threading.RLock()
 
     def close(self):
+        self.phone_control.close()
         self.pool.close()
         self.executions.close()
 
@@ -82,6 +89,7 @@ class ResumeService:
         return metadata.get("run_mode", "generate") == "generate" and metadata.get("collection_artifacts_version") == 2
 
     def schedule(self):
+        self.phone_control.schedule()
         try:
             runs = self.runtime.store.collection_runs.list_runs()
         except (OSError,sqlite3.Error):
@@ -132,7 +140,9 @@ class ResumeService:
             projection = PlanProjection(self.root, run_id)
             projection.initialize(run, plan)
             ledger = ReceiptStore(self.records, run_id)
-            projection.observe(run_id, 0, plan, ledger.rows(limit=len(plan)))
+            self.result_corrections.observe(run, projection, run_id, 0, plan, ledger)
+            self.result_corrections.sync(run, projection)
+            self.result_corrections.observe(run, projection, run_id, 0, plan, ledger)
             head = self.records.get("collection_resume_heads", run_id)
             if head:
                 self._recover_operations(run)
@@ -264,9 +274,26 @@ class ResumeService:
         run = self._run(run_id)
         if not self._eligible(run):
             raise PhoneFactoryError("resume_unsupported：此运行不支持续采", 409)
-        allowed = {"request_id","preview_id","selection_digest","expected_revision","confirm_unknown_phone_ids"}
+        allowed = {"request_id","preview_id","selection_digest","expected_revision","confirm_unknown_phone_ids","device_config_revision"}
         if set(data) - allowed:
             raise PhoneFactoryError("续采不允许修改原模型、任务或重复次数")
+        revision = data.get("device_config_revision")
+        if revision is not None:
+            if (run.get("request",{}).get("metadata",{}).get("agent_type") != "pipelineagent"
+                    or not isinstance(revision,dict) or not revision or set(revision)-{"adb_path","app_list"}):
+                raise PhoneFactoryError("设备修订仅支持 Pipeline 的 ADB 路径和 App 映射")
+            if "adb_path" in revision and (not isinstance(revision["adb_path"],str) or not
+                    (PureWindowsPath(revision["adb_path"]).is_absolute() or PurePosixPath(revision["adb_path"]).is_absolute())):
+                raise PhoneFactoryError("修订 ADB 路径必须是绝对路径")
+            apps=revision.get("app_list")
+            if "app_list" in revision and (not isinstance(apps,dict) or not apps or any(
+                    not isinstance(name,str) or not name.strip() or not isinstance(package,str) or
+                    not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+",package)
+                    for name,package in apps.items())):
+                raise PhoneFactoryError("App 映射必须是名称到 Android 包名的 JSON 对象")
+            capability=self.runtime.store._remote_result(["capabilities"])
+            if capability.get("collection_resume",{}).get("device_config_revision") != 1:
+                raise PhoneFactoryError("采集端尚不支持设备配置修订，请升级",409)
         operation_id = _identifier(data.get("request_id"), "续采请求编号")
         preview_id = _identifier(data.get("preview_id"), "预览编号")
         confirmations = data.get("confirm_unknown_phone_ids",[])
@@ -411,8 +438,11 @@ class ResumeService:
         identifiers=[d.get("execution_id") for d in value["executions"] if isinstance(d,dict)]
         if (len(identifiers)!=len(value["executions"]) or len(set(identifiers))!=len(identifiers)
                 or not identifiers or identifiers[0]!=run_id or type(value.get("revision")) is not int
-                or value["revision"]!=len(identifiers)-1):
+                or value["revision"]<len(identifiers)-1):
             raise ValueError("执行分段版本、次序或唯一身份不匹配")
+        head = self.records.get("collection_resume_heads",run_id) or {}
+        if value["revision"] < head.get("remote_revision",0):
+            raise ValueError("执行分段版本回退")
         if type(value.get("revision")) is int:
             self.records.update("collection_resume_heads",run_id,
                 lambda h:h.update(remote_revision=value["revision"]))
@@ -429,7 +459,7 @@ class ResumeService:
                     failures.append(exc)
             ledger = ReceiptStore(self.records, child["collection_run_id"])
             plan = ArtifactTransfer._expected(child)
-            projection.observe(child["collection_run_id"], ordinal, plan, ledger.rows(limit=len(plan)))
+            self.result_corrections.observe(run, projection, child["collection_run_id"], ordinal, plan, ledger)
             settled = self.records.get("collection_executions",child["collection_run_id"]) or {}
             if settled.get("receipt_closed"):
                 for op in self.records.list("collection_resume_operations"):
@@ -482,6 +512,14 @@ class ResumeService:
                 return  # More bytes or a durable acknowledgement are still pending.
             if row["item"]["manifest_sha256"] != item.get("manifest_sha256"):
                 raise ValueError("快照引用产物摘要发生变化")
+            correction = item.get("result_correction")
+            if correction:
+                if not isinstance(correction,dict) or not correction.get("correction_id"):
+                    raise ValueError("逻辑快照结果处置无效")
+                corrected = self.result_corrections.corrected(run_id,execution_id,row,correction["correction_id"])
+                if corrected is row:
+                    return  # Await the append-only, identity-checked disposition.
+                row = corrected
             entry = row.get("entry") or {}
             if entry and (entry.get("phone_id"),entry.get("collection_case_id"),entry.get("repeat_index")) != identity:
                 raise ValueError("快照实例与已验收产物归属不一致")
@@ -535,7 +573,7 @@ class ResumeService:
             self.records.put_many([
                 *([] if old else [{"namespace":"collection_resume_snapshots","key":snapshot_id,"payload":saved,"expected_revision":0}]),
                 {"namespace":"collection_resume_heads","key":run_id,"expected_revision":current["storage_revision"],
-                 "payload":{**current,"active":False,"current_snapshot_id":snapshot_id,
+                 "payload":{**current,"active":False,"result_reconciliation_pending":False,"current_snapshot_id":snapshot_id,
                             "current_snapshot_digest":saved["input_digest"],"collection_summary":counts,
                             "current_errors":errors[:100],"current_error_count":len(errors)}}])
 
@@ -558,7 +596,11 @@ class ResumeService:
                 status="completed" if all(p.get("status")=="completed" for p in phones) else "partial"
             elif (head.get("cancel_intent") or {}).get("epoch")==head["revision"]:
                 status="stopping"
+        if active and head.get("result_reconciliation_pending") and not pending and not expected:
+            original=self.records.get("collection_runs",run_id) or {}
+            status=original.get("collection_status",original.get("status",status))
         return {"resume_revision": head["revision"], "resume_active": active,
+                "result_reconciliation_pending":bool(head.get("result_reconciliation_pending")),
                 "collection_status":status,"transfer_status":"downloading" if active else "completed",
                 "error":None,"dispatch_error":None,"transfer_error":self.errors.get(run_id),
                 "control_error":self.runtime._control_memory.get(run_id,{}).get("error"),
@@ -631,6 +673,13 @@ class ResumeService:
             return self.cases(run_id,mode,data)
         if len(parts)==5 and method=="GET" and parts[2]=="cases" and parts[4]=="instances":
             return self.cases(run_id,mode,data,parts[3])
+        if len(parts)==5 and parts[2]=="phones":
+            if method=="GET" and parts[4]=="ownership":
+                return self.phone_control.ownership(run_id,parts[3],mode)
+            if method=="POST" and parts[4] in {"reconcile","stop"}:
+                return self.phone_control.submit(run_id,parts[3],parts[4],data,mode)
+        if len(parts)==4 and method=="GET" and parts[2]=="phone-control-operations":
+            return self.phone_control.operation(run_id,parts[3],mode)
         if mode!="generate":
             raise PhoneFactoryError("模型迭代采集不支持续采",409)
         if len(parts)==3 and method=="POST" and parts[2]=="resume-preview":

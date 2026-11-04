@@ -12,9 +12,13 @@ export function diagnosisStatus(value?: string) {
     completed: '已完成', idle: '空闲', unknown: '待确认', stopped: '已停止', cancelled: '已取消',
     queued: '排队中', pending: '等待中', not_run: '未执行', timeout: '超时', interrupted: '已中断',
     received: '已接收', quarantined: '已隔离', retry_wait: '等待回传', downloading: '下载中',
-    accepted: '已受理', uncertain: '等待受理确认', succeeded: '已完成', rejected: '未受理', stopping: '正在停止', preparing: '准备中' } as Record<string, string>)[value || ''] || value || '等待状态'
+    accepted: '已受理', uncertain: '等待受理确认', succeeded: '已完成', rejected: '未受理', stopping: '正在停止', preparing: '准备中', starting: '启动中', waiting: '等待中', needs_attention: '需要处理', conflict: '状态已变化' } as Record<string, string>)[value || ''] || value || '等待状态'
 }
-export function phoneDiagnosisText(row: PhoneDiagnosis) { return row.message || row.reason || row.reason_code || diagnosisStatus(row.status) }
+export function phoneDiagnosisText(row: PhoneDiagnosis) {
+  if (row.reason?.startsWith('wait_expired:phone_busy:') || row.historical_blocker_execution_id) return `本次未执行：当时等待运行 ${row.historical_blocker_execution_id || row.reason?.slice('wait_expired:phone_busy:'.length)} 释放超时`
+  if (row.process_exit_confirmed && ['failed', 'cancelled', 'not_run', 'error'].includes(row.status) && row.reason_code === 'storage_unavailable') return '此前文件或存储操作失败，执行进程已退出；修复后继续该手机'
+  return row.message || row.reason || row.reason_code || diagnosisStatus(row.status)
+}
 export function diagnosisConfidence(value?: PhoneDiagnosis['confidence']) {
   return ({ confirmed: '已有明确依据', suspected: '疑似原因', needs_confirmation: '需要人工确认' } as Record<string, string>)[value || ''] || '依据待同步'
 }
