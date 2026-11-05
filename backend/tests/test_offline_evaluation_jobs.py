@@ -54,7 +54,7 @@ class AsyncEvaluationTests(unittest.TestCase):
         command = args[0]
         value = {}
         if command == "capabilities":
-            value = {"offline_evaluation_jobs": {"version": 1 if self.supported else 0}}
+            value = {"offline_evaluation_jobs": {"version": 1 if self.supported else 0, "readonly_input_version": 1}}
         elif command == "evaluation-preview":
             source = json.loads(args[2])
             pid = jobs.preview_id(source.pop("request_id"))

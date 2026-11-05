@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { factoryBatchesApi, modelIterationApi, phoneFactoryApi } from './phoneFactoryApi'
+import { factoryBatchesApi, modelIterationApi, phoneFactoryApi, factoryStorageApi } from './phoneFactoryApi'
 import { notifyBatchesPublished } from '@/utils/batchLifecycle'
 afterEach(() => vi.unstubAllGlobals())
 describe('phone factory transport contracts', () => {
@@ -174,4 +174,14 @@ describe('phone factory transport contracts', () => {
     await expect(phoneFactoryApi.remoteDeletePhone('phone-1')).rejects.toThrow('device stop failed')
     expect(fetcher.mock.calls).toHaveLength(2)
   })
+})
+
+it('routes collector storage independently of module mode and preserves failed operation snapshots', async () => {
+  const failed = { operation_id: 'op/a', run_id: 'eval/a', kind: 'cleanup', status: 'partial', error: 'file locked', errors: [{ path: 'one', error: 'locked' }] }
+  const fetcher = vi.fn(async () => new Response(JSON.stringify(failed))); vi.stubGlobal('fetch', fetcher)
+  expect(await factoryStorageApi.cleanup('eval/a', 'same', 'retire')).toEqual(failed)
+  await factoryStorageApi.scan('eval/a', 'scan'); await factoryStorageApi.archive('eval/a', 'zip'); await factoryStorageApi.operation('op/a')
+  expect(fetcher.mock.calls.map(call => call[0])).toEqual(['/api/phone-factory/storage/runs/eval%2Fa/cleanup', '/api/phone-factory/storage/runs/eval%2Fa/scan', '/api/phone-factory/storage/runs/eval%2Fa/archive', '/api/phone-factory/storage/operations/op%2Fa'])
+  expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({ request_id: 'same', mode: 'retire' })
+  expect(factoryStorageApi.archiveDownloadUrl('eval/a')).toBe('/api/phone-factory/storage/runs/eval%2Fa/archive-download')
 })

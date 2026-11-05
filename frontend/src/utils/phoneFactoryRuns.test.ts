@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import type { FactoryRun } from '@/phoneFactoryApi'
 import { runDisplayStatus, runMessage, canCancelCollectionRun, canPreprocessCollection } from './phoneFactoryRuns'
 
 describe('factory run status and warnings', () => {
@@ -35,4 +36,10 @@ it('requires settled qualified input while allowing a stable partial receipt', (
   expect(canPreprocessCollection(run)).toBe(true)
   expect(canPreprocessCollection({ ...run, receipt_closed: false })).toBe(false)
   expect(canPreprocessCollection({ ...run, collection_summary: { preprocessing_eligible_count: 0 } })).toBe(false)
+})
+
+it('keeps saved platform preprocessing available after collector cleanup while disabling collector stop', () => {
+  const run = { status: 'failed', batch_id: 'b', collector_data_state: 'retired' as const, can_cancel_collection: true, receipt_policy_version: 2, receipt_closed: true, transfer_status: 'completed', collection_summary: { preprocessing_eligible_count: 2 } } as FactoryRun
+  expect(canCancelCollectionRun(run)).toBe(false)
+  expect(canPreprocessCollection(run)).toBe(true)
 })

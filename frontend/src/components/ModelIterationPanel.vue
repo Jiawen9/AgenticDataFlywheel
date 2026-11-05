@@ -42,6 +42,7 @@
       </label>
       <p v-if="sourceKind === 'run' && sourceRunId" class="hint">来源运行：<DisplayId kind="run" :id="sourceRunId" /></p>
       <label v-if="sourceKind === 'directory'">轨迹目录<el-input v-model="sourcePath" :disabled="starting || !offlineSupported" placeholder="9011 服务器上的完整轨迹目录" /></label>
+      <p class="hint">新独立评测直接只读轨迹原件，不复制截图。评测期间请保留原目录；日志和报告单独保存。</p>
       <p v-if="sourceKind === 'directory'" class="hint">目录位于采集服务器，而非当前浏览器所在电脑。{{ allowedRoots.length ? `允许范围：${allowedRoots.join('；')}` : '允许范围由采集服务器配置。' }}</p>
       <el-button :loading="sourcesLoading" :disabled="starting || loading || !offlineSupported" @click="loadSources">刷新可用采集结果</el-button>
       <el-alert v-if="!loading && !jobsSupported" title="当前采集端尚未支持轨迹后台检查与输入准备，请升级采集端后重试。" type="warning" :closable="false" />

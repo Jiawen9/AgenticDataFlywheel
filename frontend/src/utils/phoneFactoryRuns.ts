@@ -1,6 +1,6 @@
 import type { FactoryRun } from '@/phoneFactoryApi'
 
-export const runStatus = (status: string) => ({ preparing: '准备中', stopping: '正在停止', needs_attention: '等待对账', not_run: '未执行', quarantined: '已隔离', received: '已保存', building: '构建中', dispatching: '正在下发', queued: '排队中', starting: '启动中', running: '运行中', completed: '已完成', succeeded: '已完成', failed: '失败', cancelled: '已取消', interrupted: '已中断', partial: '部分完成', ready: '结果已就绪', waiting: '等待回传', syncing: '正在回传', downloading: '正在下载', verified: '已校验', timeout: '超时', retry_wait: '等待重试', remote_failed: '采集无有效轨迹', pending: '等待中' } as Record<string, string>)[status] || status
+export const runStatus = (status: string) => ({ not_requested: '未生成（按需）', reference: '只读原件', source_cleaned: '来源已清理', preparing: '准备中', stopping: '正在停止', needs_attention: '等待对账', not_run: '未执行', quarantined: '已隔离', received: '已保存', building: '构建中', dispatching: '正在下发', queued: '排队中', starting: '启动中', running: '运行中', completed: '已完成', succeeded: '已完成', failed: '失败', cancelled: '已取消', interrupted: '已中断', partial: '部分完成', ready: '结果已就绪', waiting: '等待回传', syncing: '正在回传', downloading: '正在下载', verified: '已校验', timeout: '超时', retry_wait: '等待重试', remote_failed: '采集无有效轨迹', pending: '等待中' } as Record<string, string>)[status] || status
 
 export function collectionProgressText(run: Partial<FactoryRun>): string {
   const summary = run.collection_summary
@@ -35,7 +35,15 @@ export function runMessage(run: FactoryRun): string {
 }
 
 export function canCancelCollectionRun(run: FactoryRun): boolean {
+  if (collectorDataUnavailable(run)) return false
   if (run.can_cancel_collection != null) return run.can_cancel_collection
   if (run.control_terminal) return false
   return ['preparing', 'dispatching', 'queued', 'starting', 'running', 'stopping', 'needs_attention'].includes(run.collection_status || run.status)
+}
+
+export function collectorDataUnavailable(run: Partial<FactoryRun>): boolean {
+  return ['retiring', 'retired', 'cleanup_failed'].includes(run.collector_data_state || '')
+}
+export function collectorDataLabel(state?: string): string {
+  return ({ available: '采集端数据保留', retiring: '正在清理采集端数据', retired: '采集端数据已清理', cleanup_failed: '采集端数据部分清理，待重试' } as Record<string, string>)[state || 'available'] || state || ''
 }

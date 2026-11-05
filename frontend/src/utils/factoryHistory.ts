@@ -1,4 +1,5 @@
 import type { EvaluationCase, FactoryRun, ReportFolder } from '@/phoneFactoryApi'
+import { collectorDataUnavailable } from './phoneFactoryRuns'
 
 export const factoryRunId = (run: FactoryRun) => run.collection_run_id || run.run_id || ''
 export const newestFactoryRuns = (runs: FactoryRun[]) => [...runs].sort((a, b) =>
@@ -11,6 +12,7 @@ export function factoryRunErrors(run: FactoryRun): string[] {
 }
 
 export function factoryRunActive(run: FactoryRun): boolean {
+  if (collectorDataUnavailable(run)) return run.collector_data_state === 'retiring'
   return ['preparing', 'dispatching', 'queued', 'starting', 'running', 'stopping', 'needs_attention'].includes(run.status)
     || ['waiting', 'syncing', 'pending', 'downloading', 'retry_wait'].includes(run.transfer_status || '')
     || ['preparing', 'queued', 'starting', 'running', 'stopping', 'needs_attention'].includes(run.collection_status || '')

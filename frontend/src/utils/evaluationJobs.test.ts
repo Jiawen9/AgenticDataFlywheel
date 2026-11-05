@@ -32,6 +32,8 @@ describe('offline evaluation browser session', () => {
   it('shows measured counters and stages without inventing a scan percentage', () => {
     expect(evaluationJobPhase('queued', 'preparing')).toBe('等待后台处理')
     expect(evaluationJobPhase('scanning')).toBe('扫描轨迹目录')
+    expect(evaluationJobPhase('validating_inputs')).toBe('校验原件并登记评测输入')
+    expect(evaluationJobPhase('preparing_inputs')).toBe('准备历史评测副本')
     expect(evaluationJobCounts({ discovered: 23, checked: 5, eligible: 4, excluded: 1 })).toBe('已发现 23 条 · 已检查 5 条 · 可评测 4 条 · 已排除 1 条')
     expect(evaluationJobCounts({ discovered: 23, total: 300 })).not.toContain('%')
     expect(evaluationJobCounts()).toBe('')

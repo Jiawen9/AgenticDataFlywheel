@@ -91,8 +91,11 @@ class CollectionTransferManager:
             self._stop.wait(self.interval)
 
     def _candidates(self):
+        from .collector_storage import unavailable
         candidates = []
         for run in self.runs.list_runs():
+            if unavailable(self.records, run["collection_run_id"]):
+                continue
             if self._stop.is_set():
                 break
             if run.get("receipt_closed") or (run["status"] == "interrupted" and not stream_enabled(run)) or (run["status"] == "completed" and run.get("transfer_status") == "completed") or not is_batch_active(run["batch_id"], self.root):
@@ -302,6 +305,9 @@ class CollectionTransferManager:
         return completed
 
     def sync(self, run_id, *, force=True):
+        from .collector_storage import unavailable
+        if unavailable(self.records, run_id):
+            return self.runs.get(run_id)
         run, owner = {}, None
         try:
             run = self.runs.get(run_id) or {}
@@ -332,6 +338,9 @@ class CollectionTransferManager:
             return result
 
     def _sync_with_diagnostics(self, run_id, *, force=False):
+        from .collector_storage import unavailable
+        if unavailable(self.records, run_id):
+            return self.runs.get(run_id)
         run = self.runs.get(run_id)
         if run is None:
             raise CollectionRunError("采集运行不存在", 404)

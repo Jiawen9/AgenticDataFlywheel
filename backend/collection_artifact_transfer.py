@@ -169,6 +169,8 @@ class ArtifactTransfer:
                 raise CollectionRunError("已落盘产物大小或 SHA256 不匹配")
 
     def _assert_current(self, run):
+        from .collector_storage import require_available
+        require_available(self.records, run["collection_run_id"])
         current = self.runs.get(run["collection_run_id"])
         if (not current or current.get("request_digest") != run.get("request_digest")
                 or current["batch_id"] != run["batch_id"]):
@@ -205,6 +207,9 @@ class ArtifactTransfer:
 
     def _ingest(self, run, ledger, row):
         run_id, item = run["collection_run_id"], row["item"]
+        from .collector_storage import unavailable
+        if unavailable(self.records, run_id):
+            return
         artifact_id = item["artifact_id"]
         try:
             ledger.update(artifact_id, status="downloading", last_attempt_at=utc_now())
@@ -265,6 +270,8 @@ class ArtifactTransfer:
             if io_path(temp).exists():
                 self.owner._remove(temp)
         except Exception as exc:
+            if unavailable(self.records, run_id):
+                return  # Cleanup supersedes transport retry, not previously received files.
             local_storage_failure = self.storage.on_error(exc)
             # Filesystem/network outages can recover; immutable identity/path
             # violations are quarantined. Corrupt downloads get bounded retries.

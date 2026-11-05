@@ -89,7 +89,7 @@ def run_client(args: list[str]) -> dict:
         environment = dict(os.environ, PHONE_FACTORY_CLIENT_ERROR_METADATA="1")
         command = args[0] if args else None
         request_timeout = float(os.environ.get("PHONE_FACTORY_TIMEOUT", "30"))
-        if command in {"run-archive", "report-download"}:
+        if command in {"run-archive", "report-download", "storage-archive-download"}:
             client_timeout = float(os.environ.get("PHONE_FACTORY_TRANSFER_TIMEOUT", "300")) + 5
         else:
             # start-run negotiates manifest transport before its separate POST.

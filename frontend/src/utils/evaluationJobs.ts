@@ -45,11 +45,11 @@ export function evaluationPreviewSession(storage?: Pick<Storage, 'getItem' | 'se
 }
 
 export function evaluationJobPhase(phase?: string, status?: string): string {
-  const phases: Record<string, string> = { queued: '等待后台处理', scanning: '扫描轨迹目录', discovering: '扫描轨迹目录', validating: '检查轨迹证据', checking: '检查轨迹证据', hashing: '校验文件摘要', freezing: '保存评测规则快照', freezing_profile: '保存评测规则快照', preparing: '准备评测输入', copying: '准备评测输入', ready: '输入准备完成', evaluating: '评测中', running: '评测中', completed: '检查完成', cancelled: '已取消', failed: '准备失败', paused: '准备已暂停，等待恢复', waiting_recovery: '等待恢复' }
+  const phases: Record<string, string> = { queued: '等待后台处理', scanning: '扫描轨迹目录', discovering: '扫描轨迹目录', validating: '校验轨迹原件', validating_inputs: '校验原件并登记评测输入', validating_source: '校验轨迹原件', registering_inputs: '登记评测输入', referencing: '登记评测输入', checking: '检查轨迹证据', hashing: '校验文件摘要', freezing: '保存评测规则快照', freezing_profile: '保存评测规则快照', preparing: '登记评测输入', copying: '准备历史评测副本', ready: '输入准备完成', evaluating: '评测中', running: '评测中', completed: '检查完成', cancelled: '已取消', failed: '准备失败', paused: '准备已暂停，等待恢复', waiting_recovery: '等待恢复' }
   if (phase === 'cancelling') return '正在取消检查'
   if (phase === 'retrying') return '正在重新排队'
   if (phase === 'syncing') return '同步预览结果'
-  if (phase === 'preparing_inputs') return '准备评测输入'
+  if (phase === 'preparing_inputs') return '准备历史评测副本'
   return phases[phase || ''] || phases[status || ''] || '后台处理中'
 }
 export function evaluationJobCounts(progress?: EvaluationJobProgress): string {
