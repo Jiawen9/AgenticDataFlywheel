@@ -47,6 +47,7 @@ describe('shared factory details drawer', () => {
     expect(view.state.selectedRun).toBe('run-03'); expect(view.state.caseControls.page).toBe(1)
     view.state.showCases('run-02'); await nextTick()
     expect(view.progress.selectedRun.value).toBe('run-02'); expect(view.tab).toHaveBeenCalledWith('cases')
+    view.state.showStorage('run-03'); expect(view.state.storageFocusedRun).toBe('run-03'); expect(view.tab).toHaveBeenCalledWith('storage')
     view.progress.busy.value = true; view.state.showCases('run-01')
     expect(view.progress.selectedRun.value).toBe('run-02')
     view.app.unmount()

@@ -50,6 +50,8 @@ class ResumeService:
         self.executions.close()
 
     def _remote(self, command, run_id, body=None, extra=()):
+        from .collector_storage import require_available
+        require_available(self.records, run_id)
         args = [command, run_id, *extra]
         if body is not None:
             args.extend(["--payload", json.dumps(body, ensure_ascii=False)])
@@ -74,6 +76,8 @@ class ResumeService:
         return json.loads(row[0]) if row else None
 
     def _run(self, run_id, mode="generate", *, read=False):
+        from .collector_storage import require_available
+        require_available(self.records, run_id)
         _identifier(run_id, "采集运行编号")
         run = self.run_cache.get(run_id) if read else None
         if run is None:
@@ -89,6 +93,7 @@ class ResumeService:
         return metadata.get("run_mode", "generate") == "generate" and metadata.get("collection_artifacts_version") == 2
 
     def schedule(self):
+        from .collector_storage import unavailable
         self.phone_control.schedule()
         try:
             runs = self.runtime.store.collection_runs.list_runs()
@@ -97,6 +102,8 @@ class ResumeService:
         # Recent active runs first; never create one thread per device or per case.
         for run in sorted(runs, key=lambda r: self.next_due.get(r["collection_run_id"], 0)):
             run_id = run["collection_run_id"]
+            if unavailable(self.records, run_id):
+                continue
             self.run_cache[run_id] = run
             if time.monotonic() < self.next_due.get(run_id, 0):
                 continue
@@ -107,8 +114,13 @@ class ResumeService:
 
     def refresh(self, run):
         run_id = run["collection_run_id"]
+        from .collector_storage import unavailable
+        if unavailable(self.records, run_id):
+            return
         try:
             value = self._remote("run-diagnostics", run_id)
+            if unavailable(self.records, run_id):
+                return
             identity = value.get("root_run_id", value.get("collection_run_id", value.get("run_id")))
             if (identity != run_id or value.get("batch_id", run["batch_id"]) != run["batch_id"]
                     or not isinstance(value.get("phones"), list)
@@ -132,7 +144,7 @@ class ResumeService:
                     "supported": False if unsupported else old.get("supported", True),
                     "stale": True, "sync_error": str(exc)[:500], "phones": old.get("phones", [])}
             self.next_due[run_id] = time.monotonic() + 30
-        if not self._eligible(run):
+        if unavailable(self.records, run_id) or not self._eligible(run):
             return
         try:
             self._send_cancel(run_id)  # A durable stop must not wait for a projection write.
@@ -398,6 +410,8 @@ class ResumeService:
                     self.errors[run["collection_run_id"]] = "续采请求已冻结，确认结果暂未持久化"
 
     def _register_execution(self, run, descriptor, ordinal):
+        from .collector_storage import require_available
+        require_available(self.records, run["collection_run_id"])
         execution_id = _identifier(descriptor.get("execution_id", descriptor.get("collection_run_id")), "执行分段编号")
         if execution_id == run["collection_run_id"]:
             if ordinal != 0:

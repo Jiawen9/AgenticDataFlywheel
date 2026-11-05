@@ -3,6 +3,7 @@ import { ElMessageBox } from 'element-plus'
 import { modelIterationApi, type EvaluationCase, type EvaluationResults, type FactoryRun } from '@/phoneFactoryApi'
 import { useFactoryPolling } from './useFactoryPolling'
 import { newestFactoryRuns } from '@/utils/factoryHistory'
+import { collectorDataUnavailable } from '@/utils/phoneFactoryRuns'
 
 /** A single page-owned progress session shared by the summary and details drawer. */
 export function useEvaluationProgress(runs: Ref<FactoryRun[]>, onChanged: (runId: string) => void | Promise<void>) {
@@ -11,12 +12,12 @@ export function useEvaluationProgress(runs: Ref<FactoryRun[]>, onChanged: (runId
   let disposed = false, mounted = false, selectionEpoch = 0
   const visible = () => typeof document === 'undefined' || !document.hidden
   const selectedRunRecord = computed(() => runs.value.find(run => run.run_id === selectedRun.value))
-  const canCancel = computed(() => !!selectedRunRecord.value && (selectedRunRecord.value.can_cancel_collection === true || !!selectedRunRecord.value.control_error || !['completed', 'succeeded', 'partial', 'failed', 'interrupted', 'cancelled'].includes(selectedRunRecord.value.status) || !!selectedRunRecord.value.dispatch_error || (selectedRunRecord.value.execution_mode === 'evaluate_only' && ['queued', 'preparing', 'paused'].includes((results.value?.preparation || selectedRunRecord.value.preparation)?.status || ''))))
+  const canCancel = computed(() => !!selectedRunRecord.value && !collectorDataUnavailable(selectedRunRecord.value) && (selectedRunRecord.value.can_cancel_collection === true || !!selectedRunRecord.value.control_error || !['completed', 'succeeded', 'partial', 'failed', 'interrupted', 'cancelled'].includes(selectedRunRecord.value.status) || !!selectedRunRecord.value.dispatch_error || (selectedRunRecord.value.execution_mode === 'evaluate_only' && ['queued', 'preparing', 'paused'].includes((results.value?.preparation || selectedRunRecord.value.preparation)?.status || ''))))
   const resultMetadata = computed(() => ({ ...selectedRunRecord.value, ...results.value }))
   const busy = computed(() => cancelling.value || !!downloading.value)
   const poller = useFactoryPolling(async (signal, current) => {
     const run = selectedRun.value, epoch = selectionEpoch
-    if (!run) return
+    if (!run || (selectedRunRecord.value && collectorDataUnavailable(selectedRunRecord.value))) return
     try {
       const value = await modelIterationApi.evaluations(run, signal)
       if (!disposed && current() && epoch === selectionEpoch && run === selectedRun.value) {
@@ -29,6 +30,10 @@ export function useEvaluationProgress(runs: Ref<FactoryRun[]>, onChanged: (runId
   })
   watch(selectedRun, () => {
     selectionEpoch++; results.value = null; resultError.value = ''
+    if (mounted && visible()) poller.start()
+  }, { flush: 'sync' })
+  watch(() => selectedRunRecord.value?.collector_data_state, () => {
+    selectionEpoch++
     if (mounted && visible()) poller.start()
   }, { flush: 'sync' })
   watch(runs, values => {

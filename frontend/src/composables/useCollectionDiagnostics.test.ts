@@ -171,3 +171,14 @@ describe('page-owned collection diagnostics and resume', () => {
     expect(view.state.snapshot.value?.message).toContain('当前评测快照')
   })
 })
+
+it('stops remote diagnostic reads and rejects late responses when cleanup starts', async () => {
+  const view = mount(), pending = deferred<CollectionDiagnostics>(); view.api.diagnostics.mockReturnValueOnce(pending.promise)
+  const work = view.state.refresh(); view.runs.value = view.runs.value.map(run => run.run_id === 'a' ? { ...run, collector_data_state: 'retiring' as const } : run)
+  await flush(); pending.resolve(snapshot('a')); await work
+  await view.state.refresh()
+  expect(view.api.diagnostics).toHaveBeenCalledTimes(1)
+  expect(view.state.snapshot.value?.supported).toBe(false)
+  await view.state.continuePhones(['p1'])
+  expect(view.api.resumePreview).not.toHaveBeenCalled()
+})

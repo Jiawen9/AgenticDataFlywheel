@@ -29,6 +29,8 @@ def accept(runtime, data):
     # Replay precedes current defaults, preview expiry and selectable profile
     # checks: an accepted request must remain the same request after recovery.
     if old:
+        from .collector_storage import require_available
+        require_available(runtime.records, run_id)
         frozen = old["request"]
         candidate = {k: frozen[k] for k in OPTIONS if k in frozen}
         candidate.update({k: v for k, v in data.items() if k in OPTIONS})
@@ -50,6 +52,9 @@ def accept(runtime, data):
     if not record or not record.get("paged"):
         raise PhoneFactoryError("请重新检查轨迹，使用后台准备预览", 409)
     preview = record["preview"]
+    from .collector_storage import require_available
+    if record.get("request", {}).get("source_run_id"):
+        require_available(runtime.records, record["request"]["source_run_id"])
     if (not preview.get("valid") or preview.get("status") != "completed" or record.get("pending_control")
             or record.get("cached_count", 0) != preview["trajectory_count"]):
         raise PhoneFactoryError("轨迹预览尚未完成或没有可评测轨迹", 409)
@@ -58,7 +63,8 @@ def accept(runtime, data):
                "preview_id": pid, "source_preview_id": pid, "source_preview_revision": preview["revision"],
                "source_count": preview["trajectory_count"], "source": preview["source"],
                "source_digest": preview["source_digest"], "source_request": record["request"],
-               "collector_server": record["collector_server"], "offline_evaluation_jobs_version": 1}
+               "collector_server": record["collector_server"], "offline_evaluation_jobs_version": 1,
+               "input_mode": "reference"}
     payload = {"run_id": run_id, "collection_run_id": run_id, "run_mode": "modeliter",
                "execution_mode": "evaluate_only", "source": preview["source"], "source_digest": preview["source_digest"],
                "evaluation_profile_id": options["evaluation_profile_id"],
@@ -82,6 +88,9 @@ def schedule(runtime, run_id):
 
 
 def dispatch(runtime, run_id):
+    from .collector_storage import unavailable
+    if unavailable(runtime.records, run_id):
+        return
     run = runtime.records.get("model_iter_runs", run_id)
     if not run or run.get("dispatch_confirmed") or run.get("dispatch_rejected"):
         return
@@ -99,12 +108,20 @@ def dispatch(runtime, run_id):
         if run.get("evaluation_control_terminal"):
             return
         frozen = run["request"]
+        if frozen.get("input_mode") == "reference":
+            capability = remote(runtime.store, ["capabilities"], frozen["collector_server"])
+            if capability.get("offline_evaluation_jobs", {}).get("readonly_input_version") != 1:
+                raise PhoneFactoryError("采集服务尚不支持直接读取评测原件，请升级采集端", 409)
         payload = {k: frozen[k] for k in OPTIONS if k in frozen}
         payload.update(collection_run_id=run_id, preview_id=frozen["preview_id"])
+        if "input_mode" in frozen:
+            payload["input_mode"] = frozen["input_mode"]
         response = remote(runtime.store, ["start-evaluation", "--payload", json.dumps(payload, ensure_ascii=False)],
                           frozen["collector_server"])
         validate(run_id, response)
         def accepted(row):
+            if unavailable(runtime.records, run_id):
+                return
             # Acknowledgement establishes identity even if a concurrent stop
             # changed the local control epoch; it cannot clear the stop intent.
             row.update(dispatch_confirmed=True, dispatch_error=None, dispatch_checked_epoch=time.time())
@@ -120,7 +137,7 @@ def dispatch(runtime, run_id):
         if saved.get("stop_requested_at"):
             runtime._control_pool.submit("evaluation:" + run_id, lambda: runtime._cancel_evaluation_remote(run_id))
     except Exception as exc:
-        rejected = isinstance(exc, PhoneFactoryError) and exc.status in {400, 404, 405, 409, 422, 429}
+        rejected = isinstance(exc, PhoneFactoryError) and exc.status in {400, 404, 405, 409, 410, 422, 429}
         def failed(row):
             if row.get("evaluation_control_terminal"):
                 return
@@ -141,6 +158,8 @@ def validate(run_id, response):
 
 
 def retry(runtime, run_id, body):
+    from .collector_storage import require_available
+    require_available(runtime.records, run_id)
     if set(body) - {"request_id", "expected_revision"}:
         raise PhoneFactoryError("输入准备重试参数无效")
     request_id = _identifier(body.get("request_id"), "重试请求编号")
@@ -175,6 +194,9 @@ def retry(runtime, run_id, body):
 
 
 def retry_remote(runtime, run_id):
+    from .collector_storage import unavailable
+    if unavailable(runtime.records, run_id):
+        return
     run = runtime.records.get("model_iter_runs", run_id)
     operation = run.get("pending_preparation_control") if run else None
     if not operation or run.get("stop_requested_at"):

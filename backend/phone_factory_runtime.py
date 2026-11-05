@@ -50,6 +50,8 @@ class FactoryRuntime:
         self._control_pool = BoundedSyncPool("collection-control", max_workers=4)
         self._control_memory = {}
         self._resume_service = None
+        from .collector_storage import StorageService
+        self.storage_service = StorageService(self)
 
     @property
     def resume_service(self):
@@ -67,6 +69,8 @@ class FactoryRuntime:
         return self._transfer
 
     def get_run(self, run_id):
+        from .collector_storage import require_available
+        require_available(self.records, run_id)
         run = self.records.get("model_iter_runs", run_id)
         if run and run.get("request", {}).get("collector_server"):
             from .evaluation_job_previews import remote
@@ -108,20 +112,30 @@ class FactoryRuntime:
         self.store._remote_result(["run-archive", run_id, "--out", str(destination)])
 
     def get_collection_artifacts(self, run_id, cursor=0, limit=100):
+        from .collector_storage import require_available
+        require_available(self.records, run_id)
         return self.store._remote_result(["collection-artifacts", run_id, "--cursor", str(cursor), "--limit", str(limit)])
 
     def get_collection_artifact(self, run_id, artifact_id):
+        from .collector_storage import require_available
+        require_available(self.records, run_id)
         return self.store._remote_result(["collection-artifact", run_id, artifact_id])
 
     def download_collection_artifact(self, run_id, artifact_id, destination):
+        from .collector_storage import require_available
+        require_available(self.records, run_id)
         return self.store._remote_result(["collection-artifact-archive", run_id, artifact_id, "--out", str(destination)])
 
     def set_receipt_storage(self, run_id, paused):
+        from .collector_storage import require_available
+        require_available(self.records, run_id)
         return self.store._remote_result(["receipt-storage", run_id, "--payload", json.dumps({
             "paused": bool(paused), "reason": "platform_storage_unavailable" if paused else "",
             "revision": time.time_ns()})])
 
     def get_collection_manifest(self, run_id):
+        from .collector_storage import require_available
+        require_available(self.records, run_id)
         return self.store._remote_result(["collection-manifest", run_id])
 
     def download_collection_archive(self, run_id, destination):
@@ -136,6 +150,7 @@ class FactoryRuntime:
 
     def close(self):
         self._stop.set()
+        self.storage_service.close()
         if self._resume_service is not None:
             self._resume_service.close()
         if self._transfer is not None:
@@ -149,7 +164,7 @@ class FactoryRuntime:
 
     def _poll_evaluations(self):
         while not self._stop.wait(5):
-            for schedule in (self._schedule_controls,self._schedule_archives,self._schedule_evaluations,
+            for schedule in (self.storage_service.schedule,self._schedule_controls,self._schedule_archives,self._schedule_evaluations,
                              self._schedule_previews, lambda:self.resume_service.schedule()):
                 try:
                     schedule()
@@ -161,7 +176,10 @@ class FactoryRuntime:
         schedule_previews(self)
 
     def _schedule_archives(self):
+        from .collector_storage import unavailable
         for run in self.store.collection_runs.list_runs():
+            if unavailable(self.records, run["collection_run_id"]):
+                continue
             if (run.get("receipt_closed") and run.get("archive_status") in {"pending", "building"}
                     and is_batch_active(run["batch_id"], self.root)
                     and time.time() >= run.get("archive_checked_epoch", 0) + 30):
@@ -176,7 +194,7 @@ class FactoryRuntime:
             if (remote.get("collection_run_id", remote.get("run_id")) != run_id
                     or remote.get("batch_id") != run["batch_id"]
                     or remote.get("agent_type", "newagent") != metadata.get("agent_type", "newagent")
-                    or remote.get("archive_status") not in {"pending", "building", "ready", "failed"}):
+                    or remote.get("archive_status") not in {"not_requested", "pending", "building", "ready", "failed"}):
                 raise PhoneFactoryError("采集归档状态身份或格式不匹配", 502)
             values = {"archive_status": remote["archive_status"], "archive_error": None}
         except Exception as exc:
@@ -189,8 +207,11 @@ class FactoryRuntime:
             pass  # Publishing freezes public batch metadata too.
 
     def _schedule_evaluations(self):
+        from .collector_storage import unavailable
         candidates = []
         for run in self.records.list("model_iter_runs"):
+            if unavailable(self.records, run["run_id"]):
+                continue
             if run.get("request", {}).get("offline_evaluation_jobs_version") == 1:
                 if not run.get("dispatch_confirmed"):
                     if (not run.get("dispatch_rejected") and not run.get("evaluation_control_terminal")
@@ -239,6 +260,8 @@ class FactoryRuntime:
         return run
 
     def sync_evaluation(self, run_id, *, force=True, fresh=False):
+        from .collector_storage import require_available
+        require_available(self.records, run_id)
         run = self.records.get("model_iter_runs", _identifier(run_id, "评估运行编号"))
         if run is None:
             raise PhoneFactoryError("评估运行不存在", 404)
@@ -260,8 +283,11 @@ class FactoryRuntime:
         return result
 
     def _sync_evaluation(self, run_id):
+        from .collector_storage import require_available
+        require_available(self.records, run_id)
         run = self.records.get("model_iter_runs", run_id)
         remote = self.get_run(run_id)
+        require_available(self.records, run_id)
         if not isinstance(remote, dict):
             raise PhoneFactoryError("远端评估运行响应格式无效", 502, remote_kind="protocol", remote_command="run")
         if remote.get("run_id", remote.get("collection_run_id")) != run_id or remote.get("run_mode") != "modeliter":
@@ -887,6 +913,8 @@ class FactoryRuntime:
                 raise
 
     def retry_collection_transfer(self, run_id):
+        from .collector_storage import require_available
+        require_available(self.records, run_id)
         run_id = _identifier(run_id, "采集运行编号")
         run = self.store.collection_runs.get(run_id)
         if not run:
@@ -962,6 +990,7 @@ class FactoryRuntime:
         return evaluation_snapshot_status(self.records,{**request.get("source_request",{}),**request.get("source",{})})
 
     def run_views(self, mode):
+        from .collector_storage import public_state as storage_state
         if mode == "modeliter":
             runs = []
             for run in self.records.list("model_iter_runs"):
@@ -971,7 +1000,7 @@ class FactoryRuntime:
                                                          "evaluation_profile_digest", "checklist_source", *MODEL_OVERRIDE_FIELDS) if key in request}
                 runs.append({**run, **metadata, **self._collection_progress(run["run_id"]), **({"agent_type": request.get("agent_type", "newagent")} if request.get("execution_mode") != "evaluate_only" else {}), "execution_mode": request.get("execution_mode", "collect_and_evaluate"),
                              "sync": self.sync_policy.view("evaluation", run["run_id"]),**snapshot_status})
-            return [self._public_run(item) for item in sorted(runs, key=lambda item: (item["created_at"], item["run_id"]))]
+            return [self._public_run({**item, **storage_state(self.records, item["run_id"])}) for item in sorted(runs, key=lambda item: (item["created_at"], item["run_id"]))]
         views = []
         for run in self.store.collection_runs.list_runs():
             transfer = self.records.get("collection_transfers", run["collection_run_id"]) or {}
@@ -983,7 +1012,7 @@ class FactoryRuntime:
                           "published_at": batch_state["published_at"], "filename": metadata.get("filename"), "vla": metadata.get("vla"), "agent_type": metadata.get("agent_type", "newagent"), **{key: metadata[key] for key in MODEL_OVERRIDE_FIELDS if key in metadata}, **{key: transfer[key] for key in ("remote_status", "transfer_status", "transfer_error", "remote_errors", "transfer_updated_at") if key in transfer}, "trajectory_count": len(run.get("trajectories", [])), "can_cancel_collection": can_cancel(run),
                           "sync": self.sync_policy.view("collection", run["collection_run_id"])})
         return [self._public_run({**item, **(self._resume_service.view(item["collection_run_id"])
-                    if self._resume_service is not None else {})}) for item in views]
+                    if self._resume_service is not None else {}), **storage_state(self.records, item["collection_run_id"])}) for item in views]
 
     def public_state(self, state, mode):
         statuses = {"dispatching": "下发中", "queued": "排队中", "starting": "启动中", "running": "运行中", "completed": "已回传", "succeeded": "已完成", "partial": "部分完成", "failed": "失败", "interrupted": "已中断", "cancelled": "已中断"}
@@ -1096,7 +1125,10 @@ class FactoryRuntime:
             return collection  # Evaluation control cannot rewrite a published source.
 
     def _schedule_controls(self):
+        from .collector_storage import unavailable
         for run in self.records.list("model_iter_runs"):
+            if unavailable(self.records, run["run_id"]):
+                continue
             if run.get("stop_requested_at") and not run.get("evaluation_control_terminal"):
                 delay = min(60, 2 ** min(run.get("stop_attempt_count", 0), 6))
                 memory = self._control_memory.get(run["run_id"], {})
@@ -1106,6 +1138,8 @@ class FactoryRuntime:
                         lambda run_id=run_id: self._cancel_evaluation_remote(run_id))
         for run in self.store.collection_runs.list_runs():
             if run.get("request", {}).get("metadata", {}).get("run_mode") == "modeliter":
+                continue
+            if unavailable(self.records, run["collection_run_id"]):
                 continue
             if not run.get("stop_requested_at") or (run.get("control_terminal") and not can_cancel(run)):
                 continue
@@ -1140,6 +1174,9 @@ class FactoryRuntime:
             pass
 
     def _cancel_evaluation_remote(self, run_id):
+        from .collector_storage import unavailable
+        if unavailable(self.records, run_id):
+            return
         run = self.records.get("model_iter_runs", run_id)
         if not run or not run.get("stop_requested_at"):
             return
@@ -1207,6 +1244,9 @@ class FactoryRuntime:
         return {**saved, "ok": True, "stop_accepted": True}
 
     def _cancel_collection_remote(self, run_id):
+        from .collector_storage import unavailable
+        if unavailable(self.records, run_id):
+            return
         run = self.store.collection_runs.get(run_id)
         if not run or not run.get("stop_requested_at"):
             return
@@ -1258,6 +1298,8 @@ class FactoryRuntime:
 
     def dispatch(self, action, method, data, mode):
         parts = action.split("/")
+        if parts[0] == "storage":
+            return True, self.storage_service.dispatch(parts, method, data)
         if len(parts) >= 3 and parts[0] == "collection-runs" and parts[2] in {
                 "diagnostics", "cases", "resume-preview", "resume", "resume-operations", "phones", "phone-control-operations"}:
             return True, self.resume_service.dispatch(parts, method, data, mode)

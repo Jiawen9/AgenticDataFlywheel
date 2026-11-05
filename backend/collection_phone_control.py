@@ -177,6 +177,7 @@ class PhoneControlService:
             self.due["operation:" + request_id] = time.monotonic() + 5
 
     def schedule(self):
+        from .collector_storage import unavailable
         if not self.pool.available:
             return
         try:
@@ -184,5 +185,7 @@ class PhoneControlService:
         except (OSError, sqlite3.Error):
             return
         for row in rows:
+            if unavailable(self.records, row["run_id"]):
+                continue
             if row.get("status") not in TERMINAL:
                 self.pool.submit("operation:" + row["request_id"], lambda rid=row["request_id"]: self._work(rid))

@@ -32,7 +32,7 @@ def remote(store, args, server):
     try:
         return store._remote_result([*args, "--server", server])
     except PhoneFactoryError as exc:
-        if exc.remote_status in {400, 404, 405, 409, 422, 429}:
+        if exc.remote_status in {400, 404, 405, 409, 410, 422, 429}:
             raise PhoneFactoryError(str(exc), exc.remote_status, remote_kind=exc.remote_kind,
                                     remote_status=exc.remote_status, remote_command=args[0]) from exc
         raise
@@ -51,6 +51,9 @@ def _cases_namespace(pid, revision):
 
 
 def accept_request(store, source, request_id, *, original_source=None):
+    from .collector_storage import require_available
+    if source.get("source_run_id"):
+        require_available(store.records, source["source_run_id"])
     from .evaluation_previews import schedule
     request_id = _identifier(request_id, "预览请求编号")
     pid = preview_id(request_id)
@@ -69,7 +72,7 @@ def accept_request(store, source, request_id, *, original_source=None):
             store.records.put("model_iter_previews", pid, {"preview_id": pid, "request_id": request_id,
                 "original_request": original, "request": source, "collector_server": endpoint(),
                 "preview": value, "paged": True, "submitted": False, "cached_count": 0,
-                "control_epoch": 0, "created_at": utc_now()}, expected_revision=0)
+                "control_epoch": 0, "input_mode": "reference", "created_at": utc_now()}, expected_revision=0)
     schedule(store, pid)
     return state(store, pid)
 
@@ -156,6 +159,8 @@ def refresh(store, pid):
             capability = remote(store, ["capabilities"], old["collector_server"])
             if capability.get("offline_evaluation_jobs", {}).get("version") != 1:
                 raise PhoneFactoryError("采集服务尚未升级目录后台预览与输入准备能力，请先升级 9011", 409)
+            if old.get("input_mode") == "reference" and capability.get("offline_evaluation_jobs", {}).get("readonly_input_version") != 1:
+                raise PhoneFactoryError("采集服务尚不支持直接读取评测原件，请升级采集端", 409)
             # Durable marker makes cancellation after a lost acknowledgement
             # reconcile the request instead of declaring a remote job absent.
             def begin(row):
@@ -208,7 +213,7 @@ def refresh(store, pid):
                 row["control_error"] = str(exc)[:1000]
                 row["force_refresh"] = True
                 return
-            if isinstance(exc, PhoneFactoryError) and exc.status in {400, 404, 405, 409, 422, 429}:
+            if isinstance(exc, PhoneFactoryError) and exc.status in {400, 404, 405, 409, 410, 422, 429}:
                 row["preview"] = {**row["preview"], "status": "failed", "valid": False,
                     "phase": "failed", "retryable": True, "errors": [{"error": str(exc)[:1000]}]}
         store.records.update("model_iter_previews", pid, failed)

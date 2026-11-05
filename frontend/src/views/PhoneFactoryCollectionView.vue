@@ -234,8 +234,8 @@
         </el-dialog>
       </section>
     </div>
-    <FactoryRunDetailsDrawer v-model="detailsVisible" v-model:tab="detailsTab" v-model:run-filter="detailsRunFilter" :focused-run="detailsFocusedRun" :scope-key="historySourceId" :evaluation="isEvaluation" :runs="filteredRuns" :progress="evaluationProgress" :diagnostics="diagnostics" :diagnostics-api="factoryApi" :allow-resume="diagnosticResumeAllowed" :focused-phone="detailsFocusedPhone" :folders="reportFolders" :run-error="runError" :report-error="reportError" :loading-reports="loadingReports" :downloading-report="downloadingReport" @refresh-reports="reportPoller.start()" @download-report="downloadReport">
-      <template #run-actions="{ run: row }"><router-link v-if="isPublishedRun(row)" :to="publishedRunLocation(row)" class="preprocessing-link">查看发布记录</router-link><router-link v-if="canPreprocessCollection(row) && !isPublishedRun(row) && !pipelineContext.isPipelineRoute.value && !managedBatchIds.includes(row.batch_id)" :to="collectionResultLocation(row)" class="preprocessing-link">前往预处理</router-link><el-button v-if="!isEvaluation || (row.batch_id && row.execution_mode !== 'evaluate_only')" link :loading="syncingRun === (row.collection_run_id || row.run_id)" :disabled="pipelineContext.isPipelineRoute.value || managedBatchIds.includes(row.batch_id) || isPublishedRun(row)" @click="syncRun(row)">重试回传</el-button><el-button v-if="!isEvaluation && canCancelCollectionRun(row) && !isPublishedRun(row)" link type="danger" :loading="cancellingRun === (row.collection_run_id || row.run_id)" :disabled="pipelineContext.isPipelineRoute.value || managedBatchIds.includes(row.batch_id)" @click="cancelCollectionRun(row)">停止</el-button></template>
+    <FactoryRunDetailsDrawer v-model="detailsVisible" v-model:tab="detailsTab" v-model:run-filter="detailsRunFilter" :focused-run="detailsFocusedRun" :scope-key="historySourceId" :evaluation="isEvaluation" :runs="filteredRuns" :storage="runStorage" :storage-runs="runs" :progress="evaluationProgress" :diagnostics="diagnostics" :diagnostics-api="factoryApi" :allow-resume="diagnosticResumeAllowed" :focused-phone="detailsFocusedPhone" :folders="reportFolders" :run-error="runError" :report-error="reportError" :loading-reports="loadingReports" :downloading-report="downloadingReport" @refresh-reports="reportPoller.start()" @download-report="downloadReport">
+      <template #run-actions="{ run: row }"><router-link v-if="isPublishedRun(row)" :to="publishedRunLocation(row)" class="preprocessing-link">查看发布记录</router-link><router-link v-if="canPreprocessCollection(row) && !isPublishedRun(row) && !pipelineContext.isPipelineRoute.value && !managedBatchIds.includes(row.batch_id)" :to="collectionResultLocation(row)" class="preprocessing-link">前往预处理</router-link><el-button v-if="!collectorDataUnavailable(row) && (!isEvaluation || (row.batch_id && row.execution_mode !== 'evaluate_only'))" link :loading="syncingRun === (row.collection_run_id || row.run_id)" :disabled="pipelineContext.isPipelineRoute.value || managedBatchIds.includes(row.batch_id) || isPublishedRun(row)" @click="syncRun(row)">重试回传</el-button><el-button v-if="!isEvaluation && canCancelCollectionRun(row) && !isPublishedRun(row)" link type="danger" :loading="cancellingRun === (row.collection_run_id || row.run_id)" :disabled="pipelineContext.isPipelineRoute.value || managedBatchIds.includes(row.batch_id)" @click="cancelCollectionRun(row)">停止</el-button></template>
     </FactoryRunDetailsDrawer>
     </template>
   </div>
@@ -264,12 +264,13 @@ import ModelIterationPanel from '@/components/ModelIterationPanel.vue'
 import FactoryRunSummary from '@/components/FactoryRunSummary.vue'
 import FactoryRunDetailsDrawer, { type FactoryDetailsTab } from '@/components/FactoryRunDetailsDrawer.vue'
 import { useEvaluationProgress } from '@/composables/useEvaluationProgress'
+import { useRunStorage } from '@/composables/useRunStorage'
 import { useCollectionDiagnostics } from '@/composables/useCollectionDiagnostics'
 import PhoneRunDiagnostics from '@/components/PhoneRunDiagnostics.vue'
 import DisplayId from '@/components/DisplayId.vue'
 import { useDisplayIdentifiers } from '@/composables/useDisplayIdentifiers'
 import { useFactoryPolling } from '@/composables/useFactoryPolling'
-import { canCancelCollectionRun, canPreprocessCollection } from '@/utils/phoneFactoryRuns'
+import { canCancelCollectionRun, canPreprocessCollection, collectorDataUnavailable } from '@/utils/phoneFactoryRuns'
 import { usePhoneCollectionBatches } from '@/composables/usePhoneCollectionBatches'
 
 const props = withDefaults(defineProps<{ mode?: 'generate' | 'modeliter' }>(), { mode: 'generate' })
@@ -355,6 +356,10 @@ const devices = ref<AdbDevice[]>([])
 const deviceError = ref('')
 const runError = ref('')
 const runs = ref<FactoryRun[]>([])
+const runStorage = useRunStorage({
+  onState(id, state, operationId) { runs.value = runs.value.map(run => (run.collection_run_id || run.run_id) === id && !(run.collector_data_state === 'retired' && state !== 'retired') ? { ...run, collector_data_state: state, cleanup_operation_id: operationId } : run) },
+  onArchive(id, status) { runs.value = runs.value.map(run => (run.collection_run_id || run.run_id) === id ? { ...run, archive_status: status } : run) },
+})
 const historySourceId = ref('')
 const filteredRuns = computed(() => runs.value.filter(run => isEvaluation || pipelineContext.isPipelineRoute.value || collectionRunBelongsToSource(run, historySourceId.value)))
 const evaluationProgress = isEvaluation ? useEvaluationProgress(runs, refreshEvaluationRuns) : undefined
@@ -402,7 +407,7 @@ const filteredCollectionBatches = computed(() => collectionBatches.value.filter(
 const pipelineContext = usePipelineContext({ lookupByBatch: false, stepId: 'collection' })
 const managedBatchIds = ref<string[]>([])
 function mayResume(run: FactoryRun) {
-  return !isEvaluation && run.execution_mode !== 'evaluate_only' && !isPublishedRun(run)
+  return !collectorDataUnavailable(run) && !isEvaluation && run.execution_mode !== 'evaluate_only' && !isPublishedRun(run)
     && !pipelineContext.isPipelineRoute.value && !managedBatchIds.value.includes(run.batch_id || '')
 }
 const diagnostics = useCollectionDiagnostics(filteredRuns, factoryApi, {

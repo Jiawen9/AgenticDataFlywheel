@@ -270,6 +270,19 @@ def build_parser():
     sub.add_parser("capabilities").add_argument("--server")
     sub.add_parser("evaluation-profiles")
     sub.add_parser("evaluation-sources")
+    for command in ("storage-scan", "storage-cleanup", "storage-archive"):
+        item = sub.add_parser(command)
+        item.add_argument("run_id")
+        item.add_argument("--payload", required=True)
+        item.add_argument("--server")
+    storage = sub.add_parser("storage-operation")
+    storage.add_argument("operation_id")
+    storage.add_argument("--server")
+    storage = sub.add_parser("storage-archive-download")
+    storage.add_argument("run_id")
+    storage.add_argument("--archive-kind", choices=["collection", "run"], required=True)
+    storage.add_argument("--out", required=True)
+    storage.add_argument("--server")
     for command in ("evaluation-preview", "start-evaluation"):
         item = sub.add_parser(command)
         item.add_argument("--payload", required=True)
@@ -351,7 +364,18 @@ def main():
         if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
             sys.exit("错误：采集服务地址无效")
         SERVER = args.server.rstrip("/")
-    if args.cmd == "phone-control-capabilities":
+    if args.cmd in {"storage-scan", "storage-cleanup", "storage-archive"}:
+        payload = json.loads(args.payload)
+        if not isinstance(payload, dict):
+            sys.exit("错误：存储请求必须为 JSON 对象")
+        suffix = {"storage-scan": "storage-scan", "storage-cleanup": "cleanup", "storage-archive": "archive"}[args.cmd]
+        result = post_json("/runs/" + urllib.parse.quote(args.run_id, safe="") + "/" + suffix, payload)
+    elif args.cmd == "storage-operation":
+        result = get_json("/storage-operations/" + urllib.parse.quote(args.operation_id, safe=""))
+    elif args.cmd == "storage-archive-download":
+        suffix = "collection-archive" if args.archive_kind == "collection" else "archive"
+        result = download_file("/runs/" + urllib.parse.quote(args.run_id, safe="") + "/" + suffix, args.out)
+    elif args.cmd == "phone-control-capabilities":
         result = get_json("/capabilities")
     elif args.cmd == "phone-ownership":
         result = get_json("/phones/" + urllib.parse.quote(args.phone_id, safe="") + "/ownership")

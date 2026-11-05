@@ -4,11 +4,13 @@ import type { FactoryRun, ReportFolder, ReportFile, createFactoryApi } from '@/p
 import type { EvaluationProgress } from '@/composables/useEvaluationProgress'
 import type { CollectionDiagnosticsState } from '@/composables/useCollectionDiagnostics'
 import PhoneRunDiagnostics from './PhoneRunDiagnostics.vue'
+import FactoryRunStorage from './FactoryRunStorage.vue'
+import type { RunStorageState } from '@/composables/useRunStorage'
 import CollectionCaseGroups from './CollectionCaseGroups.vue'
 import DisplayId from './DisplayId.vue'
 import CollectionRunProgress from './CollectionRunProgress.vue'
 import CollectionArtifactDetails from './CollectionArtifactDetails.vue'
-import { runStatus, collectionProgressText, hasCollectionProgress } from '@/utils/phoneFactoryRuns'
+import { runStatus, collectionProgressText, hasCollectionProgress, collectorDataUnavailable, collectorDataLabel } from '@/utils/phoneFactoryRuns'
 import { useDisplayIdentifiers } from '@/composables/useDisplayIdentifiers'
 import { agentLabel } from '@/utils/collectionAgents'
 import { runDisplayStatus, runMessage } from '@/utils/phoneFactoryRuns'
@@ -16,9 +18,10 @@ import { collectionTaskSource } from '@/utils/collectionResults'
 import { evaluationModeLabel, evaluationSourceLabel, evaluationStatus, collectionStatus, verdictLabel, checklistSourceLabel, collectionSnapshotLabel } from '@/utils/modelIteration'
 import { caseErrors, evaluationCaseAbnormal, evaluationCaseActive, factoryRunAbnormal, factoryRunActive, factoryRunErrors, factoryRunId, flatReportFiles, newestFactoryRuns } from '@/utils/factoryHistory'
 
-export type FactoryDetailsTab = 'runs' | 'cases' | 'reports' | 'diagnostics'
+export type FactoryDetailsTab = 'runs' | 'cases' | 'reports' | 'diagnostics' | 'storage'
 const props = defineProps<{
   modelValue: boolean; tab: FactoryDetailsTab; evaluation: boolean; runs: FactoryRun[]
+  storage?: RunStorageState; storageRuns?: FactoryRun[]
   progress?: EvaluationProgress; folders: ReportFolder[]; runError?: string; reportError?: string
   loadingReports: boolean; downloadingReport: string; runFilter?: 'all' | 'active' | 'abnormal'; focusedRun?: string; scopeKey?: string
   diagnostics?: CollectionDiagnosticsState; diagnosticsApi?: ReturnType<typeof createFactoryApi>; allowResume?: boolean; focusedPhone?: string
@@ -33,6 +36,8 @@ const runControls = reactive({ query: '', status: 'all', page: 1, size: 10 })
 const caseControls = reactive({ query: '', status: 'all', page: 1, size: 10 })
 const reportControls = reactive({ query: '', page: 1, size: 10 })
 const expandedRuns = ref<string[]>([])
+const storageFocusedRun = ref(props.focusedRun || '')
+watch(() => props.focusedRun, id => { if (id) storageFocusedRun.value = id })
 const orderedRuns = computed(() => newestFactoryRuns(props.runs))
 const selectedRun = computed({ get: () => props.progress?.selectedRun.value || '', set: value => props.progress?.selectRun(value) })
 const results = computed(() => props.progress?.results.value)
@@ -74,6 +79,7 @@ function showCases(runId: string) {
   props.diagnostics?.selectRun(runId)
   props.progress?.selectRun(runId); emit('update:tab', 'cases')
 }
+function showStorage(runId: string) { storageFocusedRun.value = runId; emit('update:tab', 'storage') }
 function showDiagnostics(runId: string) { props.diagnostics?.selectRun(runId); emit('update:tab', 'diagnostics') }
 </script>
 
@@ -83,31 +89,33 @@ function showDiagnostics(runId: string) { props.diagnostics?.selectRun(runId); e
       <button role="tab" :aria-selected="tab === 'runs'" :class="{ active: tab === 'runs' }" @click="emit('update:tab', 'runs')">运行记录</button>
       <button v-if="diagnostics" role="tab" :aria-selected="tab === 'diagnostics'" :class="{ active: tab === 'diagnostics' }" @click="emit('update:tab', 'diagnostics')">运行诊断</button>
       <button v-if="evaluation || diagnostics" role="tab" :aria-selected="tab === 'cases'" :class="{ active: tab === 'cases' }" @click="emit('update:tab', 'cases')">用例明细</button>
+      <button v-if="storage" role="tab" :aria-selected="tab === 'storage'" :class="{ active: tab === 'storage' }" @click="emit('update:tab', 'storage')">存储与清理</button>
       <button v-if="evaluation" role="tab" :aria-selected="tab === 'reports'" :class="{ active: tab === 'reports' }" @click="emit('update:tab', 'reports')">报告</button>
     </div>
     <section v-show="tab === 'runs'" data-testid="run-details-tab">
       <div class="detail-toolbar"><el-input v-model="runControls.query" clearable placeholder="搜索编号、文件名或结果" aria-label="搜索运行" /><el-select v-model="runControls.status" aria-label="运行状态筛选"><el-option label="全部状态" value="all" /><el-option label="活动运行" value="active" /><el-option label="异常运行" value="abnormal" /></el-select></div>
       <el-alert v-if="runError" :title="runError" type="warning" :closable="false" />
       <el-table :data="pagedRuns" :row-key="factoryRunId" :expand-row-keys="expandedRuns" border data-testid="factory-runs" @expand-change="(_row: FactoryRun, expanded: FactoryRun[]) => expandedRuns = expanded.map(factoryRunId)">
-        <el-table-column type="expand"><template #default="{ row }"><div class="expanded-record"><CollectionRunProgress :run="row" /><details><summary>历史回传原件与诊断文件</summary><CollectionArtifactDetails :run="row" /></details><p v-if="!evaluation">每任务采集次数：{{ row.repeat_times ?? 1 }}</p><p v-if="row.filename">文件：{{ row.filename }}</p><details v-if="factoryRunErrors(row).length"><summary>历史运行错误（{{ factoryRunErrors(row).length }}）</summary><p v-for="message in factoryRunErrors(row)" :key="message" class="error-text">{{ message }}</p></details><p v-if="!factoryRunErrors(row).length">{{ runMessage(row) || '暂无错误记录' }}</p><p v-if="evaluation">{{ evaluationModeLabel(row.execution_mode) }} · {{ row.evaluation_profile_id || '历史配置' }} · {{ evaluationSourceLabel(row) }}</p><template v-if="row.agent_type === 'pipelineagent'"><p>执行模型：{{ row.execution_model || '沿用采集端配置' }} · VLA 接口：{{ row.vla || '沿用采集端配置' }}</p><p>规划模型：{{ row.planner_config?.model || '沿用采集端配置' }} · 规划接口：{{ row.planner_config?.base_url || '沿用采集端配置' }}</p></template></div></template></el-table-column>
+        <el-table-column type="expand"><template #default="{ row }"><div class="expanded-record"><CollectionRunProgress :run="row" /><details v-if="!collectorDataUnavailable(row)"><summary>历史回传原件与诊断文件</summary><CollectionArtifactDetails :run="row" /></details><p v-if="!evaluation">每任务采集次数：{{ row.repeat_times ?? 1 }}</p><p v-if="row.filename">文件：{{ row.filename }}</p><details v-if="factoryRunErrors(row).length"><summary>历史运行错误（{{ factoryRunErrors(row).length }}）</summary><p v-for="message in factoryRunErrors(row)" :key="message" class="error-text">{{ message }}</p></details><p v-if="!factoryRunErrors(row).length">{{ runMessage(row) || '暂无错误记录' }}</p><p v-if="evaluation">{{ evaluationModeLabel(row.execution_mode) }} · {{ row.evaluation_profile_id || '历史配置' }} · {{ evaluationSourceLabel(row) }}</p><template v-if="row.agent_type === 'pipelineagent'"><p>执行模型：{{ row.execution_model || '沿用采集端配置' }} · VLA 接口：{{ row.vla || '沿用采集端配置' }}</p><p>规划模型：{{ row.planner_config?.model || '沿用采集端配置' }} · 规划接口：{{ row.planner_config?.base_url || '沿用采集端配置' }}</p></template></div></template></el-table-column>
         <el-table-column v-if="!evaluation" label="任务来源" min-width="150"><template #default="{ row }"><DisplayId kind="batch" :id="collectionTaskSource(row)" /></template></el-table-column>
         <el-table-column label="结果批次" min-width="150"><template #default="{ row }"><DisplayId kind="batch" :id="row.batch_id" /><small v-if="row.batch_status === 'published'"> · 已发布</small></template></el-table-column>
         <el-table-column label="运行编号" min-width="150"><template #default="{ row }"><DisplayId kind="run" :id="factoryRunId(row)" /></template></el-table-column>
         <el-table-column v-if="evaluation" label="采集快照" min-width="180"><template #default="{ row }">{{ collectionSnapshotLabel(row) || '—' }}</template></el-table-column>
         <el-table-column label="采集引擎" min-width="110"><template #default="{ row }">{{ row.execution_mode === 'evaluate_only' ? (row.source?.agent_type ? agentLabel(row.source.agent_type) : '已有轨迹') : agentLabel(row.agent_type) }}</template></el-table-column>
         <el-table-column label="时间" min-width="155"><template #default="{ row }">{{ row.created_at?.slice(0, 19).replace('T', ' ') || '—' }}</template></el-table-column>
-        <el-table-column label="状态" width="105"><template #default="{ row }">{{ runDisplayStatus(row) }}</template></el-table-column>
+        <el-table-column label="状态" width="105"><template #default="{ row }">{{ runDisplayStatus(row) }}<small v-if="row.collector_data_state">{{ collectorDataLabel(row.collector_data_state) }}</small></template></el-table-column>
         <el-table-column label="采集 / 回传" min-width="150"><template #default="{ row }"><template v-if="row.collection_summary && hasCollectionProgress(row)">{{ runStatus(row.collection_status || 'pending') }} / {{ runStatus(row.transfer_status || 'waiting') }}<small class="transfer-count">已回传 {{ row.collection_summary.transferred_trajectory_count ?? 0 }}/{{ row.collection_summary.sealed_trajectory_count }} 条</small></template><template v-else>—</template></template></el-table-column>
         <el-table-column label="结果" min-width="170" show-overflow-tooltip><template #default="{ row }">{{ runMessage(row) }}</template></el-table-column>
-        <el-table-column label="操作" min-width="200"><template #default="{ row }"><el-button v-if="diagnostics" link @click="showDiagnostics(factoryRunId(row))">诊断</el-button><el-button v-if="evaluation || diagnostics" link :disabled="progressBusy" @click="showCases(factoryRunId(row))">查看用例</el-button><slot name="run-actions" :run="row" /></template></el-table-column>
+        <el-table-column label="操作" min-width="200"><template #default="{ row }"><el-button v-if="diagnostics && !collectorDataUnavailable(row)" link @click="showDiagnostics(factoryRunId(row))">诊断</el-button><el-button v-if="evaluation || diagnostics" link :disabled="progressBusy" @click="showCases(factoryRunId(row))">查看用例</el-button><el-button v-if="storage" link @click="showStorage(factoryRunId(row))">存储与清理</el-button><slot name="run-actions" :run="row" /></template></el-table-column>
       </el-table>
       <el-pagination v-model:current-page="runControls.page" v-model:page-size="runControls.size" :page-sizes="[10, 20, 50]" :total="filteredRuns.length" layout="total, sizes, prev, pager, next" />
     </section>
+    <FactoryRunStorage v-if="storage" v-show="tab === 'storage'" :runs="storageRuns || runs" :state="storage" :focused-run="storageFocusedRun" />
     <section v-if="diagnostics" v-show="tab === 'diagnostics'" data-testid="diagnosis-details-tab"><PhoneRunDiagnostics :state="diagnostics" :runs="runs" :allow-resume="!!allowResume" detailed /></section>
     <section v-if="diagnostics && diagnosticsApi" v-show="tab === 'cases'" data-testid="grouped-case-details-tab">
       <div class="detail-toolbar"><el-select :model-value="diagnostics.selectedRunId.value" filterable placeholder="选择运行" aria-label="分组用例运行" @update:model-value="diagnostics.selectRun"><el-option v-for="run in orderedRuns" :key="factoryRunId(run)" :value="factoryRunId(run)" :label="displayId('run', factoryRunId(run))" /></el-select></div>
       <CollectionCaseGroups v-show="groupedCases" :run-id="diagnostics.selectedRunId.value" :api="diagnosticsApi" :active="modelValue && tab === 'cases' && groupedCases" :phone-ids="diagnostics.snapshot.value?.phones.map(phone => phone.phone_id)" :focused-phone="focusedPhone" @unsupported="groupedUnsupported = $event" />
-      <template v-if="!groupedCases && !evaluation"><el-alert title="该运行暂不支持分组明细，以下保留原回传条目及下载入口。" type="info" :closable="false" /><CollectionArtifactDetails v-if="currentDiagnosticRun" :run="currentDiagnosticRun" /></template>
+      <template v-if="!groupedCases && !evaluation"><el-alert title="该运行暂不支持分组明细，以下保留原回传条目及下载入口。" type="info" :closable="false" /><CollectionArtifactDetails v-if="currentDiagnosticRun && !collectorDataUnavailable(currentDiagnosticRun)" :run="currentDiagnosticRun" /></template>
     </section>
     <section v-if="evaluation && progress" v-show="tab === 'cases' && !groupedCases" data-testid="case-details-tab">
       <div class="detail-toolbar"><el-select v-model="selectedRun" filterable :disabled="progressBusy" placeholder="选择评估运行" aria-label="明细评估运行"><el-option v-for="run in orderedRuns" :key="run.run_id" :value="run.run_id" :label="`${displayId('run', run.run_id)} · ${run.evaluation_profile_id || '历史规则'}${run.stale_collection_snapshot ? ' · 旧采集快照' : ''}`" /></el-select><el-button v-if="progress.canCancel.value" type="danger" plain :loading="progress.cancelling.value" :disabled="!!progress.downloading.value" @click="progress.cancelRun">停止本次运行</el-button></div>

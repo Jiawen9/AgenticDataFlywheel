@@ -272,7 +272,8 @@ class ModelIterationFlaskTests(unittest.TestCase):
         self.assertEqual(record['evaluation_profile']['profile_digest'], profile['digest'])
         for case in record['evaluation_cases']:
             self.assertTrue(Path(case['trajectory_path']).is_file())
-            self.assertFalse(Path(case['trajectory_path']).is_relative_to(self.inputs))
+            self.assertTrue(Path(case['trajectory_path']).is_relative_to(self.inputs))
+            self.assertEqual(case['input_mode'], 'reference')
         self.dispatcher.tick()
         self.assertEqual(len(self.jobs), 2)
         self.assertTrue(all(job.argument('--checklist-source') == 'auto' for job in self.jobs))
@@ -314,6 +315,17 @@ class ModelIterationFlaskTests(unittest.TestCase):
         reports = self.factory.dispatch('reports', 'GET', {}, mode='modeliter')['folders']
         folder = next(item for item in reports if item.get('run_id') == run['run_id'])
         self.assertTrue(any(item['name'].endswith('.xlsx') for item in folder['files']))
+        self.assertEqual(record['archive_status'], 'not_requested')
+        self.assertFalse(Path(record['archive_path']).exists())
+        operation = self.factory.dispatch(f"storage/runs/{run['run_id']}/archive", 'POST', {'request_id':'explicit-archive'})
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            operation = self.factory.runtime.storage_service.get(operation['operation_id'])
+            if operation['status'] in {'completed','failed','partial'}:
+                break
+            self.factory.runtime.storage_service.schedule()
+            time.sleep(.03)
+        self.assertEqual(operation['status'], 'completed', operation)
         with zipfile.ZipFile(record['archive_path']) as archive:
             names = archive.namelist()
             self.assertTrue(any(name.startswith('evaluation_profile/') for name in names))

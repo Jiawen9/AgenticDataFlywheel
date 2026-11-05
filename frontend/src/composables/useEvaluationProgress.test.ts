@@ -64,3 +64,13 @@ describe('page-owned evaluation progress', () => {
     expect(view.progress.results.value).toBeNull()
   })
 })
+
+it('keeps saved results but stops polling and cancellation after collector retirement', async () => {
+  const view = mount(), pending = deferred<any>(); mocks.evaluations.mockReturnValueOnce(pending.promise)
+  const work = mocks.poll!(new AbortController().signal, () => true)
+  view.runs.value = view.runs.value.map(run => ({ ...run, collector_data_state: 'retired' }))
+  await flush(); pending.resolve({ run_id: 'new', summary: { total: 100 }, cases: [] }); await work
+  await mocks.poll!(new AbortController().signal, () => true)
+  expect(mocks.evaluations).toHaveBeenCalledTimes(1); expect(view.progress.results.value).toBeNull(); expect(view.progress.canCancel.value).toBe(false)
+  view.app.unmount()
+})
