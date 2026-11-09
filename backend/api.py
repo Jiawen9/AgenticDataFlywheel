@@ -57,6 +57,7 @@ from .pipeline_access import PipelineManagedError
 from .rollout_imports import RolloutImportStore
 from .rollout_import_router import router as rollout_import_router, configure_rollout_import_store
 from .display_identifiers_router import router as display_identifiers_router
+from .coordinate_info import batch_coordinate_info
 
 
 FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
@@ -464,6 +465,26 @@ def get_task_tree(run_id: str, task_id: str) -> JSONResponse:
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise HTTPException(status_code=409, detail=f"质检输入 JSON 缺失或损坏：{exc}") from exc
     return JSONResponse(tree)
+
+
+class CoordinateInfoRequest(BaseModel):
+    batch_id: str
+    annotation_version: str | None = None
+    trajectory_id: str
+    image: str
+
+
+@app.post("/api/coordinate-info")
+def coordinate_info(request: CoordinateInfoRequest) -> dict[str, Any]:
+    try:
+        return batch_coordinate_info(request.batch_id, request.annotation_version,
+                                     request.trajectory_id, request.image, root=DATA_ROOT)
+    except AnnotationVersionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (OSError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.get("/api/assets/{relative_path:path}")

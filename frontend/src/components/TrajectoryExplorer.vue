@@ -4,6 +4,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import type { TrajectoryRecord, TrajectoryStep, TrajectoryScope } from '@/types'
 import { imageUrl } from '@/api'
 import ActionImage from './ActionImage.vue'
+import { batchCoordinateSource } from '@/composables/useCoordinateInfo'
 
 const props = defineProps<{ taskId: string; trajectory: TrajectoryRecord; scope: TrajectoryScope; disabled?: boolean;
   saveBbox: (step: TrajectoryStep, bbox: [number, number, number, number]) => Promise<void> }>()
@@ -66,6 +67,8 @@ defineExpose({ protect, isEditing })
         :image-url="imageUrl(activeStep.image, scope)"
         :action="activeStep.action"
         :actions-box="activeStep.actions_box"
+        :coordinate-source="batchCoordinateSource(scope, trajectory.trajectory_id, activeStep.image)"
+        :agent-type="activeStep.agent_type || trajectory.agent_type"
         :alt="`${trajectory.trajectory_id} step ${activeStep.step}`"
         :editable="canEditBBox"
         :show-edit-trigger="false"

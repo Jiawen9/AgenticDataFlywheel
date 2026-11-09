@@ -1,5 +1,15 @@
 export type ActionPayload = Record<string, unknown>
 
+export interface CoordinateInfo {
+  space: 'pixel' | 'normalized' | 'unknown'
+  width?: number
+  height?: number
+  reason?: string
+}
+export type CoordinateSource =
+  | { kind: 'batch'; batch_id: string; annotation_version?: string; trajectory_id: string; image: string }
+  | { kind: 'correction'; session_id: string; excel_row: number; expected_revision?: number }
+
 export interface TrajectoryScope {
   batch_id: string
   annotation_version?: string
@@ -80,6 +90,7 @@ export interface TaskSummary {
 }
 
 export interface TrajectoryStep {
+  agent_type?: string
   step: number
   excel_row: number
   image: string
@@ -92,6 +103,7 @@ export interface TrajectoryStep {
 }
 
 export interface TrajectoryRecord {
+  agent_type?: string
   trajectory_id: string
   step_count: number
   steps: TrajectoryStep[]
@@ -233,6 +245,7 @@ export interface ClassificationResult {
 }
 
 export interface TreeOccurrence {
+  agent_type?: string
   trajectory: string
   step: number
   excel_row: number
@@ -249,6 +262,7 @@ export interface TreeOccurrence {
 }
 
 export interface AuditStep {
+  agent_type?: string
   step: number
   image: string
   xml: string
@@ -345,6 +359,7 @@ export interface CorrectionBatch {
 }
 
 export interface CorrectionRow {
+  agent_type?: string
   step_key?: string
   excel_row: number
   step: number
@@ -409,6 +424,7 @@ export interface CorrectionGroup extends CorrectionGroupSummary {
 }
 
 export interface CorrectionCotRow {
+  agent_type?: string
   task_id: string
   trajectory_id: string
   excel_row: number

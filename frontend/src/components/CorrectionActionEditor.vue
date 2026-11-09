@@ -1,27 +1,25 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import type { CorrectionRow } from '@/types'
+import type { CorrectionRow, CoordinateInfo } from '@/types'
 import { parseBBox, type BBox, type Point } from '@/utils/actionOverlay'
 
-const props = defineProps<{ row: CorrectionRow; imageUrl: string; saving?: boolean; readOnly?: boolean }>()
+import { useCoordinateInfo } from '@/composables/useCoordinateInfo'
+import { changesCoordinates, coordinateExtent, emptyActionForm, fromImageFraction, parseActionForm, serializeActionForm, toImagePoint } from '@/utils/correctionCoordinates'
+
+const props = defineProps<{ row: CorrectionRow; imageUrl: string; saving?: boolean; readOnly?: boolean; sessionId?: string; storageRevision?: number; coordinateInfo?: CoordinateInfo }>()
 const emit = defineEmits<{ save: [actions: string]; draft: [actions: string | null] }>()
 
-interface ActionForm {
-  action: string
-  x: number
-  y: number
-  sx: number
-  sy: number
-  ex: number
-  ey: number
-  text: string
-  button: string
-  status: string
-}
-
 const actionTypes = ['click', 'long_press', 'type', 'open', 'swipe', 'system_button', 'wait', 'terminate', 'answer']
-const form = ref<ActionForm>(emptyForm())
-const baseline = ref('')
+const form = ref(emptyActionForm())
+const originalForm = ref(emptyActionForm())
+const coordinates = useCoordinateInfo(() => props.coordinateInfo || !props.sessionId ? undefined : ({
+  kind: 'correction', session_id: props.sessionId, excel_row: props.row.excel_row, expected_revision: props.storageRevision,
+}), () => props.row.agent_type)
+const coordinateInfo = computed(() => props.coordinateInfo ?? coordinates.coordinateInfo.value)
+const canPickCoordinates = computed(() => Boolean(coordinateExtent(coordinateInfo.value)) && !coordinates.conflict.value)
+const coordinateChanged = computed(() => changesCoordinates(form.value, originalForm.value))
+const draftValue = computed(() => serializeActionForm(props.row.actions, originalForm.value, form.value))
+const saveBlocked = computed(() => coordinateChanged.value && !canPickCoordinates.value)
 const swipeDragging = ref(false)
 const swipeStart = ref<Point | null>(null)
 const swipeDragPoint = ref<Point | null>(null)
@@ -35,61 +33,38 @@ const originalBbox = computed<BBox | null>(() => parseBBox(props.row.original_ac
 const bboxText = computed(() => bbox.value ? `[${bbox.value.x1}, ${bbox.value.y1}, ${bbox.value.x2}, ${bbox.value.y2}]` : '未标框')
 const originalBboxText = computed(() => originalBbox.value ? `[${originalBbox.value.x1}, ${originalBbox.value.y1}, ${originalBbox.value.x2}, ${originalBbox.value.y2}]` : '未标框')
 const actionType = computed(() => form.value.action)
-const clickPoint = computed<Point | null>(() => normalized(form.value.x, form.value.y))
+const clickPoint = computed<Point | null>(() => project(form.value.x, form.value.y))
 const swipePoints = computed<[Point, Point] | null>(() => {
   if (actionType.value !== 'swipe') return null
   const start = swipeStart.value || { x: form.value.sx, y: form.value.sy }
   const end = swipeDragPoint.value || { x: form.value.ex, y: form.value.ey }
-  return [normalized(start.x, start.y), normalized(end.x, end.y)]
+  const a = project(start.x, start.y), b = project(end.x, end.y)
+  return a && b ? [a, b] : null
 })
 const coordinateBadge = computed(() => {
-  if (['click', 'long_press'].includes(actionType.value)) return `坐标 ${clamp(form.value.x)}, ${clamp(form.value.y)}`
-  if (actionType.value === 'swipe') return `起点 ${clamp(form.value.sx)}, ${clamp(form.value.sy)} · 终点 ${clamp(form.value.ex)}, ${clamp(form.value.ey)}`
+  if (['click', 'long_press'].includes(actionType.value)) return `坐标 ${form.value.x}, ${form.value.y}`
+  if (actionType.value === 'swipe') return `起点 ${form.value.sx}, ${form.value.sy} · 终点 ${form.value.ex}, ${form.value.ey}`
   return ''
 })
 const imageHint = computed(() => {
+  if (!canPickCoordinates.value) return coordinateInfo.value.reason || '坐标信息不足，暂不可取点；可编辑文本及其他非坐标字段'
   if (['click', 'long_press'].includes(actionType.value)) return '点击图片设置动作点'
   if (actionType.value === 'swipe') return '按住并拖动设置滑动起点和终点'
   return '当前动作无需在图片上取点'
 })
 const markerId = `correction-arrow-${Math.random().toString(36).slice(2)}`
 
-function emptyForm(): ActionForm {
-  return { action: 'click', x: 500, y: 500, sx: 250, sy: 500, ex: 750, ey: 500, text: '', button: 'back', status: 'success' }
-}
-
 function loadAction() {
-  const next = emptyForm()
-  try {
-    const parsed = JSON.parse(props.row.actions) as Record<string, unknown>
-    if (typeof parsed.action === 'string' && actionTypes.includes(parsed.action)) next.action = parsed.action
-    if (Array.isArray(parsed.coordinate)) {
-      next.x = Number(parsed.coordinate[0]) || 0
-      next.y = Number(parsed.coordinate[1]) || 0
-    }
-    if (Array.isArray(parsed.start_coordinate)) {
-      next.sx = Number(parsed.start_coordinate[0]) || 0
-      next.sy = Number(parsed.start_coordinate[1]) || 0
-    }
-    if (Array.isArray(parsed.end_coordinate)) {
-      next.ex = Number(parsed.end_coordinate[0]) || 0
-      next.ey = Number(parsed.end_coordinate[1]) || 0
-    }
-    if (typeof parsed.text === 'string') next.text = parsed.text
-    if (typeof parsed.button === 'string') next.button = parsed.button
-    if (typeof parsed.status === 'string') next.status = parsed.status
-  } catch {
-    // Keep a valid click form for malformed legacy rows.
-  }
+  const next = parseActionForm(props.row.actions)
+  originalForm.value = { ...next }
   form.value = next
-  baseline.value = JSON.stringify(actionPayload())
   swipeDragging.value = false
   swipeStart.value = null
   swipeDragPoint.value = null
 }
 
-function normalized(x: number, y: number): Point {
-  return { x: (Number(x) / 999) * naturalWidth.value, y: (Number(y) / 999) * naturalHeight.value }
+function project(x: number, y: number): Point | null {
+  return toImagePoint({ x, y }, { x: naturalWidth.value, y: naturalHeight.value }, coordinateInfo.value)
 }
 
 function onImageLoad(event: Event) {
@@ -111,26 +86,25 @@ function updateCanvasSize() {
   }
 }
 
-function pointFromEvent(event: MouseEvent | PointerEvent): Point {
-  const target = event.currentTarget as HTMLElement
-  const rect = target.getBoundingClientRect()
-  return {
-    x: Math.round(Math.max(0, Math.min(999, ((event.clientX - rect.left) / rect.width) * 999))),
-    y: Math.round(Math.max(0, Math.min(999, ((event.clientY - rect.top) / rect.height) * 999))),
-  }
+function pointFromEvent(event: MouseEvent | PointerEvent): Point | null {
+  const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
+  if (rect.width <= 0 || rect.height <= 0) return null
+  return fromImageFraction({ x: (event.clientX - rect.left) / rect.width, y: (event.clientY - rect.top) / rect.height }, coordinateInfo.value)
 }
 
 function handleImageClick(event: MouseEvent) {
-  if (props.saving || props.readOnly || !['click', 'long_press'].includes(actionType.value)) return
+  if (props.saving || props.readOnly || !canPickCoordinates.value || !['click', 'long_press'].includes(actionType.value)) return
   const point = pointFromEvent(event)
+  if (!point) return
   form.value.x = point.x
   form.value.y = point.y
 }
 
 function startSwipe(event: PointerEvent) {
-  if (props.saving || props.readOnly || actionType.value !== 'swipe') return
+  if (props.saving || props.readOnly || !canPickCoordinates.value || actionType.value !== 'swipe') return
   event.preventDefault()
   const point = pointFromEvent(event)
+  if (!point) return
   swipeDragging.value = true
   swipeStart.value = point
   swipeDragPoint.value = point
@@ -145,6 +119,7 @@ function moveSwipe(event: PointerEvent) {
 function finishSwipe(event: PointerEvent) {
   if (!swipeDragging.value || !swipeStart.value || actionType.value !== 'swipe') return
   const end = pointFromEvent(event)
+  if (!end) return
   form.value.sx = swipeStart.value.x
   form.value.sy = swipeStart.value.y
   form.value.ex = end.x
@@ -156,26 +131,9 @@ function finishSwipe(event: PointerEvent) {
   if (target.hasPointerCapture(event.pointerId)) target.releasePointerCapture(event.pointerId)
 }
 
-function actionPayload(): Record<string, unknown> {
-  const value: Record<string, unknown> = { action: form.value.action }
-  if (['click', 'long_press'].includes(form.value.action)) value.coordinate = [clamp(form.value.x), clamp(form.value.y)]
-  if (form.value.action === 'swipe') {
-    value.start_coordinate = [clamp(form.value.sx), clamp(form.value.sy)]
-    value.end_coordinate = [clamp(form.value.ex), clamp(form.value.ey)]
-  }
-  if (['type', 'open', 'answer'].includes(form.value.action)) value.text = form.value.text
-  if (form.value.action === 'system_button') value.button = form.value.button
-  if (form.value.action === 'terminate') value.status = form.value.status
-  return value
-}
-
-function clamp(value: number) {
-  return Math.max(0, Math.min(999, Math.round(Number(value) || 0)))
-}
-
 function save() {
-  if (props.saving || props.readOnly) return
-  emit('save', JSON.stringify(actionPayload(), null, 2))
+  if (props.saving || props.readOnly || saveBlocked.value) return
+  emit('save', draftValue.value)
 }
 
 watch(() => [props.row.excel_row, props.row.actions], loadAction, { immediate: true })
@@ -184,7 +142,7 @@ watch(actionType, () => {
   swipeStart.value = null
   swipeDragPoint.value = null
 })
-watch(() => JSON.stringify(actionPayload()), (value) => emit('draft', value === baseline.value ? null : value), { immediate: true, flush: 'post' })
+watch(draftValue, (value) => emit('draft', value === props.row.actions ? null : value), { immediate: true, flush: 'post' })
 
 onMounted(() => {
   resizeObserver = new ResizeObserver(updateCanvasSize)
@@ -197,7 +155,7 @@ onBeforeUnmount(() => resizeObserver?.disconnect())
 <template>
   <section class="correction-editor">
     <div ref="imageShell" class="editor-image-shell">
-      <div class="editor-image" :style="{ width: `${canvasSize.width}px`, height: `${canvasSize.height}px` }" :class="{ 'is-clickable': ['click', 'long_press'].includes(actionType), 'is-draggable': actionType === 'swipe' }"
+      <div class="editor-image" :style="{ width: `${canvasSize.width}px`, height: `${canvasSize.height}px` }" :class="{ 'is-clickable': canPickCoordinates && ['click', 'long_press'].includes(actionType), 'is-draggable': canPickCoordinates && actionType === 'swipe' }"
         @click="handleImageClick" @pointerdown="startSwipe" @pointermove="moveSwipe" @pointerup="finishSwipe" @pointercancel="finishSwipe">
         <img :src="imageUrl" :alt="`第 ${row.step} 步截图`" @load="onImageLoad" />
         <svg class="editor-overlay" :viewBox="`0 0 ${naturalWidth} ${naturalHeight}`" preserveAspectRatio="none" aria-hidden="true">
@@ -226,8 +184,9 @@ onBeforeUnmount(() => resizeObserver?.disconnect())
         <small v-if="row.bbox_edited">当前框为专家修改后的结果，将随导出文件保存。</small>
       </div>
 
-      <div class="editor-hint">坐标使用 0–999 归一化值；图片上的修改需要点击保存动作后写入。</div>
-      <el-button class="save-action" type="primary" :loading="props.saving" :disabled="props.readOnly" @click="save">保存动作</el-button>
+      <div v-if="coordinates.error.value" class="editor-hint" role="status">{{ coordinates.error.value }}</div>
+      <div class="editor-hint">{{ coordinateInfo.space === 'pixel' ? '坐标使用源截图像素（' + coordinateInfo.width + ' × ' + coordinateInfo.height + '）' : coordinateInfo.space === 'normalized' ? '坐标使用 0–999 归一化值' : '保留原值，坐标待确认' }}；图片上的修改需要点击保存动作后写入。</div>
+      <el-button class="save-action" type="primary" :loading="props.saving" :disabled="props.readOnly || saveBlocked" @click="save">保存动作</el-button>
     </fieldset>
   </section>
 </template>

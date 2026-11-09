@@ -425,6 +425,8 @@ onBeforeUnmount(() => { disposed = true; ++detailRequest; ++listRequest; stopPol
             :image-url="activeRow.image_url"
             :action="parsedAction"
             :actions-box="activeRow.actions_box"
+            :agent-type="activeRow.agent_type"
+            :coordinate-source="{ kind: 'correction', session_id: selectedSessionId, excel_row: activeRow.excel_row, expected_revision: sessionCot?.storage_revision }"
             :alt="`${activeRow.trajectory_id} Step ${activeRow.step}`"
             :editable="!pipelineReadOnly && canEditBBox && !jobRunning && !saving"
             :show-edit-trigger="true"

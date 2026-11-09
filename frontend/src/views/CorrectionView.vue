@@ -289,7 +289,7 @@ onBeforeUnmount(() => {
                     <el-button type="primary" :disabled="pipelineReadOnly || busy || activeGroup.can_adopt_review === false" @click="reviewGroup(activeGroup.group_id, 'adopt')">采用保留的修改</el-button>
                     <el-button :disabled="pipelineReadOnly || busy" @click="reviewGroup(activeGroup.group_id, 'discard')">放弃保留的修改</el-button>
                   </div>
-                  <CorrectionWorkbench v-if="activeGroup && session && !loadingGroup && !groupError" :session-id="session.session_id" :group="activeGroup" :row="activeRow" :revision="actionRevision" :saving="busy" :read-only="pipelineReadOnly"
+                  <CorrectionWorkbench v-if="activeGroup && session && !loadingGroup && !groupError" :session-id="session.session_id" :group="activeGroup" :row="activeRow" :revision="actionRevision" :storage-revision="session.storage_revision" :saving="busy" :read-only="pipelineReadOnly"
                     @select="ws.chooseRow" @delete="toggleDeleted" @action="ws.saveAction" @draft="actionDraft = $event" />
                 </div>
               </el-collapse-item>

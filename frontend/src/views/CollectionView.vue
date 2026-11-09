@@ -274,7 +274,7 @@ onBeforeUnmount(() => { disposed = true; flow.dispose(); window.removeEventListe
                   <el-collapse-item v-for="trajectory in taskData[task.task_id]" :key="trajectory.trajectory_id" :name="trajectory.trajectory_id">
                     <template #title><div class="trajectory-title"><el-icon><Refresh /></el-icon><b><DisplayId kind="trajectory" :id="trajectory.trajectory_id" :scope="batchId" /></b><span>{{ trajectory.step_count }} 步 · {{ timeText(trajectory.collected_at) }}</span></div></template>
                     <div v-loading="loadingTrajectories[flow.key(task.task_id, trajectory.trajectory_id)]" class="trajectory-detail">
-                      <TrajectoryExplorer v-if="trajectoryData[flow.key(task.task_id, trajectory.trajectory_id)]"
+                      <TrajectoryExplorer v-if="expandedTasks.includes(task.task_id) && expandedTrajectories[task.task_id] === trajectory.trajectory_id && trajectoryData[flow.key(task.task_id, trajectory.trajectory_id)]"
                         :ref="value => registerEditor(flow.key(task.task_id, trajectory.trajectory_id), value)"
                         :task-id="task.task_id" :trajectory="trajectoryData[flow.key(task.task_id, trajectory.trajectory_id)]" :scope="scope" :disabled="pipelineReadOnly || busy || processing || building"
                         :save-bbox="(step: TrajectoryStep, bbox: [number, number, number, number]) => flow.saveBBox(task.task_id, trajectory.trajectory_id, step, bbox)" />
