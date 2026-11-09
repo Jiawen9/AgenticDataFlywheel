@@ -179,7 +179,8 @@ class ExternalReleaseImporter:
             if not parsed["valid"]:
                 return response
             metadata = parsed["metadata"]
-            canonical = {"schema_version": 1, "parser_version": 1, "metadata": metadata,
+            parser_version = parsed["parser_version"]
+            canonical = {"schema_version": 1, "parser_version": parser_version, "metadata": metadata,
                          "content_hash": parsed["content_hash"], "rows": parsed["rows"],
                          "warnings": parsed["warnings"]}
             _write_bytes(directory / "canonical.json", _json_bytes(canonical))
@@ -188,6 +189,7 @@ class ExternalReleaseImporter:
             record = {
                 "import_id": import_id, "status": "validated", "created_at": utc_now(), "expires_at": expires,
                 "filename": filename, "suffix": suffix, "size": size, "metadata": metadata,
+                "parser_version": parser_version,
                 "source_sha256": source_hash, "canonical_sha256": _sha256(directory / "canonical.json"),
                 "content_hash": parsed["content_hash"], "metadata_signature": _metadata_signature(metadata),
                 "file_key": _hash({"sha256": source_hash, "sheet_name": metadata["sheet_name"]}),
@@ -216,7 +218,13 @@ class ExternalReleaseImporter:
             if not path.is_file() or not path.resolve().is_relative_to(directory.resolve()) or _sha256(path) != digest:
                 raise ImportFailure("上传暂存文件缺失或发生变化，请重新校验", status=409, code="import_changed")
         data = json.loads(canonical.read_text(encoding="utf-8"))
-        if data.get("metadata") != record["metadata"] or data.get("content_hash") != record["content_hash"]:
+        # Old validated previews did not carry a parser_version in their journal;
+        # their immutable canonical file remains v1 and must never be reparsed.
+        parser_version = record.get("parser_version", 1)
+        if (type(parser_version) is not int or parser_version not in (1, 2)
+                or data.get("schema_version") != 1 or type(data.get("parser_version")) is not int
+                or data["parser_version"] != parser_version
+                or data.get("metadata") != record["metadata"] or data.get("content_hash") != record["content_hash"]):
             raise ImportFailure("上传预览来源不一致，请重新校验", status=409, code="import_changed")
         return source, canonical
 
@@ -338,12 +346,13 @@ class ExternalReleaseImporter:
         canonical_ref = {"path": self.registry.project_path(final / "external-data.json"),
                          "sha256": record["canonical_sha256"]}
         metadata = record["metadata"]
-        manifest = {"schema_version": 1, "parser_version": 1, "release_id": release_id, "batch_id": batch_id,
+        parser_version = record.get("parser_version", 1)
+        manifest = {"schema_version": 1, "parser_version": parser_version, "release_id": release_id, "batch_id": batch_id,
                     "import_id": record["import_id"], "filename": record["filename"], "sheet_name": metadata["sheet_name"],
                     "metadata": metadata, "source": raw_ref, "canonical": canonical_ref,
                     "content_hash": record["content_hash"], "created_at": created_at}
         _write_bytes(staging / "import-manifest.json", _json_bytes(manifest))
-        external = {**metadata, "filename": record["filename"], "import_id": record["import_id"], "parser_version": 1,
+        external = {**metadata, "filename": record["filename"], "import_id": record["import_id"], "parser_version": parser_version,
                     "source_sha256": record["source_sha256"], "content_hash": record["content_hash"],
                     "canonical": canonical_ref,
                     "manifest": {"path": self.registry.project_path(final / "import-manifest.json"),

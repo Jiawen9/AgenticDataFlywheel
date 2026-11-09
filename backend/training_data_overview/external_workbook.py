@@ -16,7 +16,10 @@ from openpyxl.utils.exceptions import InvalidFileException
 
 from .converter import _classification_known, _field, _image, _json_action, _text
 
-PARSER_VERSION = 1
+PARSER_VERSION = 2
+SUPPORTED_PARSER_VERSIONS = (1, PARSER_VERSION)
+MANUAL_SOURCE_COLUMN = "数据来源"
+MANUAL_RECORD_SOURCE = "external_step_data_source"
 MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
 METADATA_FIELDS = ("data_source", "data_date", "app", "level1", "level2", "sheet_name")
 IDENTITY_FIELDS = ("trajectory_id", "文件夹名", "meta_task", "轨迹")
@@ -38,7 +41,7 @@ def _issue(sheet: str, row: int | None, field: str, message: str) -> dict:
     return {"sheet": sheet, "row": row, "field": field, "message": message}
 
 
-def _summary(rows: list[dict]) -> dict:
+def _summary(rows: list[dict], parser_version: int = 1) -> dict:
     apps: dict[str, dict] = {}
     scenes: dict[tuple[str, str], dict] = {}
     for row in rows:
@@ -48,8 +51,15 @@ def _summary(rows: list[dict]) -> dict:
         for value in (app, scene):
             value["trajectory_count"] += 1
             value["step_count"] += row["step数量"]
-    return {"trajectory_count": len(rows), "step_count": sum(row["step数量"] for row in rows),
-            "apps": list(apps.values()), "scenes": list(scenes.values())}
+    summary = {"trajectory_count": len(rows), "step_count": sum(row["step数量"] for row in rows),
+               "apps": list(apps.values()), "scenes": list(scenes.values())}
+    if parser_version == 2:
+        known = sum(row["manual_known_steps"] for row in rows)
+        summary.update(manual_refine_steps=sum(row["人工精修步骤数量"] or 0 for row in rows) if known else None,
+                       manual_known_steps=known,
+                       manual_unknown_steps=sum(row["manual_unknown_steps"] for row in rows),
+                       manual_source_column=MANUAL_SOURCE_COLUMN)
+    return summary
 
 
 def parse_external_workbook(path: Path | str, *, data_source: str, data_date: str,
@@ -66,7 +76,7 @@ def parse_external_workbook(path: Path | str, *, data_source: str, data_date: st
                 "sheet_name": _text(sheet_name)}
     result = {"valid": False, "sheets": [], "sheet_name": metadata["sheet_name"],
               "metadata": metadata, "summary": _summary([]), "errors": [], "warnings": [],
-              "rows": [], "content_hash": ""}
+              "rows": [], "content_hash": "", "parser_version": 1}
     errors, warnings = result["errors"], result["warnings"]
     try:
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", metadata["data_date"]):
@@ -109,6 +119,11 @@ def parse_external_workbook(path: Path | str, *, data_source: str, data_date: st
         while raw_headers and raw_headers[-1] is None:
             raw_headers.pop()
         headers = [_text(value) for value in raw_headers]
+        # The column was previously opaque: tables without it retain the exact
+        # v1 fingerprint, aggregate shape and unknown-manual semantics.
+        parser_version = PARSER_VERSION if MANUAL_SOURCE_COLUMN in headers else 1
+        result["parser_version"] = parser_version
+        result["summary"] = _summary([], parser_version)
         counts = Counter(header for header in headers if header)
         for header, count in counts.items():
             if count > 1:
@@ -122,7 +137,7 @@ def parse_external_workbook(path: Path | str, *, data_source: str, data_date: st
         groups: dict[str, dict] = {}
         # Stream the same canonical JSON used by parser v1; do not retain every
         # step's SOP, image path and auxiliary cells in a second in-memory table.
-        fingerprint = {"parser_version": PARSER_VERSION,
+        fingerprint = {"parser_version": parser_version,
                        "metadata": {key: value for key, value in metadata.items() if key != "sheet_name"},
                        "headers": headers}
         digest = hashlib.sha256()
@@ -155,8 +170,15 @@ def parse_external_workbook(path: Path | str, *, data_source: str, data_date: st
                 image = _image(row.get("image"))
                 identity = f"{PurePosixPath(image).parent.as_posix()}/{original}" if image else original
             group = groups.setdefault(identity, {"steps": 0, "actions": Counter(),
-                "fields": [{}, {}, {}], "first_row": row_number})
+                "fields": [{}, {}, {}], "first_row": row_number,
+                "manual_known_steps": 0, "manual_refined_excel_rows": []})
             group["steps"] += 1
+            if parser_version == 2:
+                step_source = _text(row.get(MANUAL_SOURCE_COLUMN))
+                if step_source:
+                    group["manual_known_steps"] += 1
+                if step_source == "修正内化":
+                    group["manual_refined_excel_rows"].append(row_number)
             for target, aliases in zip(group["fields"], CLASSIFICATION_FIELDS):
                 value = _field(row, aliases, "")
                 if value:
@@ -182,18 +204,30 @@ def parse_external_workbook(path: Path | str, *, data_source: str, data_date: st
                 if not values and not metadata[key]:
                     warnings.append(_issue(selected, group["first_row"], aliases[0], f"该轨迹未提供分类，已归入{fallback}"))
             app_value, first, second = labels
-            rows.append({"trajectory_identity": identity, "step数量": group["steps"],
+            aggregate = {"trajectory_identity": identity, "step数量": group["steps"],
                 "APP": app_value, "一级场景": first, "二级场景": second,
                 "时间": metadata["data_date"], "生产方式": metadata["data_source"],
                 "人工精修步骤数量": None, "manual_known": False,
                 "action_box": dict(sorted(group["actions"].items())),
                 "app_known": _classification_known(app_value), "level1_known": _classification_known(first),
-                "level2_known": _classification_known(second)})
+                "level2_known": _classification_known(second)}
+            if parser_version == 2:
+                known = group["manual_known_steps"]
+                unknown = group["steps"] - known
+                aggregate.update({"人工精修步骤数量": len(group["manual_refined_excel_rows"]) if known else None,
+                                  "manual_known": unknown == 0, "manual_record_source": MANUAL_RECORD_SOURCE,
+                                  "manual_known_steps": known, "manual_unknown_steps": unknown,
+                                  "manual_refined_excel_rows": group["manual_refined_excel_rows"]})
+            rows.append(aggregate)
         if not rows:
             errors.append(_issue(selected, None, "file", "工作表没有可统计的轨迹步骤"))
-        result["summary"] = _summary(rows)
+        result["summary"] = _summary(rows, parser_version)
         if not errors:
-            warnings.append(_issue(selected, None, "人工精修步骤数量", "外部步骤表未提供可核验的精修记录，人工精修数量记为未知"))
+            if parser_version == 1:
+                warnings.append(_issue(selected, None, "人工精修步骤数量", "外部步骤表未提供可核验的精修记录，人工精修数量记为未知"))
+            elif result["summary"]["manual_unknown_steps"]:
+                warnings.append(_issue(selected, None, MANUAL_SOURCE_COLUMN,
+                                       "数据来源为空的步骤，其人工修正状态记为未知；仅统计非空值中的“修正内化”"))
             result["rows"] = rows
             digest.update(b"]}")
             result["content_hash"] = digest.hexdigest()
