@@ -39,6 +39,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  coordinateInfo(source: import('./types').CoordinateSource & { kind: 'batch' }): Promise<{ coordinate_info: import('./types').CoordinateInfo; annotation_version: string }> {
+    const { kind: _kind, ...body } = source
+    return request('/api/coordinate-info', { method: 'POST', body: JSON.stringify(body) })
+  },
+  correctionCoordinateInfo(sessionId: string, excelRow: number, revision?: number): Promise<{ coordinate_info: import('./types').CoordinateInfo; storage_revision: number }> {
+    const query = revision === undefined ? '' : '?expected_revision=' + encodeURIComponent(revision)
+    return request('/api/correction/sessions/' + encodeURIComponent(sessionId) + '/rows/' + excelRow + '/coordinate-info' + query, { cache: 'no-store' })
+  },
   async listPipelines(options: { batch_id?: string; active_only?: boolean } = {}, signal?: AbortSignal): Promise<Pipeline[]> {
     const query = new URLSearchParams()
     if (options.batch_id) query.set('batch_id', options.batch_id)

@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import type { ActionPayload } from '@/types'
+import type { ActionPayload, CoordinateInfo, CoordinateSource } from '@/types'
+import { useCoordinateInfo } from '@/composables/useCoordinateInfo'
 import {
   actionKind,
   fallbackSwipePoints,
-  normalizedPoint,
+  actionPoint,
   parseBBox,
   swipeDirection,
   type BBox,
@@ -16,20 +17,30 @@ const props = withDefaults(
     imageUrl: string
     action: ActionPayload
     actionsBox?: string
+    coordinateSource?: CoordinateSource
+    coordinateInfo?: CoordinateInfo
+    agentType?: string
     alt?: string
     showOverlay?: boolean
     editable?: boolean
     showEditTrigger?: boolean
+    allowZoom?: boolean
     colorTone?: 'deep' | 'bright'
     onSaveBbox?: (bbox: [number, number, number, number]) => Promise<void>
   }>(),
-  { actionsBox: '', alt: '轨迹步骤截图', showOverlay: true, editable: false, showEditTrigger: true, colorTone: 'deep' },
+  { actionsBox: '', alt: '轨迹步骤截图', showOverlay: true, editable: false, showEditTrigger: true, allowZoom: true, colorTone: 'deep' },
 )
 const emit = defineEmits<{ 'editing-change': [editing: boolean] }>()
+
+const coordinates = useCoordinateInfo(() => props.coordinateInfo ? undefined : props.coordinateSource, () => props.agentType)
+const coordinateInfo = computed(() => props.coordinateInfo ?? coordinates.coordinateInfo.value)
+const coordinateNotice = computed(() => coordinateInfo.value.space === 'unknown'
+  ? coordinateInfo.value.reason || '坐标信息不足，保留原图及标框' : coordinates.error.value)
 
 const naturalWidth = ref(1080)
 const naturalHeight = ref(2340)
 const failed = ref(false)
+const previewVisible = ref(false)
 const editing = ref(false)
 const drawing = ref(false)
 const saving = ref(false)
@@ -39,13 +50,13 @@ const markerId = `arrow-${Math.random().toString(36).slice(2)}`
 const kind = computed(() => actionKind(props.action))
 const bbox = computed(() => parseBBox(props.actionsBox))
 const clickPoint = computed(() =>
-  normalizedPoint(props.action.coordinate, naturalWidth.value, naturalHeight.value),
+  actionPoint(props.action.coordinate, naturalWidth.value, naturalHeight.value, coordinateInfo.value),
 )
 const swipePoints = computed<[Point, Point] | null>(() => {
-  const start = normalizedPoint(props.action.start_coordinate, naturalWidth.value, naturalHeight.value)
-  const end = normalizedPoint(props.action.end_coordinate, naturalWidth.value, naturalHeight.value)
+  const start = actionPoint(props.action.start_coordinate, naturalWidth.value, naturalHeight.value, coordinateInfo.value)
+  const end = actionPoint(props.action.end_coordinate, naturalWidth.value, naturalHeight.value, coordinateInfo.value)
   if (start && end) return [start, end]
-  return bbox.value ? fallbackSwipePoints(bbox.value, swipeDirection(props.actionsBox)) : null
+  return coordinateInfo.value.space === 'normalized' && bbox.value ? fallbackSwipePoints(bbox.value, swipeDirection(props.actionsBox)) : null
 })
 const color = computed(() => {
   if (props.colorTone === 'bright') {
@@ -63,6 +74,7 @@ const labelX = computed(() => Math.max(12, bbox.value?.x1 ?? 16))
 const labelY = computed(() => Math.max(82, (bbox.value?.y1 ?? 100) - 18))
 
 watch(() => props.imageUrl, () => {
+  previewVisible.value = false
   failed.value = false
   editing.value = false
   drawing.value = false
@@ -70,6 +82,7 @@ watch(() => props.imageUrl, () => {
 })
 
 function beginEditing() {
+  previewVisible.value = false
   const current = bbox.value
   draftBBox.value = current ? { ...current } : null
   editing.value = true
@@ -203,9 +216,10 @@ function onLoad(event: Event) {
           <text x="26" y="0" fill="white" font-size="64" font-weight="800">{{ kind }}</text>
         </g>
       </svg>
-      <div v-if="editable && (showEditTrigger || editing)" class="action-image__toolbar">
-        <button v-if="!editing && showEditTrigger" type="button" @click="beginEditing">修改 bbox</button>
-        <template v-else>
+      <div v-if="allowZoom || (editable && (showEditTrigger || editing))" class="action-image__toolbar">
+        <button v-if="allowZoom && !editing" type="button" class="action-image__zoom-trigger" @click="previewVisible = true">放大预览</button>
+        <button v-if="editable && !editing && showEditTrigger" type="button" @click="beginEditing">修改 bbox</button>
+        <template v-if="editable && editing">
           <button type="button" :disabled="saving" @click="cancelEditing">取消</button>
           <button
             type="button"
@@ -240,11 +254,22 @@ function onLoad(event: Event) {
       </div>
     </div>
     <el-empty v-else description="截图加载失败" :image-size="72" />
+    <p v-if="showOverlay && coordinateNotice" class="action-image__coordinate-notice" role="status">{{ coordinateNotice }}</p>
+    <el-dialog v-if="allowZoom" v-model="previewVisible" title="截图放大预览" width="min(1200px, 96vw)" append-to-body destroy-on-close>
+      <div class="action-image__zoom-viewport">
+        <ActionImage v-if="previewVisible" :image-url="imageUrl" :action="action" :actions-box="actionsBox"
+          :coordinate-info="coordinateInfo" :alt="alt" :show-overlay="showOverlay" :color-tone="colorTone"
+          :allow-zoom="false" :style="{ width: `${naturalWidth}px` }" />
+      </div>
+    </el-dialog>
   </div>
 </template>
 
 <style scoped>
 .action-image { display: grid; place-items: center; width: 100%; min-height: 240px; }
+.action-image__coordinate-notice { margin: 8px 0; color: #92400e; font-size: 12px; line-height: 1.5; }
+.action-image__zoom-viewport { max-height: 76vh; overflow: auto; }
+.action-image__zoom-viewport :deep(.action-image img) { max-height: none; }
 .action-image__canvas { position: relative; display: inline-block; max-width: 100%; line-height: 0; }
 .action-image img { display: block; width: auto; max-width: 100%; max-height: 68vh; border-radius: 14px; box-shadow: 0 16px 48px rgba(15, 23, 42, .16); }
 .action-image__overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }

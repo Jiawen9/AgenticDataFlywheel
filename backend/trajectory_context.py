@@ -12,7 +12,7 @@ from .data_store import ArtifactStore, DATA_ROOT, rebase_data_path
 
 from .agent_types import PROVENANCE_FIELDS
 
-IDENTITY_FIELDS = ("task_id", "trajectory_id", "source_trajectory_id", "collection_run_id", "collected_at") + PROVENANCE_FIELDS
+IDENTITY_FIELDS = ("task_id", "trajectory_id", "source_trajectory_id", "collection_run_id", "collected_at", "coordinate_info") + PROVENANCE_FIELDS
 
 
 class AnnotationVersionConflict(ValueError):

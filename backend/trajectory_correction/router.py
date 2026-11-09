@@ -32,6 +32,7 @@ from .service import (
     session_asset,
     sessions,
     get_cot,
+    get_row_coordinate_info,
     review_group,
 )
 from .cot_jobs import CotJobManager
@@ -189,6 +190,19 @@ def correction_task_export(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="修正任务不存在") from exc
+    except RevisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (OSError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/sessions/{session_id}/rows/{excel_row}/coordinate-info")
+def correction_row_coordinate_info(session_id: str, excel_row: int,
+                                   expected_revision: int | None = Query(default=None)):
+    try:
+        return get_row_coordinate_info(session_id, excel_row, expected_revision)
+    except (FileNotFoundError, KeyError) as exc:
+        raise HTTPException(status_code=404, detail="修正会话或步骤不存在") from exc
     except RevisionConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (OSError, TypeError, ValueError) as exc:

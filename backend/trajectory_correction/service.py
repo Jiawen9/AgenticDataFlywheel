@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import hashlib
 import shutil
+import threading
+from collections import OrderedDict
 from copy import deepcopy
 from contextlib import contextmanager
 from functools import wraps
@@ -33,6 +35,31 @@ from .workbook import load_snapshot, parse_action, has_workbook_json
 from ..stage_artifacts import read_workbook_payload, write_payload_workbook
 from ..trajectory_data import _format_manual_actions_box
 from ..trajectories_tree.tree_builder import parse_bbox
+from ..coordinate_info import coordinate_changed, edit_contract, resolve_coordinate_info
+from ..trajectory_context import row_identity_metadata
+
+_COORDINATE_ROWS = OrderedDict()
+_COORDINATE_ROWS_LOCK = threading.Lock()
+
+
+def _coordinate_row(session, excel_row):
+    key = (str(storage_root()), session["session_id"], session.get("storage_revision"),
+           session.get("source_snapshot", {}).get("sha256"))
+    with _COORDINATE_ROWS_LOCK:
+        cached = _COORDINATE_ROWS.get(key)
+        if cached is not None:
+            _COORDINATE_ROWS.move_to_end(key)
+    if cached is None:
+        snapshot = session.get("snapshot_payload") or _snapshot(session)
+        rows = {int(row["excel_row"]): row for group in snapshot["groups"] for row in group["rows"]}
+        headers = set(snapshot.get("headers", []))
+        legacy = {"task", "meta_task", "actions", "task_manual_result", "micro_manual", "macro_manual"}.issubset(headers)
+        cached = rows, legacy
+        with _COORDINATE_ROWS_LOCK:
+            _COORDINATE_ROWS[key] = cached
+            while len(_COORDINATE_ROWS) > 8 or (len(_COORDINATE_ROWS) > 1 and sum(len(item[0]) for item in _COORDINATE_ROWS.values()) > 100_000):
+                _COORDINATE_ROWS.popitem(last=False)
+    return cached[0][excel_row], cached[1]
 
 
 def _session_or_raise(session_id: str) -> dict[str, Any]:
@@ -138,6 +165,8 @@ def _overlay_row(session_id: str, session: dict[str, Any], base: dict[str, Any])
     if "actions" in edit:
         row["actions"] = edit["actions"]
         row["action"] = parse_action(edit["actions"])
+    if "coordinate_info" in edit:
+        row["coordinate_info"] = deepcopy(edit["coordinate_info"])
     row["deleted"] = bool(edit.get("deleted", False))
     row["action_edited"] = "actions" in edit
     row["sop_edited"] = "sop" in edit
@@ -512,6 +541,7 @@ def get_cot(session_id: str) -> dict[str, Any]:
             "task": group["task"],
             "rows": [
                 {
+                    **row_identity_metadata(row),
                     "task_id": str(row.get("task_id") or group.get("task_id") or str(row.get("image", "")).replace("\\", "/").split("/", 1)[0]),
                     "trajectory_id": group["meta_task"],
                     "excel_row": row["excel_row"],
@@ -548,7 +578,30 @@ def get_cot(session_id: str) -> dict[str, Any]:
     return {"session_id": session_id, "batch_id": session.get("storage_batch_id") or session.get("tree_run_id"), "storage_revision": session.get("storage_revision"), "pending_review_count": len(session.get("pending_review", {})), "groups": groups}
 
 
-def patch_row(session_id: str, excel_row: int, payload: dict[str, Any]) -> dict[str, Any]:
+def _coordinate_info_for_row(session, base):
+    _, asset_root = _source_for_session(session)
+    edit = session.get("row_edits", {}).get(str(base["excel_row"]), {})
+    # This is the original human8.0 input schema, not an arbitrary external
+    # annotation sheet. Its action coordinates predate engine provenance.
+    _, legacy_native = _coordinate_row(session, int(base["excel_row"]))
+    return resolve_coordinate_info(base, asset_root,
+        current_action=edit.get("actions", base["actions"]),
+        saved_contract=edit.get("coordinate_info"), legacy_native=legacy_native)
+
+
+def get_row_coordinate_info(session_id: str, excel_row: int, expected_revision: int | None = None):
+    session = _session_or_raise(session_id)
+    _check_revision(session, expected_revision)
+    base, _ = _coordinate_row(session, excel_row)
+    info = _coordinate_info_for_row(session, base)
+    # Reading evidence is outside the batch lock. Reject a response if the
+    # session changed while the file was being read.
+    latest = _session_or_raise(session_id)
+    _check_revision(latest, session.get("storage_revision"))
+    return {"coordinate_info": info, "storage_revision": session.get("storage_revision")}
+
+
+def patch_row(session_id: str, excel_row: int, payload: dict[str, Any], *, _coordinate_contract=None) -> dict[str, Any]:
     session = _session_or_raise(session_id)
     snapshot = _snapshot(session)
     group, base = _base_row(snapshot, excel_row)
@@ -569,16 +622,27 @@ def patch_row(session_id: str, excel_row: int, payload: dict[str, Any]) -> dict[
             parsed = parse_action(actions)
             if parsed.get("action") == "unknown":
                 raise ValueError("actions 必须是包含合法 action 字段的 JSON")
-            if actions == base["actions"]:
+            previous = parse_action(edit.get("actions", base["actions"]))
+            if parsed == previous:
+                # A text/SOP save or editor round trip must not clamp,
+                # reformat, or invalidate an unchanged historical action.
+                pass
+            elif parsed == parse_action(base["actions"]):
                 edit.pop("actions", None)
                 edit.pop("original_actions", None)
+                edit.pop("coordinate_info", None)
             else:
                 edit.setdefault("original_actions", base["actions"])
                 edit["actions"] = actions
+                if _coordinate_contract is not None:
+                    edit["coordinate_info"] = deepcopy(_coordinate_contract)
+                else:
+                    edit.pop("coordinate_info", None)
             # A changed action invalidates any COT generated for the previous
             # action.  The result remains available in the cache for audit, but
             # cannot be displayed or exported for the new action.
-            session.setdefault("cot", {}).pop(str(excel_row), None)
+            if parsed != previous:
+                session.setdefault("cot", {}).pop(str(excel_row), None)
 
         if payload.get("actions_box") is not None:
             actions_box = str(payload["actions_box"])
@@ -665,6 +729,7 @@ def _publish_stage_snapshot(session: dict[str, Any], snapshot: dict[str, Any], s
                           "summary_source": row["summary_source"], "thought_source": row["thought_source"],
                           "original_action": row.get("original_action", ""), "original_summary": row.get("original_summary", ""),
                           "original_thought": row.get("original_thought", ""), "original_actions_box": row.get("original_actions_box", ""),
+                          "coordinate_info": row.get("coordinate_info"),
                           "人工修改": session.get("row_edits", {}).get(str(row["excel_row"]), {}),
                           "COT元数据": session.get("cot", {}).get(str(row["excel_row"]), {})})
     payload = {"schema_version": 2, "session_id": session["session_id"], "tree_run_id": session.get("tree_run_id"),
@@ -920,8 +985,44 @@ def session_asset(session_id: str, image_value: str) -> Path:
     _, package_root = _source_for_session(session)
     return resolve_asset(package_root, image_value)
 
-# Upstream invalidation and interactive writes share the same batch lock.
-patch_row = _locked_session(patch_row)
+def _coordinate_checked_patch(function):
+    locked = _locked_session(function)
+    @wraps(function)
+    def checked(session_id, excel_row, payload):
+        payload = dict(payload)
+        contract = None
+        if payload.get("actions") is not None:
+            session = _session_or_raise(session_id)
+            _check_revision(session, payload.get("expected_revision"))
+            base, _ = _coordinate_row(session, excel_row)
+            previous = session.get("row_edits", {}).get(str(excel_row), {}).get("actions", base["actions"])
+            action = parse_action(payload["actions"])
+            if action != parse_action(previous) and action != parse_action(base["actions"]):
+                try:
+                    info = _coordinate_info_for_row(session, base)
+                except (OSError, ValueError):
+                    # Missing source evidence must not prevent a non-coordinate
+                    # edit in an old session. It cannot authorize new points.
+                    info = {"space": "unknown"}
+                if coordinate_changed(previous, action):
+                    contract = edit_contract(info, action, base.get("image", ""))
+                else:
+                    # Keep a confirmed source canvas through click -> type ->
+                    # click, not just duration edits. Old unbound edits remain
+                    # unknown; preserving metadata does not bypass revalidation.
+                    existing = session.get("row_edits", {}).get(str(excel_row), {}).get("coordinate_info")
+                    source = info if info.get("space") in {"pixel", "normalized"} else existing
+                    from ..coordinate_info import action_digest
+                    if isinstance(source, dict):
+                        contract = {**source, "contract_version": 1, "image": str(base.get("image", "")).replace("\\", "/"),
+                                    "action_sha256": action_digest(action)}
+            payload["expected_revision"] = session.get("storage_revision")
+        return locked(session_id, excel_row, payload, _coordinate_contract=contract)
+    return checked
+
+
+# Image evidence is resolved before acquiring the mutation/batch lock.
+patch_row = _coordinate_checked_patch(patch_row)
 patch_group_export = _locked_session(patch_group_export)
 review_group = _locked_session(review_group)
 

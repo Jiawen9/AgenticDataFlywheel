@@ -1,4 +1,4 @@
-import type { ActionPayload } from '@/types'
+import type { ActionPayload, CoordinateInfo } from '@/types'
 
 export interface BBox {
   x1: number
@@ -32,6 +32,16 @@ export function normalizedPoint(value: unknown, width: number, height: number): 
   const y = Number(value[1])
   if (!Number.isFinite(x) || !Number.isFinite(y)) return null
   return { x: (x / 1000) * width, y: (y / 1000) * height }
+}
+
+export function actionPoint(value: unknown, width: number, height: number, info: CoordinateInfo): Point | null {
+  if (info.space === 'normalized') return normalizedPoint(value, width, height)
+  if (info.space !== 'pixel' || !Number.isFinite(info.width) || !Number.isFinite(info.height)
+      || !info.width || info.width <= 0 || !info.height || info.height <= 0) return null
+  if (!Array.isArray(value) || value.length < 2) return null
+  const x = Number(value[0]), y = Number(value[1])
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null
+  return { x: x / info.width * width, y: y / info.height * height }
 }
 
 export function actionKind(action: ActionPayload): string {

@@ -57,6 +57,8 @@ def _row_values(
         values[headers.index("summary")] = edits["summary"]
     if "thought" in headers and "thought" in edits:
         values[headers.index("thought")] = edits["thought"]
+    if "coordinate_info" in headers and restored_action is None and "coordinate_info" in edits:
+        values[headers.index("coordinate_info")] = json.dumps(edits["coordinate_info"], ensure_ascii=False)
     cot = session.get("cot", {}).get(str(row_number), {})
     if isinstance(cot, dict):
         action_value = values[headers.index(action_name)] if action_name in headers else ""
@@ -117,6 +119,8 @@ def export_session_workbook(
             headers.append("is_refined")
         if "thought" not in headers:
             headers.append("thought")
+        if "coordinate_info" not in headers and any("coordinate_info" in edit for edit in session.get("row_edits", {}).values()):
+            headers.append("coordinate_info")
 
         routed: dict[str, list[tuple[list[Any], int]]] = {
             "SFT_人工精修": [],
@@ -303,6 +307,8 @@ def export_full_dataset_workbook(
             sheet.cell(row_number, bbox_column).value = bbox_value
             sheet.cell(row_number, summary_column).value = summary_value
             sheet.cell(row_number, thought_column).value = thought_value
+            if "coordinate_info" in edits:
+                sheet.cell(row_number, ensure_column("coordinate_info")).value = json.dumps(edits["coordinate_info"], ensure_ascii=False)
             changed_rows += 1
 
         io_path(output_dir).mkdir(parents=True, exist_ok=True)
