@@ -92,6 +92,41 @@ class OverviewTests(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertEqual(self.calls, ["rel_one"])
 
+    def test_external_step_marks_count_without_renaming_source_and_track_partial_coverage(self):
+        external = row(identity="external", steps=4, known=False)
+        external.update({"生产方式": "外部历史数据", "人工精修步骤数量": 2,
+                         "manual_record_source": "external_step_data_source",
+                         "manual_known_steps": 3, "manual_unknown_steps": 1})
+        legacy = row(identity="legacy", steps=2, known=False)
+        legacy["生产方式"] = "修正内化"
+        value = summarize({"rows": [row(), external, legacy]}, [], {})
+        self.assertEqual(value["overview"]["manual_refine_steps"], 3)
+        self.assertEqual(value["overview"]["manual_known_steps"], 6)
+        self.assertEqual(value["overview"]["manual_unknown_steps"], 3)
+        filtered = summarize({"rows": [row(), external, legacy]}, [], {"source": "外部历史数据"})
+        self.assertTrue(filtered["overview"]["show_manual_refine_steps"])
+        self.assertEqual(filtered["overview"]["manual_refine_steps"], 2)
+        self.assertEqual(filtered["overview"]["manual_unknown_steps"], 1)
+        self.assertEqual(filtered["overview"]["total_steps"], 4)
+        self.assertTrue(any("1 步" in warning for warning in filtered["warnings"]))
+
+    def test_external_zero_unknown_and_flywheel_label_are_not_double_counted(self):
+        external = row(identity="external", steps=2)
+        external.update({"生产方式": "外部历史数据", "人工精修步骤数量": 0,
+                         "manual_record_source": "external_step_data_source",
+                         "manual_known_steps": 2, "manual_unknown_steps": 0})
+        zero = summarize({"rows": [external]}, [], {})["overview"]
+        self.assertTrue(zero["show_manual_refine_steps"])
+        self.assertEqual(zero["manual_refine_steps"], 0)
+        external.update({"人工精修步骤数量": None, "manual_known": False,
+                         "manual_known_steps": 0, "manual_unknown_steps": 2})
+        unknown = summarize({"rows": [external]}, [], {})["overview"]
+        self.assertFalse(unknown["show_manual_refine_steps"])
+        self.assertEqual(unknown["manual_unknown_steps"], 2)
+        external.update({"生产方式": "数据飞轮外部表", "人工精修步骤数量": 1,
+                         "manual_known_steps": 2, "manual_unknown_steps": 0})
+        self.assertEqual(summarize({"rows": [external]}, [], {})["overview"]["manual_refine_steps"], 1)
+
     def test_concurrent_requests_convert_once_and_accumulate_versions(self):
         self.registry.releases.clear()
         self.manager.start()

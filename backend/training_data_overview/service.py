@@ -65,6 +65,16 @@ def _manual_number(value) -> float:
         return 0
 
 
+def _manual_coverage(row: dict) -> tuple[int, int]:
+    """Use step coverage from new external imports; keep frozen v1 semantics."""
+    steps = row["step数量"]
+    if row.get("manual_record_source") == "external_step_data_source":
+        known, unknown = row.get("manual_known_steps"), row.get("manual_unknown_steps")
+        if type(known) is int and type(unknown) is int and known >= 0 and unknown >= 0 and known + unknown == steps:
+            return known, unknown
+    return (steps, 0) if row.get("manual_known") else (0, steps)
+
+
 def summarize(catalog: dict | None, conversions: list[dict], filters: dict) -> dict:
     """DEV statistics over the committed catalog; no conversion or workbook writes."""
     for name in ("start_date", "end_date"):
@@ -80,16 +90,19 @@ def summarize(catalog: dict | None, conversions: list[dict], filters: dict) -> d
     all_rows = catalog.get("rows", [])
     rows = [r for r in all_rows if _matches(r, filters)]
     counts = _counts(rows)
-    known = [r for r in rows if r.get("manual_known")]
     flywheel = [r for r in rows if "数据飞轮" in str(r.get("生产方式", ""))]
-    show_manual = bool(flywheel) and any("人工精修步骤数量" in r for r in all_rows)
+    external_marked = [r for r in rows if r.get("manual_record_source") == "external_step_data_source"]
+    manual_rows = [r for r in rows if "数据飞轮" in str(r.get("生产方式", ""))
+                   or r.get("manual_record_source") == "external_step_data_source"]
+    show_manual = ((bool(flywheel) and any("人工精修步骤数量" in r for r in all_rows))
+                   or any(_manual_coverage(r)[0] > 0 for r in external_marked))
+    coverage = [_manual_coverage(r) for r in rows]
     overview = {**counts,
         "subtask_trajectories": len(rows),
-        "manual_refine_steps": int(sum(_manual_number(r.get("人工精修步骤数量")) for r in flywheel)) if show_manual else 0,
+        "manual_refine_steps": int(sum(_manual_number(r.get("人工精修步骤数量")) for r in manual_rows)) if show_manual else 0,
         "show_manual_refine_steps": show_manual,
-        # Preserve coverage diagnostics without changing DEV's card arithmetic.
-        "manual_known_steps": sum(r["step数量"] for r in known),
-        "manual_unknown_steps": sum(r["step数量"] for r in rows if not r.get("manual_known")),
+        "manual_known_steps": sum(known for known, _ in coverage),
+        "manual_unknown_steps": sum(unknown for _, unknown in coverage),
         "level1_scenes": _unique(rows, "一级场景"),
         "level2_scenes": _unique(rows, "二级场景"),
         "total_apps": _unique(rows, "APP"),

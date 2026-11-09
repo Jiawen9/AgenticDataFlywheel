@@ -62,6 +62,53 @@ class _WorkbookFixture(unittest.TestCase):
 
 
 class ExternalWorkbookTests(_WorkbookFixture):
+    def test_step_data_source_counts_known_unknown_and_original_excel_rows(self):
+        path = self.workbook(headers=["trajectory_id", "action", "数据来源"], rows=[
+            ["a", '{"action":"click"}', " 修正内化\t"],
+            ["a", '{"action":"finish"}', "经验内化"], [],
+            ["a", '{"action":"wait"}', " \t "],
+            ["b", '{"action":"wait"}', None],
+            ["c", '{"action":"wait"}', 0],
+            ["c", '{"action":"finish"}', False]])
+        result = self.parse(path, data_source="混合历史来源")
+        self.assertTrue(result["valid"], result["errors"])
+        self.assertEqual(result["parser_version"], 2)
+        first, unknown, unrefined = result["rows"]
+        self.assertEqual((first["manual_known_steps"], first["manual_unknown_steps"],
+                          first["人工精修步骤数量"], first["manual_known"]), (2, 1, 1, False))
+        self.assertEqual(first["manual_refined_excel_rows"], [2])
+        self.assertIsNone(unknown["人工精修步骤数量"])
+        self.assertEqual((unknown["manual_known_steps"], unknown["manual_unknown_steps"]), (0, 1))
+        self.assertEqual((unrefined["人工精修步骤数量"], unrefined["manual_known"]), (0, True))
+        self.assertEqual(unrefined["manual_refined_excel_rows"], [])
+        for row in result["rows"]:
+            self.assertEqual(row["manual_record_source"], "external_step_data_source")
+            self.assertEqual(row["生产方式"], "混合历史来源")
+        self.assertEqual({key: result["summary"][key] for key in (
+            "step_count", "manual_refine_steps", "manual_known_steps", "manual_unknown_steps", "manual_source_column")},
+            {"step_count": 6, "manual_refine_steps": 1, "manual_known_steps": 4,
+             "manual_unknown_steps": 2, "manual_source_column": "数据来源"})
+
+    def test_manual_marker_requires_exact_trimmed_cell_and_never_infers_from_task_or_action(self):
+        sources = [" 修正内化\n", "修正内化", "经验内化", "修正内化说明", "经验内化/修正内化", "修正 内化", "=A2", ""]
+        result = self.parse(self.workbook(headers=["trajectory_id", "action", "数据来源", "task", "original_action"],
+            rows=[["a", '{"action":"finish"}', source, "人工修正内化任务", '{"action":"click"}']
+                  for source in sources]), data_source="修正内化")
+        row, = result["rows"]
+        self.assertEqual(row["人工精修步骤数量"], 2)
+        self.assertEqual(row["manual_refined_excel_rows"], [2, 3])
+        self.assertEqual((row["manual_known_steps"], row["manual_unknown_steps"]), (7, 1))
+
+    def test_all_blank_step_sources_remain_unknown_in_v2(self):
+        result = self.parse(self.workbook(headers=["trajectory_id", "action", "数据来源"],
+            rows=[["a", '{"action":"click"}', ""], ["a", '{"action":"finish"}', "  "]]))
+        self.assertTrue(result["valid"])
+        self.assertIsNone(result["summary"]["manual_refine_steps"])
+        self.assertEqual(result["summary"]["manual_unknown_steps"], 2)
+        row, = result["rows"]
+        self.assertIsNone(row["人工精修步骤数量"])
+        self.assertFalse(row["manual_known"])
+
     def test_grouped_table_classifications_override_fallback_and_manual_stays_unknown(self):
         result = self.parse(app="上传 App", level1="上传场景", level2="上传能力")
         self.assertTrue(result["valid"], result["errors"])
@@ -223,6 +270,9 @@ class ExternalWorkbookTests(_WorkbookFixture):
 
     def test_streamed_hash_preserves_v1_json_identity(self):
         result = self.parse()
+        self.assertEqual(result["parser_version"], 1)
+        self.assertNotIn("manual_refine_steps", result["summary"])
+        self.assertNotIn("manual_record_source", result["rows"][0])
         fingerprint = {"parser_version": 1,
                        "metadata": {key: value for key, value in result["metadata"].items() if key != "sheet_name"},
                        "headers": self.headers,
@@ -265,18 +315,19 @@ class ExternalReleaseConverterTests(_WorkbookFixture):
         path.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
         return self.reference(path)
 
-    def release(self, release_id="rel_external"):
-        path = self.workbook()
+    def release(self, release_id="rel_external", **workbook_options):
+        path = self.workbook(**workbook_options)
         parsed = self.parse(path)
+        parser_version = parsed["parser_version"]
         destination = self.root / "releases" / release_id
         (destination / "001").mkdir(parents=True)
         original = destination / "001" / "steps.xlsx"
         shutil.copyfile(path, original)
         original_ref = self.reference(original)
-        canonical = {"schema_version": 1, "parser_version": 1,
+        canonical = {"schema_version": 1, "parser_version": parser_version,
                      **{key: parsed[key] for key in ("metadata", "rows", "warnings", "content_hash")}}
         canonical_ref = self.write_json(destination / "external-data.json", canonical)
-        manifest = {"schema_version": 1, "parser_version": 1, "release_id": release_id,
+        manifest = {"schema_version": 1, "parser_version": parser_version, "release_id": release_id,
                     "batch_id": "external_batch", "import_id": "import_one", "filename": "steps.xlsx",
                     "sheet_name": parsed["sheet_name"], "metadata": parsed["metadata"],
                     "source": original_ref, "canonical": canonical_ref, "content_hash": parsed["content_hash"],
@@ -284,7 +335,7 @@ class ExternalReleaseConverterTests(_WorkbookFixture):
         manifest_ref = self.write_json(destination / "import-manifest.json", manifest)
         return {"release_id": release_id, "source_kind": "external_manual", "batch_ids": ["external_batch"],
                 "created_at": "2026-09-20T02:00:00Z", "excel_paths": [original_ref], "trajectory_paths": [],
-                "external_import": {**parsed["metadata"], "parser_version": 1, "import_id": "import_one",
+                "external_import": {**parsed["metadata"], "parser_version": parser_version, "import_id": "import_one",
                     "source_sha256": original_ref["sha256"], "content_hash": parsed["content_hash"],
                     "canonical": canonical_ref, "manifest": manifest_ref}}
 
@@ -323,6 +374,65 @@ class ExternalReleaseConverterTests(_WorkbookFixture):
         second = convert_release(self.registry, self.release("rel_second"))
         self.assertNotEqual(first["rows"][0]["轨迹"], second["rows"][0]["轨迹"])
         self.assertEqual(first["rows"][0]["trajectory_identity"], second["rows"][0]["trajectory_identity"])
+
+    def test_v2_conversion_keeps_partial_manual_counts_without_reparsing(self):
+        release = self.release(headers=["trajectory_id", "action", "数据来源"], rows=[
+            ["a", '{"action":"click"}', "修正内化"], ["a", '{"action":"finish"}', "经验内化"],
+            ["a", '{"action":"wait"}', None], ["b", '{"action":"wait"}', None]])
+        with patch("backend.training_data_overview.converter.load_workbook", side_effect=AssertionError("reparse")), \
+             patch("backend.training_data_overview.external_workbook.parse_external_workbook", side_effect=AssertionError("reparse")):
+            first, unknown = convert_release(self.registry, release)["rows"]
+        self.assertEqual((first["人工精修步骤数量"], first["manual_known_steps"],
+                          first["manual_unknown_steps"], first["manual_known"]), (1, 2, 1, False))
+        self.assertEqual(first["manual_refined_excel_rows"], [2])
+        self.assertEqual(first["manual_record_source"], "external_step_data_source")
+        self.assertIsNone(unknown["人工精修步骤数量"])
+
+    def test_v2_manual_counts_source_and_excel_row_bounds_are_validated(self):
+        changes = [
+            {"manual_record_source": "session"}, {"manual_known_steps": True},
+            {"manual_known_steps": -1}, {"manual_unknown_steps": -1},
+            {"manual_unknown_steps": 1}, {"manual_known": False},
+            {"人工精修步骤数量": None}, {"人工精修步骤数量": -1},
+            {"人工精修步骤数量": 3}, {"人工精修步骤数量": True},
+            {"manual_refined_excel_rows": [2]}, {"manual_refined_excel_rows": [2, 2]},
+            {"manual_refined_excel_rows": [1, 3]}, {"manual_refined_excel_rows": [2, 1048577]},
+            {"manual_refined_excel_rows": [2, True]}, {"manual_refined_excel_rows": [2, 3.0]},
+        ]
+        for index, change in enumerate(changes):
+            with self.subTest(change=change):
+                release = self.release(f"rel_manual_invalid_{index}",
+                    headers=["trajectory_id", "action", "数据来源"], rows=[
+                        ["a", '{"action":"click"}', "修正内化"], ["a", '{"action":"finish"}', "修正内化"]])
+                self.update_json(release, "canonical", lambda value: value["rows"][0].update(change))
+                with self.assertRaises(ConversionError):
+                    convert_release(self.registry, release)
+        unknown = self.release("rel_unknown_invalid", headers=["trajectory_id", "action", "数据来源"],
+            rows=[["a", '{"action":"wait"}', None]])
+        self.update_json(unknown, "canonical", lambda value: value["rows"][0].update({"人工精修步骤数量": 0}))
+        with self.assertRaises(ConversionError):
+            convert_release(self.registry, unknown)
+
+    def test_manual_excel_row_cannot_be_counted_in_two_trajectories(self):
+        release = self.release(headers=["trajectory_id", "action", "数据来源"], rows=[
+            ["a", '{"action":"click"}', "修正内化"], ["b", '{"action":"finish"}', "修正内化"]])
+        self.update_json(release, "canonical", lambda value: value["rows"][1].update(manual_refined_excel_rows=[2]))
+        with self.assertRaisesRegex(ConversionError, "行号无效或重复"):
+            convert_release(self.registry, release)
+
+    def test_all_three_frozen_parser_versions_must_match_and_be_supported(self):
+        for field in ("registration", "canonical", "manifest"):
+            for version in (1, 3, True):
+                with self.subTest(field=field, version=version):
+                    release = self.release(f"rel_version_{field}_{version}",
+                        headers=["trajectory_id", "action", "数据来源"],
+                        rows=[["a", '{"action":"click"}', "修正内化"]])
+                    if field == "registration":
+                        release["external_import"]["parser_version"] = version
+                    else:
+                        self.update_json(release, field, lambda value: value.update(parser_version=version))
+                    with self.assertRaises(ConversionError):
+                        convert_release(self.registry, release)
 
     def test_all_frozen_files_require_matching_hashes(self):
         release = self.release()

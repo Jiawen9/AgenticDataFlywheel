@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -47,13 +48,20 @@ class ExternalDatasetImportTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def workbook(self, *, title="完整步骤", style=False, identity="tr-one", auxiliary=False):
+    def workbook(self, *, title="完整步骤", style=False, identity="tr-one", auxiliary=False, step_sources=None):
         workbook = Workbook()
         sheet = workbook.active
         sheet.title = title
-        sheet.append(["trajectory_id", "image", "actions", "sop", "APP", "一级场景", "二级场景"])
-        sheet.append([identity, "arbitrary/step001.jpg", '{"action":"click"}', "点击", "表内App", "业务", "查询"])
-        sheet.append([identity, "arbitrary/step002.jpg", '{"action":"finish"}', "结束", "", "", ""])
+        headers = ["trajectory_id", "image", "actions", "sop", "APP", "一级场景", "二级场景"]
+        rows = [[identity, "arbitrary/step001.jpg", '{"action":"click"}', "点击", "表内App", "业务", "查询"],
+                [identity, "arbitrary/step002.jpg", '{"action":"finish"}', "结束", "", "", ""]]
+        if step_sources is not None:
+            headers.append("数据来源")
+            for row, source in zip(rows, step_sources):
+                row.append(source)
+        sheet.append(headers)
+        for row in rows:
+            sheet.append(row)
         if style:
             sheet["A1"].font = Font(bold=True)
         if auxiliary:
@@ -115,6 +123,74 @@ class ExternalDatasetImportTests(unittest.TestCase):
         with self.assertRaises(ImportFailure) as caught:
             self.publish(preview, name="different", request_id="once")
         self.assertEqual(caught.exception.detail["code"], "idempotency_conflict")
+
+    def test_v2_publication_freezes_manual_counts_and_preserves_original_and_deduplication(self):
+        workbook = self.workbook(step_sources=[" 修正内化 ", "经验内化"])
+        preview = self.preview(workbook, data_source="修正内化")
+        self.assertEqual(preview["summary"]["manual_refine_steps"], 1)
+        self.assertEqual(preview["summary"]["manual_known_steps"], 2)
+        release = self.publish(preview)
+        self.assertEqual(release["external_import"]["parser_version"], 2)
+        for field in ("canonical", "manifest"):
+            path = self.registry.resolve_project_path(release["external_import"][field]["path"])
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["parser_version"], 2)
+        path, _ = self.registry.excel_file(release["release_id"], 0)
+        self.assertEqual(path.read_bytes(), workbook)
+        row, = convert_release(self.registry, release)["rows"]
+        self.assertEqual((row["人工精修步骤数量"], row["step数量"], row["manual_known"]), (1, 2, True))
+        self.assertEqual(row["生产方式"], "修正内化")
+        self.assertEqual(row["manual_refined_excel_rows"], [2])
+        repeat = self.preview(workbook, data_source="修正内化")
+        self.assertEqual(self.publish(repeat)["release_id"], release["release_id"])
+        resaved = self.preview(self.workbook(title="另存表", style=True,
+            step_sources=[" 修正内化 ", "经验内化"]), data_source="修正内化")
+        self.assertEqual(self.publish(resaved)["release_id"], release["release_id"])
+        self.assertEqual(len(self.registry.list_releases()), 1)
+        self.assertEqual(path.read_bytes(), workbook)
+
+    def test_legacy_frozen_preview_with_source_column_stays_v1_and_original_reupload_reuses_it(self):
+        workbook = self.workbook(step_sources=["修正内化", "经验内化"])
+        # Emulate the old parser when this column was still an opaque extra cell.
+        with patch("backend.training_data_overview.external_workbook.PARSER_VERSION", 1):
+            preview = self.preview(workbook)
+        self.assertNotIn("manual_refine_steps", preview["summary"])
+        record = self.records.get(IMPORTS, preview["import_id"])
+        canonical_path = self.importer._directory(preview["import_id"]) / "canonical.json"
+        frozen = canonical_path.read_bytes()
+        self.assertEqual(json.loads(frozen)["parser_version"], 1)
+        # Journals already validated by the original importer have no version field.
+        def remove_parser_version(value):
+            value.pop("parser_version")
+
+        self.records.update(IMPORTS, preview["import_id"], remove_parser_version)
+        with patch("backend.training_data_overview.external_workbook.parse_external_workbook", side_effect=AssertionError("reparse")):
+            release = self.publish(preview)
+        self.assertEqual(release["external_import"]["parser_version"], 1)
+        published = self.registry.resolve_project_path(release["external_import"]["canonical"]["path"])
+        self.assertEqual(published.read_bytes(), frozen)
+        row, = convert_release(self.registry, release)["rows"]
+        self.assertIsNone(row["人工精修步骤数量"])
+        self.assertFalse(row["manual_known"])
+        self.assertNotIn("manual_record_source", row)
+        repeat = self.preview(workbook)
+        self.assertEqual(repeat["summary"]["manual_refine_steps"], 1)
+        self.assertEqual(repeat["duplicate_release"]["release_id"], release["release_id"])
+        self.assertEqual(self.publish(repeat)["release_id"], release["release_id"])
+        self.assertEqual(len(self.registry.list_releases()), 1)
+        self.assertEqual(published.read_bytes(), frozen)
+        path, _ = self.registry.excel_file(release["release_id"], 0)
+        self.assertEqual(path.read_bytes(), workbook)
+        self.assertEqual(self.registry.get(release["release_id"])["external_import"]["parser_version"], 1)
+
+    def test_frozen_preview_version_mismatch_is_rejected(self):
+        for version in (1, 3, True):
+            with self.subTest(version=version):
+                preview = self.preview(self.workbook(step_sources=["修正内化", None]))
+                self.records.update(IMPORTS, preview["import_id"], lambda value: value.update(parser_version=version))
+                with self.assertRaises(ImportFailure) as caught:
+                    self.publish(preview)
+                self.assertEqual(caught.exception.detail["code"], "import_changed")
+        self.assertEqual(self.registry.list_releases(), [])
 
     def test_renamed_sheet_and_style_only_changes_reuse_normalized_result(self):
         original = self.publish(self.preview())

@@ -277,11 +277,12 @@ def _external_frozen_file(registry: Any, release_id: str, reference: dict, label
 
 def _convert_external_release(registry: Any, release: dict, release_id: str) -> dict:
     """Use the frozen parser result; never infer external provenance from sessions."""
-    from .external_workbook import METADATA_FIELDS, PARSER_VERSION
+    from .external_workbook import METADATA_FIELDS, SUPPORTED_PARSER_VERSIONS, MANUAL_RECORD_SOURCE
 
     try:
         imported = release.get("external_import")
-        if not isinstance(imported, dict) or imported.get("parser_version") != PARSER_VERSION:
+        parser_version = imported.get("parser_version") if isinstance(imported, dict) else None
+        if type(parser_version) is not int or parser_version not in SUPPORTED_PARSER_VERSIONS:
             raise ConversionError("外部发布缺少受支持的导入记录")
         metadata = {key: imported.get(key) for key in METADATA_FIELDS}
         if any(not isinstance(value, str) for value in metadata.values()):
@@ -307,7 +308,8 @@ def _convert_external_release(registry: Any, release: dict, release_id: str) -> 
         if not isinstance(canonical, dict) or not isinstance(manifest, dict):
             raise ConversionError("外部规范化数据或导入清单格式无效")
         for value in (canonical, manifest):
-            if value.get("schema_version") != 1 or value.get("parser_version") != PARSER_VERSION:
+            if (value.get("schema_version") != 1 or type(value.get("parser_version")) is not int
+                    or value["parser_version"] != parser_version):
                 raise ConversionError("外部规范化数据或导入清单版本无效")
             if value.get("metadata") != metadata:
                 raise ConversionError("外部导入元数据与冻结文件不一致")
@@ -326,7 +328,7 @@ def _convert_external_release(registry: Any, release: dict, release_id: str) -> 
         rows = canonical.get("rows")
         if not isinstance(rows, list) or not rows:
             raise ConversionError("外部规范化数据没有可统计的轨迹")
-        result, identities = [], set()
+        result, identities, refined_excel_rows = [], set(), set()
         for row in rows:
             if not isinstance(row, dict):
                 raise ConversionError("外部规范化轨迹格式无效")
@@ -338,9 +340,27 @@ def _convert_external_release(registry: Any, release: dict, release_id: str) -> 
                     or any(not isinstance(key, str) or not key or type(value) is not int or value < 1
                            for key, value in actions.items()) or sum(actions.values()) != steps):
                 raise ConversionError("外部规范化轨迹的步骤或动作数量无效")
-            if (row.get("时间") != metadata["data_date"] or row.get("生产方式") != metadata["data_source"]
-                    or row.get("人工精修步骤数量") is not None or row.get("manual_known") is not False):
+            if row.get("时间") != metadata["data_date"] or row.get("生产方式") != metadata["data_source"]:
                 raise ConversionError("外部规范化轨迹的日期、来源或精修信息不一致")
+            if parser_version == 1:
+                if row.get("人工精修步骤数量") is not None or row.get("manual_known") is not False:
+                    raise ConversionError("外部规范化轨迹的日期、来源或精修信息不一致")
+            else:
+                known, unknown = row.get("manual_known_steps"), row.get("manual_unknown_steps")
+                refined, excel_rows = row.get("人工精修步骤数量"), row.get("manual_refined_excel_rows")
+                if (row.get("manual_record_source") != MANUAL_RECORD_SOURCE
+                        or type(known) is not int or type(unknown) is not int
+                        or known < 0 or unknown < 0 or known + unknown != steps
+                        or row.get("manual_known") is not (unknown == 0)
+                        or (known == 0 and refined is not None)
+                        or (known > 0 and (type(refined) is not int or not 0 <= refined <= known))):
+                    raise ConversionError("外部规范化轨迹的人工修正数量或来源无效")
+                if (not isinstance(excel_rows, list) or len(excel_rows) != (refined or 0)
+                        or any(type(index) is not int or not 2 <= index <= 1048576 for index in excel_rows)
+                        or len(set(excel_rows)) != len(excel_rows)
+                        or refined_excel_rows.intersection(excel_rows)):
+                    raise ConversionError("外部规范化轨迹的人工修正源行号无效或重复")
+                refined_excel_rows.update(excel_rows)
             for field, known in (("APP", "app_known"), ("一级场景", "level1_known"), ("二级场景", "level2_known")):
                 value = row.get(field)
                 if not isinstance(value, str) or not value or row.get(known) is not _classification_known(value):
