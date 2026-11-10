@@ -15,7 +15,7 @@ vi.mock('@/composables/useFactoryPolling', () => ({ useFactoryPolling: () => ({ 
 
 const sampling: FactoryConfig = { sampling_enabled: true, temperature: 0.35, top_p: 0.8, use_experience_lib: false, capture_logprobs: true }
 const capabilities: AgentCapabilities = {
-  newagent: { available: true, collection: true, repeat_times: true, max_repeat_times: 100, capture_logprobs: true, model_iteration_evaluation: true, offline_evaluation: true },
+  newagent: { available: true, collection: true, repeat_times: true, max_repeat_times: 100, capture_logprobs: true, model_iteration_evaluation: true, offline_evaluation: true, model_overrides: true },
   pipelineagent: { available: true, collection: true, repeat_times: true, max_repeat_times: 100, capture_logprobs: true, model_iteration_evaluation: true, offline_evaluation: true, model_overrides: true },
 }
 const defaults = (suffix = 'saved') => ({ vla: `http://execution-${suffix}.invalid/v1`, execution_model: `vla-${suffix}`, planner_config: { base_url: `http://planner-${suffix}.invalid/v1`, model: `planner-${suffix}`, api_key_env: 'PLANNER_API_KEY' } })
@@ -24,7 +24,7 @@ const source = (): FactoryBatchDetail => ({ schema_version: 1, batch_id: 'entryp
 const factoryState = (): FactoryState => ({ phones: ['phone-1'], apps: ['AppA'], phoneApps: [{ phone_id: 'phone-1', app: 'AppA', status: '空闲' }], vla: ['http://legacy-execution.invalid/v1'], tasks: [{ description: '采集任务', filename: 'source.xlsx', source_batch_id: source().batch_id, status: '未运行' }] })
 const cleanConfig = (value: unknown) => {
   expect(value).toEqual(sampling)
-  for (const key of ['agent_type', 'model_defaults', 'planner_config', 'execution_model', 'vla', 'repeat_times']) expect(value).not.toHaveProperty(key)
+  for (const key of ['agent_type', 'model_defaults', 'newagent_model_defaults', 'planner_config', 'execution_model', 'vla', 'repeat_times']) expect(value).not.toHaveProperty(key)
 }
 
 beforeEach(() => {
@@ -200,5 +200,140 @@ describe('pipeline model configuration across platform entrypoints', () => {
     expect(request.repeat_times).toBe(3)
     expect(request.agent_type).toBe('newagent'); expect(request).not.toHaveProperty('execution_model'); expect(request).not.toHaveProperty('planner_config')
     cleanConfig(request.config)
+  })
+
+  it.each(['generate', 'modeliter'] as const)('uses isolated NewAgent defaults for %s and freezes requests independently of later edits', async mode => {
+    const factory = mode === 'generate' ? phoneFactoryApi : modelIterationApi
+    const saved: FactorySettings = { ...settings(mode), agent_type: 'newagent', newagent_model_defaults: { execution_model: `newagent-${mode}` } }
+    vi.mocked(factory.config).mockResolvedValue(saved)
+    const view = await render('factory', mode)
+    expect(view.models.execution_model).toBe(`vla-${mode}`)
+    expect(view.activeModels.execution_model).toBe(`newagent-${mode}`)
+    expect(view.newVla).toBe(factoryState().vla[0])
+    cleanConfig(view.config)
+    if (mode === 'modeliter') {
+      view.evaluationReady = true
+      view.evaluationProfile = { id: 'rules-v1', digest: 'rules-hash' }
+      view.evaluatorConfig = { text: { base_url: 'http://text.invalid/v1', model: 'text', api_key_env: 'TEXT_KEY' }, vision: { base_url: 'http://vision.invalid/v1', model: 'vision', api_key_env: 'VISION_KEY' } }
+    }
+    const send = vi.mocked(factory.remoteStartRun)
+    send.mockRejectedValueOnce(new Error('acknowledgement lost'))
+    await view.handleStartTask(factoryState().tasks[0])
+    const first = send.mock.calls[0]![0]
+    expect(first).toMatchObject({ agent_type: 'newagent', execution_model: `newagent-${mode}`, repeat_times: mode === 'generate' ? 3 : 1 })
+    expect(first).not.toHaveProperty('planner_config')
+    cleanConfig(first.config)
+    await view.handleStartTask(factoryState().tasks[0])
+    expect(send.mock.calls[1]![0].request_id).toBe(first.request_id)
+    view.newagentModels.execution_model = 'changed-newagent'
+    await view.handleStartTask(factoryState().tasks[0])
+    expect(send.mock.calls[2]![0].execution_model).toBe('changed-newagent')
+    expect(send.mock.calls[2]![0].request_id).not.toBe(first.request_id)
+    expect(first.execution_model).toBe(`newagent-${mode}`)
+    view.agentType = 'pipelineagent'
+    expect(view.activeModels.execution_model).toBe(`vla-${mode}`)
+    view.agentType = 'newagent'
+    expect(view.activeModels.execution_model).toBe('changed-newagent')
+  })
+
+  it('keeps custom NewAgent edits isolated from Pipeline and the next ordinary run', async () => {
+    vi.mocked(phoneFactoryApi.config).mockResolvedValue({ ...settings(), agent_type: 'newagent', newagent_model_defaults: { execution_model: 'newagent-default' } })
+    const view = await render('factory')
+    view.openCustomRun(factoryState().phoneApps[0])
+    expect(view.activeRunModels.execution_model).toBe('newagent-default')
+    view.runDialogNewagentModels.execution_model = 'custom-newagent'
+    view.runDialogAgentType = 'pipelineagent'
+    expect(view.activeRunModels.execution_model).toBe('vla-saved')
+    view.runDialogAgentType = 'newagent'
+    expect(view.activeRunModels.execution_model).toBe('custom-newagent')
+    view.runDialogTaskKey = `batch:${source().batch_id}`
+    await view.confirmRun()
+    const send = vi.mocked(phoneFactoryApi.remoteStartRun)
+    expect(send.mock.calls[0]![0]).toMatchObject({ agent_type: 'newagent', execution_model: 'custom-newagent' })
+    expect(send.mock.calls[0]![0]).not.toHaveProperty('planner_config')
+    await view.handleStartTask(factoryState().tasks[0])
+    expect(send.mock.calls[1]![0].execution_model).toBe('newagent-default')
+    expect(view.models.execution_model).toBe('vla-saved')
+  })
+
+  it.each(['generate', 'modeliter'] as const)('saves %s NewAgent defaults without overwriting retained unsaved Pipeline drafts', async mode => {
+    const factory = mode === 'generate' ? phoneFactoryApi : modelIterationApi
+    const saved: FactorySettings = { ...settings(mode), agent_type: 'newagent', newagent_model_defaults: { execution_model: 'saved-newagent' } }
+    vi.mocked(factory.config).mockResolvedValue(saved)
+    const view = await render('factory', mode)
+    view.models.execution_model = 'unsaved-pipeline'
+    view.newagentModels.execution_model = 'new-default'
+    const fetch = vi.fn(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as FactorySettings
+      return { ok: true, json: async () => ({ ...saved, ...body }) }
+    })
+    vi.stubGlobal('fetch', fetch)
+    await view.handleConfigChange()
+    expect(JSON.parse(String(fetch.mock.calls[0]![1].body))).not.toHaveProperty('newagent_model_defaults')
+    expect(view.newagentModels.execution_model).toBe('new-default')
+    await view.saveModelDefaults()
+    const body = JSON.parse(String(fetch.mock.calls[1]![1].body))
+    expect(fetch.mock.calls[1]![0]).toBe(mode === 'generate' ? '/api/phone-factory/config' : '/api/model-iter/config')
+    expect(body.newagent_model_defaults).toEqual({ execution_model: 'new-default' })
+    expect(body).not.toHaveProperty('model_defaults')
+    expect(body).not.toHaveProperty('execution_model')
+    expect(view.models.execution_model).toBe('unsaved-pipeline')
+    expect(view.newagentModels.execution_model).toBe('new-default')
+    cleanConfig(view.config)
+    view.agentType = 'pipelineagent'
+    view.newagentModels.execution_model = 'another-unsaved-newagent'
+    await view.saveModelDefaults()
+    expect(JSON.parse(String(fetch.mock.calls[2]![1].body))).not.toHaveProperty('newagent_model_defaults')
+    expect(view.newagentModels.execution_model).toBe('another-unsaved-newagent')
+  })
+
+  it('freezes NewAgent automatic collection defaults while existing-data workflows remain free of model overrides', async () => {
+    vi.mocked(phoneFactoryApi.config).mockResolvedValue({ ...settings(), agent_type: 'newagent', newagent_model_defaults: { execution_model: 'auto-newagent' } })
+    const create = vi.spyOn(api, 'createPipeline').mockResolvedValue({ pipeline_id: 'created', batch_id: 'result' } as never)
+    const view = await render('pipeline')
+    await view.loadChoices()
+    expect(view.draft).not.toHaveProperty('newagent_model_defaults')
+    expect(view.activeModels.execution_model).toBe('auto-newagent')
+    expect(view.draft.vla).toBe(factoryState().vla[0])
+    view.newagentModels.execution_model = 'frozen-newagent'
+    await view.loadChoices(false)
+    expect(view.newagentModels.execution_model).toBe('frozen-newagent')
+    Object.assign(view.draft, { name: 'newagent auto', mode: 'automatic', start_mode: 'collect', batch_id: source().batch_id })
+    await nextTick(); await view.create()
+    const first = create.mock.calls[0]![0]
+    expect(first.collection_config).toMatchObject({ agent_type: 'newagent', execution_model: 'frozen-newagent' })
+    expect(first.collection_config).not.toHaveProperty('planner_config')
+    cleanConfig(first.collection_config!.config)
+    view.newagentModels.execution_model = 'later'
+    expect(first.collection_config!.execution_model).toBe('frozen-newagent')
+    view.draft.agent_type = 'pipelineagent'
+    expect(view.activeModels.execution_model).toBe('vla-saved')
+    Object.assign(view.draft, { start_mode: 'existing', batch_id: 'ready-result' })
+    await nextTick(); await view.create()
+    expect(create.mock.calls[1]![0]).not.toHaveProperty('collection_config')
+  })
+
+  it('blocks unsupported NewAgent overrides before ordinary, custom and automatic dispatch but allows blank legacy defaults', async () => {
+    vi.mocked(phoneFactoryApi.config).mockResolvedValue({ ...settings(), agent_type: 'newagent', newagent_model_defaults: { execution_model: 'explicit-id' } })
+    vi.mocked(phoneFactoryApi.agentCapabilities).mockResolvedValue({ ok: true, agent_types: { ...capabilities, newagent: { ...capabilities.newagent!, model_overrides: false } } })
+    const view = await render('factory')
+    expect(view.agentIssue).toContain('NewAgent')
+    await view.handleStartTask(factoryState().tasks[0])
+    expect(phoneFactoryApi.remoteStartRun).not.toHaveBeenCalled()
+    view.openCustomRun(factoryState().phoneApps[0])
+    view.runDialogTaskKey = `batch:${source().batch_id}`
+    await view.confirmRun()
+    expect(phoneFactoryApi.remoteStartRun).not.toHaveBeenCalled()
+    view.runDialogVisible = false
+    view.newagentModels.execution_model = ''
+    await view.handleStartTask(factoryState().tasks[0])
+    expect(vi.mocked(phoneFactoryApi.remoteStartRun).mock.calls[0]![0]).not.toHaveProperty('execution_model')
+    const create = vi.spyOn(api, 'createPipeline').mockResolvedValue({ pipeline_id: 'created', batch_id: 'result' } as never)
+    const pipeline = await render('pipeline')
+    await pipeline.loadChoices()
+    Object.assign(pipeline.draft, { name: 'blocked', mode: 'automatic', start_mode: 'collect', batch_id: source().batch_id })
+    await nextTick(); await pipeline.create()
+    expect(pipeline.createError).toContain('NewAgent')
+    expect(create).not.toHaveBeenCalled()
   })
 })

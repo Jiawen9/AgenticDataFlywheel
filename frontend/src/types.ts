@@ -360,6 +360,9 @@ export interface CorrectionBatch {
 
 export interface CorrectionRow {
   agent_type?: string
+  coordinate_info?: CoordinateInfo
+  coordinate_info_version?: number
+  coordinate_info_revision?: number
   step_key?: string
   excel_row: number
   step: number

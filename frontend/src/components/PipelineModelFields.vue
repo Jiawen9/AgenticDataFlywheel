@@ -5,7 +5,7 @@
       <p>使用上方 VLA 接口；模型名留空时沿用采集端配置。</p>
       <label>执行模型名<el-input :model-value="modelValue.execution_model" :disabled="disabled" placeholder="服务实际提供的模型名（可留空）" data-testid="execution-model" @update:model-value="update('execution_model', $event)" /></label>
     </fieldset>
-    <fieldset>
+    <fieldset v-if="agentType === 'pipelineagent'">
       <legend>规划模型</legend>
       <el-radio-group :model-value="modelValue.planner_custom" :disabled="disabled" data-testid="planner-mode" @update:model-value="update('planner_custom', Boolean($event))">
         <el-radio :value="false">沿用采集端</el-radio><el-radio :value="true">自定义</el-radio>
@@ -21,7 +21,8 @@
 </template>
 <script setup lang="ts">
 import type { PipelineModelDraft } from '@/utils/pipelineModels'
-const props = defineProps<{ modelValue: PipelineModelDraft; disabled?: boolean }>()
+import type { AgentType } from '@/phoneFactoryApi'
+const props = withDefaults(defineProps<{ modelValue: PipelineModelDraft; disabled?: boolean; agentType?: AgentType }>(), { agentType: 'pipelineagent' })
 const emit = defineEmits<{ 'update:modelValue': [value: PipelineModelDraft] }>()
 function update<K extends keyof PipelineModelDraft>(key: K, value: PipelineModelDraft[K]) { emit('update:modelValue', { ...props.modelValue, [key]: value }) }
 </script>

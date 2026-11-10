@@ -1,4 +1,4 @@
-"""Public PipelineAgent model overrides, independent of sampling and evaluator settings."""
+"""Collection execution models and Pipeline planner overrides, separate from sampling."""
 from __future__ import annotations
 
 import re
@@ -9,6 +9,16 @@ MODEL_OVERRIDE_FIELDS = ("execution_model", "planner_config")
 
 def default_models():
     return {"vla": "", "execution_model": "", "planner_config": None}
+
+
+def newagent_default_models():
+    return {"execution_model": ""}
+
+
+def normalize_newagent_defaults(value):
+    if not isinstance(value, dict) or set(value) - {"execution_model"}:
+        raise ValueError("NewAgent 模型默认配置只接受 execution_model")
+    return {"execution_model": model_name(value.get("execution_model", ""), "执行模型名")}
 
 
 def model_name(value, label):
@@ -69,6 +79,6 @@ def normalize_overrides(data, agent_type):
         result["execution_model"] = execution
     if planner is not None:
         result["planner_config"] = planner
-    if result and agent_type != "pipelineagent":
-        raise ValueError("执行模型名和规划模型覆盖配置仅支持 PipelineAgent")
+    if planner is not None and agent_type != "pipelineagent":
+        raise ValueError("规划模型覆盖配置仅支持 PipelineAgent")
     return result

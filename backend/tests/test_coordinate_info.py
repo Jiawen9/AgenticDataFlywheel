@@ -1,5 +1,6 @@
 """Small real-image fixtures; no device, model, or production data access."""
 from copy import deepcopy
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
@@ -148,8 +149,90 @@ class CoordinateEvidenceTests(unittest.TestCase):
         result = service.patch_row(self.sid, 2, {"actions": json.dumps(self.action, separators=(",", ":")), "sop": "edited", "expected_revision": revision})
         self.assertEqual(result["row"]["actions"], original)
         self.assertNotIn("actions", draft_store.load_session(self.sid)["row_edits"]["2"])
+        self.assertEqual(result["row"]["coordinate_info"]["space"], "pixel")
+        self.assertEqual(result["row"]["coordinate_info_revision"], result["storage_revision"])
+        self.assertEqual(result["group"]["storage_revision"], result["storage_revision"])
         with self.assertRaises(RevisionConflict):
             service.get_row_coordinate_info(self.sid, 2, revision)
+
+    def test_existing_group_route_embeds_only_selected_rows_outside_lock(self):
+        session = self.create_session()
+        group_id = self.snapshot["groups"][0]["group_id"]
+        # A legacy workbook value must not be copied as if already verified.
+        session["snapshot_payload"]["groups"][0]["rows"][0]["coordinate_info"] = '{"space":"normalized"}'
+        other = deepcopy(session["snapshot_payload"]["groups"][0])
+        other["group_id"] = "not-opened"
+        other["meta_task"] = "other-trajectory"
+        other["rows"][0]["excel_row"] = 3
+        other["rows"][0]["meta_task"] = "other-trajectory"
+        other["rows"][0]["image"] = "task/other-trajectory/step001_vla_input.jpg"
+        session["snapshot_payload"]["groups"].append(other)
+        session = draft_store.save_session(session)
+        lock_depth = 0
+        original_lock = service.active_session_lock
+        @contextmanager
+        def tracked_lock(sid):
+            nonlocal lock_depth
+            with original_lock(sid) as current:
+                lock_depth += 1
+                try:
+                    yield current
+                finally:
+                    lock_depth -= 1
+        original_resolve = service.resolve_coordinate_info
+        def resolve(*args, **kwargs):
+            self.assertEqual(lock_depth, 0, "image/evidence I/O held the batch lock")
+            return original_resolve(*args, **kwargs)
+        with patch.object(service, "active_session_lock", tracked_lock), patch.object(service, "resolve_coordinate_info", side_effect=resolve) as called:
+            result = service.get_group(self.sid, group_id)
+            self.assertEqual(called.call_count, 1)
+        self.assertEqual(result["storage_revision"], session["storage_revision"])
+        row = result["rows"][0]
+        self.assertEqual(row["coordinate_info"]["space"], "pixel")
+        self.assertEqual(row["coordinate_info_version"], 1)
+        self.assertEqual(row["coordinate_info_revision"], result["storage_revision"])
+        with patch.object(service, "resolve_coordinate_info") as called:
+            service.get_groups(self.sid)
+            service.get_cot(self.sid)
+            called.assert_not_called()
+
+    def test_group_rejects_revision_changed_while_evidence_is_read(self):
+        self.create_session()
+        group_id = self.snapshot["groups"][0]["group_id"]
+        original = service.resolve_coordinate_info
+        def changed(*args, **kwargs):
+            current = draft_store.load_session(self.sid)
+            draft_store.save_session(current)
+            return original(*args, **kwargs)
+        with patch.object(service, "resolve_coordinate_info", side_effect=changed):
+            with self.assertRaises(RevisionConflict):
+                service.get_group(self.sid, group_id)
+
+    def test_group_missing_source_keeps_text_and_does_not_authorize_coordinates(self):
+        self.create_session()
+        group_id = self.snapshot["groups"][0]["group_id"]
+        with patch.object(service, "_source_for_session", side_effect=FileNotFoundError("source removed")):
+            result = service.get_group(self.sid, group_id)
+            self.assertEqual(result["rows"][0]["coordinate_info"]["space"], "unknown")
+            saved = service.patch_row(self.sid, 2, {"sop": "text still saved"})
+            self.assertEqual(saved["row"]["sop"], "text still saved")
+            self.assertEqual(saved["row"]["coordinate_info"]["space"], "unknown")
+            with self.assertRaisesRegex(ValueError, "坐标来源"):
+                service.patch_row(self.sid, 2, {"actions": '{"action":"click","coordinate":[20,30]}'})
+
+    def test_patch_coordinate_reads_are_unlocked_and_late_edits_do_not_fail_save(self):
+        self.create_session()
+        original = service.resolve_coordinate_info
+        def changed(*args, **kwargs):
+            current = draft_store.load_session(self.sid)
+            current["row_edits"]["2"]["sop"] = "newer text"
+            draft_store.save_session(current)
+            return original(*args, **kwargs)
+        with patch.object(service, "resolve_coordinate_info", side_effect=changed):
+            result = service.patch_row(self.sid, 2, {"sop": "saved text"})
+        self.assertEqual(result["row"]["sop"], "saved text")
+        self.assertEqual(result["row"]["coordinate_info"]["reason"], "session_changed_reload_required")
+        self.assertEqual(draft_store.load_session(self.sid)["row_edits"]["2"]["sop"], "newer text")
 
     def test_unknown_blocks_only_coordinate_changes(self):
         self.create_session()
@@ -225,4 +308,26 @@ class CoordinateEvidenceTests(unittest.TestCase):
             response = client.get(url, params={"expected_revision": session["storage_revision"]})
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(client.get(url, params={"expected_revision": -1}).status_code, 409)
+
+    def test_existing_task_http_route_works_when_new_coordinate_route_is_unavailable(self):
+        from fastapi.responses import HTMLResponse
+        session = self.create_session()
+        app = FastAPI()
+        app.include_router(router)
+        @app.middleware("http")
+        async def old_gateway(request, call_next):
+            if request.url.path.endswith("/coordinate-info"):
+                return HTMLResponse("<html>Not Found</html>", status_code=404)
+            return await call_next(request)
+        with TestClient(app) as client:
+            self.assertEqual(client.get(f"/api/correction/sessions/{self.sid}/rows/2/coordinate-info").status_code, 404)
+            group_id = self.snapshot["groups"][0]["group_id"]
+            response = client.get(f"/api/correction/sessions/{self.sid}/tasks/{group_id}")
+            self.assertEqual(response.status_code, 200, response.text)
+            group = response.json()["group"]
+            self.assertEqual(group["storage_revision"], session["storage_revision"])
+            self.assertEqual(group["rows"][0]["coordinate_info"]["width"], 2160)
+            saved = client.patch(f"/api/correction/sessions/{self.sid}/rows/2", json={"sop": "text", "expected_revision": group["storage_revision"]})
+            self.assertEqual(saved.status_code, 200, saved.text)
+            self.assertEqual(saved.json()["row"]["coordinate_info"]["space"], "pixel")
 

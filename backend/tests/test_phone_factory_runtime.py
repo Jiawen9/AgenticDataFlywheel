@@ -110,7 +110,7 @@ class FactoryRuntimeTests(unittest.TestCase):
                 self.assertIn('--sampling', args)
                 self.assertEqual(args[args.index('--temperature') + 1], '0.35')
                 self.assertEqual(args[args.index('--top-p') + 1], '0.75')
-                self.assertEqual(store.config(), {**config, "agent_type": "newagent", "repeat_times": 1, "model_defaults": default_models()})
+                self.assertEqual(store.config(), {**config, "agent_type": "newagent", "repeat_times": 1, "model_defaults": default_models(), "newagent_model_defaults": {"execution_model": ""}})
 
     def test_invalid_logprob_override_is_rejected_before_dispatch(self):
         self.store.add_task(self.upload)
