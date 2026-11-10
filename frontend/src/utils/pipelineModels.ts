@@ -8,7 +8,7 @@ export interface PipelineModelDraft {
   planner_api_key_env: string
 }
 
-export function modelDraft(defaults?: PipelineModelDefaults): PipelineModelDraft {
+export function modelDraft(defaults?: Partial<PipelineModelDefaults>): PipelineModelDraft {
   return {
     execution_model: defaults?.execution_model || '',
     planner_custom: Boolean(defaults?.planner_config),
@@ -18,7 +18,9 @@ export function modelDraft(defaults?: PipelineModelDefaults): PipelineModelDraft
   }
 }
 
-export function modelValidationIssue(draft: PipelineModelDraft): string {
+export function modelValidationIssue(draft: PipelineModelDraft, agent: AgentType = 'pipelineagent'): string {
+  if (/[\u0000-\u001f]/.test(draft.execution_model)) return '执行模型名不能包含控制字符'
+  if (agent !== 'pipelineagent') return ''
   if (!draft.planner_custom) return ''
   if (!draft.planner_base_url.trim() || !draft.planner_model.trim()) return '请同时填写规划模型的接口地址和模型名'
   try {
@@ -32,12 +34,11 @@ export function modelValidationIssue(draft: PipelineModelDraft): string {
 }
 
 export function modelOptions(agent: AgentType, draft: PipelineModelDraft): ModelOverrides {
-  if (agent !== 'pipelineagent') return {}
-  const issue = modelValidationIssue(draft)
+  const issue = modelValidationIssue(draft, agent)
   if (issue) throw new Error(issue)
   return {
     ...(draft.execution_model.trim() ? { execution_model: draft.execution_model.trim() } : {}),
-    ...(draft.planner_custom ? { planner_config: {
+    ...(agent === 'pipelineagent' && draft.planner_custom ? { planner_config: {
       base_url: draft.planner_base_url.trim(), model: draft.planner_model.trim(),
       ...(draft.planner_api_key_env.trim() ? { api_key_env: draft.planner_api_key_env.trim() } : {}),
     } } : {}),
@@ -50,9 +51,8 @@ export function modelDefaults(vla: string, draft: PipelineModelDraft): PipelineM
 }
 
 export function modelBlockedReason(capabilities: AgentCapabilities | null, agent: AgentType, draft: PipelineModelDraft): string {
-  if (agent !== 'pipelineagent') return ''
-  const issue = modelValidationIssue(draft)
+  const issue = modelValidationIssue(draft, agent)
   if (issue) return issue
-  if ((draft.execution_model.trim() || draft.planner_custom) && !capabilities?.pipelineagent?.model_overrides) return '采集端尚未声明模型覆盖能力，请升级 9011 与内置 PipelineAgent 后刷新引擎'
+  if ((draft.execution_model.trim() || (agent === 'pipelineagent' && draft.planner_custom)) && !capabilities?.[agent]?.model_overrides) return `采集端尚未声明 ${agent === 'newagent' ? 'NewAgent' : 'PipelineAgent'} 模型覆盖能力，请升级采集端后刷新引擎`
   return ''
 }

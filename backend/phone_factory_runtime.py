@@ -522,11 +522,12 @@ class FactoryRuntime:
             remote = self.store._remote_result(["capabilities"])
         except PhoneFactoryError:
             if (agent_type == "newagent" and not require_batch_protocol
-                    and options.get("repeat_times", 1) == 1 and not options.get("collection_artifacts_version")):
+                    and options.get("repeat_times", 1) == 1 and not options.get("collection_artifacts_version")
+                    and not any(key in options for key in MODEL_OVERRIDE_FIELDS)):
                 return  # Preserve the established legacy newagent transport.
             if require_batch_protocol:
                 raise
-            raise PhoneFactoryError("无法确认 PipelineAgent 能力，请检查并升级采集电脑", 409)
+            raise PhoneFactoryError(f"无法确认 {agent_type} 能力，请检查并升级采集电脑", 409)
         if (agent_type == "pipelineagent" or require_batch_protocol) and (remote.get("protocol_version") != 1 or remote.get("batch_results") is not True):
             raise PhoneFactoryError("独立结果采集需要支持批次回传的采集服务，请升级采集电脑", 409)
         capability = engine_capabilities(remote).get(agent_type, {})
@@ -545,7 +546,7 @@ class FactoryRuntime:
         if capability.get("available") is not True or capability.get("collection") is not True:
             raise PhoneFactoryError(capability.get("reason") or f"采集电脑不支持 {agent_type}", 409)
         if any(key in options for key in MODEL_OVERRIDE_FIELDS) and capability.get("model_overrides") is not True:
-            raise PhoneFactoryError("采集电脑尚不支持 PipelineAgent 模型覆盖配置，请先升级采集端", 409)
+            raise PhoneFactoryError(f"采集电脑尚不支持 {agent_type} 模型覆盖配置，请先升级采集端", 409)
         if options["config"]["capture_logprobs"] and capability.get("capture_logprobs") is not True:
             raise PhoneFactoryError(f"{agent_type} 尚不支持 Logprobs 采集", 409)
         if options["run_mode"] == "modeliter" and capability.get("model_iteration_evaluation") is not True:

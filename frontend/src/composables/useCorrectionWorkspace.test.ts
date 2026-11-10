@@ -223,6 +223,86 @@ describe('correction task list and protected workbench', () => {
 
 
 describe('current batch correction reviews', () => {
+  it('binds cached group details to the session revision and adopts fresh detail revision', async () => {
+    const { ws, api, groups, saved } = fixture()
+    ws.setSession({ ...saved, storage_revision: 7 })
+    groups.forEach(group => { group.storage_revision = 7 })
+    await ws.toggleTrajectory('group_0')
+    await ws.toggleTrajectory('group_1')
+    ws.session.value!.storage_revision = 8
+    groups[0]!.storage_revision = 8
+    groups[0]!.rows[0]!.sop = 'fresh text'
+    await ws.toggleTrajectory('group_0')
+    expect(api.correctionGroup).toHaveBeenCalledTimes(3)
+    expect(ws.activeRow.value!.sop).toBe('fresh text')
+    groups[2]!.storage_revision = 9
+    await ws.toggleTrajectory('group_2')
+    expect(ws.session.value!.storage_revision).toBe(9)
+  })
+  it('rejects a delayed detail revision instead of rolling the session backwards', async () => {
+    const { ws, api, groups, saved } = fixture()
+    ws.setSession({ ...saved, storage_revision: 7 })
+    const pending = deferred<CorrectionGroup>()
+    api.correctionGroup.mockReturnValueOnce(pending.promise)
+    const loading = ws.loadGroup('group_0')
+    ws.session.value!.storage_revision = 8
+    pending.resolve({ ...clone(groups[0]!), storage_revision: 7 })
+    await loading
+    expect(ws.activeGroup.value).toBeNull()
+    expect(ws.groupError.value).toContain('批次已有更新')
+    expect(ws.session.value!.storage_revision).toBe(8)
+  })
+  it('does not relabel stale rows as fresh when an export summary advances their revision', async () => {
+    const { ws, api, groups, saved } = fixture()
+    ws.setSession({ ...saved, storage_revision: 7 })
+    groups.forEach(group => { group.storage_revision = 7 })
+    await ws.loadGroup('group_0')
+    // Another editor changes A; opening B reveals the new shared revision.
+    groups[0]!.rows[0]!.sop = 'externally updated SOP'
+    groups[0]!.storage_revision = 8
+    groups[1]!.storage_revision = 8
+    await ws.loadGroup('group_1')
+    api.patchCorrectionExport.mockResolvedValueOnce({ ...saved.groups[0]!, export: true, storage_revision: 9 })
+    await ws.toggleExport(saved.groups[0]!)
+    expect(api.patchCorrectionExport).toHaveBeenCalledWith('old-session', 'group_0', true, 8)
+    groups[0]!.storage_revision = 9
+    await ws.loadGroup('group_0')
+    expect(api.correctionGroup).toHaveBeenCalledTimes(3)
+    expect(ws.activeRow.value!.sop).toBe('externally updated SOP')
+    expect(ws.session.value!.storage_revision).toBe(9)
+  })
+  it('keeps complete detail cache current after its own matching-revision row PATCH', async () => {
+    const { ws, api, groups, saved } = fixture()
+    ws.setSession({ ...saved, storage_revision: 7 })
+    groups[0]!.storage_revision = 7
+    await ws.loadGroup('group_0')
+    const savedResult = { group: { ...saved.groups[0]!, storage_revision: 8 },
+      row: { ...groups[0]!.rows[0]!, actions: '{"action":"wait"}' }, storage_revision: 8 }
+    api.patchCorrectionRow.mockResolvedValueOnce(savedResult)
+    expect(await ws.saveAction('{"action":"wait"}')).toBe(true)
+    await ws.loadGroup('group_0')
+    expect(api.correctionGroup).toHaveBeenCalledTimes(1)
+    expect(ws.activeRow.value!.actions).toBe('{"action":"wait"}')
+  })
+  it('keeps a newer draft when an earlier save completes with embedded coordinates', async () => {
+    const { ws, api, groups, saved } = fixture()
+    ws.setSession({ ...saved, storage_revision: 7 })
+    groups[0]!.storage_revision = 7
+    await ws.loadGroup('group_0')
+    const pending = deferred<{ group: CorrectionGroupSummary; row: CorrectionRow; storage_revision?: number }>()
+    api.patchCorrectionRow.mockImplementationOnce(() => pending.promise)
+    ws.actionDraft.value = '{"action":"wait"}'
+    const saving = ws.saveAction()
+    ws.actionDraft.value = '{"action":"type","text":"new draft"}'
+    pending.resolve({ group: { ...groups[0]!, storage_revision: 8 }, storage_revision: 8, row: {
+      ...groups[0]!.rows[0]!, actions: '{"action":"wait"}', coordinate_info: { space: 'pixel', width: 1080, height: 2400 },
+      coordinate_info_version: 1, coordinate_info_revision: 8,
+    } })
+    expect(await saving).toBe(true)
+    expect(ws.actionDraft.value).toContain('new draft')
+    expect(ws.activeRow.value!.coordinate_info?.space).toBe('pixel')
+    expect(ws.activeGroup.value!.storage_revision).toBe(8)
+  })
   it('uses the new revision after changing export selection and exporting', async () => {
     const { ws, api, saved } = fixture()
     ws.setSession({ ...saved, batch_id: 'batch-a', storage_revision: 7 })

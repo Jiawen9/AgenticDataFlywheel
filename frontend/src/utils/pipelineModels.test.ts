@@ -1,13 +1,17 @@
 import { describe, expect, it } from 'vitest'
 import { modelDraft, modelDefaults, modelOptions, modelValidationIssue, modelBlockedReason } from './pipelineModels'
 import type { AgentCapabilities } from '@/phoneFactoryApi'
+import { createSSRApp, defineComponent, h } from 'vue'
+import { renderToString } from '@vue/server-renderer'
+import PipelineModelFields from '@/components/PipelineModelFields.vue'
 
 describe('PipelineAgent model configuration', () => {
-  it('preserves legacy omission and does not send retained pipeline settings to NewAgent', () => {
+  it('preserves omission and sends only the execution role for NewAgent', () => {
     expect(modelOptions('pipelineagent', modelDraft())).toEqual({})
+    expect(modelOptions('newagent', modelDraft())).toEqual({})
     const draft = { ...modelDraft(), execution_model: 'execute-v2', planner_custom: true }
-    expect(modelOptions('newagent', draft)).toEqual({})
-    expect(modelBlockedReason(null, 'newagent', draft)).toBe('')
+    expect(modelOptions('newagent', draft)).toEqual({ execution_model: 'execute-v2' })
+    expect(modelBlockedReason(null, 'newagent', draft)).toContain('NewAgent 模型覆盖能力')
     expect(() => modelOptions('pipelineagent', draft)).toThrow('同时填写')
   })
   it('copies defaults, trims values and only serializes explicitly selected roles', () => {
@@ -39,5 +43,27 @@ describe('PipelineAgent model configuration', () => {
     draft.execution_model = 'actual-model'
     expect(modelBlockedReason({}, 'pipelineagent', draft)).toContain('模型覆盖能力')
     expect(modelBlockedReason({ pipelineagent: { model_overrides: true } } as AgentCapabilities, 'pipelineagent', draft)).toBe('')
+    expect(modelBlockedReason({ pipelineagent: { model_overrides: true } } as AgentCapabilities, 'newagent', draft)).toContain('NewAgent')
+    expect(modelBlockedReason({ newagent: { model_overrides: true } } as AgentCapabilities, 'newagent', draft)).toBe('')
+    expect(modelBlockedReason({}, 'newagent', modelDraft())).toBe('')
+  })
+  it('validates the execution model independently of Pipeline planning fields', () => {
+    const draft = modelDraft({ execution_model: ' served-model ' })
+    expect(modelOptions('newagent', draft)).toEqual({ execution_model: 'served-model' })
+    draft.planner_custom = true
+    expect(modelValidationIssue(draft, 'newagent')).toBe('')
+    draft.execution_model = 'model\nname'
+    expect(() => modelOptions('newagent', draft)).toThrow('控制字符')
+  })
+  it('shows the execution input for both engines and planning inputs only for Pipeline', async () => {
+    for (const agentType of ['newagent', 'pipelineagent'] as const) {
+      const app = createSSRApp(PipelineModelFields, { agentType, modelValue: modelDraft({ execution_model: 'served-id' }) })
+      app.component('el-input', defineComponent({ props: ['modelValue'], setup: props => () => h('input', { value: props.modelValue }) }))
+      for (const tag of ['el-radio', 'el-radio-group']) app.component(tag, defineComponent({ setup: (_, { slots }) => () => h('div', slots.default?.()) }))
+      const html = await renderToString(app)
+      expect(html).toContain('执行模型名')
+      expect(html).toContain('served-id')
+      expect(/<legend\b[^>]*>规划模型<\/legend>/.test(html)).toBe(agentType === 'pipelineagent')
+    }
   })
 })

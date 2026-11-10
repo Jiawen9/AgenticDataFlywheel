@@ -136,7 +136,17 @@ function save() {
   emit('save', draftValue.value)
 }
 
-watch(() => [props.row.excel_row, props.row.actions], loadAction, { immediate: true })
+watch(() => [props.row.excel_row, props.row.actions] as const, (value, previous) => {
+  if (previous && value[0] === previous[0]) {
+    const draft = serializeActionForm(previous[1], originalForm.value, form.value)
+    if (draft !== previous[1] && draft !== value[1]) {
+      // A late save/SOP refresh must not discard a newer local action draft.
+      originalForm.value = parseActionForm(value[1])
+      return
+    }
+  }
+  loadAction()
+}, { immediate: true })
 watch(actionType, () => {
   swipeDragging.value = false
   swipeStart.value = null

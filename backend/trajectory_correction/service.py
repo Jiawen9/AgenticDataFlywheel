@@ -512,16 +512,23 @@ def get_groups(session_id: str) -> list[dict[str, Any]]:
 
 
 def get_group(session_id: str, group_id: str) -> dict[str, Any]:
-    session = _session_or_raise(session_id)
-    snapshot = _snapshot(session)
-    group = next((item for item in snapshot["groups"] if item["group_id"] == group_id or item.get("legacy_group_id") == group_id), None)
-    if group is None:
-        raise KeyError(group_id)
-    return {
-        **_group_summary(session_id, session, group),
-        "rows": [_overlay_row(session_id, session, row) for row in group["rows"]],
-        "pending_reviews": reviews_for_group(session, snapshot, group),
-    }
+    # Capture only this group's public rows while holding the existing lifecycle
+    # lock. Evidence reads must not hold that lock or run for every group summary.
+    with active_session_lock(session_id) as session:
+        snapshot = _snapshot(session)
+        group = next((item for item in snapshot["groups"] if item["group_id"] == group_id or item.get("legacy_group_id") == group_id), None)
+        if group is None:
+            raise KeyError(group_id)
+        result = {
+            **_group_summary(session_id, session, group),
+            "rows": [_overlay_row(session_id, session, row) for row in group["rows"]],
+            "pending_reviews": reviews_for_group(session, snapshot, group),
+            "storage_revision": session.get("storage_revision"),
+        }
+    _attach_coordinate_info(session, snapshot, group["rows"], result["rows"])
+    with active_session_lock(session_id) as latest:
+        _check_revision(latest, session.get("storage_revision"))
+    return result
 
 
 def get_cot(session_id: str) -> dict[str, Any]:
@@ -589,6 +596,33 @@ def _coordinate_info_for_row(session, base):
         saved_contract=edit.get("coordinate_info"), legacy_native=legacy_native)
 
 
+def _attach_coordinate_info(session, snapshot, bases, rows):
+    """Resolve selected rows, never trust a workbook string or saved contract.
+
+    The response-only version marker distinguishes this verified metadata from
+    legacy coordinate_info columns. No resolved metadata is written to drafts.
+    """
+    headers = set(snapshot.get("headers", []))
+    legacy = {"task", "meta_task", "actions", "task_manual_result", "micro_manual", "macro_manual"}.issubset(headers)
+    try:
+        _, asset_root = _source_for_session(session)
+    except (OSError, ValueError):
+        asset_root = None
+    for base, row in zip(bases, rows):
+        info = {"space": "unknown", "reason": "source_evidence_unavailable"}
+        if asset_root is not None:
+            edit = session.get("row_edits", {}).get(str(base["excel_row"]), {})
+            try:
+                info = resolve_coordinate_info(base, asset_root,
+                    current_action=edit.get("actions", base["actions"]),
+                    saved_contract=edit.get("coordinate_info"), legacy_native=legacy)
+            except (OSError, ValueError):
+                pass  # Missing evidence must not hide SOP/text editing.
+        row["coordinate_info"] = info
+        row["coordinate_info_version"] = 1
+        row["coordinate_info_revision"] = session.get("storage_revision")
+
+
 def get_row_coordinate_info(session_id: str, excel_row: int, expected_revision: int | None = None):
     session = _session_or_raise(session_id)
     _check_revision(session, expected_revision)
@@ -601,7 +635,7 @@ def get_row_coordinate_info(session_id: str, excel_row: int, expected_revision: 
     return {"coordinate_info": info, "storage_revision": session.get("storage_revision")}
 
 
-def patch_row(session_id: str, excel_row: int, payload: dict[str, Any], *, _coordinate_contract=None) -> dict[str, Any]:
+def patch_row(session_id: str, excel_row: int, payload: dict[str, Any], *, _coordinate_contract=None, _coordinate_context=None) -> dict[str, Any]:
     session = _session_or_raise(session_id)
     snapshot = _snapshot(session)
     group, base = _base_row(snapshot, excel_row)
@@ -683,8 +717,10 @@ def patch_row(session_id: str, excel_row: int, payload: dict[str, Any], *, _coor
         if not edit:
             session.setdefault("row_edits", {}).pop(str(excel_row), None)
     session = update_session(session_id, apply)
+    if _coordinate_context is not None:
+        _coordinate_context.append((session, snapshot, base))
     return {
-        "group": _group_summary(session_id, session, group),
+        "group": {**_group_summary(session_id, session, group), "storage_revision": session.get("storage_revision")},
         "row": _overlay_row(session_id, session, base),
         "storage_revision": session.get("storage_revision"),
     }
@@ -1017,7 +1053,19 @@ def _coordinate_checked_patch(function):
                         contract = {**source, "contract_version": 1, "image": str(base.get("image", "")).replace("\\", "/"),
                                     "action_sha256": action_digest(action)}
             payload["expected_revision"] = session.get("storage_revision")
-        return locked(session_id, excel_row, payload, _coordinate_contract=contract)
+        context = []
+        result = locked(session_id, excel_row, payload, _coordinate_contract=contract, _coordinate_context=context)
+        session, snapshot, base = context[0]
+        _attach_coordinate_info(session, snapshot, [base], [result["row"]])
+        # The save has already committed. A concurrent edit must not turn it
+        # into a reported failure or attach newer evidence to this older row.
+        try:
+            latest = _session_or_raise(session_id)
+        except (OSError, ValueError):
+            latest = {}
+        if latest.get("storage_revision") != session.get("storage_revision"):
+            result["row"]["coordinate_info"] = {"space": "unknown", "reason": "session_changed_reload_required"}
+        return result
     return checked
 
 
@@ -1029,5 +1077,5 @@ review_group = _locked_session(review_group)
 # These are workbench entry points; historical downloads/assets remain read-only.
 get_session = _locked_session(get_session)
 get_groups = _locked_session(get_groups)
-get_group = _locked_session(get_group)
+# get_group captures its rows under the lock, then resolves evidence outside it.
 get_cot = _locked_session(get_cot)

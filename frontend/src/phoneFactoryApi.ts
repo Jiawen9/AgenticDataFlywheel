@@ -8,7 +8,8 @@ export interface AgentProvenance { agent_type?: AgentType; agent_version?: strin
 export interface PlannerConfig { base_url: string; model: string; api_key_env?: string }
 export interface ModelOverrides { execution_model?: string; planner_config?: PlannerConfig }
 export interface PipelineModelDefaults { vla: string; execution_model: string; planner_config: PlannerConfig | null }
-export interface FactorySettings extends FactoryConfig { agent_type?: AgentType; model_defaults?: PipelineModelDefaults; repeat_times?: number }
+export interface NewAgentModelDefaults { execution_model: string }
+export interface FactorySettings extends FactoryConfig { agent_type?: AgentType; model_defaults?: PipelineModelDefaults; newagent_model_defaults?: NewAgentModelDefaults; repeat_times?: number }
 export interface PhoneAppRow { phone_id: string; app: string; status: string }
 export interface CollectionWarning { sheet: string; row: number; field: string; message: string }
 export interface CollectionBatchLineage { batch_role?: 'collection_result'; task_source_batch_id?: string }

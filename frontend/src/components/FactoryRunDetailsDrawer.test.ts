@@ -68,4 +68,20 @@ describe('shared factory details drawer', () => {
     expect(view.state.pagedReports[0].folder.run_id).toBeUndefined()
     view.app.unmount()
   })
+  it.each([
+    { agent_type: 'newagent' as const, execution_model: 'served-newagent', execution_mode: 'collect_and_evaluate' as const, execution: true, planner: false },
+    { agent_type: 'pipelineagent' as const, execution_model: 'served-pipeline', execution_mode: 'collect_and_evaluate' as const, execution: true, planner: true },
+    { agent_type: 'newagent' as const, execution_model: 'historical-value', execution_mode: 'evaluate_only' as const, execution: false, planner: false },
+  ])('shows the submitted $agent_type model only for collection ($execution_mode)', async scenario => {
+    const row: FactoryRun = { ...scenario, run_id: 'model-view-run', batch_id: 'batch', status: 'completed', collector_data_state: 'retired', planner_config: { base_url: 'http://planner.invalid/v1', model: 'planner-id' } }
+    const app = createSSRApp(FactoryRunDetailsDrawer, { modelValue: true, tab: 'runs', evaluation: false, runs: [row], folders: [], loadingReports: false, downloadingReport: '' })
+    const passthrough = defineComponent({ setup: (_p, { slots }) => () => h('div', slots.default?.()) })
+    for (const name of ['el-drawer', 'el-button', 'el-select', 'el-option', 'el-table']) app.component(name, passthrough)
+    app.component('el-table-column', defineComponent({ props: ['type'], setup: (props, { slots }) => () => h('div', props.type === 'expand' ? slots.default?.({ row }) : []) }))
+    for (const name of ['el-input', 'el-alert', 'el-progress', 'el-pagination']) app.component(name, defineComponent({ render: () => h('div') }))
+    const html = await renderToString(app)
+    expect(html.includes('执行模型：')).toBe(scenario.execution)
+    expect(html.includes(scenario.execution_model)).toBe(scenario.execution)
+    expect(html.includes('规划模型：')).toBe(scenario.planner)
+  })
 })

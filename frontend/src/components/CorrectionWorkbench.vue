@@ -1,9 +1,17 @@
 <script setup lang="ts">
+import { computed } from 'vue'
 import type { CorrectionGroup, CorrectionRow } from '@/types'
 import { correctionAssetUrl } from '@/api'
 import CorrectionActionEditor from '@/components/CorrectionActionEditor.vue'
 
 const props = defineProps<{ sessionId: string; group: CorrectionGroup; row: CorrectionRow | null; revision: number; storageRevision?: number; saving: boolean; readOnly?: boolean }>()
+// Older workbooks/drafts may contain a coordinate_info string or an unchecked
+// saved contract. Only the server's resolved response carries these markers.
+const rowCoordinateInfo = computed(() => {
+  const row = props.row, info = row?.coordinate_info
+  if (row?.coordinate_info_version !== 1 || !Number.isInteger(row.coordinate_info_revision) || !info || typeof info !== 'object') return undefined
+  return ['pixel', 'normalized', 'unknown'].includes(info.space) ? info : undefined
+})
 const emit = defineEmits<{
   select: [row: CorrectionRow]
   delete: [row: CorrectionRow]
@@ -19,7 +27,7 @@ function rowClassName({ row }: { row: CorrectionRow }) {
   <section class="workbench" aria-label="轨迹修正台">
     <aside class="editor-pane">
       <template v-if="row">
-        <CorrectionActionEditor :key="`${sessionId}:${group.group_id}:${row.excel_row}:${revision}`" :row="row" :session-id="sessionId" :storage-revision="storageRevision" :image-url="correctionAssetUrl(sessionId, row.image)" :saving="saving" :read-only="readOnly" @save="emit('action', $event)" @draft="emit('draft', $event)" />
+        <CorrectionActionEditor :key="`${sessionId}:${group.group_id}:${row.excel_row}:${revision}`" :row="row" :session-id="sessionId" :storage-revision="storageRevision" :coordinate-info="rowCoordinateInfo" :image-url="correctionAssetUrl(sessionId, row.image)" :saving="saving" :read-only="readOnly" @save="emit('action', $event)" @draft="emit('draft', $event)" />
       </template>
       <el-empty v-else description="该轨迹没有可修正步骤" :image-size="80" />
     </aside>

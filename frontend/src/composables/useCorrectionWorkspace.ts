@@ -26,6 +26,9 @@ export function useCorrectionWorkspace(api: WorkspaceApi, feedback: Feedback) {
   const savingCount = ref(0)
   const guarding = ref(false)
   const cache = new Map<string, CorrectionGroup>()
+  // Summary mutations may advance the session without reading this group's
+  // rows. Keep the detail snapshot's revision separate from summary metadata.
+  const cacheRevisions = new Map<string, number | undefined>()
   const rememberedRows = new Map<string, number>()
   const pendingWrites = new Set<Promise<boolean>>()
   let epoch = 0
@@ -36,6 +39,7 @@ export function useCorrectionWorkspace(api: WorkspaceApi, feedback: Feedback) {
   const hasUnsaved = computed(() => actionDraft.value !== null)
   const busy = computed(() => savingCount.value > 0 || guarding.value)
   const key = (sessionId: string, groupId: string) => `${sessionId}:${groupId}`
+  const olderRevision = (revision: number | undefined) => revision !== undefined && session.value?.storage_revision !== undefined && revision < session.value.storage_revision
 
   function clearDetail() {
     ++detailRequest
@@ -53,6 +57,7 @@ export function useCorrectionWorkspace(api: WorkspaceApi, feedback: Feedback) {
     session.value = value
     expandedTasks.value = []
     cache.clear()
+    cacheRevisions.clear()
     rememberedRows.clear()
   }
 
@@ -64,13 +69,13 @@ export function useCorrectionWorkspace(api: WorkspaceApi, feedback: Feedback) {
   }
 
   function applySummary(summary: CorrectionGroupSummary) {
-    if (!session.value) return
+    if (!session.value || olderRevision(summary.storage_revision)) return
     if (summary.storage_revision !== undefined) session.value.storage_revision = summary.storage_revision
     session.value.groups = session.value.groups.map((group) => group.group_id === summary.group_id ? summary : group)
     const cacheKey = key(session.value.session_id, summary.group_id)
     const previous = cache.get(cacheKey)
     if (previous) {
-      const updated = { ...previous, ...summary }
+      const updated = { ...previous, ...summary, rows: previous.rows }
       cache.set(cacheKey, updated)
       if (activeGroup.value?.group_id === summary.group_id) activeGroup.value = updated
     }
@@ -94,19 +99,28 @@ export function useCorrectionWorkspace(api: WorkspaceApi, feedback: Feedback) {
       const result = revision === undefined ? await api.patchCorrectionRow(sessionId, row.excel_row, patch) : await api.patchCorrectionRow(sessionId, row.excel_row, patch, revision)
       if (epoch !== version || session.value?.session_id !== sessionId) return false
       if (result.group.group_id !== groupId || result.row.excel_row !== row.excel_row) throw new Error('保存响应与当前轨迹不一致，请重新加载')
+      if (olderRevision(result.storage_revision)) throw new Error('批次已有更新，已保留当前草稿，请重新加载轨迹确认保存结果')
       if (result.storage_revision !== undefined && session.value) session.value.storage_revision = result.storage_revision
       const cacheKey = key(sessionId, groupId)
       const previous = cache.get(cacheKey)
-      if (previous) cache.set(cacheKey, { ...previous, rows: previous.rows.map((item) => item.excel_row === row.excel_row ? result.row : item) })
-      applySummary(result.group)
+      if (previous) {
+        cache.set(cacheKey, { ...previous, rows: previous.rows.map((item) => item.excel_row === row.excel_row ? result.row : item) })
+        // Only this acknowledged CAS mutation proves that the other cached
+        // rows still belong to the input revision used for the write.
+        if (cacheRevisions.get(cacheKey) === revision) cacheRevisions.set(cacheKey, result.storage_revision)
+      }
+      applySummary({ ...result.group, storage_revision: result.storage_revision ?? result.group.storage_revision })
       return true
     })
   }
 
   async function saveAction(actions = actionDraft.value): Promise<boolean> {
     if (!activeRow.value || actions === null) return true
+    const version = epoch, groupId = openGroupId.value, rowId = activeRowId.value, draft = actionDraft.value
     const success = await patchRow(activeRow.value, { actions })
-    if (success) { actionDraft.value = null; ++actionRevision.value }
+    if (success && epoch === version && openGroupId.value === groupId && activeRowId.value === rowId && actionDraft.value === draft) {
+      actionDraft.value = null; ++actionRevision.value
+    }
     return success
   }
 
@@ -133,9 +147,13 @@ export function useCorrectionWorkspace(api: WorkspaceApi, feedback: Feedback) {
     const cacheKey = key(sessionId, groupId)
     loadingGroup.value = true
     try {
-      const group = cache.get(cacheKey) ?? await api.correctionGroup(sessionId, groupId)
+      const cached = cache.get(cacheKey)
+      const group = cached && cacheRevisions.get(cacheKey) === session.value?.storage_revision ? cached : await api.correctionGroup(sessionId, groupId)
       if (epoch !== version || request !== detailRequest) return
+      if (olderRevision(group.storage_revision)) throw new Error('批次已有更新，请重新加载轨迹')
+      if (group.storage_revision !== undefined && session.value) session.value.storage_revision = group.storage_revision
       cache.set(cacheKey, group)
+      cacheRevisions.set(cacheKey, group.storage_revision)
       activeGroup.value = group
       selectRow(group.rows.find((row) => row.excel_row === rememberedRows.get(cacheKey)) ?? group.rows.find((row) => !row.deleted) ?? group.rows[0] ?? null)
     } catch (error) {
@@ -176,6 +194,7 @@ export function useCorrectionWorkspace(api: WorkspaceApi, feedback: Feedback) {
       const revision = session.value?.storage_revision
       const summary = revision === undefined ? await api.patchCorrectionExport(sessionId, group.group_id, !group.export) : await api.patchCorrectionExport(sessionId, group.group_id, !group.export, revision)
       if (epoch !== version || session.value?.session_id !== sessionId) return false
+      if (olderRevision(summary.storage_revision)) throw new Error('批次已有更新，请重新加载轨迹')
       applySummary(summary)
       return true
     })

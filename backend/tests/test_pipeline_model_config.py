@@ -156,10 +156,10 @@ class ModelRunTests(unittest.TestCase):
         self.store.remote_start(self.request(request_id="old-compatible", agent_type="pipelineagent"))
         self.assertTrue(any(item[0] == "start-run" for item in self.calls))
 
-    def test_newagent_and_evaluate_only_reject_model_overrides(self):
+    def test_newagent_rejects_planner_and_evaluate_only_rejects_all_models(self):
+        with self.assertRaisesRegex(PhoneFactoryError, "PipelineAgent"):
+            self.store.runtime._options(self.request(planner_config=PLANNER), "generate")
         for data in ({"execution_model": "model"}, {"planner_config": PLANNER}):
-            with self.assertRaisesRegex(PhoneFactoryError, "PipelineAgent"):
-                self.store.runtime._options(self.request(**data), "generate")
             with self.assertRaisesRegex(PhoneFactoryError, "独立评测"):
                 self.store.runtime.remote_start_evaluation(data)
         self.assertFalse(self.calls)

@@ -30,7 +30,7 @@ from .data_store.locking import batch_lock
 from .collection_runs import CollectionRunError, CollectionRunStore
 from .agent_types import normalize_agent_type
 from .collection_protocol import repeat_times
-from .pipeline_model_config import default_models, normalize_defaults
+from .pipeline_model_config import default_models, normalize_defaults, newagent_default_models, normalize_newagent_defaults
 
 DEFAULT_CONFIG = {
     "sampling_enabled": False, "temperature": 0.7,
@@ -239,7 +239,8 @@ class PhoneFactoryStore:
         state = self._current()
         return {**DEFAULT_CONFIG, **state["config"], "agent_type": state.get("agent_type", "newagent"),
                 "repeat_times": state.get("collection_defaults", {}).get("repeat_times", 1) if mode == "generate" else 1,
-                "model_defaults": state.get("model_defaults", {}).get(mode, default_models())}
+                "model_defaults": state.get("model_defaults", {}).get(mode, default_models()),
+                "newagent_model_defaults": state.get("newagent_model_defaults", {}).get(mode, newagent_default_models())}
 
     def _update(self, mutator: Callable[[dict], None]) -> dict:
         return self.records.update("phone_factory", "state", mutator, default=self._empty_state())
@@ -424,6 +425,7 @@ class PhoneFactoryStore:
             try:
                 agent_type = normalize_agent_type(data.get("agent_type", self._current().get("agent_type", "newagent")))
                 models = normalize_defaults(data["model_defaults"]) if "model_defaults" in data else None
+                newagent_models = normalize_newagent_defaults(data["newagent_model_defaults"]) if "newagent_model_defaults" in data else None
                 repeats = repeat_times(data["repeat_times"], mode=mode) if "repeat_times" in data else None
             except ValueError as exc:
                 raise PhoneFactoryError(str(exc)) from exc
@@ -431,6 +433,8 @@ class PhoneFactoryStore:
                 state.update(config=config, agent_type=agent_type)
                 if models is not None:
                     state.setdefault("model_defaults", {})[mode] = models
+                if newagent_models is not None:
+                    state.setdefault("newagent_model_defaults", {})[mode] = newagent_models
                 if repeats is not None and mode == "generate":
                     state.setdefault("collection_defaults", {})["repeat_times"] = repeats
             self._update(update_config)
