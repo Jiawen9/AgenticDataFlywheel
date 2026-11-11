@@ -2,7 +2,7 @@ import { activeBatchItems, notifyBatchesPublished } from '@/utils/batchLifecycle
 import type { Pipeline, CreatePipeline, PipelineAction } from './types/pipeline'
 import type { BuildJob, CorrectionBatch, CorrectionCotJob, CorrectionCotResponse, CorrectionExport, CorrectionGroup, CorrectionGroupSummary, CorrectionRecommendation, CorrectionSession, DatasetRelease, DatasetReleaseCandidate, DatasetUploadJob, KnowledgeBaseSummary, QualityJob, RunQualitySummary, TaskGenerationExport, TaskGenerationJob, TaskGenerationResult, TaskGenerationTree, TaskGenerationSelection, TaskGenerationTreeNode, TaskQualityResult, TaskSummary, TrajectoryRecord, TrajectorySummary, TrajectoryTreeNode, TreeRun } from './types'
 
-import type { AugmentationPreview, CollectionSourceRun, CollectionSourceTask, DatasetUploadCapabilities, PreprocessingBatch, PreprocessingJob, StageArtifact, TrajectoryScope } from './types'
+import type { AugmentationPreview, CollectionSourceRun, CollectionSourceTask, DatasetUploadCapabilities, DatasetUploadOptions, PreprocessingBatch, PreprocessingJob, StageArtifact, TrajectoryScope } from './types'
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
 
@@ -118,8 +118,10 @@ export const api = {
     return (await request<{ runs: CollectionSourceRun[] }>('/api/phone-factory/collection-runs?batch_id=' + encodeURIComponent(batchId))).runs
   },
   async collectionSourceTasks(batchId: string, sourceKind?: 'rollout_import'): Promise<CollectionSourceTask[]> {
-    const path = sourceKind === 'rollout_import' ? '/api/rollout-imports/batches/' : '/api/task-generation/collection-batches/'
-    return (await request<{ snapshot: { tasks: CollectionSourceTask[] } }>(path + encodeURIComponent(batchId))).snapshot.tasks
+    // Factory detail resolves generated, manual and frozen result batches. A
+    // result batch keeps the source kind but has its own identity and snapshot.
+    const path = sourceKind === 'rollout_import' ? '/api/rollout-imports/batches/' : '/api/phone-factory/batches/'
+    return (await request<{ snapshot: { tasks: CollectionSourceTask[] } }>(path + encodeURIComponent(batchId), { cache: 'no-store' })).snapshot.tasks
   },
   createPreprocessing(batchId: string): Promise<PreprocessingJob> {
     return request('/api/trajectory-preprocessing/jobs', { method: 'POST', body: JSON.stringify({ batch_id: batchId }) })
@@ -288,10 +290,10 @@ export const api = {
   async builds(): Promise<BuildJob[]> {
     return (await request<{ jobs: BuildJob[] }>('/api/tree-builds')).jobs
   },
-  async uploadDatasetRelease(releaseId: string, target?: 'internal'): Promise<DatasetUploadJob> {
+  async uploadDatasetRelease(releaseId: string, target?: 'internal', options?: DatasetUploadOptions): Promise<DatasetUploadJob> {
     return (await request<{ job: DatasetUploadJob }>(`/api/dataset-releases/${encodeURIComponent(releaseId)}/upload`, {
       method: 'POST',
-      ...(target ? { body: JSON.stringify({ target }) } : {}),
+      ...(target ? { body: JSON.stringify({ target, ...options }) } : {}),
     })).job
   },
   async datasetUploadJob(jobId: string): Promise<DatasetUploadJob> {

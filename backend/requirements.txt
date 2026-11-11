@@ -9,3 +9,4 @@ openai>=1.40,<2
 python-multipart>=0.0.9,<1
 pandas>=2.0,<4
 pypinyin>=0.50,<1
+psutil>=5.9,<8

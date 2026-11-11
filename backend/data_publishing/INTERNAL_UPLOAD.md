@@ -1,123 +1,75 @@
-# 云道S3 Excel 上传接入
+# 云道发布上传接入
 
-云道S3是目标网站名称。接口中的 `target: "internal"`、`internal_upload` 字段及适配模块名称保持不变；
-此命名不表示已配置网站连接，也不会将现有上传协议改为通用 S3 API。
+平台调用内网已有的 `s3_uploader.py`，直接读取冻结发布 Excel 与该表包含的完整轨迹目录。不会复制整批数据、打 ZIP、修改 Excel、生成云端清单或重新进行 XML／动作／图片质量检查。未配置时不会启动脚本。
 
-页面、后台作业、文件定位、校验、逐文件回执、重试和刷新恢复已接通。接入方只需实现本目录的
-`internal_uploader.py`，与现有 Python 后端一起部署运行。默认实现始终未配置，不发送网络请求。
-本接口只上传发布登记的全部 Excel；不会上传原始轨迹目录、合并表格或转成 JSON。
+## 后端配置
 
-## 同事需要实现什么
+安装平台 `backend/requirements.txt`（本次新增 `psutil`，用于进程身份核对）。在实际运行平台后端的电脑配置环境变量或 `backend/.env`，环境变量优先，显式空值会禁用同名 `.env` 值：
 
-1. 在 `is_configured() -> bool` 中检查后端所需配置是否就绪。返回真正的布尔值；不要在此上传文件。
-2. 在 `upload_excel(context: UploadContext) -> UploadResult` 中完成登录和单份 Excel 上传。
-3. 凭据从后端环境变量或公司凭据服务读取，配置名称由目标网站接入方确定。不要传给浏览器或写入回执。
-4. 为登录、连接和读取设置有限超时。只有目标网站明确确认接收成功后，才能返回 `UploadResult(success=True)`。
-   HTTP 200 或“提交到异步队列”本身不一定代表文件已被接收，应按目标接口的真实语义确认。
-5. 失败抛出 `UploadError("可直接展示给用户的原因")`。不要包含密码、令牌或原始 HTTP 响应。
-   未预期异常只显示通用错误。回执 ID 必须是字符串；链接必须是无用户名密码的 HTTP(S) 地址。
-
-`DATASET_UPLOAD_MODE=mock` 仅控制历史模拟接口，**不会启用云道S3上传**。
-本次没有新增虚假的“启用开关”；接入完成并配置凭据后，由 `is_configured()` 返回 True。
-重启后端并刷新页面即可更新按钮可用状态。
-
-## 系统已解析的调用参数
-
-| context 字段 | 类型及含义 |
-| --- | --- |
-| file_path | Path，已解析并核验的绝对 Excel 路径；可直接以 rb 打开 |
-| filename | str，登记的原始文件名 |
-| dataset_name | str，数据集名称 |
-| release_id | str，发布编号，如 rel_0123456789abcdef |
-| file_index | int，登记清单中的位置，从 0 开始；不同文件可能同名 |
-| sha256 | str，发布时的 SHA256，上传前已核验 |
-| idempotency_key | str，`发布编号:文件序号:小写SHA256`，重试保持不变 |
-
-无需读取 releases.json、解析发布编号、查找目录或重新导出 Excel。
-函数返回示意：
-
-```python
-return UploadResult(
-    success=True,
-    remote_id="目标网站返回的记录编号",  # 可省略
-    url="https://目标网站/记录地址",     # 可省略
-)
+```dotenv
+ADF_YUNDAO_PYTHON=D:\python-env\python.exe
+ADF_YUNDAO_SCRIPT=D:\upload-tools\s3_uploader.py
+ADF_YUNDAO_APP_TOKEN=<由内网维护人员填写，不提交到 Git>
+ADF_YUNDAO_REGION=cn-southwest-204-dev
+ADF_YUNDAO_BUCKET=bucket-jinglun
+ADF_YUNDAO_PREFIX=data/gui_data/e2e_data/flywheel_data
 ```
 
-应把 `context.idempotency_key` 传入目标网站的幂等机制，或由接入方按该键查重。
-远端已接收但本地尚未保存回执时，网络超时或进程退出会造成结果不确定；重试仍用同一个键。
-仅靠本地成功记录无法保证远端绝不重复。适配器不得修改源 Excel。
+Python 必须能运行该脚本及其依赖。后端运行账号必须能读取源目录；桌面登录用户的映射盘不一定对服务账号可见。目标前缀可在上传弹窗修改，空白表示 bucket 根目录；bucket、region 由后端配置。
 
-## HTTP 协议
+启动参数沿用：`--local_folder_absolute_path`、`--app_token`、`--region`、`--bucket_name`、`--bucket_path`、`--show_speed`。参数数组启动、不开 shell。进程先等待平台持久登记身份，然后执行原脚本。token 不返回前端、不存入作业记录、不写入日志；脚本输出在截断前脱敏。由于私有脚本使用命令行参数接收 token，操作系统中有权限读取进程参数的本机管理员仍能查看它。
 
-- `GET /api/dataset-upload-capabilities`：
-  `{"internal":{"configured":false,"reason":"云道S3上传尚未配置"}}`；已配置时 reason 为 null。
-- `POST /api/dataset-releases/{release_id}/upload`，JSON `{"target":"internal"}`：
-  202 返回 `{"job":{...}}`。同一发布已有排队中、上传中或已成功任务时返回该任务。
-  缺少发布记录 404；未配置、无 Excel、缺失文件或 SHA256 校验失败 409；不合法 target 422。
-  不传 body 或 target 的旧调用仍走模拟上传，显式 `target:"mock"` 也支持。
-- `GET /api/dataset-upload-jobs/{job_id}`：返回 `{"job":{...}}`；不存在 404。
-- 发布列表及详情增加可选 `internal_upload` 摘要。历史无该字段表示尚未上传云道S3。
-  原 `upload_status`、`s3_uri` 等保留为模拟状态，不能作为真实接收凭据。
+本地不包含该私有脚本。内网接入只需确认两项契约：
 
-旧版本保存的系统提示由页面按精确匹配显示为云道S3文案，不改写原记录。
-适配器的其他错误原文、文件名、远端编号及链接保持原样。
+1. `bucket_path` 是**目录内容**的目标位置，不再自动多加本地目录 basename。若原脚本自动加 basename，在薄适配层修正，不复制源目录来迎合参数。
+2. 退出码 0 表示所有文件已经完成上传；失败要返回非零。如果只提交远端队列或吞掉单文件失败，接入层应等待最终结果／汇总失败后返回，不能直接宣布成功。
 
-内部任务示例（部分成功后停止）：
+## 上传范围与布局
 
-```json
-{
-  "job_id": "0123456789abcdef0123456789abcdef",
-  "release_id": "rel_0123456789abcdef",
-  "mode": "internal",
-  "status": "failed",
-  "current_file": "第二份.xlsx",
-  "completed_files": 1,
-  "total_files": 2,
-  "percent": 50,
-  "error": "目标网站暂不可用",
-  "file_results": [
-    {"index": 0, "filename": "第一份.xlsx", "sha256": "<64位校验值>", "idempotency_key": "<稳定键>", "status": "succeeded", "remote_id": "record-123", "url": "https://internal.example.test/records/123", "error": null},
-    {"index": 1, "filename": "第二份.xlsx", "sha256": "<64位校验值>", "idempotency_key": "<稳定键>", "status": "failed", "remote_id": null, "url": null, "error": "目标网站暂不可用"}
-  ]
-}
+根据冻结 Excel 实际行及其发布来源解析路径；不读当前页面勾选，不使用可能指向整个共享根目录的旧 `trajectory_paths`。一用例 10 条、表内选 2 条，只上传选中的 2 个完整目录，目录内所有现存文件和子目录交由原脚本传输。旧“完整数据集”表本身可能含全部轨迹，页面展示实际解析出的范围。
+
+```text
+<前缀>/<批次编号>/
+  发布表格/001/<原文件名.xlsx>
+  发布表格/002/<另一原文件名.xlsx>
+  <用例编号>/<原轨迹目录名>__<稳定来源摘要>/...
 ```
 
-任务及文件状态为 queued / uploading / succeeded / failed / interrupted；文件未处理时为 pending。
-百分比按已确认成功的文件数计算，不表示网络传输百分比。
-多份表格按登记顺序串行执行，一份失败后停止。重试创建新任务、保留旧任务记录，
-跳过已确认成功且校验值一致的文件；失败文件重用原幂等键。全部成功后不会再次启动。
+摘要后缀用于区分同名目录、不同手机、重复采集和运行，重试保持相同目标。多批次发布分别进入对应批次目录；重复引用同一轨迹只上传一次。完整目录的传输不受坏 XML、损坏图片或未在表中引用的文件影响。轨迹身份无法定位、越界或本地目录不存在会明确失败，不能改为上传整个共享目录。
 
-## 持久化与恢复
+Excel 已冻结在 `<DATA_ROOT>/releases/<release>/<序号>/<原文件名>`；轨迹仍在既有原始目录。后台逐目录串行调用，不额外创建合并目录。Excel 保持原字节和内部路径字符串，云端上传不会自动重写表中本地绝对路径。
 
-- 当前发布登记、摘要、上传任务及逐文件回执仅保存于 `backend_workspace/system/app.sqlite`，不读写可变状态 JSON 镜像。
-- 新发布会将已导出的 Excel 原样冻结到 `backend_workspace/releases/{release_id}/{文件序号}/{原文件名}`，同目录 `manifest.json` 记录源会话、导出版本和校验值。上传使用这份冻结文件，不受后续源文件变化影响。
-- `ADF_DATA_ROOT` 可覆盖默认 `backend_workspace/`；适配器始终接收解析好的绝对路径，无需自行拼接。
-- 当前发布工作目录为 `backend_workspace/system/dataset_release`。原旧 workspace 中的发布、上传任务和旧 JSON 不导入；不可把旧 `dataset_release` 目录并入新目录。
-- 发布前核验导出记录的 SHA256；下载及云道S3上传再次核验冻结 Excel。文件缺失或校验不符时明确失败，不用旧目录文件替代。
+## HTTP 与前端适配
 
-提交检查和任务登记使用现有作业管理器锁；该模式适用于现有单后端进程。
-每份成功回执先原子落盘，再更新发布摘要。重启后依据最新任务修复摘要，
-执行中的任务标为中断，保留已成功回执，等待用户手动重试。上传不会自动重启。
-如果未来部署多个后端进程，需要共享任务队列和跨进程锁，不能仅复用进程内锁。
+沿用原 API 地址及网关前缀，不新增网关路由：
 
-## 无网络自测
+- `GET /api/dataset-upload-capabilities`：`internal` 增加 `directory_upload`、`default_prefix`、`region`、`bucket`，保留 `configured/reason`；不返回 token、Python 或脚本路径。
+- `POST /api/dataset-releases/{release_id}/upload`：`{"target":"internal","include_trajectories":true,"destination_prefix":"data/gui_data"}`。持久登记后立即返回 202 和 job，不等待 Excel 解析或文件传输。
+- `GET /api/dataset-upload-jobs/{job_id}`：复用轮询，任务包含 `folder_upload`、`include_trajectories`、`destination`、`source_summary`、`item_results`、`completed_items/total_items`、`current_item`、`progress`、`recent_output`。
+- 同目标失败／中断重试可附 `retry_job_id`。后端核对发布、范围和原目标；bucket／region 已改变时明确报错，不能静默上传到新 bucket。更改前缀创建新任务，不携带旧重试编号。
+- 原 `target:internal` 的 Excel-only 调用继续支持；配置本次脚本后同样走可登记进程的后台目录任务，仅传表格，保留旧计数／回执投影。未带 target 的历史模拟接口保持原行为，模拟结果不代表真实云道上传。
 
-可运行：
+新目录任务阶段：`queued → resolving → uploading → succeeded/failed`。重启若旧进程仍存在或身份读取暂不可用，显示 `recovering` 并继续查询，不能启动第二份；确认进程退出但没有完成回执时标为 `interrupted`，由用户重试未确认目录。
+
+`percent` 是完成目录比例；`progress` 中的速度和字节数据只来自脚本实际输出。纯百分比文字不作为字节总进度，只有可信已传／总字节时才展示字节百分比。兼容 CR、LF、CRLF 和 UTF-8 分段输出；未知格式仍展示脱敏文字。当前目录的字节进度不冒充整批总进度。
+
+页面关闭不终止上传；刷新恢复原任务。目录回执默认折叠、每页 10 条，最近输出最多 20 行。进度小记录最多每秒保存一次（目录结束另保存最终值），不随每行速度输出重写全部目录清单。
+
+## 幂等、恢复与部署
+
+同一冻结发布、范围、region、bucket 和前缀复用任务；新目标独立上传。失败重试沿用已解析来源和目标，跳过已确认成功目录，不重新选轨迹。远端已收、平台还未保存确认时，可能重传该未确认目录；目标键保持稳定，需内网脚本确认同键覆盖／幂等语义，平台不承诺远端恰好一次。
+
+作业、回执和轻量进度使用平台既有 SQLite；不新建运行数据库、不修改采集记录。当前调度适用于现有单后端进程；多服务进程的分布式执行协调不在本轮范围。
+
+先同步后端代码、安装依赖并配置私有脚本，核对能力；再同步前端。创新平台只合并业务组件、类型和调用字段，保留自身 API_BASE_URL、路由及 UI 体系。采集端、9011 及模型配置不用同步。
+
+## 定向验证
 
 ```powershell
-python -m unittest backend.tests.test_internal_dataset_upload backend.tests.test_data_publishing -v
+python -m unittest backend.tests.test_directory_upload_jobs backend.tests.test_upload_sources backend.tests.test_yundao_script_adapter backend.tests.test_internal_dataset_upload backend.tests.test_data_publishing backend.tests.test_pipeline_release -q
 cd frontend
-npm test
+npm test -- src/datasetPublishingApi.test.ts src/components/DatasetFolderUploadProgress.test.ts src/views/DataPublishingUpload.test.ts
 npm run build
-# 使用本机已安装的 Playwright（必要时配置 NODE_PATH）
-node tests/dataset-upload.browser.cjs
 ```
 
-`backend/tests/test_internal_dataset_upload.py` 包含可直接参考的 `FakeAdapter`：
-实现相同的两个入口，通过构造参数 `DatasetUploadJobManager(..., internal_adapter=adapter)`
-注入隔离测试管理器。它仅在临时数据下返回明确标注的测试回执，不会自动进入生产路径。
-不要把这个测试适配器用于真实发布数据。
-
-完成真实接入后，先在目标网站测试环境验证登录、单表接收、多表、超时、同键重试查重及可展示错误，
-再配置正式后端。本次自动测试不调用真实网站。
+这些测试只用临时发布数据及本地模拟脚本，无云道网络传输。内网最终用一个小型发布核对目录层级、选中范围、速度输出及同目标重试。未执行真实上传时不能写成云道验收通过。

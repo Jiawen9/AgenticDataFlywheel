@@ -6,6 +6,7 @@ import re
 from typing import Any
 from urllib.parse import urlsplit
 from ..identifiers import allocate_id
+from ..file_io import io_path
 
 from ..trajectory_correction.draft_store import utc_now
 from .internal_uploader import UploadContext, UploadError, UploadResult
@@ -22,18 +23,28 @@ class InternalUploadJobsMixin:
             reason = None if configured else "云道S3上传尚未配置"
         except Exception:
             configured, reason = False, "云道S3上传配置检查失败，请联系维护人员"
-        return {"internal": {"configured": configured, "reason": reason}}
+        result = {"configured": configured, "reason": reason}
+        if callable(getattr(self.internal_adapter, "get_configuration", None)):
+            try:
+                config = self.internal_adapter.get_configuration()
+                result.update({key: config.get(key) for key in
+                               ("directory_upload", "default_prefix", "region", "bucket")})
+                if not configured:
+                    result["reason"] = config.get("reason") or reason
+            except Exception:
+                result.update(configured=False, reason="云道S3上传配置检查失败，请联系维护人员")
+        return {"internal": result}
 
     def _validate_excel(self, item: dict[str, Any]) -> Path:
         try:
             path = self.registry.resolve_project_path(str(item.get("path", "")))
-            if path.suffix.lower() not in {".xlsx", ".xlsm"} or not path.is_file():
+            if path.suffix.lower() not in {".xlsx", ".xlsm"} or not io_path(path).is_file():
                 raise ValueError("文件不存在或不是 Excel")
             expected = str(item.get("sha256", ""))
             if not re.fullmatch(r"[0-9a-fA-F]{64}", expected):
                 raise ValueError("缺少有效的发布校验值")
             digest = hashlib.sha256()
-            with path.open("rb") as stream:
+            with io_path(path).open("rb") as stream:
                 for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                     digest.update(chunk)
             if digest.hexdigest() != expected.lower():

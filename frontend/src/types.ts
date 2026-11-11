@@ -720,7 +720,37 @@ export interface DatasetReleaseExcel {
 export type DatasetUploadStatus = 'not_uploaded' | 'queued' | 'uploading' | 'succeeded' | 'failed' | 'interrupted'
 
 export interface DatasetUploadCapabilities {
-  internal: { configured: boolean; reason: string | null }
+  internal: { configured: boolean; reason: string | null; directory_upload?: boolean; default_prefix?: string; region?: string; bucket?: string }
+}
+
+export interface DatasetUploadOptions {
+  include_trajectories: boolean
+  destination_prefix: string
+  retry_job_id?: string
+}
+
+export interface DatasetUploadItem {
+  idempotency_key: string
+  kind: 'excel' | 'trajectory'
+  filename: string
+  label?: string
+  source_dir: string
+  bucket_path: string
+  status: DatasetUploadFileResult['status']
+  error?: string | null
+}
+
+export interface DatasetFolderUpload {
+  folder_upload?: boolean
+  include_trajectories?: boolean
+  destination?: { prefix: string; region: string; bucket: string }
+  source_summary?: { case_count: number; trajectory_count: number; excel_count: number }
+  item_results?: DatasetUploadItem[]
+  completed_items?: number
+  total_items?: number
+  current_item?: string | null
+  progress?: { message?: string; speed_text?: string; transferred_bytes?: number; total_bytes?: number; percent?: number }
+  recent_output?: string[]
 }
 
 export interface DatasetUploadFileResult {
@@ -734,7 +764,7 @@ export interface DatasetUploadFileResult {
   error: string | null
 }
 
-export interface DatasetInternalUpload {
+export interface DatasetInternalUpload extends DatasetFolderUpload {
   job_id: string
   status: Exclude<DatasetUploadStatus, 'not_uploaded'>
   completed_at: string | null
@@ -785,7 +815,7 @@ export interface DatasetRelease {
   local_available: boolean
 }
 
-export interface DatasetUploadJob {
+export interface DatasetUploadJob extends DatasetFolderUpload {
   file_results?: DatasetUploadFileResult[]
   job_id: string
   release_id: string

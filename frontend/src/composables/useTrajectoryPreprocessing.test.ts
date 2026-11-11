@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { useTrajectoryPreprocessing } from './useTrajectoryPreprocessing'
+import { api } from '@/api'
 import type { BuildJob, CollectionSourceTask, CollectionSourceRun, PreprocessingBatch, PreprocessingJob, TrajectoryRecord, TrajectoryScope } from '@/types'
 
 const batch = (id: string, version: string | null = 'v1'): PreprocessingBatch => ({
@@ -36,9 +37,46 @@ function setup(protect = vi.fn(async () => true), options: Parameters<typeof use
   disposers.push(flow.dispose)
   return { flow, client, protect }
 }
-afterEach(() => { disposers.splice(0).forEach(dispose => dispose()); vi.useRealTimers() })
+afterEach(() => { disposers.splice(0).forEach(dispose => dispose()); vi.useRealTimers(); vi.unstubAllGlobals() })
 
 describe('batch preprocessing workspace', () => {
+  it.each(['manual_collection', 'task_generation', 'augmentation'])('loads the frozen result snapshot for %s without querying its task-source ID', async kind => {
+    const { flow, client } = setup()
+    const resultId = 'b261110-002'
+    const frozenTask = { task_id: 'original', collection_case_id: 'case-01', task: 'Frozen task', app: 'Demo' }
+    client.preprocessingBatches.mockResolvedValue([{ ...batch(resultId), kind,
+      batch_role: 'collection_result', task_source_batch_id: 'old-source' }])
+    client.collectionSourceTasks.mockImplementation(api.collectionSourceTasks)
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => String(input) === '/api/phone-factory/batches/' + resultId
+      ? new Response(JSON.stringify({ snapshot: { tasks: [frozenTask] } }))
+      : new Response(JSON.stringify({ detail: '采集批次不存在' }), { status: 404 }))
+    vi.stubGlobal('fetch', fetcher)
+    await flow.loadBatches(resultId)
+    expect(flow.sourceTasks.value).toEqual([frozenTask])
+    expect(flow.sourceError.value).toBe('')
+    expect(flow.tasks.value).toHaveLength(1)
+    expect(fetcher).toHaveBeenCalledTimes(1)
+    expect(client.collectionSourceRuns).toHaveBeenCalledWith(resultId)
+    expect(client.createPreprocessing).not.toHaveBeenCalled()
+  })
+
+  it('keeps annotation and run evidence visible when a genuine missing source returns 404', async () => {
+    const { flow, client } = setup()
+    const frozenTask = { task_id: 'original', collection_case_id: 'case-01', task: 'Run snapshot', app: 'Demo' }
+    client.preprocessingBatches.mockResolvedValue([{ ...batch('missing'), kind: 'manual_collection', batch_role: 'collection_result' }])
+    client.collectionSourceTasks.mockImplementation(api.collectionSourceTasks)
+    client.collectionSourceRuns.mockResolvedValue([{ collection_run_id: 'cr-existing', batch_id: 'missing',
+      status: 'completed', created_at: '2026-11-10', completed_at: null,
+      batch_tasks: { original: frozenTask }, trajectories: [], errors: [], dispatch_error: null }])
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ detail: '采集批次确实不存在' }), { status: 404 })))
+    await flow.loadBatches('missing')
+    expect(flow.sourceError.value).toContain('采集批次确实不存在')
+    expect(flow.sourceTasks.value).toEqual([frozenTask])
+    expect(flow.tasks.value).toHaveLength(1)
+    expect(flow.loadingSources.value).toBe(false)
+    expect(client.createPreprocessing).not.toHaveBeenCalled()
+  })
+
   it('reads imported Rollout task mappings through their own source endpoint before preprocessing', async () => {
     const { flow, client } = setup()
     client.preprocessingBatches.mockResolvedValue([{ ...batch('local-rollout', null), kind: 'rollout_import' }])
