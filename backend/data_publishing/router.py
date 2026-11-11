@@ -30,6 +30,9 @@ class ImportReleaseRequest(BaseModel):
 
 class UploadReleaseRequest(BaseModel):
     target: Literal["internal", "mock"] | None = None
+    include_trajectories: bool = False
+    destination_prefix: str | None = Field(default=None, max_length=1024)
+    retry_job_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 router = APIRouter(prefix="/api", tags=["data-publishing"])
@@ -150,7 +153,11 @@ def dataset_upload_capabilities() -> dict[str, object]:
 @router.post("/dataset-releases/{release_id}/upload", status_code=202)
 def upload_dataset_release(release_id: str, request: Optional[UploadReleaseRequest] = None) -> dict[str, object]:
     try:
-        return {"job": upload_manager.submit(release_id, target=request.target if request else None)}
+        return {"job": upload_manager.submit(
+            release_id, target=request.target if request else None,
+            include_trajectories=request.include_trajectories if request else False,
+            destination_prefix=request.destination_prefix if request else None,
+            retry_job_id=request.retry_job_id if request else None)}
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except InternalUploadConflict as exc:

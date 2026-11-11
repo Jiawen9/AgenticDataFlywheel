@@ -18,6 +18,14 @@ describe('dataset internal upload API', () => {
     await api.uploadDatasetRelease('legacy')
     expect(fetcher.mock.calls[0]?.[1].body).toBeUndefined()
   })
+  it('submits the editable destination and frozen release scope without client-side file paths', async () => {
+    const fetcher = vi.fn().mockResolvedValue(new Response('{"job":{"job_id":"folders","folder_upload":true}}', { status: 202 }))
+    vi.stubGlobal('fetch', fetcher)
+    await api.uploadDatasetRelease('发布/1', 'internal', { include_trajectories: true, destination_prefix: 'data/中文目标/' })
+    expect(fetcher).toHaveBeenCalledTimes(1)
+    expect(fetcher.mock.calls[0]?.[0]).toBe('/api/dataset-releases/%E5%8F%91%E5%B8%83%2F1/upload')
+    expect(JSON.parse(fetcher.mock.calls[0]?.[1].body)).toEqual({ target: 'internal', include_trajectories: true, destination_prefix: 'data/中文目标/' })
+  })
   it('reads capabilities and persisted progress', async () => {
     const fetcher = vi.fn()
       .mockResolvedValueOnce(new Response('{"internal":{"configured":false,"reason":"云道S3上传尚未配置"}}'))
@@ -26,6 +34,12 @@ describe('dataset internal upload API', () => {
     expect((await api.datasetUploadCapabilities()).internal).toEqual({ configured: false, reason: '云道S3上传尚未配置' })
     expect((await api.datasetUploadJob('job')).completed_files).toBe(1)
     expect(fetcher.mock.calls.map(call => call[0])).toEqual(['/api/dataset-upload-capabilities', '/api/dataset-upload-jobs/job'])
+  })
+  it('passes a same-target retry identity without changing the endpoint', async () => {
+    const fetcher = vi.fn().mockResolvedValue(new Response('{"job":{"job_id":"retry"}}'))
+    vi.stubGlobal('fetch', fetcher)
+    await api.uploadDatasetRelease('rel', 'internal', { include_trajectories: true, destination_prefix: 'original/', retry_job_id: 'job-failed' })
+    expect(JSON.parse(fetcher.mock.calls[0]?.[1].body)).toEqual({ target: 'internal', include_trajectories: true, destination_prefix: 'original/', retry_job_id: 'job-failed' })
   })
   it('surfaces 409 validation failures', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('{"detail":"表格 SHA256 不一致"}', { status: 409 })))

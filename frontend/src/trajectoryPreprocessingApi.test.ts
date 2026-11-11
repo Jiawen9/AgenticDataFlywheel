@@ -5,6 +5,27 @@ import type { StageArtifact } from './types'
 
 afterEach(() => vi.unstubAllGlobals())
 describe('batch-scoped trajectory API', () => {
+  it('reads collection snapshots from the unified factory endpoint and keeps Rollout separate', async () => {
+    const task = { task_id: 'original-1', collection_case_id: 'case-1', task: 'Frozen goal', app: 'Demo' }
+    const fetcher = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+      const path = String(input)
+      if (path.startsWith('/api/phone-factory/batches/') || path.startsWith('/api/rollout-imports/batches/')) {
+        return new Response(JSON.stringify({ snapshot: { tasks: [task] } }))
+      }
+      // The former task-generation route cannot locate result or manual IDs.
+      return new Response(JSON.stringify({ detail: '采集批次不存在' }), { status: 404 })
+    })
+    vi.stubGlobal('fetch', fetcher)
+    for (const id of ['b261110-002', 'manual/source', 'generated-source', 'augmented-source']) {
+      expect(await api.collectionSourceTasks(id)).toEqual([task])
+      expect(fetcher.mock.calls.at(-1)?.[0]).toBe('/api/phone-factory/batches/' + encodeURIComponent(id))
+      expect(fetcher.mock.calls.at(-1)?.[1]?.cache).toBe('no-store')
+    }
+    expect(await api.collectionSourceTasks('rollout/local', 'rollout_import')).toEqual([task])
+    expect(fetcher.mock.calls.at(-1)?.[0]).toBe('/api/rollout-imports/batches/rollout%2Flocal')
+    expect(fetcher.mock.calls.some(([url]) => String(url).includes('task-generation/collection-batches'))).toBe(false)
+  })
+
   it('loads quality images from the selected business batch', () => {
     expect(imageUrl('runs/cr/original/1.png', treeRunScope({ batch_id: 'batch-b', annotation_version: 'v2' }))).toBe('/api/assets/runs/cr/original/1.png?batch_id=batch-b')
     expect(treeRunScope(undefined)).toBeUndefined()

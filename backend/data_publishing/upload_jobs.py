@@ -17,6 +17,7 @@ from ..identifiers import allocate_id, is_short_id
 from .service import DatasetReleaseRegistry
 from . import internal_uploader
 from .internal_jobs import InternalUploadJobsMixin
+from .directory_jobs import DirectoryUploadJobsMixin
 
 
 Progress = Callable[[dict[str, Any]], None]
@@ -39,7 +40,7 @@ def _setting(name: str, default: str) -> str:
     return os.getenv(name) or _load_env().get(name) or default
 
 
-class DatasetUploadJobManager(InternalUploadJobsMixin):
+class DatasetUploadJobManager(DirectoryUploadJobsMixin, InternalUploadJobsMixin):
     def __init__(
         self,
         registry: DatasetReleaseRegistry,
@@ -77,7 +78,10 @@ class DatasetUploadJobManager(InternalUploadJobsMixin):
         if self._path(job_id).name == ".invalid-job-id":
             return None
         with self._lock:
-            return self._records.get("dataset_upload_jobs", job_id)
+            payload = self._records.get("dataset_upload_jobs", job_id)
+            if payload and payload.get("folder_upload"):
+                payload = self._read_directory_job(payload)
+            return payload
 
     def mark_interrupted_jobs(self) -> None:
         payloads = self._records.list("dataset_upload_jobs")
@@ -88,6 +92,9 @@ class DatasetUploadJobManager(InternalUploadJobsMixin):
             return (int(item.get("attempt", 0)), item.get("created_at", ""))
 
         for payload in sorted(payloads, key=internal_order):
+            if payload.get("folder_upload"):
+                self._recover_directory_job(payload)
+                continue
             if payload.get("mode") == "internal":
                 release = self.registry.get(str(payload.get("release_id", "")))
                 if release is None:
@@ -157,8 +164,18 @@ class DatasetUploadJobManager(InternalUploadJobsMixin):
                 payload["percent"] = min(99, round(100 * completed / total)) if total else 0
             self._write(payload)
 
-    def submit(self, release_id: str, *, target: Optional[str] = None) -> dict[str, Any]:
+    def submit(self, release_id: str, *, target: Optional[str] = None,
+               include_trajectories: bool = False, destination_prefix: str | None = None,
+               retry_job_id: str | None = None) -> dict[str, Any]:
+        if include_trajectories:
+            if target != "internal":
+                raise ValueError("完整轨迹上传只支持云道目标")
+            return self._submit_directory(release_id, destination_prefix=destination_prefix, retry_job_id=retry_job_id)
+        if destination_prefix is not None or retry_job_id is not None:
+            raise ValueError("自定义云道目录需启用完整轨迹上传")
         if target == "internal":
+            if callable(getattr(self.internal_adapter, "upload_directory", None)):
+                return self._submit_directory(release_id, include_trajectories=False)
             return self._submit_internal(release_id)
         if target not in {None, "mock"}:
             raise ValueError("未知上传目标")

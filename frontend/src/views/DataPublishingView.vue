@@ -14,6 +14,8 @@ import { ElMessage } from 'element-plus'
 import { CopyDocument, Download, Plus, Refresh, Search, Upload, View } from '@element-plus/icons-vue'
 import { api, datasetReleaseExcelUrl } from '@/api'
 import DatasetUploadReceipts from '@/components/DatasetUploadReceipts.vue'
+import DatasetFolderUploadProgress from '@/components/DatasetFolderUploadProgress.vue'
+import { uploadDestinationPrefix, uploadRetryJobId } from '@/utils/datasetFolderUpload'
 import ReleaseOverviewStatus from '@/components/ReleaseOverviewStatus.vue'
 import ExternalDatasetImport from '@/components/ExternalDatasetImport.vue'
 import { datasetUploadMessage } from '@/utils/datasetUploadMessage'
@@ -26,6 +28,12 @@ const managedBatchIds = ref<string[]>([])
 const ACTIVE_UPLOAD_KEY = 'agentic-data-flywheel.active-internal-dataset-upload'
 const capabilities = ref<DatasetUploadCapabilities>({ internal: { configured: false, reason: '正在检查云道S3上传配置' } })
 const submitting = ref(false)
+const uploadDialogVisible = ref(false)
+const uploadRelease = ref<DatasetRelease | null>(null)
+const destinationPrefix = ref('')
+const retryUploadId = computed(() => uploadRetryJobId(uploadRelease.value?.internal_upload, destinationPrefix.value))
+const uploadDestination = computed(() => retryUploadId.value && uploadRelease.value?.internal_upload?.destination
+  ? uploadRelease.value.internal_upload.destination : capabilities.value.internal)
 const pollError = ref('')
 let pollEpoch = 0
 let loadEpoch = 0
@@ -206,7 +214,7 @@ async function pollUpload(jobId: string, epoch = pollEpoch) {
     localStorage.removeItem(ACTIVE_UPLOAD_KEY)
     await loadData(true)
     if (disposed || epoch !== pollEpoch) return
-    if (job.status === 'succeeded') ElMessage.success('全部 Excel 已上传到云道S3')
+    if (job.status === 'succeeded') ElMessage.success(job.folder_upload && job.include_trajectories !== false ? '发布表格及所选完整轨迹已上传到云道S3' : '全部表格已上传到云道S3')
     else ElMessage.error(datasetUploadMessage(job.error) || '上传作业未成功完成')
   } catch (error) {
     if (disposed || epoch !== pollEpoch) return
@@ -216,13 +224,26 @@ async function pollUpload(jobId: string, epoch = pollEpoch) {
   }
 }
 
-async function startUpload(release: DatasetRelease) {
+function startUpload(release: DatasetRelease) {
   if (uploadDisabled(release)) return
+  uploadRelease.value = release
+  destinationPrefix.value = uploadDestinationPrefix(release.internal_upload, capabilities.value)
+  uploadDialogVisible.value = true
+}
+
+async function confirmUpload() {
+  const release = uploadRelease.value
+  if (!release || uploadDisabled(release)) return
+  const folders = !isExternalRelease(release)
   submitting.value = true
   try {
-    const job = await api.uploadDatasetRelease(release.release_id, 'internal')
+    const job = await api.uploadDatasetRelease(release.release_id, 'internal', folders ? {
+      include_trajectories: true, destination_prefix: destinationPrefix.value.trim(),
+      ...(retryUploadId.value ? { retry_job_id: retryUploadId.value } : {}),
+    } : undefined)
     localStorage.setItem(ACTIVE_UPLOAD_KEY, job.job_id)
     if (disposed) return
+    uploadDialogVisible.value = false
     activeUpload.value = job
     void pollUpload(job.job_id, ++pollEpoch)
     await loadData(true)
@@ -235,13 +256,15 @@ async function startUpload(release: DatasetRelease) {
 
 function uploadDisabled(release: DatasetRelease) {
   return !capabilities.value.internal.configured || submitting.value || Boolean(uploadRunning.value)
-    || ['queued', 'uploading', 'succeeded'].includes(internalStatus(release))
-    || !release.excel_paths.length || release.excel_paths.some(item => item.available === false)
+    || (!isExternalRelease(release) && capabilities.value.internal.directory_upload !== true)
+    || ['queued', 'uploading'].includes(internalStatus(release))
+    || (isExternalRelease(release) && internalStatus(release) === 'succeeded')
+    || !release.excel_paths.length || (isExternalRelease(release) && release.excel_paths.some(item => item.available === false))
 }
 
 function uploadLabel(release: DatasetRelease) {
   const status = internalStatus(release)
-  if (status === 'succeeded') return '已上传云道S3'
+  if (status === 'succeeded') return isExternalRelease(release) ? '已上传云道S3' : '云道S3上传／更换目标'
   if (['failed', 'interrupted'].includes(status)) return '重试云道S3上传'
   return '云道S3上传'
 }
@@ -290,7 +313,7 @@ onBeforeUnmount(() => { disposed = true; ++pollEpoch; clearPoll() })
     <template v-if="!pipelineContext.historyOnly.value">
     <BatchPublishedNotice :notice="publishedNotice" />
     <header class="page-hero release-hero">
-      <div><span class="eyebrow">DATASET RELEASE</span><h1>数据发布</h1><p>发布专家纠偏数据或已有的轨迹表格，将发布记录中的全部 Excel 上传到云道S3。</p></div>
+      <div><span class="eyebrow">DATASET RELEASE</span><h1>数据发布</h1><p>发布数据表，并将平台发布表包含的完整轨迹目录上传到云道S3。</p></div>
       <div class="release-actions"><ExternalDatasetImport @released="externalReleased" /><el-button :icon="Refresh" :loading="loading" @click="loadData()">刷新</el-button></div>
     </header>
 
@@ -303,6 +326,7 @@ onBeforeUnmount(() => { disposed = true; ++pollEpoch; clearPoll() })
 
     <el-alert v-if="pageError" :title="pageError" type="error" :closable="false" show-icon />
     <el-alert v-if="!capabilities.internal.configured" :title="datasetUploadMessage(capabilities.internal.reason) || '云道S3上传尚未配置'" type="warning" :closable="false" show-icon />
+    <el-alert v-else-if="capabilities.internal.directory_upload !== true" title="当前后端仅支持旧版表格上传，请同步支持完整轨迹目录上传的后端。" type="warning" :closable="false" show-icon />
     <el-alert v-if="pollError" :title="pollError" type="warning" :closable="false" show-icon />
 
     <section v-if="!pipelineContext.isPipelineRoute.value" class="panel create-panel" v-loading="loading">
@@ -329,12 +353,15 @@ onBeforeUnmount(() => { disposed = true; ++pollEpoch; clearPoll() })
     </section>
 
     <section v-if="activeUpload" class="panel upload-progress">
-      <div class="upload-progress__head"><div><span class="status-dot" :class="activeUpload.status" /><b>{{ statusText(activeUpload.status) }}</b><DisplayId kind="release" :id="activeUpload.release_id" /></div><strong>{{ activeUpload.percent }}%</strong></div>
-      <el-progress :percentage="activeUpload.percent" :status="activeUpload.status === 'failed' ? 'exception' : activeUpload.status === 'succeeded' ? 'success' : undefined" />
-      <div class="upload-progress__meta"><span>已确认 {{ activeUpload.completed_files }}/{{ activeUpload.total_files }} 个 Excel</span><span>{{ formatBytes(activeUpload.completed_bytes) }}/{{ formatBytes(activeUpload.total_bytes) }}</span><span v-if="activeUpload.current_file" class="current-file" :title="activeUpload.current_file">当前文件：{{ activeUpload.current_file }}</span></div>
+      <div class="upload-progress__head"><div><span class="status-dot" :class="activeUpload.status" /><b>{{ statusText(activeUpload.status) }}</b><DisplayId kind="release" :id="activeUpload.release_id" /></div><strong v-if="!activeUpload.folder_upload">{{ activeUpload.percent }}%</strong></div>
+      <DatasetFolderUploadProgress v-if="activeUpload.folder_upload" :key="activeUpload.job_id" :upload="activeUpload" :stage="activeUpload.stage" />
+      <template v-else>
+        <el-progress :percentage="activeUpload.percent" :status="activeUpload.status === 'failed' ? 'exception' : activeUpload.status === 'succeeded' ? 'success' : undefined" />
+        <div class="upload-progress__meta"><span>已确认 {{ activeUpload.completed_files }}/{{ activeUpload.total_files }} 个 Excel</span><span>{{ formatBytes(activeUpload.completed_bytes) }}/{{ formatBytes(activeUpload.total_bytes) }}</span><span v-if="activeUpload.current_file" class="current-file" :title="activeUpload.current_file">当前文件：{{ activeUpload.current_file }}</span></div>
+        <DatasetUploadReceipts :files="activeUpload.file_results" />
+      </template>
       <el-alert v-if="activeUpload.error" :title="datasetUploadMessage(activeUpload.error)" type="error" :closable="false" />
-      <p v-if="['failed', 'interrupted'].includes(activeUpload.status)" class="retry-hint">重试将跳过已确认成功且校验值一致的文件，继续上传剩余表格。</p>
-      <DatasetUploadReceipts :files="activeUpload.file_results" />
+      <p v-if="['failed', 'interrupted'].includes(activeUpload.status)" class="retry-hint">{{ activeUpload.folder_upload ? '使用同一目标重试将跳过已确认成功的目录，继续剩余传输。' : '重试将跳过已确认成功且校验值一致的文件，继续上传剩余表格。' }}</p>
     </section>
 
     <section class="panel history-panel">
@@ -347,11 +374,29 @@ onBeforeUnmount(() => { disposed = true; ++pollEpoch; clearPoll() })
         <el-table-column label="来源" min-width="120"><template #default="{ row }"><el-tag :type="isExternalRelease(row) ? 'info' : 'success'">{{ releaseSource(row) }}</el-tag><small v-if="isExternalRelease(row)" class="release-progress">{{ row.external_import?.data_source || '人工采集' }}</small></template></el-table-column>
         <el-table-column label="发布时间" min-width="170"><template #default="{ row }">{{ formatDate(row.created_at) }}</template></el-table-column>
         <el-table-column label="规模" min-width="180"><template #default="{ row }">{{ row.excel_paths.length }} Excel · {{ row.trajectory_count }} 轨迹 · {{ row.step_count }} 步</template></el-table-column>
-        <el-table-column label="云道S3" min-width="130"><template #default="{ row }"><el-tag :type="statusType(internalStatus(row))" effect="light">{{ statusText(internalStatus(row)) }}</el-tag><small v-if="row.internal_upload" class="release-progress">{{ row.internal_upload.completed_files }}/{{ row.internal_upload.total_files }} 个 Excel</small></template></el-table-column>
+        <el-table-column label="云道S3" min-width="130"><template #default="{ row }"><el-tag :type="statusType(internalStatus(row))" effect="light">{{ statusText(internalStatus(row)) }}</el-tag><small v-if="row.internal_upload" class="release-progress">{{ row.internal_upload.folder_upload ? `${row.internal_upload.completed_items || 0}/${row.internal_upload.total_items || 0} 个目录` : `${row.internal_upload.completed_files}/${row.internal_upload.total_files} 个 Excel` }}</small></template></el-table-column>
         <el-table-column label="操作" width="380" fixed="right"><template #default="{ row }"><el-button text :icon="View" @click="showDetails(row)">详情</el-button><el-button v-if="row.excel_paths.length" text :icon="Download" tag="a" :href="datasetReleaseExcelUrl(row.release_id, 0)" target="_blank">下载 Excel</el-button><el-button text type="primary" :icon="Upload" :disabled="uploadDisabled(row)" @click="startUpload(row)">{{ uploadLabel(row) }}</el-button></template></el-table-column>
       </el-table>
       <el-empty v-else description="暂无匹配的发布记录" :image-size="80" />
     </section>
+
+    <el-dialog v-model="uploadDialogVisible" width="min(660px, 94vw)" title="上传到云道S3" :close-on-click-modal="!submitting" :close-on-press-escape="!submitting" destroy-on-close>
+      <template v-if="uploadRelease">
+        <p><b>{{ uploadRelease.name }}</b></p>
+        <template v-if="!isExternalRelease(uploadRelease)">
+          <p class="upload-scope">按冻结发布表包含的轨迹上传完整目录，不读取当前页面勾选。例如同一用例 10 条轨迹中发布 2 条，只上传这 2 条的完整文件。旧“完整数据集”表可能包含全部轨迹，实际范围会在后台定位后展示。</p>
+          <el-form label-position="top" @submit.prevent="confirmUpload">
+            <el-form-item label="云道目标前缀"><el-input v-model="destinationPrefix" data-testid="upload-destination-prefix" :disabled="submitting" placeholder="例如 data/gui_data/flywheel_data/（空白表示 bucket 根目录）" /></el-form-item>
+          </el-form>
+          <p class="upload-scope">Bucket：{{ uploadDestination.bucket || '后端配置' }} · Region：{{ uploadDestination.region || '后端配置' }}</p>
+          <p class="upload-scope">目标：<code>s3://{{ uploadDestination.bucket || 'bucket' }}/{{ destinationPrefix.replace(/^\/+|\/+$/g, '') }}{{ destinationPrefix.replace(/^\/+|\/+$/g, '') ? '/' : '' }}&lt;批次编号&gt;/</code></p>
+          <p class="upload-scope">发布表格放入“发布表格/序号/”，轨迹按“用例/轨迹/”保存。直接传输现有目录，不额外复制本地数据。</p>
+          <p v-if="uploadRelease.internal_upload?.folder_upload && ['failed', 'interrupted'].includes(internalStatus(uploadRelease))" class="upload-scope">已填入上次目标。保持目标重试可跳过成功目录；更改目标会创建新上传任务。</p>
+        </template>
+        <p v-else class="upload-scope">外部导入记录沿用表格上传，不查找或上传外部轨迹目录。</p>
+      </template>
+      <template #footer><el-button :disabled="submitting" @click="uploadDialogVisible = false">取消</el-button><el-button data-testid="confirm-yundao-upload" type="primary" :loading="submitting" @click="confirmUpload">开始上传</el-button></template>
+    </el-dialog>
 
     <el-dialog v-model="detailVisible" width="min(760px, 92vw)" title="数据集详情" destroy-on-close>
       <template v-if="detailRelease">
@@ -375,10 +420,11 @@ onBeforeUnmount(() => { disposed = true; ++pollEpoch; clearPoll() })
           <el-descriptions-item v-if="!isExternalRelease(detailRelease)" label="模拟 S3 地址"><code>{{ detailRelease.s3_uri || '无' }}</code><el-button v-if="detailRelease.s3_uri" text :icon="CopyDocument" @click="copyS3(detailRelease.s3_uri)">复制</el-button></el-descriptions-item>
         </el-descriptions>
         <template v-if="detailRelease.internal_upload">
-          <h4>云道S3上传结果 · {{ detailRelease.internal_upload.completed_files }}/{{ detailRelease.internal_upload.total_files }} 个 Excel</h4>
+          <h4>云道S3上传结果</h4>
           <p v-if="detailRelease.internal_upload.completed_at">任务结束时间：{{ formatDate(detailRelease.internal_upload.completed_at) }}</p>
           <el-alert v-if="detailRelease.internal_upload.error" :title="datasetUploadMessage(detailRelease.internal_upload.error)" type="error" :closable="false" />
-          <DatasetUploadReceipts :files="detailRelease.internal_upload.file_results" />
+          <DatasetFolderUploadProgress v-if="detailRelease.internal_upload.folder_upload" :key="detailRelease.internal_upload.job_id" :upload="detailRelease.internal_upload" />
+          <DatasetUploadReceipts v-else :files="detailRelease.internal_upload.file_results" />
         </template>
         <ReleaseOverviewStatus v-if="detailVisible" :key="detailRelease.release_id" :release-id="detailRelease.release_id" />
         <h4>{{ isExternalRelease(detailRelease) || isPipelineRelease(detailRelease) ? '发布 Excel' : '纠偏 Excel' }}</h4>
@@ -427,6 +473,7 @@ onBeforeUnmount(() => { disposed = true; ++pollEpoch; clearPoll() })
 .current-file { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .release-progress { display: block; color: var(--muted); margin-top: 5px; }
 .retry-hint { color: var(--muted); font-size: 13px; }
+.upload-scope { color: var(--muted); line-height: 1.7; overflow-wrap: anywhere; }
 .history-heading { align-items: center; margin-bottom: 16px; }
 .filters { display: grid; grid-template-columns: 240px 130px; gap: 10px; }
 .release-name { display: grid; gap: 4px; }
