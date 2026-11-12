@@ -37,7 +37,7 @@ Progress = Callable[[dict[str, Any]], None]
 QualityRunner = Callable[..., dict[str, Any]]
 
 
-_PROGRESS_STAGES = {"preparing", "generating_rubric", "evaluating", "publishing"}
+_PROGRESS_STAGES = {"preparing", "generating_rubric", "evaluating", "checklist_preparing", "checklist_evaluating", "fusing", "publishing"}
 _PROGRESS_IDENT = re.compile(r"^[A-Za-z0-9_.:-]{1,96}$")
 _HEARTBEAT_TIMEOUT = 60.0
 _REQUEST_CLEANUP_GRACE = 15.0
@@ -321,6 +321,12 @@ def _run_quality_subprocess(run_id: str, task_ids: list[str], *, job_id: str, pr
             finally:
                 exited = stop_owned_process(process)
         quality_execution.update_process(root, job_id, token, {"exited": exited, "cleanup_failed": not exited})
+        if quality_execution.committed_result(root, job_id, token) is None:
+            try:
+                from .quality_checklist import cancel_remote_jobs
+                cancel_remote_jobs(root, job_id)
+            except Exception as exc:
+                diagnostics.log_event("quality_checklist_cleanup_failed", error=diagnostics.format_exception(exc))
         if process.stdin is not None:
             process.stdin.close()
         if exited:
@@ -429,6 +435,11 @@ class QualityJobManager:
         task_ids = list(dict.fromkeys(task_ids or []))
         if not run_id or not task_ids:
             raise ValueError("请选择批次和质检任务")
+        # Freeze before taking a batch lock: capability/profile queries are remote.
+        checklist_options = None
+        if self.runner is run_quality_subprocess:
+            from .quality_checklist import freeze_options
+            checklist_options = freeze_options(self.data_root)
         alias = self.records.get("batch_run_aliases", run_id)
         if alias:
             from .batch_lifecycle import ensure_batch_active
@@ -443,17 +454,19 @@ class QualityJobManager:
             ensure_pipeline_write(run_id, self.data_root)
             trees = current_tree_payload(run_id, self.data_root)
             if trees.get("trees"):
-                return self._submit_batch(run_id, task_ids, trees)
+                return self._submit_batch(run_id, task_ids, trees, checklist_options=checklist_options)
             if batch_id is not None:
                 raise ValueError("所选批次没有当前轨迹树")
-            return self._submit_job(run_id, task_ids)
+            return self._submit_job(run_id, task_ids, {"checklist_options": checklist_options} if checklist_options else None)
 
-    def _submit_batch(self, batch_id, task_ids, trees):
+    def _submit_batch(self, batch_id, task_ids, trees, *, checklist_options=None):
         if any(task not in trees["trees"] for task in task_ids):
             raise ValueError("所选任务没有当前轨迹树")
-        fingerprints = quality_task_fingerprints(trees)
+        fingerprints = quality_task_fingerprints(trees, checklist_options=checklist_options)
         expected = {task: fingerprints[task] for task in task_ids}
-        current = current_quality_payload(batch_id, self.data_root).get("task_fingerprints", {})
+        published = current_quality_payload(batch_id, self.data_root)
+        incomplete = {item["task_id"] for item in published.get("tasks", []) if item.get("scoring_version") == "checklist_fusion_v1" and not item.get("fusion_complete")}
+        current = {task: value for task, value in published.get("task_fingerprints", {}).items() if task not in incomplete}
         jobs = [job for job in self.list_jobs() if (job.get("batch_id") or job.get("run_id")) == batch_id]
         for job in jobs:
             if job.get("status") in {"queued", "running"} and all(
@@ -473,7 +486,8 @@ class QualityJobManager:
                 return waiting
         return self._submit_job(batch_id, pending, {"batch_id": batch_id, "task_fingerprints": {task: expected[task] for task in pending} if pending else expected,
             "source_tree_hashes": {task: trees["tree_hashes"][task] for task in pending},
-            "requested_task_ids": task_ids, "reused_task_ids": [task for task in task_ids if task not in pending]})
+            "requested_task_ids": task_ids, "reused_task_ids": [task for task in task_ids if task not in pending],
+            **({"checklist_options": checklist_options, "scoring_version": "checklist_fusion_v1"} if checklist_options else {})})
 
     def _submit_job(self, run_id, task_ids, extra=None):
         if self._closed:

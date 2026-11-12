@@ -346,14 +346,20 @@ def create_session(tree_run_id: str | None = None, *, batch_id: str | None = Non
         if str(selection.get("storage_batch_id") or identifier) != selected_batch:
             raise ValueError("批次来源已更新，请重新选择")
         with _input_for_batch(identifier) as (workbook_path, package_root, current_tree):
-            full_snapshot = load_snapshot(workbook_path, asset_root=package_root, source_kind="annotated_workbook")
-            snapshot = identified(filter_snapshot(full_snapshot, selection))
             raw_payload = read_workbook_payload(workbook_path)
             table_payload = {key: deepcopy(raw_payload[key]) for key in ("schema_version", "columns", "sheets") if key in raw_payload}
-            source_key = fingerprint({"table": table_payload, "selection": selection.get("selected_trajectories"),
-                                      "tasks": selection.get("task_fingerprints", {})})
             existing = next((item for item in list_sessions() if not item.get("archived")
                 and str(item.get("storage_batch_id") or item.get("batch_id") or item.get("tree_run_id")) == selected_batch), None)
+            if (existing is not None and not existing.get("stale_tasks")
+                    and fingerprint(existing.get("workbook_payload")) == fingerprint(table_payload)
+                    and existing.get("task_fingerprints", {}) == selection.get("task_fingerprints", {})):
+                # A draft owns its chosen trajectories. Re-scoring identical inputs
+                # must not replace a user's work when the page refreshes.
+                return _public_session(existing, _snapshot(existing))
+            full_snapshot = load_snapshot(workbook_path, asset_root=package_root, source_kind="annotated_workbook")
+            snapshot = identified(filter_snapshot(full_snapshot, selection))
+            source_key = fingerprint({"table": table_payload, "selection": selection.get("selected_trajectories"),
+                                      "tasks": selection.get("task_fingerprints", {})})
             if existing is not None:
                 if existing.get("input_fingerprint") == source_key and not existing.get("stale_tasks"):
                     return _public_session(existing, _snapshot(existing))

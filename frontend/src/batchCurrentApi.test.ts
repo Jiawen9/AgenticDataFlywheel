@@ -2,6 +2,16 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { api } from './api'
 afterEach(() => vi.unstubAllGlobals())
 describe('current business batch API', () => {
+  it('uses the shared API route for quality settings and submits only the saved profile identity', async () => {
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(JSON.stringify({ supported: true, profiles: [] })))
+    vi.stubGlobal('fetch', fetcher)
+    await api.qualitySettings()
+    expect(fetcher.mock.calls.at(-1)?.[0]).toBe('/api/quality-jobs/settings')
+    const selected = { evaluation_profile_id: 'current', evaluation_profile_digest: 'frozen-digest' }
+    await api.saveQualitySettings(selected)
+    expect(fetcher.mock.calls.at(-1)?.[1]?.method).toBe('PUT')
+    expect(JSON.parse(String(fetcher.mock.calls.at(-1)?.[1]?.body))).toEqual(selected)
+  })
   it('addresses trees, quality, submissions and correction by business batch only', async () => {
     const fetcher = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(JSON.stringify({ session: {}, group: {} })))
     vi.stubGlobal('fetch', fetcher)

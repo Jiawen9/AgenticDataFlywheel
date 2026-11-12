@@ -124,6 +124,11 @@ def progress(**changes: Any) -> None:
     diagnostics.log_event("quality_progress", **changes)
 
 
+def _check_quality_execution() -> None:
+    with execution_write_guard():
+        pass
+
+
 def _now() -> str:
     return datetime.now(ZoneInfo("Asia/Shanghai")).isoformat()
 
@@ -258,8 +263,9 @@ async def _run_frozen(run_id: str, task_ids: list[str], job_id: str,
     else:
         workbook, tasks, all_trajectories = _ensure_workbook(run_id, manifest, task_ids)
     config = GEN.load_config(CONFIG_PATH)
-    input_fingerprints = quality_task_fingerprints(current) if current is not None else {}
     queued = RecordStore(DATA_ROOT).get("quality_jobs", job_id) or {}
+    checklist_options = queued.get("checklist_options")
+    input_fingerprints = quality_task_fingerprints(current, checklist_options=checklist_options) if current is not None else {}
     if current is not None and queued.get("task_fingerprints") and any(
             queued["task_fingerprints"].get(task) != input_fingerprints.get(task) for task in task_ids):
         raise StaleTaskInput("质检配置已变化，请重新提交")
@@ -362,12 +368,36 @@ async def _run_frozen(run_id: str, task_ids: list[str], job_id: str,
             "evaluation_settings": settings, "trajectory_count": len(evaluations),
             "average_score": average, "passed_count": passed, "evaluations": serialized,
         }
+        if checklist_options:
+            from backend.quality_checklist import build_task, evaluate_task, digest
+            from backend.quality_fusion import enrich_task
+            try:
+                progress(stage="checklist_preparing", current_task=task_id)
+                checklist_task = build_task(task_id, task, trajectories)
+                source_digest = input_fingerprints.get(task_id) or digest({"tree": tree, "task": checklist_task})
+                checklists = evaluate_task(DATA_ROOT, queued, checklist_task, source_digest,
+                                          progress=progress, check=lambda: _check_quality_execution())
+            except QualityExecutionRevoked:
+                raise
+            except Exception as exc:
+                # Keep Rubric results and diagnostics; one failed Checklist must
+                # not erase completed trajectories or older published artifacts.
+                safe_error = diagnostics.format_exception(exc).get("message") or type(exc).__name__
+                checklists = {item.trajectory_id: {"status": "error", "error": safe_error[:1000]} for item in trajectories}
+            definitions = {item.get("definition_digest") for item in checklists.values() if item.get("status") == "complete"}
+            definition_digest = next(iter(definitions)) if len(definitions) == 1 else "definition_mismatch"
+            progress(stage="fusing", current_task=task_id)
+            task_result = enrich_task(task_result, tree, checklists,
+                                      [item.trajectory_id for item in trajectories], definition_digest)
+            task_result["checklist_options"] = checklist_options
         task_results.append(task_result)
-        summaries.append({key: task_result[key] for key in ("task_id", "completed_at", "trajectory_count", "average_score", "passed_count")})
+        summary_fields = ("task_id", "completed_at", "trajectory_count", "average_score", "passed_count",
+                          "scoring_version", "fusion_complete", "fusion_eligible_count", "checklist_definition_digest")
+        summaries.append({key: task_result[key] for key in summary_fields if key in task_result})
 
     progress(stage="publishing", completed_trajectories=completed, total_trajectories=total, percent=97)
     if current is not None:
-        fingerprints = quality_task_fingerprints(current)
+        fingerprints = quality_task_fingerprints(current, checklist_options=checklist_options)
         if any(fingerprints.get(task) != input_fingerprints.get(task) for task in task_ids):
             raise StaleTaskInput("质检期间模型配置已变化，请重新提交")
         return merge_quality_results(run_id, task_results,

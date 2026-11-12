@@ -272,8 +272,9 @@ onBeforeUnmount(() => {
                     <el-icon><Refresh /></el-icon>
                     <b><DisplayId kind="trajectory" :id="trajectory.trajectory_id" :scope="selectedBatchId" /></b>
                     <span class="rank">Top-{{ trajectory.rank }}</span>
-                    <span class="score">{{ trajectory.global_score.toFixed(4) }} 分</span>
-                    <el-tag size="small" :type="trajectory.passed_threshold ? 'success' : 'warning'">{{ trajectory.passed_threshold ? '质检通过' : '质检未通过' }}</el-tag>
+                    <span v-if="trajectory.ranking_basis === 'fusion'" class="score">F {{ trajectory.fusion_score == null ? '未评测' : trajectory.fusion_score.toFixed(3) }}</span>
+                    <span class="score">Rubric G {{ trajectory.global_score.toFixed(2) }} / 5</span>
+                    <el-tag size="small" :type="trajectory.passed_threshold ? 'success' : 'warning'">{{ trajectory.passed_threshold ? 'Rubric 达标' : 'Rubric 未达标' }}</el-tag>
                     <el-tag v-if="trajectory.group.pending_review" type="warning">人工修改待复核</el-tag>
                     <span>{{ trajectory.group.active_row_count }}/{{ trajectory.group.row_count }} 步 · 已改 {{ trajectory.group.edited_row_count }} 步</span>
                     <el-button class="trajectory-export" size="small" :type="trajectory.group.export ? 'success' : 'default'" plain :disabled="pipelineReadOnly || busy || trajectory.group.pending_review" @click.stop="chooseExport(task.task_id, trajectory.group.group_id)">{{ pipelineContext.managed.value ? (trajectory.group.export ? '已选择' : '选择此轨迹') : (trajectory.group.export ? '取消导出' : '加入导出') }}</el-button>

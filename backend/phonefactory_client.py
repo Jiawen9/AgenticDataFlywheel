@@ -90,6 +90,36 @@ def get_json(path):
     return _request(urllib.request.Request(SERVER + path, headers=_headers()))
 
 
+def cmd_quality_checklist(args):
+    """Dedicated asynchronous quality evaluation; never invokes phone collection."""
+    base = "/quality-checklist-jobs"
+    if args.cmd == "quality-checklist-start":
+        payload = json.loads(args.payload)
+        if not isinstance(payload, dict):
+            raise ValueError("质检请求必须为 JSON 对象")
+        manifest = Path(args.manifest).read_bytes()
+        if len(manifest) > 32 * 1024**2:
+            raise ValueError("质检轨迹清单超过 32 MiB")
+        if not isinstance(json.loads(manifest.decode("utf-8")), dict):
+            raise ValueError("质检轨迹清单必须为 UTF-8 JSON 对象")
+        capabilities = get_json("/capabilities")
+        if not isinstance(capabilities, dict) or capabilities.get("quality_checklist_jobs", {}).get("version") != 1:
+            raise ValueError("采集端不支持质检 Checklist 后台任务，请先升级采集端")
+        return post_multipart(base, {"request": json.dumps(payload, ensure_ascii=False)},
+                              [("manifest_file", "trajectories.json", manifest, "application/json")])
+    base += "/" + urllib.parse.quote(args.job_id, safe="")
+    if args.cmd == "quality-checklist-results":
+        return get_json(base + "/results?" + urllib.parse.urlencode({"offset": args.offset, "limit": args.limit}))
+    if args.cmd == "quality-checklist-report":
+        return get_json(base + "/reports/" + urllib.parse.quote(args.report_id, safe=""))
+    if args.cmd in {"quality-checklist-cancel", "quality-checklist-retry"}:
+        payload = json.loads(args.payload)
+        if not isinstance(payload, dict):
+            raise ValueError("质检控制请求必须为 JSON 对象")
+        return post_json(base + "/" + args.cmd.rsplit("-", 1)[1], payload)
+    return get_json(base)
+
+
 def post_multipart(path, fields, file_fields, *, max_body_bytes=None):
     boundary = "----phonefactory" + uuid.uuid4().hex
     chunks = []
@@ -237,6 +267,22 @@ def cmd_start_run(args):
 def build_parser():
     parser = argparse.ArgumentParser(description="独立手机工厂服务客户端")
     sub = parser.add_subparsers(dest="cmd", required=True)
+    for command in ("quality-checklist-start", "quality-checklist-status", "quality-checklist-results",
+                    "quality-checklist-cancel", "quality-checklist-retry", "quality-checklist-report"):
+        item = sub.add_parser(command)
+        item.add_argument("--server")
+        if command == "quality-checklist-start":
+            item.add_argument("--payload", required=True)
+            item.add_argument("--manifest", required=True)
+        else:
+            item.add_argument("job_id")
+        if command == "quality-checklist-results":
+            item.add_argument("--offset", type=int, default=0)
+            item.add_argument("--limit", type=int, default=50)
+        if command in {"quality-checklist-cancel", "quality-checklist-retry"}:
+            item.add_argument("--payload", default="{}")
+        if command == "quality-checklist-report":
+            item.add_argument("report_id")
     for name in ("add-phone", "del-phone", "monitor"):
         sub.add_parser(name).add_argument("phoneid")
     run = sub.add_parser("start-run")
@@ -364,7 +410,12 @@ def main():
         if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
             sys.exit("错误：采集服务地址无效")
         SERVER = args.server.rstrip("/")
-    if args.cmd in {"storage-scan", "storage-cleanup", "storage-archive"}:
+    if args.cmd.startswith("quality-checklist-"):
+        try:
+            result = cmd_quality_checklist(args)
+        except (OSError, ValueError) as exc:
+            sys.exit("错误：" + str(exc))
+    elif args.cmd in {"storage-scan", "storage-cleanup", "storage-archive"}:
         payload = json.loads(args.payload)
         if not isinstance(payload, dict):
             sys.exit("错误：存储请求必须为 JSON 对象")

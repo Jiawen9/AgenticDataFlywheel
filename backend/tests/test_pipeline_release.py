@@ -96,6 +96,34 @@ class PipelineReleaseTests(unittest.TestCase):
         artifact = release["source_refs"][0]["artifact"]
         self.assertTrue(frozen.resolve_file(artifact, "result.json").is_file())
 
+    def test_fusion_top1_then_original_rubric_threshold_without_fallback(self):
+        quality_ref = self.store.get(self.batch, "05_quality")
+        quality = self.store.read_payload(quality_ref)
+        for task in quality["tasks"]:
+            task["scoring_version"] = "checklist_fusion_v1"
+            for evaluation in task["evaluations"].values():
+                evaluation["fusion"] = {"valid": True, "score": .5}
+        task_a = quality["tasks"][0]
+        task_a["evaluations"]["a-second"].update(global_score=3, fusion={"valid": True, "score": .95})
+        task_a["evaluations"]["a-first"].update(global_score=5, fusion={"valid": True, "score": .9})
+        self.store.publish(self.batch, "05_quality", quality, source_refs=[self.store.get(self.batch, "04_tree")])
+        manual = self.pipeline("manual")["selection"]
+        self.assertEqual(manual["selected_trajectories"]["A"], "a-second")
+        winner = next(row for row in manual["tasks"] if row["task_id"] == "A")
+        self.assertEqual((winner["ranking_basis"], winner["fusion_score"], winner["global_score"]), ("fusion", .95, 3))
+        automatic = self.pipeline(threshold=4)["selection"]
+        self.assertNotIn("A", automatic["selected_trajectories"])
+        self.assertTrue(any(row["task_id"] == "A" for row in automatic["excluded"]))
+
+    def test_fusion_exact_tie_keeps_workbook_order(self):
+        quality = self.store.read_payload(self.store.get(self.batch, "05_quality"))
+        for task in quality["tasks"]:
+            task["scoring_version"] = "checklist_fusion_v1"
+            for evaluation in task["evaluations"].values():
+                evaluation["fusion"] = {"valid": True, "score": .8}
+        self.store.publish(self.batch, "05_quality", quality, source_refs=[self.store.get(self.batch, "04_tree")])
+        self.assertEqual(self.pipeline("manual")["selection"]["selected_trajectories"]["A"], "a-second")
+
     def test_automatic_rebases_existing_edits_and_cot_without_using_old_export_choices(self):
         manual_selection = self.pipeline("manual")["selection"]
         created = publishing.prepare_manual(self.batch, manual_selection, root=self.root)

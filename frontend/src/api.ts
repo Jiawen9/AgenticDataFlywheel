@@ -205,6 +205,12 @@ export const api = {
       body: JSON.stringify({ batch_id: batchId, task_ids: taskIds }),
     })
   },
+  qualitySettings(): Promise<import('./types').QualitySettings> {
+    return request('/api/quality-jobs/settings', { cache: 'no-store' })
+  },
+  saveQualitySettings(settings: Pick<import('./types').QualitySettings, 'evaluation_profile_id' | 'evaluation_profile_digest'>): Promise<import('./types').QualitySettings> {
+    return request('/api/quality-jobs/settings', { method: 'PUT', body: JSON.stringify(settings) })
+  },
   qualityJob(jobId: string): Promise<QualityJob> {
     return request(`/api/quality-jobs/${encodeURIComponent(jobId)}`)
   },

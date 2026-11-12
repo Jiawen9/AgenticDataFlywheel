@@ -18,13 +18,17 @@ export function correctionTasks(selection: CorrectionRecommendation, groups: Cor
       task = { task_id: item.task_id, goal: item.goal, trajectories: [], edited_row_count: 0, export_count: 0 }
       tasks.set(item.task_id, task)
     }
-    task.trajectories.push({ trajectory_id: item.trajectory_id, rank: 0, global_score: item.global_score, passed_threshold: item.passed_threshold, group })
+    task.trajectories.push({ trajectory_id: item.trajectory_id, rank: 0, global_score: item.global_score, fusion_score: item.fusion_score, ranking_basis: item.ranking_basis, passed_threshold: item.passed_threshold, group })
     task.edited_row_count += group.edited_row_count
     task.export_count += Number(group.export)
   }
   for (const task of tasks.values()) {
     // Stable sorting preserves selection/workbook order for tied scores.
-    task.trajectories.sort((a, b) => b.global_score - a.global_score)
+    const fused = task.trajectories.length > 0 && task.trajectories.every(item => item.ranking_basis === 'fusion')
+    const rankingScore = (item: typeof task.trajectories[number]) => fused
+      ? (typeof item.fusion_score === 'number' && Number.isFinite(item.fusion_score) ? item.fusion_score : -Infinity)
+      : item.global_score
+    task.trajectories.sort((a, b) => rankingScore(b) - rankingScore(a))
     task.trajectories.forEach((trajectory, index) => { trajectory.rank = index + 1 })
   }
   return [...tasks.values()]

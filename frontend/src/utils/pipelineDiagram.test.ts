@@ -15,11 +15,19 @@ const node = (id: string) => PIPELINE_DIAGRAM_STAGES.flatMap(stage => stage.chil
 const stage = (id: string) => PIPELINE_DIAGRAM_STAGES.find(item => item.id === id)!
 
 describe('original Pipeline diagram with real execution state', () => {
+  it.each([
+    ['checklist_preparing', '准备 Checklist'], ['checklist_evaluating', 'Checklist 评测中'], ['fusing', '融合评分与节点 Q'],
+  ])('keeps fusion phase %s within the quality job', (substage, label) => {
+    const p = pipeline({ id: 'quality', status: 'running', jobs: [{ status: 'running', stage: substage }] })
+    expect(diagramNodeState(p, node('rubrics-ranking'))).toMatchObject({ status: 'running', active: true })
+    expect(diagramNodeState(p, node('rubrics-ranking')).detail).toContain(label)
+    expect(diagramNodeState(p, node('rubrics-generation')).active).toBe(false)
+  })
   it('preserves the seven original modules and all fifteen substeps', () => {
     expect(PIPELINE_DIAGRAM_STAGES.map(item => item.label)).toEqual(['迭代评估', '任务生成', '轨迹采集', '轨迹质检', '数据发布', '模型训练', '模型发布'])
     expect(PIPELINE_DIAGRAM_STAGES.flatMap(item => item.children.map(child => child.label))).toEqual([
       '种子任务集评测', 'BadCase 提取', 'BadCase 扩增', '手机工厂并行采集', '标框', '页面总结', '轨迹树构建',
-      'Rubrics 生成', 'Rubrics 相对排序', '训练数据归档', '训练数据配比', '训练集/验证集划分', '模型训练', '训练有效性验证', '增训模型归档',
+      'Rubrics 生成', 'Checklist 融合评分', '训练数据归档', '训练数据配比', '训练集/验证集划分', '模型训练', '训练有效性验证', '增训模型归档',
     ])
   })
 

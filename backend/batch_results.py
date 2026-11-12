@@ -220,8 +220,10 @@ def merge_quality_results(batch_id: str, task_results: list[dict], expected_tree
                  "source_tree_hashes": {task: current[task] for task in valid_ids},
                  "task_fingerprints": {**{task: value for task, value in previous.get("task_fingerprints", {}).items()
                                           if task in valid_ids}, **fingerprints}}
+        previous_tasks = {item["task_id"]: item for item in previous.get("tasks", [])}
         changed = {item["task_id"] for item in task_results
-                   if previous.get("task_fingerprints", {}).get(item["task_id"]) != fingerprints.get(item["task_id"])}
+                   if previous.get("task_fingerprints", {}).get(item["task_id"]) != fingerprints.get(item["task_id"])
+                   or digest(previous_tasks.get(item["task_id"], {}).get("evaluations")) != digest(item.get("evaluations"))}
         entries = [invalidation_record_entry(store, batch_id, "quality", changed)]
         committed = commit_record_entry(store.root, job_id, batch_id, {**value, "updated_at": completed_at})
         if committed is not None:
@@ -239,7 +241,7 @@ def _write_quality_records(store: ArtifactStore, batch_id: str, value: dict, ref
                 "payload": {**item, "artifact": reference}} for item in value.get("tasks", [])]
     entries.append({"namespace": "quality_manifests", "key": batch_id,
                     "payload": {"run_id": batch_id, "updated_at": value.get("completed_at"), "artifact": reference,
-                                "tasks": [{key: val for key, val in item.items() if key not in {"evaluations", "rubric"}}
+                                 "tasks": [{key: val for key, val in item.items() if key not in {"evaluations", "rubric", "node_scores"}}
                                           for item in value.get("tasks", [])]}})
     store.records.put_many(entries)
 
@@ -306,7 +308,7 @@ def materialize_tree_inputs(batch_id: str, output_dir: Path, root: Path | None =
 
 
 def quality_task_fingerprints(trees: dict, *, config_path: Path | None = None,
-                              env_path: Path | None = None) -> dict[str, str]:
+                              env_path: Path | None = None, checklist_options: dict | None = None) -> dict[str, str]:
     backend = Path(__file__).resolve().parent
     config_path = config_path or backend / "DevelopRubrics/examples/jiawen_rubric_config.json"
     env_path = env_path or backend / ".env"
@@ -316,7 +318,8 @@ def quality_task_fingerprints(trees: dict, *, config_path: Path | None = None,
     environment = read_env_file(env_path) if env_path.is_file() else {}
     model = {key: environment.get(key, "") for key in ("MODEL_NAME", "MODEL_URL")}
     return {task: digest({"tree": value, "quality_input": _rows_for_tasks(trees.get("quality_input", {}), {task}),
-                          "config": config, "model": model, "pipeline_version": 2})
+                          "config": config, "model": model, "pipeline_version": 2,
+                          **({"checklist_options": checklist_options} if checklist_options else {})})
             for task, value in trees.get("tree_hashes", {}).items()}
 
 
@@ -397,7 +400,14 @@ def drain_batch_invalidations(batch_id: str, root: Path | None = None) -> None:
                 valid = {item["task_id"] for item in current_quality_payload(batch_id, root)["tasks"]}
                 for task in event["quality"]:
                     _task_state(store, batch_id, task, quality_status="succeeded" if task in valid else "stale")
-            _notify_invalidated(batch_id, set(event["quality"]), root)
+            # New fusion scores update recommendation snapshots, not the source
+            # actions being edited. Keep existing manual drafts and COT intact;
+            # actual source/tree changes still use the invalidation branches above.
+            fusion_tasks = {item["task_id"] for item in value.get("tasks", [])
+                            if item.get("scoring_version") == "checklist_fusion_v1"}
+            source_affected = set(event["quality"]) - fusion_tasks
+            if source_affected:
+                _notify_invalidated(batch_id, source_affected, root)
         store.records.delete("batch_invalidations", batch_id, expected_revision=event["storage_revision"])
 
 

@@ -144,7 +144,7 @@ export interface QualityJob {
   run_id: string
   task_ids: string[]
   status: 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted'
-  stage: 'queued' | 'preparing' | 'generating_rubric' | 'evaluating' | 'publishing' | 'succeeded' | 'failed' | 'interrupted'
+  stage: 'queued' | 'preparing' | 'generating_rubric' | 'evaluating' | 'checklist_preparing' | 'checklist_evaluating' | 'fusing' | 'publishing' | 'succeeded' | 'failed' | 'interrupted'
   created_at: string
   started_at: string | null
   completed_at: string | null
@@ -163,6 +163,9 @@ export interface QualityTaskSummary {
   trajectory_count?: number
   average_score?: number
   passed_count?: number
+  scoring_version?: string
+  fusion_complete?: boolean
+  fusion_eligible_count?: number
   updated_at?: string
 }
 
@@ -194,6 +197,46 @@ export interface TrajectoryQualityEvaluation {
   dimension_global_scores: DimensionEvaluation[] | Record<string, number>
   step_evaluations: StepQualityEvaluation[]
   evaluation_config?: Record<string, unknown>
+  checklist?: ChecklistQualityEvaluation
+  fusion?: FusionQualityEvaluation
+}
+
+export interface ChecklistQualityEvaluation {
+  status: string
+  definition_digest?: string
+  source?: string
+  total: number | null
+  passed: number | null
+  failed: number | null
+  unchecked: number | null
+  verdict?: unknown
+  items: Record<string, unknown>[]
+  error?: string
+}
+
+export interface FusionQualityEvaluation {
+  version: 1
+  lambda: number
+  score: number | null
+  valid: boolean
+  invalid_reasons: string[]
+}
+
+export interface QualityNodeScore {
+  q: number | null
+  advantage: number | null
+  scored_count: number
+  total_count: number
+  status: string
+}
+
+export interface QualitySettings {
+  evaluation_profile_id: string
+  evaluation_profile_digest: string
+  profiles: { id: string; name: string; digest: string }[]
+  supported: boolean
+  reason?: string
+  model_configured?: boolean
 }
 
 export interface TaskQualityResult {
@@ -204,6 +247,10 @@ export interface TaskQualityResult {
   evaluations: Record<string, TrajectoryQualityEvaluation>
   average_score: number
   passed_count: number
+  scoring_version?: string
+  fusion_complete?: boolean
+  fusion_eligible_count?: number
+  node_scores?: Record<string, QualityNodeScore>
 }
 
 export interface TreeRunTask {
@@ -324,6 +371,8 @@ export interface CorrectionTop1Task {
   goal: string
   trajectory_id: string
   global_score: number
+  fusion_score?: number | null
+  ranking_basis?: 'fusion' | 'rubric'
   passed_threshold: boolean
   trajectory_count: number
   step_count: number
@@ -498,6 +547,8 @@ export interface CorrectionTrajectoryItem {
   trajectory_id: string
   rank: number
   global_score: number
+  fusion_score?: number | null
+  ranking_basis?: 'fusion' | 'rubric'
   passed_threshold: boolean
   group: CorrectionGroupSummary
 }

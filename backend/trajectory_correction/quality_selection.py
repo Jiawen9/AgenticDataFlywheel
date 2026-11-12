@@ -441,6 +441,7 @@ def _selection_for_run(
             raise QualitySourceMismatch(
                 f"质检结果中的轨迹不在当前标注表中：{', '.join(unknown_trajectory_ids[:5])}"
             )
+        fusion_ranking = result.get("scoring_version") == "checklist_fusion_v1"
         candidates: list[tuple[dict[str, Any], float, dict[str, Any]]] = []
         for group in groups_by_task.get(task_id, []):
             trajectory_id = str(group.get("meta_task", "")).strip()
@@ -448,7 +449,11 @@ def _selection_for_run(
             if not isinstance(evaluation, dict):
                 continue
             score = _score(evaluation.get("global_score"))
-            if score is not None:
+            fusion = evaluation.get("fusion", {})
+            usable_fusion = (isinstance(fusion, dict) and fusion.get("valid") is True
+                and type(fusion.get("score")) in (int, float) and math.isfinite(fusion["score"])
+                and 0 <= fusion["score"] <= 1)
+            if score is not None and (not fusion_ranking or usable_fusion):
                 candidates.append((group, score, evaluation))
         if not candidates:
             raise QualitySelectionUnavailable(
@@ -457,7 +462,8 @@ def _selection_for_run(
 
         # ``max`` is stable, so a score tie keeps the first group in the
         # original annotated workbook order.
-        group, score, evaluation = max(candidates, key=lambda item: item[1])
+        group, score, evaluation = max(candidates, key=lambda item:
+            item[2]["fusion"]["score"] if fusion_ranking else item[1])
         trajectory_id = str(group["meta_task"])
         selected_trajectories[task_id] = trajectory_id
         selected.append(
@@ -471,6 +477,8 @@ def _selection_for_run(
                 ),
                 "trajectory_id": trajectory_id,
                 "global_score": score,
+                "fusion_score": evaluation.get("fusion", {}).get("score") if fusion_ranking else None,
+                "ranking_basis": "fusion" if fusion_ranking else "rubric",
                 "passed_threshold": _as_bool(evaluation.get("passed_threshold")),
                 "trajectory_count": int(
                     tree_summary.get("trajectory_count")

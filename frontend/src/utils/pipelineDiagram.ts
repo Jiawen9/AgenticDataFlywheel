@@ -39,7 +39,7 @@ export const PIPELINE_DIAGRAM_STAGES: readonly DiagramStage[] = [
   ] },
   { id: 'quality', label: '轨迹质检', iconKey: 'DataAnalysis', stepIds: ['quality'], children: [
     { id: 'rubrics-generation', label: 'Rubrics 生成', stepId: 'quality' },
-    { id: 'rubrics-ranking', label: 'Rubrics 相对排序', stepId: 'quality' },
+    { id: 'rubrics-ranking', label: 'Checklist 融合评分', stepId: 'quality' },
   ] },
   { id: 'publishing', label: '数据发布', iconKey: 'Upload', stepIds: ['publication'], children: [
     { id: 'training-data-archive', label: '训练数据归档', stepId: 'publication' },
@@ -61,6 +61,9 @@ const substageNodes: Record<string, string> = {
   summarizing_trajectories: 'tree-building',
   generating_rubric: 'rubrics-generation',
   evaluating: 'rubrics-ranking',
+  checklist_preparing: 'rubrics-ranking',
+  checklist_evaluating: 'rubrics-ranking',
+  fusing: 'rubrics-ranking',
 }
 const substageLabels: Record<string, string> = {
   queued: '等待作业执行', scanning: '扫描采集轨迹', converting: '转换轨迹，准备标框',
@@ -68,6 +71,7 @@ const substageLabels: Record<string, string> = {
   classifying_and_observing: '页面分类与总结', building: '构建轨迹树',
   summarizing_trajectories: '生成轨迹摘要', generating_rubric: '生成 Rubrics', evaluating: '轨迹评分与排序',
   publishing: '保存过程件',
+  checklist_preparing: '准备 Checklist', checklist_evaluating: 'Checklist 评测中', fusing: '融合评分与节点 Q',
 }
 
 function unavailable(): DiagramNodeState {

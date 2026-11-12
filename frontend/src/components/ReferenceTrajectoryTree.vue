@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import type { TrajectoryQualityEvaluation, TrajectoryTreeNode } from '@/types'
+import type { QualityNodeScore, TrajectoryTreeNode } from '@/types'
+import { nodeScoreLabel } from '@/utils/qualityScores'
 
 const props = defineProps<{
   root: TrajectoryTreeNode
   selectedId?: number
-  quality?: Record<string, TrajectoryQualityEvaluation>
+  nodeScores?: Record<string, QualityNodeScore>
 }>()
 
 const emit = defineEmits<{
@@ -17,8 +18,7 @@ interface LayoutNode {
   x: number
   y: number
   actionClass: 'root' | 'click' | 'swipe' | 'other'
-  score: number | null
-  passed: boolean | null
+  score?: QualityNodeScore
 }
 
 interface LayoutEdge {
@@ -51,7 +51,6 @@ const layout = computed(() => {
   const collect = (node: TrajectoryTreeNode) => {
     const point = positions.get(node.id)!
     const label = node.label.toLowerCase()
-    const results = node.terminal_trajectories.map((id) => props.quality?.[id]).filter(Boolean) as TrajectoryQualityEvaluation[]
     nodes.push({
       node,
       ...point,
@@ -62,8 +61,7 @@ const layout = computed(() => {
           : label.includes('swipe')
             ? 'swipe'
             : 'other',
-      score: results.length ? results.reduce((sum, result) => sum + result.global_score, 0) / results.length : null,
-      passed: results.length ? results.every((result) => result.passed_threshold) : null,
+      score: props.nodeScores?.[String(node.id)],
     })
     for (const child of node.children) {
       const childPoint = positions.get(child.id)!
@@ -193,14 +191,15 @@ onBeforeUnmount(() => window.removeEventListener('resize', resetView))
           </text>
           <circle
             v-if="item.node.terminal_trajectories.length"
-            :class="['terminal', item.passed === true ? 'terminal--passed' : item.passed === false ? 'terminal--failed' : '']"
+            class="terminal"
             cx="20"
             cy="-20"
             r="7"
           />
-          <text v-if="item.score !== null" class="quality-score" x="33" y="29">
-            {{ item.score.toFixed(2) }} / 5
+          <text class="quality-score" x="33" y="29">
+            {{ nodeScoreLabel(item.score, item.node.id === root.id) }}
           </text>
+          <title>{{ item.node.label }} · {{ nodeScoreLabel(item.score, item.node.id === root.id) }}{{ item.node.terminal_trajectories.length ? ` · ${item.node.terminal_trajectories.length} 条轨迹在此结束，点击分别查看` : '' }}</title>
         </g>
       </g>
     </svg>
@@ -210,7 +209,7 @@ onBeforeUnmount(() => window.removeEventListener('resize', resetView))
       <button type="button" title="缩小" @click="zoomBy(0.84)">－</button>
       <button type="button" class="tree-controls__reset" @click="resetView">初始视角</button>
     </div>
-    <div class="tree-hint">滚轮缩放 · 拖动画布 · 点击节点查看详情</div>
+    <div class="tree-hint">Q 为经过该节点的有效融合分均值 · 分数后标注部分评分覆盖 · 点击终点查看各条轨迹</div>
   </div>
 </template>
 
@@ -234,13 +233,11 @@ onBeforeUnmount(() => window.removeEventListener('resize', resetView))
 .reference-node .node-action { font-weight: 700; }
 .reference-node .node-summary { fill: #91a6c0; font-size: 10px; }
 .terminal { fill: #ffd166; stroke: #0b1220; stroke-width: 1; }
-.terminal--passed { fill: #34d399; }
-.terminal--failed { fill: #fb7185; }
 .reference-node .quality-score { fill: #f8fafc; font-size: 11px; font-weight: 800; }
 .tree-controls { position: absolute; top: 14px; left: 14px; z-index: 4; display: flex; overflow: hidden; border: 1px solid #58708f; border-radius: 6px; background: rgba(17,24,39,.92); box-shadow: 0 6px 18px rgba(0,0,0,.3); }
 .tree-controls button { min-width: 34px; height: 32px; padding: 0 9px; border: 0; border-right: 1px solid #354158; background: transparent; color: #dce7f5; cursor: pointer; }
 .tree-controls button:last-child { border-right: 0; }
 .tree-controls button:hover { background: #263149; color: #67b7ff; }
 .tree-controls__reset { font-size: 11px; }
-.tree-hint { position: absolute; bottom: 12px; left: 14px; padding: 7px 10px; border-radius: 5px; background: rgba(17,24,39,.86); color: #8297b1; font-size: 12px; pointer-events: none; }
+.tree-hint { position: absolute; bottom: 12px; left: 14px; max-width: calc(100% - 28px); box-sizing: border-box; padding: 7px 10px; border-radius: 5px; background: rgba(17,24,39,.86); color: #8297b1; font-size: 12px; pointer-events: none; }
 </style>
