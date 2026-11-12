@@ -3,6 +3,7 @@ import { createRenderer, createSSRApp, defineComponent, h, nextTick, ref, shallo
 import { renderToString } from '@vue/server-renderer'
 import FactoryRunDetailsDrawer from './FactoryRunDetailsDrawer.vue'
 import type { FactoryRun } from '@/phoneFactoryApi'
+import { invalidateSummaryCache } from '@/utils/summaryCache'
 import type { EvaluationProgress } from '@/composables/useEvaluationProgress'
 
 const runs = (): FactoryRun[] => Array.from({ length: 55 }, (_, i) => ({ run_id: `run-${String(i).padStart(2, '0')}`, status: i < 5 ? 'running' : 'completed', created_at: `2026-10-29T00:${String(i).padStart(2, '0')}:00` }))
@@ -10,9 +11,9 @@ const makeProgress = () => {
   const selectedRun = ref('run-54')
   return { selectedRun, results: ref({ summary: { total: 55 }, cases: Array.from({ length: 55 }, (_, i) => ({ case_key: `key-${i}`, case_id: `case-${i}`, phone_id: 'phone', collection_status: 'completed', evaluation_status: i < 5 ? 'running' : 'completed', errors: [] })) }), busy: ref(false), resultError: ref(''), cancelling: ref(false), downloading: ref(''), canCancel: ref(false), resultMetadata: ref({}), selectRun: (id: string) => { selectedRun.value = id }, cancelRun: vi.fn(), download: vi.fn() } as unknown as EvaluationProgress
 }
-function mount() {
+function mount(extra: Record<string, any> = {}) {
   const progress = makeProgress()
-  const props = shallowReactive({ modelValue: false, tab: 'runs' as const, evaluation: true, runs: runs(), progress, folders: [{ index: 1, dir_name: 'legacy', files: Array.from({ length: 55 }, (_, i) => ({ name: `report-${i}.xlsx`, size: 1 })) }], loadingReports: false, downloadingReport: '', runFilter: 'all' as const, focusedRun: '' })
+  const props = shallowReactive({ modelValue: false, tab: 'runs' as const, evaluation: true, runs: runs(), progress, folders: [{ index: 1, dir_name: 'legacy', files: Array.from({ length: 55 }, (_, i) => ({ name: `report-${i}.xlsx`, size: 1 })) }], loadingReports: false, downloadingReport: '', runFilter: 'all' as const, focusedRun: '', ...extra })
   const renderer = createRenderer<object, object>({ createElement: () => ({}), createText: () => ({}), createComment: () => ({}), setText() {}, setElementText() {}, parentNode: () => null, nextSibling: () => null, patchProp() {}, insert() {}, remove() {} })
   const component = { ...FactoryRunDetailsDrawer, render: () => h('div') }
   const tab = vi.fn()
@@ -84,4 +85,27 @@ describe('shared factory details drawer', () => {
     expect(html.includes(scenario.execution_model)).toBe(scenario.execution)
     expect(html.includes('规划模型：')).toBe(scenario.planner)
   })
+})
+
+
+it('loads server pages only for the open tab and keeps selection and paging on refresh', async () => {
+  invalidateSummaryCache()
+  const envelope = (items: any[], total = 500) => ({items, latest: [], total, filtered_total: total, scope_counts: {total, active: 1, abnormal: 4}, offset: 0, limit: 10, has_more: true, counts_complete: true, index_state: 'ready'})
+  const api = { runPage: vi.fn().mockResolvedValue(envelope(runs().slice(0, 10))), evaluationCases: vi.fn().mockResolvedValue(envelope([{case_key: 'one', evaluation_status: 'completed'}])), reportPage: vi.fn().mockResolvedValue(envelope([{key: 'legacy/report', folder: {index: 3, dir_name: 'legacy', files: []}, file: {name: 'report.json', size: 1}}], 30)), runDetail: vi.fn().mockResolvedValue({run_id: 'run-01', status: 'completed', execution_model: 'frozen'}) }
+  const view = mount({diagnosticsApi: api})
+  await nextTick(); expect(api.runPage).not.toHaveBeenCalled(); expect(api.reportPage).not.toHaveBeenCalled()
+  view.props.modelValue = true; await nextTick(); await view.state.runList.refresh()
+  expect(api.runPage).toHaveBeenCalledTimes(1); expect(api.reportPage).not.toHaveBeenCalled(); expect(api.evaluationCases).not.toHaveBeenCalled()
+  view.state.runControls.page = 3; await nextTick(); await view.state.runList.refresh()
+  expect(api.runPage).toHaveBeenLastCalledWith(expect.objectContaining({offset: 20, limit: 10}))
+  expect(view.progress.selectedRun.value).toBe('run-54')
+  view.state.expandRun({run_id: 'run-01'}, [{run_id: 'run-01'}]); await nextTick(); await Promise.resolve()
+  expect(api.runDetail).toHaveBeenCalledWith('run-01')
+  ;(view.props as any).tab = 'reports'; await nextTick(); await view.state.reportList.refresh()
+  expect(api.reportPage).toHaveBeenCalledTimes(1); expect(view.state.pagedReports[0].folder.dir_name).toBe('legacy')
+  ;(view.props as any).tab = 'cases'; await nextTick(); await view.state.caseList.refresh()
+  expect(api.evaluationCases).toHaveBeenCalledWith('run-54', expect.objectContaining({offset: 0, limit: 10}))
+  expect(view.state.runControls.page).toBe(3)
+  view.props.modelValue = false; await nextTick(); await view.state.caseList.refresh(); expect(api.evaluationCases).toHaveBeenCalledTimes(1)
+  view.app.unmount(); invalidateSummaryCache()
 })

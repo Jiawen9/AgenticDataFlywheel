@@ -92,7 +92,8 @@
     <p v-if="!runs.length" class="hint">可上传 17 列用例表开始采集并评测，或选择已有轨迹创建独立评测运行。</p>
     <template v-if="results">
       <p class="hint">方式：{{ evaluationModeLabel(resultMetadata.execution_mode) }} · 规则版本：{{ resultMetadata.evaluation_profile_name || resultMetadata.evaluation_profile_id || '历史配置' }} · 数据来源：<DisplayId v-if="sourceIdentifier(resultMetadata)" kind="run" :id="sourceIdentifier(resultMetadata)" /><template v-else>{{ evaluationSourceLabel(resultMetadata) }}</template></p>
-      <div class="progress" data-testid="evaluation-summary">
+      <p v-if="!results.summary" class="hint">正在同步评测摘要，暂不计算完成率。</p>
+      <div v-if="results.summary" class="progress" data-testid="evaluation-summary">
         <span>总轨迹 {{ results.summary.total }}</span>
         <template v-if="resultMetadata.execution_mode !== 'evaluate_only'"><span>采集完成 {{ results.summary.collection_completed }}</span><span>采集失败 {{ results.summary.collection_failed }}</span></template>
         <span>评测完成 {{ results.summary.evaluation_completed }}</span>

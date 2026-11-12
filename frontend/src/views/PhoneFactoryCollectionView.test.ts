@@ -94,6 +94,7 @@ describe('phone collection batch picker', () => {
     const run = { run_id: 'eval-transfer', collection_run_id: 'eval-transfer', batch_id: 'eval-result', execution_mode: 'collect_and_evaluate', status: 'running', transfer_status: 'failed' }
     view.runs = [run]; view.evaluationProgress.selectRun(run.run_id)
     const retry = vi.spyOn(modelIterationApi, 'retryTransfer').mockResolvedValue({ ...run, transfer_status: 'waiting' } as never)
+    vi.spyOn(modelIterationApi, 'runDetail').mockResolvedValue(run as never)
     const sync = vi.spyOn(modelIterationApi, 'syncRun')
     await view.syncRun(run)
     expect(retry).toHaveBeenCalledWith('eval-transfer'); expect(sync).not.toHaveBeenCalled()
@@ -147,6 +148,7 @@ describe('phone collection batch picker', () => {
     await render('generate', value => { view = value })
     const run = { collection_run_id: 'run-stop', batch_id: 'batch-stop', status: 'running', agent_type: 'pipelineagent' as const }
     view.runs = [run]
+    vi.spyOn(phoneFactoryApi, 'runDetail').mockResolvedValue(run)
     const cancel = vi.spyOn(phoneFactoryApi, 'cancelCollection').mockRejectedValueOnce(new Error('collector unavailable'))
     await view.cancelCollectionRun(run)
     expect(view.runs[0].status).toBe('running')

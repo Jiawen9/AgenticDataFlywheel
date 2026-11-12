@@ -122,7 +122,7 @@ async function loadData(silent = false) {
     const [nextCandidates, nextReleases, nextCapabilities, pipelines] = await Promise.all([
       api.datasetReleaseCandidates(), api.datasetReleases(),
       api.datasetUploadCapabilities().catch(() => ({ internal: { configured: false, reason: '无法读取云道S3上传配置，请刷新重试' } })),
-      typeof api.listPipelines === 'function' ? api.listPipelines({ active_only: true }) : Promise.resolve([]),
+      typeof api.pipelineBindings === 'function' ? api.pipelineBindings() : Promise.resolve([]),
     ])
     if (disposed || pipelineContext.historyOnly.value || epoch !== loadEpoch) return
     capabilities.value = nextCapabilities

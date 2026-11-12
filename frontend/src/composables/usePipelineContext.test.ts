@@ -3,7 +3,7 @@ import { reactive, ref } from 'vue'
 const hooks = vi.hoisted(() => ({ cleanup: [] as Array<() => void>, route: {} as Record<string, unknown> }))
 vi.mock('vue', async original => ({ ...await original<typeof import('vue')>(), onMounted: (callback: () => void) => callback(), onBeforeUnmount: (callback: () => void) => hooks.cleanup.push(callback) }))
 vi.mock('vue-router', () => ({ useRoute: () => hooks.route }))
-vi.mock('@/api', () => ({ api: { pipeline: vi.fn(), listPipelines: vi.fn(), controlPipeline: vi.fn() } }))
+vi.mock('@/api', () => ({ api: { pipeline: vi.fn(), pipelinePage: vi.fn(), listPipelines: vi.fn(), controlPipeline: vi.fn() } }))
 import { api } from '@/api'
 import { usePipelineContext } from './usePipelineContext'
 import type { Pipeline } from '@/types/pipeline'
@@ -16,7 +16,7 @@ beforeEach(() => {
   vi.useFakeTimers(); vi.clearAllMocks()
   vi.stubGlobal('window', new EventTarget()); vi.stubGlobal('document', Object.assign(new EventTarget(), { visibilityState: 'visible' })); vi.stubGlobal('BroadcastChannel', undefined)
   hooks.route = reactive({ path: '/quality', query: { pipeline_id: 'p', batch_id: 'batch', step_id: 'quality' } })
-  vi.mocked(api.pipeline).mockResolvedValue(record()); vi.mocked(api.listPipelines).mockResolvedValue([])
+  vi.mocked(api.pipeline).mockResolvedValue(record()); vi.mocked(api.pipelinePage).mockResolvedValue({ items: [], counts_complete: true } as any)
 })
 afterEach(() => { hooks.cleanup.splice(0).forEach(callback => callback()); vi.useRealTimers(); vi.unstubAllGlobals() })
 describe('authoritative Pipeline module context', () => {
@@ -24,7 +24,7 @@ describe('authoritative Pipeline module context', () => {
     hooks.route.query = { batch_id: 'source-batch' }
     const source = usePipelineContext({ lookupByBatch: false, stepId: 'collection' })
     await source.refresh()
-    expect(api.listPipelines).not.toHaveBeenCalled()
+    expect(api.pipelinePage).not.toHaveBeenCalled()
     expect(source.readOnly.value).toBe(false)
     source.dispose()
     hooks.route.query = { pipeline_id: 'p', batch_id: 'result-batch', step_id: 'quality' }
@@ -40,8 +40,8 @@ describe('authoritative Pipeline module context', () => {
     const context = usePipelineContext({ stepId: 'quality' }); expect(context.readOnly.value).toBe(true)
     await context.refresh()
     expect(context.jobIds.value).toEqual(['exact-job']); expect(context.step.value?.percent).toBe(25)
-    expect(api.controlPipeline).not.toHaveBeenCalled(); expect(api.listPipelines).not.toHaveBeenCalled()
-    await vi.advanceTimersByTimeAsync(1501); expect(api.pipeline).toHaveBeenCalledTimes(2)
+    expect(api.controlPipeline).not.toHaveBeenCalled(); expect(api.pipelinePage).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(5001); expect(api.pipeline).toHaveBeenCalledTimes(2)
   })
   it('does not let an older poll undo a completed control revision', async () => {
     const context = usePipelineContext(); await context.refresh()
@@ -52,15 +52,15 @@ describe('authoritative Pipeline module context', () => {
   it('waits before a child job exists then discovers the binding without navigation or submission', async () => {
     vi.mocked(api.pipeline).mockResolvedValueOnce(record({ steps: [{ id: 'quality', label: '质检', status: 'pending', job_ids: [] }] }))
     const context = usePipelineContext(); await context.refresh(); expect(context.isWaiting.value).toBe(true)
-    await vi.advanceTimersByTimeAsync(1501); expect(context.jobIds.value).toEqual(['exact-job']); expect(context.isWaiting.value).toBe(false)
+    await vi.advanceTimersByTimeAsync(5001); expect(context.jobIds.value).toEqual(['exact-job']); expect(context.isWaiting.value).toBe(false)
     expect(api.controlPipeline).not.toHaveBeenCalled()
   })
   it('looks up managed state even without Pipeline route parameters', async () => {
-    hooks.route.query = {}; vi.mocked(api.listPipelines).mockResolvedValue([record()])
+    hooks.route.query = {}; vi.mocked(api.pipelinePage).mockResolvedValue({ items: [record()], counts_complete: true } as any)
     const batch = ref('batch'), context = usePipelineContext({ batchId: batch, stepId: 'quality' })
     await context.refresh(); expect(context.managed.value).toBe(true); expect(context.readOnly.value).toBe(true)
-    expect(api.listPipelines).toHaveBeenCalledWith({ batch_id: 'batch', active_only: true }, expect.any(AbortSignal))
-    vi.mocked(api.listPipelines).mockResolvedValue([]); batch.value = 'other'; expect(context.resolved.value).toBe(false)
+    expect(api.pipelinePage).toHaveBeenCalledWith({ batch_id: 'batch', active_only: true, offset: 0, limit: 1 })
+    vi.mocked(api.pipelinePage).mockResolvedValue({ items: [], counts_complete: true } as any); batch.value = 'other'; expect(context.resolved.value).toBe(false)
     await context.refresh(); expect(context.managed.value).toBe(false); expect(context.readOnly.value).toBe(false)
   })
   it('invalidates late responses on batch and route changes', async () => {

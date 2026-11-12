@@ -50,6 +50,8 @@ class FactoryRuntime:
         self._control_pool = BoundedSyncPool("collection-control", max_workers=4)
         self._control_memory = {}
         self._resume_service = None
+        from .factory_read_models import FactoryReadModels
+        self.read_models = FactoryReadModels(self)
         from .collector_storage import StorageService
         self.storage_service = StorageService(self)
 
@@ -161,6 +163,7 @@ class FactoryRuntime:
         self._archive_pool.close()
         self._preview_pool.close()
         self._control_pool.close()
+        self.read_models.close()
 
     def _poll_evaluations(self):
         while not self._stop.wait(5):
@@ -244,6 +247,12 @@ class FactoryRuntime:
         except Exception:
             # The common policy persists and rate-limits diagnostics for both chains.
             pass
+        finally:
+            # Historical/final snapshots are projected without doing that work in GET.
+            try:
+                self.read_models.schedule_evaluation_index(run_id)
+            except (OSError, sqlite3.Error):
+                logging.getLogger(__name__).exception("评测分页索引调度失败：%s", run_id)
 
     def _restore_final_evaluation(self, run, snapshot):
         """Recover a crash between saving the validated result and the run status."""
@@ -1015,9 +1024,148 @@ class FactoryRuntime:
         return [self._public_run({**item, **(self._resume_service.view(item["collection_run_id"])
                     if self._resume_service is not None else {}), **storage_state(self.records, item["collection_run_id"])}) for item in views]
 
+    def run_detail(self, mode, run_id, *, compact=False):
+        """A detail request loads one authoritative run, never the whole history."""
+        from .collector_storage import public_state as storage_state
+        if mode == "modeliter":
+            run = self.records.get("model_iter_runs", run_id)
+            if run is None:
+                raise PhoneFactoryError("评估运行不存在", 404)
+            request = run.get("request", {})
+            metadata = {key: request[key] for key in ("source", "source_digest", "evaluation_profile_id",
+                "evaluation_profile_digest", "checklist_source", *MODEL_OVERRIDE_FIELDS) if key in request}
+            value = {**run, **metadata, **self._collection_progress(run_id),
+                     "execution_mode": request.get("execution_mode", "collect_and_evaluate"),
+                     "sync": self.sync_policy.view("evaluation", run_id), **self._evaluation_snapshot_label(run)}
+            if value["execution_mode"] != "evaluate_only":
+                value["agent_type"] = request.get("agent_type", "newagent")
+        else:
+            run = self.store.collection_runs.get(run_id)
+            if run is None:
+                raise PhoneFactoryError("采集运行不存在", 404)
+            metadata = run.get("request", {}).get("metadata", {})
+            transfer = self.records.get("collection_transfers", run_id) or {}
+            value = {**run, **self._collection_progress(run_id),
+                **{key: metadata[key] for key in ("filename", "vla", *MODEL_OVERRIDE_FIELDS) if key in metadata},
+                **{key: transfer[key] for key in ("remote_status", "transfer_status", "transfer_error", "remote_errors", "transfer_updated_at") if key in transfer},
+                "agent_type": metadata.get("agent_type", "newagent"), "trajectory_count": len(run.get("trajectories", [])),
+                "can_cancel_collection": can_cancel(run), "sync": self.sync_policy.view("collection", run_id)}
+        value.update(storage_state(self.records, run_id))
+        # The historical collection detail endpoint exposed its full record.
+        # Only the new summary view is deliberately compact.
+        return self._public_run(value) if mode == "modeliter" or compact else value
+
+    def run_summary_page(self, mode, data):
+        from .factory_read_models import page_options
+        page = self.records.summary_page("model_iter_runs" if mode == "modeliter" else "collection_runs",
+            **page_options(data), batch_id=data.get("batch_id") or None,
+            task_source_batch_id=data.get("task_source_batch_id", data.get("source_batch_id")) or None,
+            include_published=mode == "modeliter" or data.get("include_published") == "true",
+            run_mode="generate" if mode == "generate" else None)
+        if mode == "modeliter":
+            heads = {}
+            for item in page["items"] + page["latest"]:
+                item.update(self._summary_snapshot_label(item, heads))
+        return page
+
+    def _summary_snapshot_label(self, run, cache=None):
+        source_id = run.get("source_run_id") or run.get("source_collection_run_id")
+        if not source_id:
+            return {}
+        cache = cache if cache is not None else {}
+        if source_id not in cache:
+            cache[source_id] = self.records.get_summary("collection_resume_heads", source_id)
+        head = cache[source_id]
+        if not head:
+            return {}
+        previous = run.get("source_collection_snapshot_id")
+        return {"stale_collection_snapshot": bool(head.get("active") or previous != head.get("current_snapshot_id")),
+                "source_collection_snapshot_id": previous, "current_collection_snapshot_id": head.get("current_snapshot_id"),
+                "collection_snapshot_pending": bool(head.get("active"))}
+
+    def evaluation_view(self, run_id, data):
+        """Both old/new GETs use cached results; synchronization always runs in background."""
+        from .factory_read_models import page_options
+        summary_run = self.records.get_summary("model_iter_runs", run_id)
+        # Historical summaries may still be building. New views check identity
+        # without decoding the frozen request/source plan in the foreground.
+        run = None
+        if summary_run is None and data.get("view") in {"summary", "cases"}:
+            if not self.read_models.record_exists("model_iter_runs", run_id):
+                raise PhoneFactoryError("评估运行不存在", 404)
+            summary_run = {"run_id": run_id, "status": "unknown", "execution_mode": None}
+        elif summary_run is None:
+            run = self.records.get("model_iter_runs", run_id)
+            if run is None:
+                raise PhoneFactoryError("评估运行不存在", 404)
+            request = run.get("request", {})
+            summary_run = {"run_id": run_id, "status": run["status"],
+                "has_evaluator_config": bool(request.get("evaluator_config")),
+                "execution_mode": request.get("execution_mode", "collect_and_evaluate"),
+                "preparation": run.get("preparation"), "source_count": request.get("source_count")}
+        if summary_run.get("has_evaluator_config") is False:
+            raise PhoneFactoryError("历史运行不包含逐用例评测，请下载历史报告", 409)
+        summary_run.update(self._summary_snapshot_label(summary_run))
+        self.read_models.schedule_evaluation_index(run_id)
+        head = self.read_models.head("evaluations", run_id)
+        if not (head or {}).get("final"):
+            def refresh():
+                current = self.records.get("model_iter_runs", run_id)
+                if not current:
+                    return
+                if (current.get("request", {}).get("offline_evaluation_jobs_version") == 1
+                        and not current.get("dispatch_confirmed")):
+                    from .offline_evaluation_dispatch import dispatch as dispatch_offline
+                    try:
+                        dispatch_offline(self, run_id)
+                    except Exception:
+                        pass
+                else:
+                    self._background_evaluation(run_id)
+            self._evaluation_pool.submit(run_id, refresh)
+        sync = summary_run.get("sync") or {}
+        from .remote_sync import _epoch
+        snapshot_due = (not (head or {}).get("final") and bool(sync.get("next_retry_at"))
+                        and _epoch(sync["next_retry_at"]) <= self.sync_policy.clock())
+        base = {"run_id": run_id, "execution_mode": summary_run.get("execution_mode", "collect_and_evaluate"),
+                "status": summary_run.get("status"), "preparation": summary_run.get("preparation"),
+                "preparation_control_error": summary_run.get("preparation_control_error"),
+                "preparation_control_pending": summary_run.get("preparation_control_pending", False),
+                "stale": bool(sync.get("last_error") or sync.get("state") == "paused" or snapshot_due),
+                "sync_error": sync.get("last_error"),
+                **{key: value for key, value in summary_run.items() if key in {
+                    "stale_collection_snapshot", "source_collection_snapshot_id", "current_collection_snapshot_id", "collection_snapshot_pending"}}}
+        if data.get("view") == "cases":
+            page = self.read_models.page("evaluations", run_id, **page_options(data))
+            return {**page, "run_id": run_id, "sync_error": base["sync_error"], "stale": page["stale"] or base["stale"]}
+        if data.get("view") == "summary":
+            return {**({key: value for key, value in head.items() if key not in {"source_revision", "refreshed_epoch"}} if head else {}),
+                    **base, "summary": (head or {}).get("summary") or summary_run.get("evaluation_summary") or None,
+                    "planned_total": summary_run.get("source_count"),
+                    "index_state": "stale" if head and head.get("stale") else "ready" if head else "preparing", "counts_complete": bool(head),
+                    "updated_at": (head or {}).get("updated_at"), "stale": base["stale"] or (head or {}).get("stale", False) or not bool(head)}
+        # Legacy clients retain their cases/results shape, while the expensive
+        # network call is no longer tied to their request timeout.
+        snapshot = self.records.get("model_iter_results", run_id) or {}
+        run = run or self.records.get("model_iter_runs", run_id)
+        source_label = self._evaluation_snapshot_label(run)
+        result = snapshot.get("result")
+        if result:
+            if snapshot.get("final") or not base["stale"]:
+                base.pop("stale", None)
+                base.pop("sync_error", None)
+            return {**result, **base, **source_label}
+        request = (run or {}).get("request", {})
+        return {**base, **source_label, "cases": [], "reports": [], "stale": True,
+                "index_state": "preparing", "counts_complete": False,
+                "summary": {**{key: 0 for key in model_iteration.COUNTS},
+                            "total": request.get("source_count", len(request.get("source_cases", []))), "success_rate": None}}
+
     def public_state(self, state, mode):
         statuses = {"dispatching": "下发中", "queued": "排队中", "starting": "启动中", "running": "运行中", "completed": "已回传", "succeeded": "已完成", "partial": "部分完成", "failed": "失败", "interrupted": "已中断", "cancelled": "已中断"}
-        runs = self.run_views(mode)
+        runs = sorted(self.records.summary_list("model_iter_runs" if mode == "modeliter" else "collection_runs",
+            run_mode="generate" if mode == "generate" else None),
+            key=lambda item: (item.get("created_at", ""), item.get("run_id", item.get("collection_run_id", ""))))
         for task in state["tasks"]:
             matching = [run for run in runs if run.get("filename") == task["filename"]]
             if not matching:
@@ -1034,7 +1182,7 @@ class FactoryRuntime:
                     label = {"completed": "采集已完成", "cancelled": "采集已停止", "interrupted": "采集已中断", "partial": "采集部分完成", "failed": "采集失败"}.get(latest["collection_status"], "采集已结束")
                     task["status"] = label + (" · 回传中" if latest.get("transfer_status") not in {"completed", "partial"} else "")
                     continue
-                transport = latest.get("request", {}).get("metadata", {}).get("result_transport")
+                transport = latest.get("result_transport", latest.get("request", {}).get("metadata", {}).get("result_transport"))
                 if latest.get("transfer_error") and transport == "http":
                     task["status"] = "回传失败"
                 else:
@@ -1329,6 +1477,8 @@ class FactoryRuntime:
             if action == "remote/start-evaluation" and method == "POST":
                 return True, self.remote_start_evaluation(data)
         if method == "GET" and action in {"runs", "collection-runs"}:
+            if data.get("view") == "summary":
+                return True, self.run_summary_page(mode, data)
             runs = self.run_views(mode)
             if mode == "generate" and not data.get("batch_id"):
                 runs = [run for run in runs if run.get("source_kind") != "rollout_import"]
@@ -1341,6 +1491,8 @@ class FactoryRuntime:
             return True, {"runs": runs}
         if method == "GET" and action.startswith("collection-runs/"):
             parts = action.split("/")
+            if mode == "generate" and len(parts) == 2:
+                return True, self.run_detail(mode, _identifier(parts[1], "采集运行编号"), compact=data.get("view") == "detail")
             if len(parts) >= 3 and parts[2] == "artifacts":
                 from .collection_evidence_api import dispatch
                 return True, dispatch(self, parts, data, mode)
@@ -1350,10 +1502,7 @@ class FactoryRuntime:
                 from .offline_evaluation_dispatch import retry
                 return True, retry(self, _identifier(parts[1], "评估运行编号"), data)
             if method == "GET" and len(parts) == 2:
-                run = next((run for run in self.run_views(mode) if run["run_id"] == parts[1]), None)
-                if run is None:
-                    raise PhoneFactoryError("评估运行不存在", 404)
-                return True, run
+                return True, self.run_detail(mode, _identifier(parts[1], "评估运行编号"))
             if method == "POST" and len(parts) == 3 and parts[2] == "retry-transfer":
                 run_id = _identifier(parts[1], "评估运行编号")
                 evaluation = self.records.get("model_iter_runs", run_id)
@@ -1367,44 +1516,7 @@ class FactoryRuntime:
             if method == "POST" and len(parts) == 3 and parts[2] == "cancel":
                 return True, self.cancel_evaluation(parts[1])
             if method == "GET" and len(parts) == 3 and parts[2] == "evaluations":
-                run_id = _identifier(parts[1], "评估运行编号")
-                run = self.records.get("model_iter_runs", run_id)
-                if run is None:
-                    raise PhoneFactoryError("评估运行不存在", 404)
-                if not run.get("request", {}).get("evaluator_config"):
-                    raise PhoneFactoryError("历史运行不包含逐用例评测，请下载历史报告", 409)
-                snapshot = self.records.get("model_iter_results", run_id)
-                source_label=self._evaluation_snapshot_label(run)
-                if (run.get("request", {}).get("offline_evaluation_jobs_version") == 1
-                        or run.get("request", {}).get("execution_mode") == "evaluate_only" and run.get("preparation")):
-                    # GET reads cached state only. The background synchronizer
-                    # fetches progress/results without consuming proxy timeouts.
-                    from .offline_evaluation_dispatch import dispatch as dispatch_offline
-                    self._evaluation_pool.submit(run_id, lambda: self._background_evaluation(run_id)
-                        if run.get("dispatch_confirmed") or run.get("request", {}).get("offline_evaluation_jobs_version") != 1
-                        else dispatch_offline(self, run_id))
-                    result = (snapshot or {}).get("result") or {"run_id": run_id, "execution_mode": "evaluate_only",
-                        "status": run["status"], "cases": [], "reports": [],
-                        "summary": {**{key: 0 for key in model_iteration.COUNTS},
-                                    "total": run["request"].get("source_count", len(run["request"].get("source_cases", []))), "success_rate": None}}
-                    return True, {**result, "status": run["status"], "preparation": run.get("preparation"),
-                                  "preparation_control_error": run.get("preparation_control_error"),
-                                  "preparation_control_pending": bool(run.get("pending_preparation_control")), **source_label}
-                if snapshot and snapshot.get("final"):
-                    return True, {**snapshot["result"],**source_label}
-                try:
-                    self.sync_evaluation(run_id, force=False)
-                    current_snapshot = self.records.get("model_iter_results", run_id)
-                    if not current_snapshot or not current_snapshot.get("result"):
-                        raise PhoneFactoryError("评测结果正在等待同步，请稍后重试", 503)
-                    return True, {**current_snapshot["result"],**source_label}
-                except PhoneFactoryError as exc:
-                    snapshot = self.records.get("model_iter_results", run_id) or snapshot
-                    if snapshot:
-                        info = self.sync_policy.view("evaluation", run_id)
-                        stale = bool(info.get("last_error") or info.get("state") == "paused")
-                        return True, {**snapshot["result"], **({"stale": True, "sync_error": str(exc)} if stale else {}),**source_label}
-                    raise
+                return True, self.evaluation_view(_identifier(parts[1], "评估运行编号"), data)
         if action.startswith("collection-runs/") and mode == "modeliter":
             parts = action.split("/")
             evaluation = self.records.get("model_iter_runs", _identifier(parts[1], "评估运行编号"))
@@ -1452,14 +1564,11 @@ class FactoryRuntime:
             if command == "del-phone":
                 return True, self._delete_phone(_text(data.get("phone_id")), mode)
         if method == "GET" and action == "reports":
-            reports=self.store._remote_result(["reports", "--runmode", mode])
-            for folder in reports.get("folders",[]):
-                if folder.get("run_id"):
-                    try:
-                        folder.update(self._evaluation_snapshot_label(self.records.get("model_iter_runs",folder["run_id"])))
-                    except (OSError,sqlite3.Error):
-                        folder["collection_snapshot_status_unavailable"]=True
-            return True,reports
+            self.read_models.schedule_reports(mode)
+            if data.get("view") == "summary":
+                from .factory_read_models import page_options
+                return True, self.read_models.page("reports", mode, **page_options(data))
+            return True, self.read_models.legacy_reports(mode)
         if method == "GET" and action == "report-download":
             args = ["report-download", "--runmode", mode]
             for field, flag in (("run_id", "--run-id"), ("file_id", "--file-id"), ("name", "--name"), ("folder", "--folder")):
@@ -1471,11 +1580,17 @@ class FactoryRuntime:
             directory.mkdir(parents=True, exist_ok=True)
             name = _filename(data.get("name") or "evaluation-report.xlsx")
             if data.get("run_id") and data.get("file_id") and not data.get("name"):
-                folders = self.store._remote_result(["reports", "--runmode", mode]).get("folders", [])
-                matching = [file for folder in folders if folder.get("run_id") == data["run_id"]
-                            for file in folder.get("files", []) if file.get("file_id", file.get("id")) == data["file_id"]]
-                if matching:
-                    name = _filename(matching[0]["name"])
+                indexed_name = self.read_models.report_name(mode, data["run_id"], data["file_id"])
+                if indexed_name:
+                    name = _filename(indexed_name)
+                else:
+                    # Compatibility for a direct download before the metadata
+                    # index was populated; only downloads may wait on the server.
+                    folders = self.store._remote_result(["reports", "--runmode", mode]).get("folders", [])
+                    matching = [file for folder in folders if folder.get("run_id") == data["run_id"]
+                                for file in folder.get("files", []) if file.get("file_id", file.get("id")) == data["file_id"]]
+                    if matching:
+                        name = _filename(matching[0]["name"])
             destination = directory / (uuid.uuid4().hex + Path(name).suffix)
             try:
                 result = self.store._remote_result(args + ["--out", str(destination)])

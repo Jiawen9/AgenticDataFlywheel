@@ -29,7 +29,7 @@ const cleanConfig = (value: unknown) => {
 
 beforeEach(() => {
   vi.spyOn(useDisplayIdentifiers(), 'resolve').mockResolvedValue(undefined)
-  vi.spyOn(api, 'listPipelines').mockResolvedValue([])
+  vi.spyOn(api, 'pipelineBindings').mockResolvedValue([])
   vi.spyOn(api, 'preprocessingBatches').mockResolvedValue([{ batch_id: 'ready-result', label: '已采集结果', task_count: 1, ready_trajectory_count: 1 }] as never)
   vi.spyOn(factoryBatchesApi, 'list').mockResolvedValue([source()])
   vi.spyOn(factoryBatchesApi, 'detail').mockResolvedValue(source())
@@ -40,7 +40,7 @@ beforeEach(() => {
     vi.spyOn(factory, 'agentCapabilities').mockResolvedValue({ ok: true, agent_types: capabilities })
     vi.spyOn(factory, 'addTask').mockResolvedValue(factoryState())
     vi.spyOn(factory, 'remoteStartRun').mockResolvedValue({ ok: true, run_id: 'accepted-model-run', batch_id: 'accepted-result', task_source_batch_id: source().batch_id })
-    vi.spyOn(factory, 'runs').mockResolvedValue({ runs: [] })
+    vi.spyOn(factory, 'runPage').mockResolvedValue({items: [], latest: [], total: 0, scope_counts: {total: 0, active: 0, abnormal: 0}, offset: 0, limit: 10, has_more: false, index_state: 'ready', counts_complete: true})
   }
 })
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals() })
@@ -140,7 +140,7 @@ describe('pipeline model configuration across platform entrypoints', () => {
     expect(phoneFactoryApi.remoteStartRun).not.toHaveBeenCalled()
     expect(factoryBatchesApi.workbook).not.toHaveBeenCalled()
     expect(view.evaluationProgress.selectedRun.value).toBe('accepted-model-run')
-    expect(modelIterationApi.runs).toHaveBeenCalled()
+    expect(modelIterationApi.runPage).toHaveBeenCalled()
   })
 
   it('hydrates Pipeline creation defaults, preserves edits on a choices-only refresh, and nests overrides only for collection', async () => {

@@ -1,3 +1,4 @@
+import { sharedRead, summaryKey, summaryParams, type SummaryPage, type SummaryQuery } from '@/utils/summaryCache'
 import { notifyBatchesPublished, activeBatchItems } from '@/utils/batchLifecycle'
 import type { CollectionBatchDetail, CollectionBatchSummary } from '@/collectionBatchesApi'
 
@@ -137,6 +138,11 @@ export function createFactoryApi(base: '/api/phone-factory' | '/api/model-iter')
     artifactDetail: (id: string, artifact: string, signal?: AbortSignal, executionId?: string) => req<ArtifactDetail>(`/collection-runs/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(artifact)}${executionId ? `?${new URLSearchParams({ execution_id: executionId })}` : ''}`, { signal }),
     artifactFileUrl: (id: string, artifact: string, path: string, executionId?: string) => `${base}/collection-runs/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(artifact)}/file?${new URLSearchParams({ path, ...(executionId ? { execution_id: executionId } : {}) })}`,
     remoteStartEvaluation: (options: StartEvaluationOptions) => req<RemoteResult>('/remote/start-evaluation', jsonInit('POST', options)),
+    evaluationSummary: (id: string) => sharedRead(summaryKey(`${base}/runs/${id}/evaluations/summary`), () => req<EvaluationResults>(`/runs/${encodeURIComponent(id)}/evaluations?view=summary`)),
+    evaluationCases: (id: string, query: SummaryQuery = {}) => req<SummaryPage<EvaluationCase>>(`/runs/${encodeURIComponent(id)}/evaluations?${summaryParams(query).replace('view=summary', 'view=cases')}`),
+    runDetail: (id: string) => sharedRead(summaryKey(`${base}/detail/${id}`), () => req<FactoryRun>(`${base === '/api/model-iter' ? '/runs' : '/collection-runs'}/${encodeURIComponent(id)}?view=detail`)),
+    runPage: (query: SummaryQuery = {}) => req<SummaryPage<FactoryRun>>(`${base === '/api/model-iter' ? '/runs' : '/collection-runs'}?${summaryParams({ include_published: true, ...query })}`),
+    reportPage: (query: SummaryQuery = {}) => req<SummaryPage<{key: string; folder: ReportFolder; file: ReportFile}>>(`/reports?${summaryParams(query)}`),
     evaluations: (runId: string, signal?: AbortSignal) => req<EvaluationResults>(`/runs/${encodeURIComponent(runId)}/evaluations`, { signal }),
     cancelEvaluation: (runId: string) => req<FactoryRun>(`/runs/${encodeURIComponent(runId)}/cancel`, jsonInit('POST', {})),
     state: (signal?: AbortSignal) => req<FactoryState>('/state', { signal }),

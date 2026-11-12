@@ -28,7 +28,7 @@ export function usePipelineContext(options: { batchId?: MaybeRefOrGetter<string>
   const jobIds = computed(() => step.value?.job_ids || [])
   const sessionId = computed(() => pipeline.value?.session_id || '')
   const releaseId = computed(() => pipeline.value?.release_id || '')
-  let generation = 0, disposed = false
+  let generation = 0, disposed = false, failures = 0
   let controller: AbortController | undefined
   let timer: ReturnType<typeof setTimeout> | undefined
   let pending: Promise<void> | undefined
@@ -38,7 +38,7 @@ export function usePipelineContext(options: { batchId?: MaybeRefOrGetter<string>
   }
   function schedule() {
     clearTimer()
-    if (!disposed && (routePipelineId.value || batchId.value) && (typeof document === 'undefined' || document.visibilityState !== 'hidden')) timer = setTimeout(() => { void refresh() }, 1500)
+    if (!disposed && (routePipelineId.value || batchId.value) && (typeof document === 'undefined' || document.visibilityState !== 'hidden')) timer = setTimeout(() => { void refresh() }, Math.min(120000, (pipeline.value && ['running', 'retry_waiting', 'terminating'].includes(pipeline.value.status) ? 5000 : 30000) * 2 ** Math.min(failures, 3)))
   }
   function invalidate() { generation++; controller?.abort(); controller = undefined; pending = undefined; clearTimer() }
   async function refresh(): Promise<void> {
@@ -47,23 +47,27 @@ export function usePipelineContext(options: { batchId?: MaybeRefOrGetter<string>
     const current = generation, requestedId = routePipelineId.value, requestedBatch = batchId.value
     if (!requestedId && !requestedBatch) { pipeline.value = null; error.value = ''; resolved.value = true; loading.value = false; return }
     // Some isolated existing module tests stub only their own APIs.
-    if (typeof api.listPipelines !== 'function' || typeof api.pipeline !== 'function') { resolved.value = true; return }
+    if (typeof api.pipelinePage !== 'function' || typeof api.pipeline !== 'function') { resolved.value = true; return }
     controller = new AbortController()
     const signal = controller.signal
     loading.value = true
     pending = (async () => {
       try {
-        const value = requestedId ? await api.pipeline(requestedId, signal) : (await api.listPipelines({ batch_id: requestedBatch, active_only: true }, signal))[0] || null
+        const lookup = requestedId ? null : await api.pipelinePage({ batch_id: requestedBatch, active_only: true, offset: 0, limit: 1 })
+        if (lookup && !lookup.counts_complete) { if (current === generation) { resolved.value = false; error.value = '历史索引整理中，正在核对批次归属' }; return }
+        const id = requestedId || lookup?.items[0]?.pipeline_id
+        const value = id ? await api.pipeline(id, signal) : null
         if (disposed || current !== generation || signal.aborted) return
         if (value && requestedBatch && value.batch_id !== requestedBatch) throw new Error('Pipeline 与当前批次不匹配，请返回 Pipeline 重新进入')
         if (value && selectedStepId.value && !value.steps.some(item => item.id === selectedStepId.value)) throw new Error('Pipeline 步骤不存在，请返回 Pipeline 重新进入')
         if (value && pipeline.value?.pipeline_id === value.pipeline_id && pipeline.value.storage_revision > value.storage_revision) return
         pipeline.value = value
+        failures = 0
         error.value = ''
         resolved.value = true
         if (value) publishNotice(value)
       } catch (cause) {
-        if (!disposed && current === generation && !signal.aborted) { error.value = (cause as Error).message; resolved.value = true }
+        if (!disposed && current === generation && !signal.aborted) { error.value = (cause as Error).message; resolved.value = true; failures++ }
       } finally {
         if (!disposed && current === generation) { loading.value = false; pending = undefined; schedule() }
       }
@@ -81,12 +85,12 @@ export function usePipelineContext(options: { batchId?: MaybeRefOrGetter<string>
     } catch (cause) { if (!disposed) { error.value = (cause as Error).message; await refresh() }; throw cause }
     finally { controlling.value = false; schedule() }
   }
-  const unwatch = watch([routePipelineId, batchId, routeStepId], () => {
+  const unwatch = watch([routePipelineId, batchId], () => {
     invalidate(); pipeline.value = null; error.value = ''; resolved.value = false; void refresh()
   }, { immediate: true, flush: 'sync' })
   function focus() { if (!disposed) void refresh() }
   function visibility() { if (document.visibilityState === 'hidden') { invalidate(); loading.value = false } else void refresh() }
-  const unsubscribe = subscribeBatchLifecycle(event => { if (event.batch_ids.includes(pipeline.value?.batch_id || batchId.value)) void refresh() })
+  const unsubscribe = subscribeBatchLifecycle(event => { if (event.batch_ids.includes(pipeline.value?.batch_id || batchId.value)) { invalidate(); void refresh() } })
   function dispose() { if (disposed) return; disposed = true; invalidate(); unwatch(); unsubscribe(); window.removeEventListener('focus', focus); document.removeEventListener('visibilitychange', visibility) }
   onMounted(() => { window.addEventListener('focus', focus); document.addEventListener('visibilitychange', visibility) })
   onBeforeUnmount(dispose)

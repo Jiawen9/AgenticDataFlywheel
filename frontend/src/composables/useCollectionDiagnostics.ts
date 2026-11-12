@@ -4,7 +4,7 @@ import { factoryRunActive, factoryRunId, newestFactoryRuns } from '@/utils/facto
 import { useFactoryPolling } from './useFactoryPolling'
 import { collectorDataUnavailable } from '@/utils/phoneFactoryRuns'
 
-type DiagnosticsApi = Pick<ReturnType<typeof createFactoryApi>, 'diagnostics' | 'resumePreview' | 'resumeCollection' | 'resumeOperation'> & Partial<Pick<ReturnType<typeof createFactoryApi>, 'phoneOwnership' | 'phoneControl' | 'phoneControlOperation'>>
+type DiagnosticsApi = Pick<ReturnType<typeof createFactoryApi>, 'diagnostics' | 'resumePreview' | 'resumeCollection' | 'resumeOperation'> & Partial<Pick<ReturnType<typeof createFactoryApi>, 'phoneOwnership' | 'phoneControl' | 'phoneControlOperation' | 'runDetail'>>
 export interface PhoneControlState { runId: string; phoneId: string; action: 'reconcile' | 'stop'; request: PhoneControlRequest; result?: PhoneControlOperation; sending: boolean; error: string }
 export interface PhoneResumeState {
   runId: string; phoneIds: string[]; requestId: string; request?: ResumeRequest; confirmedUnknown: boolean
@@ -88,7 +88,8 @@ export function useCollectionDiagnostics(runs: Ref<FactoryRun[]>, api: Diagnosti
     }
     finally { item.sending = false }
   }
-  const selectedRun = computed(() => runs.value.find(run => factoryRunId(run) === selectedRunId.value))
+  const selectedDetail = ref<FactoryRun | null>(null)
+  const selectedRun = computed(() => selectedDetail.value && factoryRunId(selectedDetail.value) === selectedRunId.value ? selectedDetail.value : api.runDetail ? undefined : runs.value.find(run => factoryRunId(run) === selectedRunId.value))
   const snapshot = computed(() => snapshots.value[selectedRunId.value])
   const error = computed(() => errors.value[selectedRunId.value] || '')
   const selectedOperations = computed(() => operations.filter(item => item.runId === selectedRunId.value))
@@ -118,7 +119,12 @@ export function useCollectionDiagnostics(runs: Ref<FactoryRun[]>, api: Diagnosti
 
   async function refresh(signal?: AbortSignal, current: () => boolean = () => true) {
     const id = selectedRunId.value, epoch = generation, sequence = ++requestSequence
-    if (!id || !selectedRun.value) return
+    if (!id) return
+    if (api.runDetail) {
+      try { const detail = await api.runDetail(id); if (disposed || !current() || epoch !== generation || id !== selectedRunId.value) return; selectedDetail.value = detail }
+      catch (cause) { if (epoch === generation) errors.value = { ...errors.value, [id]: `运行详情暂不可用：${(cause as Error).message}` }; return }
+    }
+    if (!selectedRun.value) return
     if (collectorDataUnavailable(selectedRun.value)) {
       snapshots.value = { ...snapshots.value, [id]: { supported: false, run_id: id, phones: [], summary: { total: 0, healthy: 0, warning: 0, error: 0 }, message: '该运行的采集端数据正在清理或已清理；请在存储与清理中查看操作结果。平台已有数据保留。' } }
       errors.value = { ...errors.value, [id]: '' }; return
@@ -158,7 +164,7 @@ export function useCollectionDiagnostics(runs: Ref<FactoryRun[]>, api: Diagnosti
   const dataAvailable = (id: string) => !collectorDataUnavailable(runs.value.find(run => factoryRunId(run) === id) || {})
   const poller = useFactoryPolling(async (signal, current) => {
     await Promise.allSettled([refresh(signal, current), ...operations.filter(item => item.phase === 'waiting' && dataAvailable(item.runId)).map(item => lookupOperation(item, signal)), ...phoneControls.filter(item => !item.sending && !controlTerminal(item.result?.status) && dataAvailable(item.runId)).map(item => pollControl(item, signal))])
-  }, 5000)
+  }, () => operations.some(item => item.phase === 'waiting') || phoneControls.some(item => !controlTerminal(item.result?.status)) || (selectedRun.value && factoryRunActive(selectedRun.value)) ? 5000 : 30000)
   watch([selectedRunId, () => selectedRun.value?.collector_data_state], () => { generation++; diagnosticController?.abort(); loading.value = false; if (mounted) poller.start() }, { flush: 'sync' })
 
   async function submit(item: PhoneResumeState) {

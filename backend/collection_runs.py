@@ -186,8 +186,8 @@ class CollectionRunStore:
     def list_runs(self, batch_id: str | None = None) -> list[dict]:
         if batch_id is not None:
             _identifier(batch_id, "采集批次编号")
-        return sorted((self._current_paths(run) for run in self.records.list("collection_runs")
-                       if batch_id is None or run["batch_id"] == batch_id), key=lambda run: (run["created_at"], run["collection_run_id"]))
+        rows = self.records.get_many("collection_runs", self.records.matching_keys("collection_runs", batch_id=batch_id))
+        return sorted((self._current_paths(run) for run in rows), key=lambda run: (run["created_at"], run["collection_run_id"]))
 
     def prepare_result_batch(self, source_batch_id: str, *, dispatch_key: str, metadata: dict,
                              workbook_sha256: str | None = None) -> tuple[dict, bool]:

@@ -1,3 +1,4 @@
+import { sharedRead, summaryKey, summaryParams, invalidateSummaryCache, type SummaryPage, type SummaryQuery } from '@/utils/summaryCache'
 import { activeBatchItems, notifyBatchesPublished } from '@/utils/batchLifecycle'
 import type { Pipeline, CreatePipeline, PipelineAction } from './types/pipeline'
 import type { BuildJob, CorrectionBatch, CorrectionCotJob, CorrectionCotResponse, CorrectionExport, CorrectionGroup, CorrectionGroupSummary, CorrectionRecommendation, CorrectionSession, DatasetRelease, DatasetReleaseCandidate, DatasetUploadJob, KnowledgeBaseSummary, QualityJob, RunQualitySummary, TaskGenerationExport, TaskGenerationJob, TaskGenerationResult, TaskGenerationTree, TaskGenerationSelection, TaskGenerationTreeNode, TaskQualityResult, TaskSummary, TrajectoryRecord, TrajectorySummary, TrajectoryTreeNode, TreeRun } from './types'
@@ -47,19 +48,35 @@ export const api = {
     const query = revision === undefined ? '' : '?expected_revision=' + encodeURIComponent(revision)
     return request('/api/correction/sessions/' + encodeURIComponent(sessionId) + '/rows/' + excelRow + '/coordinate-info' + query, { cache: 'no-store' })
   },
+  pipelinePage(query: SummaryQuery = {}): Promise<SummaryPage<Pipeline>> {
+    return sharedRead(summaryKey('transport:/api/pipelines', query), () => request('/api/pipelines?' + summaryParams(query), { cache: 'no-store' }))
+  },
+  async pipelineBindings(): Promise<Pipeline[]> {
+    return sharedRead(summaryKey('/api/pipelines/bindings'), async () => {
+      const rows: Pipeline[] = []
+      for (let offset = 0; ; offset += 50) {
+        const page = await api.pipelinePage({ active_only: true, offset, limit: 50 })
+        if (!page.counts_complete) throw new Error('历史索引整理中，正在核对自动流程管理的批次')
+        rows.push(...page.items)
+        if (!page.has_more) return rows
+      }
+    }, { freshMs: 5000 })
+  },
   async listPipelines(options: { batch_id?: string; active_only?: boolean } = {}, signal?: AbortSignal): Promise<Pipeline[]> {
     const query = new URLSearchParams()
     if (options.batch_id) query.set('batch_id', options.batch_id)
     if (options.active_only !== undefined) query.set('active_only', String(options.active_only))
     return (await request<{ pipelines: Pipeline[] }>('/api/pipelines' + (query.size ? '?' + query : ''), { cache: 'no-store', signal })).pipelines
   },
-  async pipeline(id: string, signal?: AbortSignal): Promise<Pipeline> {
-    return (await request<{ pipeline: Pipeline }>('/api/pipelines/' + encodeURIComponent(id), { cache: 'no-store', signal })).pipeline
+  async pipeline(id: string, _signal?: AbortSignal): Promise<Pipeline> {
+    return sharedRead(summaryKey('/api/pipelines/' + encodeURIComponent(id)), async () => (await request<{ pipeline: Pipeline }>('/api/pipelines/' + encodeURIComponent(id), { cache: 'no-store' })).pipeline)
   },
   async createPipeline(value: CreatePipeline): Promise<Pipeline> {
+    invalidateSummaryCache()
     return (await request<{ pipeline: Pipeline }>('/api/pipelines', { method: 'POST', body: JSON.stringify(value) })).pipeline
   },
   async controlPipeline(id: string, action: PipelineAction, expectedRevision: number, sessionRevision?: number): Promise<Pipeline> {
+    invalidateSummaryCache()
     return (await request<{ pipeline: Pipeline }>(`/api/pipelines/${encodeURIComponent(id)}/${action}`, { method: 'POST', body: JSON.stringify({ expected_revision: expectedRevision, ...(sessionRevision !== undefined ? { session_revision: sessionRevision } : {}) }) })).pipeline
   },
   batchLifecycle(batchId: string): Promise<{ batch_id: string; status: 'active' | 'published'; published_at: string | null; release_id: string | null }> {

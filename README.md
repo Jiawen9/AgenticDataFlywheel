@@ -7,6 +7,8 @@
 
 手机工厂新增采集、设备监控与模型迭代评估，运行结果通过 HTTP 回传平台。配置与接入见[手机工厂集成说明](PHONE_FACTORY.md)，采集服务器部署见[独立 9011 服务说明](backend/collector_service/README.md)。
 
+自动流程、采集及评测页面的摘要索引、分页、缓存与创新前端接入见[页面加载说明](PAGE_LOADING.md)。
+
 ## 主要能力
 
 - 递归读取 rollout 轨迹并导出 Excel。

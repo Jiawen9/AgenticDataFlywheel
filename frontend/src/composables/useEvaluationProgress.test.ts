@@ -4,8 +4,8 @@ import { useEvaluationProgress, type EvaluationProgress } from './useEvaluationP
 import type { FactoryRun } from '@/phoneFactoryApi'
 import FactoryRunDetailsDrawer from '@/components/FactoryRunDetailsDrawer.vue'
 
-const mocks = vi.hoisted(() => ({ evaluations: vi.fn(), cancel: vi.fn(), confirm: vi.fn(), start: vi.fn(), registrations: 0, poll: undefined as undefined | ((signal: AbortSignal, current: () => boolean) => Promise<void>) }))
-vi.mock('@/phoneFactoryApi', () => ({ modelIterationApi: { evaluations: mocks.evaluations, cancelEvaluation: mocks.cancel } }))
+const mocks = vi.hoisted(() => ({ evaluations: vi.fn(), detail: vi.fn(), cancel: vi.fn(), confirm: vi.fn(), start: vi.fn(), registrations: 0, poll: undefined as undefined | ((signal: AbortSignal, current: () => boolean) => Promise<void>) }))
+vi.mock('@/phoneFactoryApi', () => ({ modelIterationApi: { evaluationSummary: mocks.evaluations, runDetail: mocks.detail, cancelEvaluation: mocks.cancel } }))
 vi.mock('element-plus', () => ({ ElMessageBox: { confirm: mocks.confirm } }))
 vi.mock('./useFactoryPolling', () => ({ useFactoryPolling: (work: typeof mocks.poll) => { mocks.registrations++; mocks.poll = work; return { start: mocks.start } } }))
 const flush = async () => { await nextTick(); await Promise.resolve(); await nextTick() }
@@ -25,7 +25,7 @@ function mount() {
   return { app, runs, opened, tab, changed, progress }
 }
 
-beforeEach(() => { vi.clearAllMocks(); mocks.registrations = 0 })
+beforeEach(() => { vi.resetAllMocks(); mocks.registrations = 0; mocks.detail.mockImplementation(async (id: string) => ({ run_id: id, status: 'running' })) })
 
 describe('page-owned evaluation progress', () => {
   it('owns exactly one result poller through drawer mounts, closes and tab switches', async () => {
@@ -68,6 +68,7 @@ describe('page-owned evaluation progress', () => {
 it('keeps saved results but stops polling and cancellation after collector retirement', async () => {
   const view = mount(), pending = deferred<any>(); mocks.evaluations.mockReturnValueOnce(pending.promise)
   const work = mocks.poll!(new AbortController().signal, () => true)
+  await flush()
   view.runs.value = view.runs.value.map(run => ({ ...run, collector_data_state: 'retired' }))
   await flush(); pending.resolve({ run_id: 'new', summary: { total: 100 }, cases: [] }); await work
   await mocks.poll!(new AbortController().signal, () => true)
