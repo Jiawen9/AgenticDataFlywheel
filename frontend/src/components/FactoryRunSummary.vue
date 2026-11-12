@@ -6,11 +6,11 @@ import { agentLabel } from '@/utils/collectionAgents'
 import { runDisplayStatus, runMessage, runStatus, collectionProgressText, hasCollectionProgress } from '@/utils/phoneFactoryRuns'
 import { factoryRunAbnormal, factoryRunActive, factoryRunId, newestFactoryRuns } from '@/utils/factoryHistory'
 
-const props = defineProps<{ runs: FactoryRun[]; evaluation: boolean; error?: string }>()
+const props = defineProps<{ runs: FactoryRun[]; evaluation: boolean; error?: string; counts?: {total: number | null; active: number | null; abnormal: number | null} | null; indexState?: string; cached?: boolean; updatedAt?: string }>()
 const emit = defineEmits<{ open: [filter: 'all' | 'active' | 'abnormal', runId?: string]; reports: [] }>()
 const latest = computed(() => newestFactoryRuns(props.runs).slice(0, 3))
-const active = computed(() => props.runs.filter(factoryRunActive).length)
-const abnormal = computed(() => props.runs.filter(factoryRunAbnormal).length)
+const active = computed(() => props.counts?.active ?? (props.indexState ? null : props.runs.filter(factoryRunActive).length))
+const abnormal = computed(() => props.counts?.abnormal ?? (props.indexState ? null : props.runs.filter(factoryRunAbnormal).length))
 </script>
 
 <template>
@@ -20,13 +20,16 @@ const abnormal = computed(() => props.runs.filter(factoryRunAbnormal).length)
       <div><el-button v-if="evaluation" link @click="emit('reports')">查看报告</el-button><el-button type="primary" plain @click="emit('open', 'all')">查看全部</el-button></div>
     </div>
     <div class="overview-counts" aria-label="当前范围运行统计">
-      <button @click="emit('open', 'all')">共 <b>{{ runs.length }}</b> 次运行</button>
-      <button @click="emit('open', 'active')">活动 <b>{{ active }}</b></button>
-      <button :class="{ abnormal: abnormal > 0 }" @click="emit('open', 'abnormal')">异常 <b>{{ abnormal }}</b></button>
+      <button @click="emit('open', 'all')">共 <b>{{ counts?.total ?? (indexState ? '—' : runs.length) }}</b> 次运行</button>
+      <button @click="emit('open', 'active')">活动 <b>{{ active ?? '—' }}</b></button>
+      <button :class="{ abnormal: (abnormal || 0) > 0 }" @click="emit('open', 'abnormal')">异常 <b>{{ abnormal ?? '—' }}</b></button>
       <span>最近 3 次</span>
     </div>
     <el-alert v-if="error" :title="error" type="warning" :closable="false" />
-    <p v-if="!latest.length" class="overview-empty">暂无运行记录</p>
+    <p v-if="indexState && indexState !== 'ready'">历史索引整理中，已加载记录仍可查看。</p>
+    <p v-if="cached">显示缓存摘要，正在后台更新。</p>
+    <p v-if="updatedAt" class="overview-empty">最近更新：{{ new Date(updatedAt).toLocaleString() }}</p>
+    <p v-if="!latest.length && (!indexState || indexState === 'ready')" class="overview-empty">暂无运行记录</p>
     <div v-for="run in latest" :key="factoryRunId(run)" class="latest-run">
       <span class="run-ident"><DisplayId kind="run" :id="factoryRunId(run)" /><small>{{ run.created_at?.slice(0, 19).replace('T', ' ') || '时间未记录' }} · {{ agentLabel(run.agent_type) }}</small></span>
       <span :class="{ abnormal: factoryRunAbnormal(run) }">{{ runDisplayStatus(run) }}</span>

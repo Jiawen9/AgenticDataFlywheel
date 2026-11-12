@@ -185,3 +185,18 @@ it('routes collector storage independently of module mode and preserves failed o
   expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({ request_id: 'same', mode: 'retire' })
   expect(factoryStorageApi.archiveDownloadUrl('eval/a')).toBe('/api/phone-factory/storage/runs/eval%2Fa/archive-download')
 })
+
+
+it('requests compact list, summary and case pages without downloading all historical details', async () => {
+  const fetcher = vi.fn(async () => new Response('{"items":[],"latest":[],"counts_complete":true}')); vi.stubGlobal('fetch', fetcher)
+  await phoneFactoryApi.runPage({offset: 20, limit: 10, search: '中文', status: 'all', task_source_batch_id: 'source'})
+  await modelIterationApi.reportPage({offset: 10, limit: 10})
+  await modelIterationApi.evaluationSummary('eval-page-test')
+  await modelIterationApi.evaluationCases('eval-page-test', {offset: 50, limit: 50, status: 'abnormal'})
+  const urls = fetcher.mock.calls.map(call => new URL(String(call[0]), 'http://test'))
+  expect(urls[0].searchParams.get('view')).toBe('summary'); expect(urls[0].searchParams.get('status')).toBeNull()
+  expect(urls[0].searchParams.get('task_source_batch_id')).toBe('source'); expect(urls[0].searchParams.get('search')).toBe('中文')
+  expect(urls[1].pathname).toBe('/api/model-iter/reports')
+  expect(urls[2].searchParams.get('view')).toBe('summary')
+  expect(urls[3].searchParams.get('view')).toBe('cases'); expect(urls[3].searchParams.get('offset')).toBe('50')
+})

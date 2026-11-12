@@ -160,8 +160,8 @@ class PipelineRuntime:
 
     def input_ready(self, pipeline):
         runs = self.collection_runs(pipeline["batch_id"])
-        heads = [head for head in self.records.list("collection_resume_heads")
-                 if head.get("batch_id") == pipeline["batch_id"]]
+        heads = self.records.get_many("collection_resume_heads",
+            self.records.matching_keys("collection_resume_heads", batch_id=pipeline["batch_id"]))
         if heads:
             if any(head.get("active") for head in heads):
                 return False
@@ -240,9 +240,14 @@ class PipelineRuntime:
                      "cot": "correction_cot_jobs"}.get(step)
         if not namespace:
             return []
-        return [j for j in self.records.list(namespace)
-                if (j.get("batch_id") or j.get("run_id")) == pipeline["batch_id"]
-                or (pipeline.get("session_id") and j.get("session_id") == pipeline["session_id"])]
+        return self.records.get_many(namespace, self.records.matching_keys(namespace,
+            batch_id=pipeline["batch_id"], session_id=pipeline.get("session_id")))
+
+    def bound_jobs(self, step, pipeline, job_ids):
+        namespace = {"collection": "collection_runs", "preprocessing": "preprocessing_jobs",
+                     "tree": "tree_jobs", "quality": "quality_jobs", "cot": "correction_cot_jobs"}.get(step)
+        jobs = self.records.get_many(namespace, job_ids) if namespace else []
+        return [self.factory.collection_runs._current_paths(job) for job in jobs] if step == "collection" else jobs
 
     def submit(self, step, pipeline, retry=False):
         if step == "preprocessing":
@@ -310,7 +315,11 @@ class PipelineManager:
             raise PipelineError("Pipeline 不存在", 404)
         if public:
             for step in pipeline["steps"]:
-                by_id = {j.get("job_id") or j.get("collection_run_id"): j for j in self.runtime.jobs(step["id"], pipeline)}
+                # The public detail needs only the jobs explicitly bound to
+                # this step. Discovery during orchestration remains separate.
+                jobs = (self.runtime.bound_jobs(step["id"], pipeline, step["job_ids"])
+                        if hasattr(self.runtime, "bound_jobs") else self.runtime.jobs(step["id"], pipeline))
+                by_id = {j.get("job_id") or j.get("collection_run_id"): j for j in jobs}
                 step["jobs"] = [by_id[j] for j in step["job_ids"] if j in by_id]
                 if step["status"] == "running" and step["jobs"]:
                     step["percent"] = round(sum(float(j.get("percent") or (100 if j["status"] in {"completed", "succeeded"} else 0))
@@ -320,9 +329,12 @@ class PipelineManager:
         return pipeline
 
     def list(self, batch_id=None, active_only=False):
-        return sorted((self.get(p["pipeline_id"]) for p in self.records.list("pipelines")
-                       if (not batch_id or p["batch_id"] == batch_id)
-                       and (not active_only or p["status"] not in TERMINAL)), key=lambda p: p["created_at"], reverse=True)
+        keys = self.records.matching_keys("pipelines", batch_id=batch_id,
+            excluded_statuses=TERMINAL if active_only else ())
+        return sorted((self.get(key) for key in keys), key=lambda p: p["created_at"], reverse=True)
+
+    def summary_page(self, **options):
+        return self.records.summary_page("pipelines", **options)
 
     def _busy(self, batch_id):
         if active_jobs(batch_id, self.root):
@@ -623,8 +635,8 @@ class PipelineManager:
 
     def _collection_version_fence(self, pipeline):
         """Pause on durable resume intent; late old jobs cannot advance new data."""
-        heads = [head for head in self.records.list("collection_resume_heads")
-                 if head.get("batch_id") == pipeline["batch_id"]]
+        heads = self.records.get_many("collection_resume_heads",
+            self.records.matching_keys("collection_resume_heads", batch_id=pipeline["batch_id"]))
         if not heads or pipeline.get("release_id") or pipeline["status"] in {"terminating", "terminated"}:
             return False
         if len(heads) != 1:
@@ -843,14 +855,13 @@ class PipelineManager:
 
     def _poll(self):
         while not self._stop.is_set():
-            for pipeline in self.records.list("pipelines"):
+            for pipeline_id in self.records.matching_keys("pipelines", excluded_statuses=TERMINAL - {"published_summary_failed"}):
                 if self._stop.is_set():
                     break
-                if pipeline["status"] not in TERMINAL - {"published_summary_failed"}:
-                    try:
-                        self.tick(pipeline["pipeline_id"])
-                    except Exception:
-                        LOG.exception("Pipeline reconciliation failed: %s", pipeline["pipeline_id"])
+                try:
+                    self.tick(pipeline_id)
+                except Exception:
+                    LOG.exception("Pipeline reconciliation failed: %s", pipeline_id)
             self._stop.wait(self.interval)
 
     def close(self):

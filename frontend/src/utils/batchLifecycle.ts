@@ -1,3 +1,4 @@
+import { invalidateSummaryCache } from './summaryCache'
 import type { LocationQuery, LocationQueryRaw } from 'vue-router'
 export interface PublishedBatchEvent {
   type: 'batches-published'
@@ -14,6 +15,7 @@ const seen = new Set<string>()
 let channel: BroadcastChannel | null = null
 function accept(event: PublishedBatchEvent) {
   if (event?.type !== 'batches-published' || !Array.isArray(event.batch_ids) || !event.batch_ids.every(id => typeof id === 'string') || typeof event.event_id !== 'string' || seen.has(event.event_id)) return
+  invalidateSummaryCache()
   seen.add(event.event_id)
   if (seen.size > 200) seen.delete(seen.values().next().value!)
   for (const id of event.batch_ids) published.set(id, event)

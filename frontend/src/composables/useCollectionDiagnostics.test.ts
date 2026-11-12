@@ -4,7 +4,7 @@ import type { CollectionDiagnostics, FactoryRun, PhoneOwner, PhoneOwnership } fr
 import { useCollectionDiagnostics, type CollectionDiagnosticsState } from './useCollectionDiagnostics'
 
 const polling = vi.hoisted(() => ({ registrations: 0, start: vi.fn(), work: undefined as any }))
-vi.mock('./useFactoryPolling', () => ({ useFactoryPolling: (work: any, delay: number) => { polling.registrations++; polling.work = work; expect(delay).toBe(5000); return { start: polling.start } } }))
+vi.mock('./useFactoryPolling', () => ({ useFactoryPolling: (work: any, delay: number) => { polling.registrations++; polling.work = work; expect(typeof delay === 'function' ? delay() : delay).toBe(5000); return { start: polling.start } } }))
 const deferred = <T,>() => { let resolve!: (value: T) => void; const promise = new Promise<T>(done => { resolve = done }); return { promise, resolve } }
 const snapshot = (run = 'a'): CollectionDiagnostics => ({ supported: true, run_id: run, observed_at: new Date().toISOString(), phones: [{ phone_id: 'p1', status: 'error', phase: 'model_request', model_role: 'planner', can_resume: true }], summary: { total: 1, healthy: 0, warning: 0, error: 1 } })
 const flush = async () => { await nextTick(); await Promise.resolve(); await nextTick() }

@@ -16,7 +16,7 @@ describe('independent factory observation', () => {
     vi.spyOn(phoneFactoryApi, 'state').mockResolvedValue(state)
     vi.spyOn(phoneFactoryApi, 'remoteStatus').mockReturnValue(pending)
     vi.spyOn(phoneFactoryApi, 'adbDevices').mockResolvedValue({ ok: true, devices: [] })
-    vi.spyOn(phoneFactoryApi, 'runs').mockResolvedValue({ runs: [{ run_id: 'updated', status: 'running', task_source_batch_id: 'history' }] })
+    vi.spyOn(phoneFactoryApi, 'runPage').mockResolvedValue({ items: [{ run_id: 'updated', status: 'running', task_source_batch_id: 'history' }], latest: [], scope_counts: {total: 1, active: 1, abnormal: 0}, total: 1, offset: 0, limit: 10, has_more: false, index_state: 'ready', counts_complete: true })
     const component = { ...PhoneFactoryCollectionView, ssrRender(_ctx: unknown, push: (html: string) => void) { push('<div></div>') } }
     const app = createSSRApp(component)
     app.mixin({ created() { if (this.$options.__name === 'PhoneFactoryCollectionView') view = this.$.setupState } })
@@ -24,8 +24,8 @@ describe('independent factory observation', () => {
     await renderToString(app)
     view.newVla = 'draft-vla'; view.historySourceId = 'history'; view.selectedBatchId = 'draft-source'
     const jobs = polls.work.map(work => work(new AbortController().signal, () => true))
-    await nextTick(); await Promise.resolve(); await nextTick()
-    expect(view.runs[0].run_id).toBe('updated')
+    await nextTick(); await view.runList.refresh(); await nextTick(); await Promise.resolve(); await nextTick()
+    expect(view.runList.data.value.items[0].run_id).toBe('updated')
     expect(view.historySourceId).toBe('history'); expect(view.selectedBatchId).toBe('draft-source'); expect(view.newVla).toBe('draft-vla')
     expect(phoneFactoryApi.remoteStatus).toHaveBeenCalledTimes(1)
     release({ ok: true, statuses: [] }); await Promise.all(jobs)

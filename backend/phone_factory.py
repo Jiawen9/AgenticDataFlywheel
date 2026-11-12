@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse, Response
 from .batch_operations import active_batch_lock
 from .batch_lifecycle import is_batch_active
 from .data_store import DATA_ROOT, RecordStore, RevisionConflict
+from .data_store.registry import SummaryUnavailable
 from .data_store.paths import contained_path
 from .data_store.locking import batch_lock
 from .collection_runs import CollectionRunError, CollectionRunStore
@@ -487,6 +488,8 @@ def create_router(store: PhoneFactoryStore | None = None, *, prefix="/api/phone-
             return value if isinstance(value, Response) else JSONResponse(value, status_code=202 if accepted else 200, headers={"Cache-Control": "no-store"})
         except (PhoneFactoryError, CollectionRunError) as exc:
             return JSONResponse({"error": str(exc)}, status_code=exc.status, headers={"Cache-Control": "no-store"})
+        except SummaryUnavailable as exc:
+            return JSONResponse({"error": str(exc), "retryable": True}, status_code=503, headers={"Cache-Control": "no-store"})
         except (ValueError, OSError) as exc:
             return JSONResponse({"error": str(exc)}, status_code=500, headers={"Cache-Control": "no-store"})
 

@@ -6,6 +6,8 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Check, Collection, Cpu, DataAnalysis, Plus, Promotion, Refresh, TrendCharts, Upload, WarningFilled } from '@element-plus/icons-vue'
 import { api } from '@/api'
+import { useSummaryPage } from '@/composables/useSummaryPage'
+import { invalidateSummaryCache } from '@/utils/summaryCache'
 import RolloutImportDialog from '@/components/RolloutImportDialog.vue'
 import type { RolloutImportResult } from '@/rolloutImportApi'
 import { PIPELINE_DIAGRAM_STAGES, diagramNodeState, diagramStageState, diagramStageTarget, type DiagramStage, type DiagramNodeState } from '@/utils/pipelineDiagram'
@@ -23,7 +25,11 @@ import { PIPELINE_TERMINAL, pipelineStatusLabels, pipelineStepLabels, pipelineSt
 const route = useRoute(), router = useRouter(), context = usePipelineContext()
 const { displayId, matches } = useDisplayIdentifiers()
 const batchSearch = ref(''), historySearch = ref('')
-const filteredHistory = computed(() => history.value.filter(item => matches(historySearch.value, 'pipeline', item.pipeline_id, '', item.name) || matches(historySearch.value, 'batch', item.batch_id) || matches(historySearch.value, 'batch', item.task_source_batch_id)))
+const historyPage = ref(1), historySize = ref(10), historyStatus = ref('all')
+const historyQuery = computed(() => ({ offset: (historyPage.value - 1) * historySize.value, limit: historySize.value, search: historySearch.value, status: historyStatus.value }))
+const historyList = useSummaryPage<Pipeline>('/api/pipelines', historyQuery, query => api.pipelinePage(query), { prefetch: true })
+const filteredHistory = computed(() => history.value)
+watch([historySearch, historySize, historyStatus], () => { historyPage.value = 1 })
 const visibleChoices = computed(() => choices.value.filter(item => matches(batchSearch.value, 'batch', item.batch_id, '', item.label)))
 function childJobKind(stepId: PipelineStepId) { return stepId === 'collection' ? 'run' : 'job' }
 const pipeline = context.pipeline, history = ref<Pipeline[]>([])
@@ -38,7 +44,7 @@ const newagentModels = reactive(modelDraft())
 const activeModels = computed(() => draft.agent_type === 'newagent' ? newagentModels : models)
 const collectionIssue = computed(() => agentBlockedReason(agentCapabilities.value, draft.agent_type, draft.capture_logprobs) || modelBlockedReason(agentCapabilities.value, draft.agent_type, activeModels.value) || repeatBlockedReason(agentCapabilities.value, draft.agent_type, draft.repeat_times))
 const draft = reactive({ agent_type: 'newagent' as AgentType, repeat_times: 1, name: '', batch_id: '', start_mode: 'existing' as 'existing' | 'collect', mode: 'manual' as 'manual' | 'automatic', threshold: 3, phone_id: '', app: '', vla: '', sampling_enabled: false, temperature: 1, top_p: 1, use_experience_lib: false, capture_logprobs: false })
-let disposed = false, listGeneration = 0, choicesGeneration = 0, listController: AbortController | undefined
+let disposed = false, choicesGeneration = 0
 const requests = new Map<string, string>()
 const icons = { TrendCharts, DataAnalysis, Collection, Upload, Cpu, Promotion }
 const stages = computed(() => PIPELINE_DIAGRAM_STAGES.map(stage => ({
@@ -91,17 +97,14 @@ function state(id: PipelineStepId) { return pipeline.value?.steps.find(step => s
 function openStep(id: PipelineStepId) { if (pipeline.value) void router.push(pipelineStepLocation(pipeline.value, id)) }
 function selectPipeline(id: string) { void router.replace({ path: '/pipeline', query: { pipeline_id: id } }) }
 function date(value: string) { return value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '—' }
-async function loadHistory() {
-  const generation = ++listGeneration
-  listController?.abort(); listController = new AbortController(); loading.value = true
-  try {
-    const rows = await api.listPipelines({}, listController.signal)
-    if (disposed || generation !== listGeneration) return
-    history.value = rows; error.value = ''
-    if (!route.query.pipeline_id && rows.length) selectPipeline(rows[0]!.pipeline_id)
-  } catch (cause) { if (!disposed && generation === listGeneration && (cause as Error).name !== 'AbortError') error.value = (cause as Error).message }
-  finally { if (!disposed && generation === listGeneration) loading.value = false }
-}
+async function loadHistory() { await historyList.reload() }
+watch(historyList.data, page => {
+  if (!page) return
+  history.value = page.items
+  if (!route.query.pipeline_id && page.latest.length) selectPipeline(page.latest[0]!.pipeline_id)
+}, { immediate: true })
+watch(historyList.loading, value => { loading.value = value })
+watch(historyList.error, value => { error.value = value })
 async function loadChoices(hydrateConfig = true) {
   const generation = ++choicesGeneration; choicesLoading.value = true
   const [collection, prepared, state, config] = await Promise.allSettled([factoryBatchesApi.list(), api.preprocessingBatches(), phoneFactoryApi.state(), phoneFactoryApi.config()])
@@ -158,7 +161,7 @@ async function create() {
   try {
     const created = await api.createPipeline({ ...body, request_id: requestId })
     if (disposed) return
-    requests.delete(key); history.value = [created, ...history.value.filter(item => item.pipeline_id !== created.pipeline_id)]
+    requests.delete(key); history.value = [created, ...history.value.filter(item => item.pipeline_id !== created.pipeline_id)].slice(0, historySize.value); invalidateSummaryCache(); void loadHistory()
     dialogVisible.value = false; selectPipeline(created.pipeline_id); ElMessage.success('Pipeline 已交给后台执行')
   } catch (cause) { if (!disposed) createError.value = (cause as Error).message }
   finally { if (!disposed) submitting.value = false }
@@ -178,14 +181,12 @@ async function control(action: PipelineAction) {
 watch(pipeline, value => { if (value) history.value = history.value.map(item => item.pipeline_id === value.pipeline_id ? value : item) })
 watch(() => draft.phone_id, () => { if (draft.app && !apps.value.includes(draft.app)) draft.app = '' })
 watch(() => draft.start_mode, () => { if (!choices.value.some(batch => batch.batch_id === draft.batch_id)) draft.batch_id = '' })
-function focus() { void loadHistory() }
-function visible() { if (document.visibilityState === 'visible') void loadHistory() }
 const unsubscribe = subscribeBatchLifecycle(event => {
   batches.value = batches.value.map(batch => event.batch_ids.includes(batch.batch_id) ? { ...batch, prepared: false } : batch)
   if (draft.start_mode === 'existing' && event.batch_ids.includes(draft.batch_id)) draft.batch_id = ''
 })
-onMounted(() => { localStorage.removeItem('automatic-pipeline-circuit-v3'); void loadHistory(); window.addEventListener('focus', focus); document.addEventListener('visibilitychange', visible) })
-onBeforeUnmount(() => { disposed = true; stopRetryClock(); listGeneration++; choicesGeneration++; listController?.abort(); unsubscribe(); window.removeEventListener('focus', focus); document.removeEventListener('visibilitychange', visible) })
+onMounted(() => { localStorage.removeItem('automatic-pipeline-circuit-v3') })
+onBeforeUnmount(() => { disposed = true; stopRetryClock(); choicesGeneration++; unsubscribe() })
 </script>
 
 <template>
@@ -255,7 +256,11 @@ onBeforeUnmount(() => { disposed = true; stopRetryClock(); listGeneration++; cho
       </div>
       <footer v-if="pipeline" class="run-footer">创建于 {{ date(pipeline.created_at) }}</footer>
     </section>
-    <section class="history-panel"><div class="history-heading"><h2>运行记录</h2><el-input v-model="historySearch" clearable placeholder="搜索编号、批次或名称" style="max-width:280px" /><el-button size="small" :loading="loading" @click="loadHistory"><el-icon><Refresh /></el-icon>刷新</el-button></div>
+    <section class="history-panel"><div class="history-heading"><h2>运行记录</h2><span>共 {{ historyList.counts.value?.total ?? '—' }} · 活动 {{ historyList.counts.value?.active ?? '—' }} · 异常 {{ historyList.counts.value?.abnormal ?? '—' }}</span><el-input v-model="historySearch" clearable placeholder="搜索编号、批次或名称" style="max-width:280px" /><el-select v-model="historyStatus" style="width:130px" aria-label="运行状态"><el-option value="all" label="全部状态" /><el-option value="active" label="活动运行" /><el-option value="abnormal" label="异常运行" /></el-select><el-button size="small" :loading="loading" @click="loadHistory"><el-icon><Refresh /></el-icon>刷新</el-button></div>
+      <p v-if="historyList.data.value?.index_state === 'building'">历史索引整理中，已加载的记录仍可查看。</p>
+      <p v-if="historyList.cached.value">显示缓存摘要，正在后台更新；操作以最新详情为准。</p>
+      <p v-if="historyList.data.value?.updated_at">最近更新：{{ date(historyList.data.value.updated_at) }}</p>
+<div class="history-latest" v-if="historyList.latest.value.length"><span>最近 3 次：</span><el-button v-for="run in historyList.latest.value" :key="run.pipeline_id" link @click="selectPipeline(run.pipeline_id)">{{ run.name || run.pipeline_id }}</el-button></div>
       <el-table :data="filteredHistory" stripe empty-text="暂无 Pipeline，点击右上角新建" @row-click="(row: Pipeline) => selectPipeline(row.pipeline_id)">
         <el-table-column label="名称" min-width="180"><template #default="{ row }"><div>{{ row.name }}</div><DisplayId kind="pipeline" :id="row.pipeline_id" /></template></el-table-column><el-table-column label="任务来源" min-width="150"><template #default="{ row }"><DisplayId kind="batch" :id="row.task_source_batch_id || row.batch_id" /></template></el-table-column><el-table-column label="采集结果批次" min-width="180"><template #default="{ row }"><DisplayId kind="batch" :id="row.batch_id" /><small v-if="!row.task_source_batch_id"> · 历史批次</small></template></el-table-column>
         <el-table-column label="模式" width="120"><template #default="{ row }">{{ row.mode === 'manual' ? '人工修正' : '自动发布' }}</template></el-table-column>
@@ -263,6 +268,7 @@ onBeforeUnmount(() => { disposed = true; stopRetryClock(); listGeneration++; cho
         <el-table-column label="创建时间" min-width="165"><template #default="{ row }">{{ date(row.created_at) }}</template></el-table-column>
         <el-table-column label="操作" width="85"><template #default="{ row }"><el-button link type="primary" @click.stop="selectPipeline(row.pipeline_id)">查看</el-button></template></el-table-column>
       </el-table>
+      <el-pagination v-if="historyList.data.value?.counts_complete" v-model:current-page="historyPage" v-model:page-size="historySize" :page-sizes="[10,20,50]" :total="historyList.total.value" layout="total, sizes, prev, pager, next" />
     </section>
     <el-dialog v-model="dialogVisible" title="新建 Pipeline" width="620px" :close-on-click-modal="!submitting" :close-on-press-escape="!submitting" :show-close="!submitting" destroy-on-close>
       <el-alert v-if="createError" :title="createError" type="warning" :closable="false" />

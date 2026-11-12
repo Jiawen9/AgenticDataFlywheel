@@ -138,6 +138,11 @@ async def lifespan(app: FastAPI):
         factory=factory_store, overview=manager), DATA_ROOT)
     app.state.pipelines = pipeline_manager
     pipeline_manager.start()
+    # Build small list projections in the background; authoritative records and
+    # control revisions remain unchanged. One worker covers the shared database.
+    summary_records = RecordStore(DATA_ROOT)
+    summary_records.start_summary_backfill()
+    app.state.summary_records = summary_records
 
     async def clean_expired_imports():
         while True:
@@ -153,11 +158,14 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         cleanup.cancel()
-        with suppress(asyncio.CancelledError):
-            await cleanup
-        pipeline_manager.close()
-        close_phone_factory()
-        manager.close()
+        try:
+            with suppress(asyncio.CancelledError):
+                await cleanup
+            pipeline_manager.close()
+            close_phone_factory()
+            manager.close()
+        finally:
+            summary_records.close_summary_backfill()
 
 
 app = FastAPI(title="Agentic Data Flywheel", version="1.0.0", lifespan=lifespan)

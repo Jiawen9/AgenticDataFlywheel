@@ -309,4 +309,13 @@ def capture_results(runtime, run, *, final=False, remote_status=None):
     def update(current):
         if not current.get("final"):
             current.update(result=value, final=final, updated_at=utc_now())
-    return runtime.records.update("model_iter_results", run["run_id"], update, default={})["result"]
+    saved = runtime.records.update("model_iter_results", run["run_id"], update, default={})
+    if hasattr(runtime, "read_models"):
+        try:
+            runtime.read_models.index_evaluation(run["run_id"], saved)
+        except Exception:
+            # A derived page index can be rebuilt; the validated result remains
+            # saved and must not become an evaluation failure.
+            import logging
+            logging.getLogger(__name__).exception("评测分页索引保存失败：%s", run["run_id"])
+    return saved["result"]

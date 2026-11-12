@@ -30,7 +30,7 @@ describe('Pipeline collection configuration', () => {
     let view: any
     app.mixin({ created() { if (this.$options.__name === 'PipelineView') view = this.$.setupState } })
     const empty = defineComponent({ setup: () => () => h('div') })
-    for (const name of ['button', 'icon', 'alert', 'progress', 'tag', 'table', 'table-column', 'input', 'switch', 'input-number', 'select', 'option', 'form-item', 'radio-group', 'radio-button', 'dialog', 'form']) app.component('el-' + name, empty)
+    for (const name of ['pagination', 'button', 'icon', 'alert', 'progress', 'tag', 'table', 'table-column', 'input', 'switch', 'input-number', 'select', 'option', 'form-item', 'radio-group', 'radio-button', 'dialog', 'form']) app.component('el-' + name, empty)
     await renderToString(app)
     await view.loadChoices()
     for (const keyword of [alias, batchId, '验证用例']) {
@@ -62,7 +62,7 @@ describe('Pipeline collection configuration', () => {
     let view: any
     app.mixin({ created() { if (this.$options.__name === 'PipelineView') view = this.$.setupState } })
     const empty = defineComponent({ setup: () => () => h('div') })
-    for (const name of ['button', 'icon', 'alert', 'progress', 'tag', 'table', 'table-column', 'input', 'switch', 'input-number', 'select', 'option', 'form-item', 'radio-group', 'radio-button', 'dialog', 'form']) app.component('el-' + name, empty)
+    for (const name of ['pagination', 'button', 'icon', 'alert', 'progress', 'tag', 'table', 'table-column', 'input', 'switch', 'input-number', 'select', 'option', 'form-item', 'radio-group', 'radio-button', 'dialog', 'form']) app.component('el-' + name, empty)
     await renderToString(app)
     await view.loadChoices()
     expect(view.choices.map((item: { batch_id: string }) => item.batch_id)).toEqual(['result-new', 'result-pipeline'])
@@ -94,7 +94,7 @@ describe('Pipeline collection configuration', () => {
     app.mixin({ created() { if (this.$options.__name === 'PipelineView') view = this.$.setupState } })
     const empty = defineComponent({ setup: () => () => h('div') })
     const pass = defineComponent({ setup: (_props, { slots }) => () => h('div', null, slots.default?.()) })
-    for (const name of ['button', 'icon', 'alert', 'progress', 'tag', 'table', 'table-column', 'input', 'switch', 'input-number', 'select', 'option', 'form-item', 'radio-group', 'radio-button']) app.component('el-' + name, empty)
+    for (const name of ['pagination', 'button', 'icon', 'alert', 'progress', 'tag', 'table', 'table-column', 'input', 'switch', 'input-number', 'select', 'option', 'form-item', 'radio-group', 'radio-button']) app.component('el-' + name, empty)
     app.component('el-dialog', pass); app.component('el-form', pass)
     await renderToString(app)
     expect(view.draft.capture_logprobs).toBe(false)

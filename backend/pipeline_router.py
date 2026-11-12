@@ -1,7 +1,8 @@
 """HTTP control plane for durable Pipelines; GET never starts work."""
-from fastapi import APIRouter, HTTPException, Request, Response, Depends
+from fastapi import APIRouter, HTTPException, Request, Response, Depends, Query
 from pydantic import BaseModel, ConfigDict, Field
 from .data_store import RevisionConflict
+from .data_store.registry import SummaryUnavailable
 from .pipelines import PipelineError
 
 def _no_cache(response: Response):
@@ -37,13 +38,22 @@ def _call(operation):
         raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
     except RevisionConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except SummaryUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 @router.get("")
-def list_pipelines(request: Request, batch_id: str | None = None, active_only: bool = False):
+def list_pipelines(request: Request, batch_id: str | None = None, active_only: bool = False,
+                   view: str | None = None, offset: int = Query(0, ge=0), limit: int = Query(10, ge=1, le=100),
+                   search: str = "", status: str = "", include_published: bool = True):
+    if view == "summary":
+        return _call(lambda: _manager(request).summary_page(batch_id=batch_id, active_only=active_only,
+            offset=offset, limit=limit, q=search, status=status, include_published=include_published))
+    if view is not None:
+        raise HTTPException(status_code=422, detail="未知 Pipeline 列表视图")
     return _call(lambda: {"pipelines": _manager(request).list(batch_id, active_only)})
 
 @router.post("", status_code=201)
