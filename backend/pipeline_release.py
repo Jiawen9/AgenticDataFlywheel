@@ -77,7 +77,9 @@ def build_selection(batch_id, task_ids, mode, threshold=None, *, root=None):
         results = {str(item["task_id"]): item for item in quality.get("tasks", [])}
         candidates, selected, excluded = [], [], []
         for task_id in expected:
-            evaluations = results.get(task_id, {}).get("evaluations", {})
+            task_result = results.get(task_id, {})
+            evaluations = task_result.get("evaluations", {})
+            fusion_ranking = task_result.get("scoring_version") == "checklist_fusion_v1"
             if not isinstance(evaluations, dict):
                 raise ValueError(f"{task_id} 缺少逐轨迹质检评分")
             groups = [group for group in snapshot["groups"] if group["task_id"] == task_id]
@@ -85,20 +87,34 @@ def build_selection(batch_id, task_ids, mode, threshold=None, *, root=None):
                 raise ValueError(f"{task_id} 的步骤来源与质检轨迹不完整匹配")
             choices = []
             for group in groups:
-                score = evaluations[str(group["meta_task"])].get("global_score")
+                evaluation = evaluations[str(group["meta_task"])]
+                score = evaluation.get("global_score")
                 if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score) or not 0 <= score <= 5:
                     raise ValueError(f"{task_id} 存在无效轨迹评分")
+                fusion = evaluation.get("fusion", {})
+                if fusion_ranking and not (isinstance(fusion, dict) and fusion.get("valid") is True
+                        and type(fusion.get("score")) in (int, float) and math.isfinite(fusion["score"])
+                        and 0 <= fusion["score"] <= 1):
+                    continue
                 choices.append({"task_id": task_id, "trajectory_id": str(group["meta_task"]),
                     "group_id": group["group_id"], "goal": group.get("task", task_id),
-                    "global_score": score, "passed_threshold": evaluations[str(group["meta_task"])].get("passed_threshold"),
+                    "global_score": score, "passed_threshold": evaluation.get("passed_threshold"),
+                    "fusion_score": fusion.get("score") if fusion_ranking else None,
+                    "ranking_basis": "fusion" if fusion_ranking else "rubric",
                     "trajectory_count": 1, "step_count": len(group["rows"])})
-            choices.sort(key=lambda item: (-item["global_score"], item["trajectory_id"], item["group_id"]))
+            if not choices:
+                raise ValueError(f"{task_id} 没有有效完整的融合评分，暂不能选择发布轨迹")
+            if fusion_ranking:
+                # Stable sort retains workbook order on an exact F tie.
+                choices.sort(key=lambda item: -item["fusion_score"])
+            else:
+                choices.sort(key=lambda item: (-item["global_score"], item["trajectory_id"], item["group_id"]))
             candidates.extend(choices)
             if mode == "manual" or choices[0]["global_score"] >= threshold:
                 selected.append(choices[0])
             else:
                 excluded.append({"task_id": task_id, "best_score": choices[0]["global_score"],
-                                 "reason": "没有达到总分阈值的轨迹"})
+                                 "reason": "Top-1 轨迹未达到 Rubric 总分阈值"})
         return {"status": "ready", "batch_id": batch_id, "storage_batch_id": batch_id,
                 "tree_run_id": batch_id, "run_id": batch_id, "mode": mode, "threshold": threshold,
                 "task_ids": expected, "tasks": selected, "candidates": candidates, "excluded": excluded,

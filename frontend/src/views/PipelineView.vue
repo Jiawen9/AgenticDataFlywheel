@@ -207,7 +207,7 @@ onBeforeUnmount(() => { disposed = true; stopRetryClock(); choicesGeneration++; 
       </header>
       <div v-if="pipeline" class="run-workspace" data-testid="pipeline-run-status">
         <div class="run-summary">
-          <span>{{ pipeline.mode === 'manual' ? '人工修正模式 · 每任务一条 Top1' : '自动发布模式 · 总分 ≥ ' + pipeline.threshold }}</span>
+          <span>{{ pipeline.mode === 'manual' ? '人工修正模式 · 每任务一条 Top1' : '自动发布模式 · Top1 的 Rubric G ≥ ' + pipeline.threshold }}</span>
           <span>本轮执行：{{ done }}/{{ pipeline.steps.length }} 步骤已处理</span>
           <el-progress :percentage="pipeline.steps.length ? Math.round(done / pipeline.steps.length * 100) : 0" :show-text="false" />
         </div>
@@ -280,7 +280,7 @@ onBeforeUnmount(() => { disposed = true; stopRetryClock(); choicesGeneration++; 
         <el-form-item v-if="draft.start_mode === 'existing'"><el-button :disabled="choicesLoading || submitting" data-testid="open-rollout-import" @click="rolloutImportVisible = true">导入已有 Rollout</el-button><span class="form-hint">已有本地轨迹尚未登记时，从这里添加新批次。</span></el-form-item>
         <el-form-item label="处理模式" required><el-radio-group v-model="draft.mode"><el-radio-button value="manual">人工修正</el-radio-button><el-radio-button value="automatic">自动发布</el-radio-button></el-radio-group></el-form-item>
         <p class="form-hint">{{ draft.mode === 'manual' ? '每任务选择一条 Top1，修正关卡等待人工确认；无需修改的轨迹也会导出。' : '每任务选择一条达标的最高分轨迹，未达标任务跳过；发布成功后整个批次结束处理。' }}</p>
-        <el-form-item v-if="draft.mode === 'automatic'" label="质检总分阈值（0～5）" required><el-input-number v-model="draft.threshold" :min="0" :max="5" :step="0.1" /></el-form-item>
+        <el-form-item v-if="draft.mode === 'automatic'" label="Rubric G 阈值（0～5）" required><el-input-number v-model="draft.threshold" :min="0" :max="5" :step="0.1" /></el-form-item>
         <template v-if="draft.start_mode === 'collect'">
           <el-form-item label="采集引擎"><CollectionAgentSelect v-model="draft.agent_type" :capabilities="agentCapabilities" /></el-form-item>
           <el-alert v-if="collectionIssue" :title="collectionIssue" type="warning" :closable="false" />

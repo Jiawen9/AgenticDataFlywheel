@@ -45,7 +45,7 @@ from .batch_api import router as batch_results_router, task_status_summaries
 from .data_store import ArtifactStore, DATA_ROOT, RecordStore
 from .batch_results import current_tree_payload, current_tree_batch, recover_pending_batch_results
 from .batch_lifecycle import install_lifecycle_handlers, ensure_batch_active, is_batch_active
-from .phone_factory import router as phone_factory_router, model_iter_router, start_phone_factory, close_phone_factory
+from .phone_factory import router as phone_factory_router, model_iter_router, start_phone_factory, close_phone_factory, PhoneFactoryError
 from .stage_artifacts import read_workbook_payload
 from .preprocessing_jobs import PreprocessingJobManager
 from .preprocessing_router import router as preprocessing_router, configure_preprocessing_manager
@@ -177,6 +177,11 @@ async def pipeline_managed_handler(_request, exc):
     return JSONResponse(status_code=409, content={"detail": exc.detail})
 
 
+@app.exception_handler(PhoneFactoryError)
+async def phone_factory_error_handler(_request, exc):
+    return JSONResponse(status_code=exc.status, content={"detail": str(exc)})
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[origin.strip() for origin in os.environ.get("CORS_ORIGINS", "*").split(",") if origin.strip()],
@@ -220,6 +225,8 @@ def _batch_options(batch_id: str | None, annotation_version: str | None) -> dict
 def _batch_read(operation):
     try:
         return operation()
+    except PhoneFactoryError:
+        raise
     except FileNotFoundError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (ValueError, OSError) as exc:
@@ -357,6 +364,18 @@ def create_quality_job(request: QualityJobRequest) -> dict[str, Any]:
 @app.get("/api/quality-jobs")
 def get_quality_jobs() -> dict[str, Any]:
     return {"jobs": quality_job_manager.list_jobs()}
+
+
+@app.get("/api/quality-jobs/settings")
+def get_quality_settings() -> dict[str, Any]:
+    from .quality_checklist import settings
+    return settings(DATA_ROOT)
+
+
+@app.put("/api/quality-jobs/settings")
+def put_quality_settings(request: dict[str, Any]) -> dict[str, Any]:
+    from .quality_checklist import save_settings
+    return save_settings(DATA_ROOT, request)
 
 
 @app.get("/api/quality-jobs/{job_id}")

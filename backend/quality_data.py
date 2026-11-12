@@ -29,7 +29,7 @@ def quality_manifest(run_id: str, root: Path = QUALITY_RESULTS_DIR) -> dict[str,
     batch_id = resolve_current_batch_id(run_id, data_root)
     if batch_id:
         value = current_quality_payload(batch_id, data_root)
-        return {**value, "tasks": [{key: field for key, field in item.items() if key not in {"evaluations", "rubric"}}
+        return {**value, "tasks": [{key: field for key, field in item.items() if key not in {"evaluations", "rubric", "node_scores"}}
                                    for item in value["tasks"]]}
     if RecordStore(data_root).get("batch_run_aliases", run_id):
         return {"run_id": run_id, "tasks": []}

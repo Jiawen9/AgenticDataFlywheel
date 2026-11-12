@@ -225,12 +225,24 @@ class PipelineRuntime:
             return all(t in trees.get("trees", {}) and trees.get("task_fingerprints", {}).get(t) == expected.get(t) for t in tasks)
         if step == "quality":
             quality = current_quality_payload(batch, self.root)
-            expected = quality_task_fingerprints(trees)
             by_task = {t["task_id"]: t for t in quality.get("tasks", [])}
             counts = {t["task_id"]: int(t.get("trajectory_count") or 0) for t in trees.get("tasks", [])}
-            return all(t in by_task and by_task[t].get("evaluations")
-                       and len(by_task[t]["evaluations"]) == counts.get(t)
-                       and quality.get("task_fingerprints", {}).get(t) == expected.get(t) for t in tasks)
+            quality_step = next((s for s in pipeline.get("steps", []) if s.get("id") == "quality"), {})
+            bound = self.records.get_many("quality_jobs", quality_step.get("job_ids", []))
+            frozen = {task: job.get("checklist_options") for job in bound for task in job.get("task_ids", [])}
+            for task in tasks:
+                result = by_task.get(task) or {}
+                options = frozen[task] if task in frozen else result.get("checklist_options")
+                fusion = result.get("scoring_version") == "checklist_fusion_v1"
+                if fusion and (not options or not result.get("fusion_complete")):
+                    return False
+                if options and not fusion:
+                    return False
+                expected = quality_task_fingerprints(trees, checklist_options=options)
+                if (not result.get("evaluations") or len(result["evaluations"]) != counts.get(task)
+                        or quality.get("task_fingerprints", {}).get(task) != expected.get(task)):
+                    return False
+            return True
         return False
 
     def jobs(self, step, pipeline):

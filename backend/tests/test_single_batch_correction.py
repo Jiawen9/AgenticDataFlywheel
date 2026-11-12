@@ -143,6 +143,19 @@ class SingleBatchCorrectionTests(unittest.TestCase):
         service.review_group(sid, group["group_id"], "discard")
         self.assertEqual(draft_store.load_session(sid)["row_edits"], {})
 
+    def test_new_fusion_ranking_does_not_replace_existing_draft_on_same_input(self):
+        self.inputs(["A"])
+        first = self.create()
+        sid = first["session_id"]
+        service.patch_row(sid, 2, {"thought": "keep expert edit"})
+        before = draft_store.load_session(sid)
+        # A score-only update recommends another candidate without changing
+        # the frozen workbook/task inputs. The current draft remains pinned.
+        self.selection["selected_trajectories"] = {"A": "new-fusion-winner"}
+        self.selection["tasks"][0].update(trajectory_id="new-fusion-winner", ranking_basis="fusion", fusion_score=1.0)
+        self.create()
+        self.assertEqual(draft_store.load_session(sid), before)
+
     def test_cot_result_from_replaced_input_is_rejected(self):
         self.inputs(["A"])
         sid = self.create()["session_id"]

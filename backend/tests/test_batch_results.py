@@ -31,6 +31,21 @@ class BatchResultsTests(unittest.TestCase):
         self.hook.start()
         self.addCleanup(self.hook.stop)
 
+    def test_fusion_rescore_keeps_manual_drafts_but_updates_quality_record(self):
+        self.build("A")
+        trees = current_tree_payload(self.batch, self.root)
+        before = {"session_id": "manual", "row_edits": {"2": {"action": "edited"}}, "cot": {"2": "manual reasoning"}}
+        records = RecordStore(self.root)
+        records.put("correction_sessions", "manual", before)
+        saved = records.get("correction_sessions", "manual")
+        with patch("backend.batch_results._notify_invalidated") as notify:
+            merge_quality_results(self.batch, [{"task_id": "A", "scoring_version": "checklist_fusion_v1",
+                "evaluations": {"A-1": {"global_score": 4, "fusion": {"valid": True, "score": .9}}}}],
+                {"A": trees["tree_hashes"]["A"]}, {"A": "fusion"}, job_id="fusion", completed_at="now", root=self.root)
+            notify.assert_not_called()
+        self.assertEqual(records.get("correction_sessions", "manual"), saved)
+        self.assertEqual(records.get("quality_results", self.batch + ":A")["scoring_version"], "checklist_fusion_v1")
+
     def incoming(self, task):
         annotation = {**self.annotation, "sheets": {"VLA trajectories": [
             row for row in self.annotation["sheets"]["VLA trajectories"] if row["task_id"] == task]}}
@@ -258,7 +273,8 @@ class BatchJobTests(unittest.TestCase):
         self.assertEqual(still_waiting["status"], "queued")
         self.assertEqual(len(executor.pending), 2)
 
-    def test_overlapping_quality_requests_never_report_active_work_succeeded(self):
+    @patch("backend.quality_checklist.freeze_options", return_value=None)
+    def test_overlapping_quality_requests_never_report_active_work_succeeded(self, _freeze):
         from backend.quality_jobs import QualityJobManager
         self.build("A")
         self.build("B")
@@ -272,6 +288,27 @@ class BatchJobTests(unittest.TestCase):
         again = manager.submit(batch_id=self.batch, task_ids=["A", "B"])
         self.assertEqual(again["status"], "queued")
         self.assertEqual(len(executor.pending), 2)
+
+    def test_incomplete_fusion_can_retry_without_reusing_succeeded_job(self):
+        from backend.quality_jobs import QualityJobManager
+        from backend.batch_results import quality_task_fingerprints
+        self.build("A")
+        executor = DeferredExecutor()
+        manager = QualityJobManager(self.root / "system" / "quality_jobs", executor=executor, data_root=self.root)
+        options = {"scoring_version": "checklist_fusion_v1", "evaluation_profile_digest": "frozen"}
+        with patch("backend.quality_checklist.freeze_options", return_value=options):
+            first = manager.submit(batch_id=self.batch, task_ids=["A"])
+            manager._progress(first["job_id"], {"status": "succeeded"})
+            trees = current_tree_payload(self.batch, self.root)
+            fingerprints = quality_task_fingerprints(trees, checklist_options=options)
+            merge_quality_results(self.batch, [{"task_id": "A", "scoring_version": "checklist_fusion_v1",
+                "fusion_complete": False, "evaluations": {"A-1": {"global_score": 4}}}],
+                {"A": trees["tree_hashes"]["A"]}, {"A": fingerprints["A"]},
+                job_id=first["job_id"], completed_at="now", root=self.root)
+            retry = manager.submit(batch_id=self.batch, task_ids=["A"])
+        self.assertNotEqual(first["job_id"], retry["job_id"])
+        self.assertEqual(retry["checklist_options"], first["checklist_options"])
+        self.assertEqual(retry["task_ids"], ["A"])
 
 
 if __name__ == "__main__":

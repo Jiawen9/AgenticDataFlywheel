@@ -72,6 +72,20 @@ describe('business batch quality workspace', () => {
     expect(flow.tree.value?.id).toBe(1)
     expect(flow.loadingTree.value).toBe(false)
   })
+  it('rejects late fusion and Q scores from another batch with the same task ID', async () => {
+    const { client, flow } = setup(), slow = deferred<TaskQualityResult>()
+    client.runQuality.mockImplementation(async () => ({ run_id: 'current', tasks: [{ task_id: 'A', status: 'succeeded', rubric_ready: true }] }))
+    await flow.selectBatch('one')
+    client.taskQuality.mockReturnValueOnce(slow.promise)
+    const old = flow.viewTree('A')
+    await flow.selectBatch('two')
+    client.taskQuality.mockResolvedValue({ run_id: 'two', task_id: 'A', node_scores: { '0': { q: .9, scored_count: 1, total_count: 1 } } } as TaskQualityResult)
+    await flow.viewTree('A')
+    slow.resolve({ run_id: 'one', task_id: 'A', node_scores: { '0': { q: .2, scored_count: 1, total_count: 1 } } } as TaskQualityResult)
+    await old
+    expect(flow.quality.value?.run_id).toBe('two')
+    expect(flow.quality.value?.node_scores?.['0']?.q).toBe(.9)
+  })
   it('only requests valid task quality and disables tasks whose tree became stale', async () => {
     const { client, flow } = setup()
     client.batchTree.mockResolvedValue({ ...built('one', ['A', 'B']), tasks: [task('A'), task('B', 'stale')] } as TreeRun)
