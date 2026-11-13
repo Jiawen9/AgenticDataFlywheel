@@ -4,13 +4,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 from .data_store import RecordStore
-from .file_io import io_path
+from .file_io import io_path, logical_path, resolve_path
 from .quality_fusion import SCORING_VERSION
 
 TERMINAL = {"complete", "completed", "succeeded", "partial", "failed", "cancelled", "error"}
@@ -69,24 +70,85 @@ def freeze_options(root, *, store=None):
             "evaluation_profile_digest": current["evaluation_profile_digest"]}
 
 
-def build_task(task_id, task, trajectories):
+def _source_error(code, task_id, trajectory_id, message):
+    return ValueError(f"[{code}] 质检任务 {task_id} / 轨迹 {trajectory_id}：{message}")
+
+
+def _source_directory(task_id, trajectory, raw_root):
+    """Resolve the frozen source only; never guess from cwd or change metadata."""
+    ident = trajectory.trajectory_id
+    metadata = trajectory.metadata or {}
+    directory = metadata.get("source_directory")
+    if not isinstance(directory, str) or not directory.strip():
+        raise _source_error("source_directory_missing", task_id, ident, "冻结质检输入缺少原件目录")
+    source = metadata.get("source_identity") or {}
+    # source_identity.task_id may be the original case ID before platform
+    # numbering, so compare the quality task itself, not that source alias.
+    if ((getattr(trajectory, "task_id", None) and str(trajectory.task_id) != str(task_id))
+            or (source.get("trajectory_id") and str(source["trajectory_id"]) != str(ident))):
+        raise _source_error("source_identity_mismatch", task_id, ident, "原件身份与冻结任务或轨迹不一致")
+    try:
+        if "\x00" in directory:
+            raise ValueError("原件目录包含无效字符")
+        path = logical_path(directory)
+        root = None
+        if raw_root is not None:
+            root = logical_path(raw_root)
+            if not root.is_absolute():
+                raise ValueError("冻结原件根目录不是绝对路径")
+            root = resolve_path(root)
+        if not path.is_absolute():
+            if path.anchor:
+                raise ValueError("原件目录不是完整的绝对路径或相对路径")
+            if root is None:
+                raise _source_error("source_root_missing", task_id, ident,
+                                    "原件目录为相对路径，但冻结输入没有登记原件根目录")
+            path = root / path
+        path = resolve_path(path)
+        if root is not None and not path.is_relative_to(root):
+            raise ValueError("原件目录超出冻结输入登记的根目录")
+    except OSError as exc:
+        raise _source_error("source_directory_unreadable", task_id, ident,
+                            f"原件目录无法解析或访问：{exc}") from exc
+    except (TypeError, ValueError) as exc:
+        if str(exc).startswith("[source_root_missing]"):
+            raise
+        raise _source_error("source_directory_invalid", task_id, ident, str(exc)) from exc
+    try:
+        if not stat.S_ISDIR(io_path(path).stat().st_mode):
+            raise _source_error("source_directory_invalid", task_id, ident, f"原件路径不是目录：{path}")
+        # Read one entry at most, solely to distinguish an unreadable directory.
+        with os.scandir(io_path(path)) as entries:
+            next(entries, None)
+    except FileNotFoundError as exc:
+        raise _source_error("source_directory_not_found", task_id, ident, f"原件目录不存在：{path}") from exc
+    except OSError as exc:
+        raise _source_error("source_directory_unreadable", task_id, ident,
+                            f"原件目录不可读：{path}；{exc}") from exc
+    return path
+
+
+def build_task(task_id, task, trajectories, *, raw_root=None):
     """Map frozen quality identities to original complete trajectory directories."""
     rows = []
     case_ids = set()
     key_elements = set()
     for trajectory in trajectories:
         metadata = trajectory.metadata or {}
-        directory = metadata.get("source_directory")
-        if not directory or not Path(directory).is_absolute():
-            raise ValueError("质检轨迹缺少可供采集服务只读访问的原件目录")
+        directory = _source_directory(task_id, trajectory, raw_root)
         source = metadata.get("source_identity") or {}
         case_ids.add(str(source.get("case_id") or source.get("task_id") or task_id))
         elements = metadata.get("key_elements") or (getattr(task, "context", {}) or {}).get("key_elements")
         if not elements:
-            original = io_path(Path(directory) / "_trajectory_for_evaluate.json")
-            if original.is_file():
+            original = io_path(directory / "_trajectory_for_evaluate.json")
+            try:
                 original_value = json.loads(original.read_text(encoding="utf-8-sig"))
-                elements = original_value.get("key_elements")
+            except FileNotFoundError:
+                original_value = {}
+            except (OSError, ValueError) as exc:
+                raise _source_error("source_metadata_unreadable", task_id, trajectory.trajectory_id,
+                                    f"原件元数据无法读取：{original.name}；{exc}") from exc
+            elements = original_value.get("key_elements")
         key_elements.add(elements if isinstance(elements, str) else
                          json.dumps(elements, ensure_ascii=False, sort_keys=True) if elements else "")
         rows.append({"trajectory_id": trajectory.trajectory_id, "source_directory": str(directory)})

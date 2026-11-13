@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 from concurrent.futures import Executor, ThreadPoolExecutor
+from copy import deepcopy
 from contextvars import copy_context
 from datetime import datetime
 from pathlib import Path
@@ -435,11 +436,6 @@ class QualityJobManager:
         task_ids = list(dict.fromkeys(task_ids or []))
         if not run_id or not task_ids:
             raise ValueError("请选择批次和质检任务")
-        # Freeze before taking a batch lock: capability/profile queries are remote.
-        checklist_options = None
-        if self.runner is run_quality_subprocess:
-            from .quality_checklist import freeze_options
-            checklist_options = freeze_options(self.data_root)
         alias = self.records.get("batch_run_aliases", run_id)
         if alias:
             from .batch_lifecycle import ensure_batch_active
@@ -448,9 +444,17 @@ class QualityJobManager:
             if resolve_current_batch_id(run_id, self.data_root) is None:
                 raise ValueError("旧建树运行已失效")
             run_id = alias["batch_id"]
+        # Reject a managed-batch write before querying remote capabilities or
+        # defaults. Recheck below under the batch lock in case ownership changes.
+        from .pipeline_access import ensure_pipeline_write
+        ensure_pipeline_write(run_id, self.data_root)
+        # Freeze before taking a batch lock: capability/profile queries are remote.
+        checklist_options = None
+        if self.runner is run_quality_subprocess:
+            from .quality_checklist import freeze_options
+            checklist_options = freeze_options(self.data_root)
         store = ArtifactStore(self.data_root)
         with active_batch_lock(run_id, self.data_root), self._lock:
-            from .pipeline_access import ensure_pipeline_write
             ensure_pipeline_write(run_id, self.data_root)
             trees = current_tree_payload(run_id, self.data_root)
             if trees.get("trees"):
@@ -458,6 +462,45 @@ class QualityJobManager:
             if batch_id is not None:
                 raise ValueError("所选批次没有当前轨迹树")
             return self._submit_job(run_id, task_ids, {"checklist_options": checklist_options} if checklist_options else None)
+
+    def retry(self, job_id: str, *, batch_id: str | None = None,
+              task_ids: list[str] | None = None) -> dict[str, Any]:
+        """Resume the same frozen quality input without reading page defaults.
+
+        A partially published job may be succeeded: its Rubric checkpoints are
+        still useful even when Checklist preparation failed. Keep that original
+        job and snapshot intact and let normal admission reuse complete results
+        or an already queued retry.
+        """
+        if self._closed:
+            raise RuntimeError("质检服务正在关闭")
+        previous = self.get(job_id)
+        if previous is None:
+            raise ValueError("原质检作业不存在，不能恢复冻结配置")
+        original_batch = previous.get("batch_id")
+        if not original_batch or (batch_id is not None and batch_id != original_batch):
+            raise ValueError("原质检作业不属于当前批次，不能重试")
+        with active_batch_lock(original_batch, self.data_root), self._lock:
+            from .pipeline_access import ensure_pipeline_write
+            ensure_pipeline_write(original_batch, self.data_root)
+            previous = self.get(job_id)
+            if previous is None or previous.get("batch_id") != original_batch:
+                raise ValueError("原质检作业记录已变化，请刷新后重试")
+            original_tasks = list(dict.fromkeys(previous.get("task_ids") or []))
+            if not original_tasks or (task_ids is not None and not set(original_tasks).issubset(task_ids)):
+                raise ValueError("原质检作业的任务范围与当前流程不匹配")
+            trees = current_tree_payload(original_batch, self.data_root)
+            frozen_options = deepcopy(previous.get("checklist_options"))
+            expected = previous.get("task_fingerprints") or {}
+            source_hashes = previous.get("source_tree_hashes") or {}
+            current = quality_task_fingerprints(trees, checklist_options=frozen_options)
+            if any(task not in expected or task not in source_hashes
+                   or current.get(task) != expected[task]
+                   or trees.get("tree_hashes", {}).get(task) != source_hashes[task]
+                   for task in original_tasks):
+                raise StaleTaskInput("原质检作业的冻结输入或评分配置已变化，请重新提交质检")
+            return self._submit_batch(original_batch, original_tasks, trees,
+                                      checklist_options=frozen_options)
 
     def _submit_batch(self, batch_id, task_ids, trees, *, checklist_options=None):
         if any(task not in trees["trees"] for task in task_ids):

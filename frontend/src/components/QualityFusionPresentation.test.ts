@@ -47,4 +47,22 @@ describe('fusion result and tree display', () => {
     expect(html).not.toContain('0.000')
     expect(await renderScore()).toContain('本条轨迹待评分')
   })
+  it('renders the source failure and existing Rubric when Checklist produced no valid F or Q', async () => {
+    const failed = evaluated('tr261112-011', .9)
+    failed.global_score = 2.8548
+    failed.fusion = { version: 1, lambda: .5, valid: false, score: null, invalid_reasons: ['checklist_incomplete'] }
+    failed.checklist = { status: 'error', error: '质检轨迹缺少可供采集服务只读访问的原件目录', total: null, passed: null, failed: null, unchecked: null, items: [] }
+    const html = await renderScore(failed)
+    expect(html).toContain('暂无有效评分')
+    expect(html).toContain('2.85 / 5')
+    expect(html).toContain('checklist_incomplete')
+    expect(html).toContain('状态：error')
+    expect(html).toContain('质检轨迹缺少可供采集服务只读访问的原件目录')
+    expect(html).not.toContain('0.900')
+    const treeHtml = await renderToString(createSSRApp(ReferenceTrajectoryTree, {
+      root: node(1, ['tr261112-011']), nodeScores: { '1': { q: null, advantage: null, scored_count: 0, total_count: 10, status: 'unavailable' } },
+    }))
+    expect(treeHtml).toContain('暂无有效评分')
+    expect(treeHtml).not.toContain('0.000')
+  })
 })

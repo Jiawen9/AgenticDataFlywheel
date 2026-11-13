@@ -292,6 +292,7 @@ class PreprocessingJobManager:
                             reviewer = QwenBoxReviewer(model=config["model"], cache_path=cache_path,
                                                        client_settings=settings)
                             reviewer.client = reviewer.client.with_options(max_retries=0)
+                            reviewer.max_output_attempts = 1
                             one_shot_reviewers.append(reviewer)
                             return reviewer
                     try:

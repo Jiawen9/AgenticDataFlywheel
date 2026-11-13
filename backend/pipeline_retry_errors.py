@@ -27,6 +27,7 @@ _QUOTA_TERMS = ("insufficient_quota", "token_quota", "quota_not_enough", "quota 
                 "quota exceeded", "pre_consume_token_quota_failed", "billing_hard_limit")
 
 _MODEL_OUTPUT_FAILURES = {
+    "bbox_invalid": ("Qwen box review output is invalid", "标框模型返回无效坐标或格式；请查看标框诊断"),
     "empty_choices": ("Qwen returned empty choices", "模型未返回候选结果"),
     "empty_content": ("Qwen returned an empty classification response", "模型返回内容为空"),
     "invalid_content": ("Qwen classification content must be text", "模型返回内容类型无效"),

@@ -31,6 +31,7 @@ const pipelineReadOnly = pipelineContext.readOnly
 const flow = useBatchQualityWorkspace(api, {
   historyOnly: () => pipelineContext.historyOnly.value,
   waitingForTree: () => (pipelineContext.isPipelineRoute.value || pipelineContext.managed.value) && !pipelineContext.pipeline.value?.steps.some(step => step.id === 'tree' && step.status === 'succeeded'),
+  // Read partial quality results even after failure; only recommendations wait.
   waitingForQuality: () => (pipelineContext.isPipelineRoute.value || pipelineContext.managed.value) && !pipelineContext.pipeline.value?.steps.some(step => step.id === 'quality' && step.status === 'succeeded'),
 })
 const { batches, batchId: selectedBatchId, currentTree: selectedRun, summaries, recommendation: correctionRecommendation, selectedTaskId, tree, quality, loadingBatches: loadingRuns, loadingTree, counts, readyTasks, error: batchError } = flow
@@ -136,10 +137,10 @@ async function pollJobs() {
       return oldStatus && ['queued', 'running'].includes(oldStatus) && !['queued', 'running'].includes(job.status)
     })
     for (const job of completed) {
-      if (job.status === 'succeeded') ElMessage.success(`轨迹质检完成：${displayId('batch', job.batch_id || selectedBatchId.value)}`)
+      if (job.status === 'succeeded') ElMessage.info(`评分作业已结束：${displayId('batch', job.batch_id || selectedBatchId.value)}；具体结果见轨迹详情`)
       else ElMessage.error(job.error || `${jobLabel(job)}：${displayId('job', job.job_id)}`)
     }
-    if (!disposed && token === jobEpoch && selectedBatchId.value && completed.some((job) => job.status === 'succeeded')) {
+    if (!disposed && token === jobEpoch && selectedBatchId.value && completed.length) {
       await flow.refresh()
       selectedNode.value = desktopTree.value
     }

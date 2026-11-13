@@ -373,7 +373,7 @@ async def _run_frozen(run_id: str, task_ids: list[str], job_id: str,
             from backend.quality_fusion import enrich_task
             try:
                 progress(stage="checklist_preparing", current_task=task_id)
-                checklist_task = build_task(task_id, task, trajectories)
+                checklist_task = build_task(task_id, task, trajectories, raw_root=manifest.get("raw_root"))
                 source_digest = input_fingerprints.get(task_id) or digest({"tree": tree, "task": checklist_task})
                 checklists = evaluate_task(DATA_ROOT, queued, checklist_task, source_digest,
                                           progress=progress, check=lambda: _check_quality_execution())
