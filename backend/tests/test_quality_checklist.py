@@ -1,3 +1,4 @@
+from copy import deepcopy
 import json
 import tempfile
 import unittest
@@ -57,6 +58,70 @@ class QualityChecklistTests(unittest.TestCase):
         requests = [json.loads(c[c.index("--payload")+1])["request_id"] for c in self.remote.calls if c[0] == "quality-checklist-start"]
         self.assertEqual(len(set(requests)), 1)
         self.assertTrue(any(c[0] == "quality-checklist-retry" for c in self.remote.calls))
+
+    def _evaluate_result_rows(self, rows, *, error=None):
+        self.task["trajectories"] = [{"trajectory_id": row["trajectory_id"], "source_directory": str(self.root)} for row in rows]
+        state = {"status": "partial", "error": error}
+        page = {"items": rows, "has_more": False}
+        before = deepcopy((state, page))
+        original = self.remote._remote_result
+
+        def respond(args):
+            if args[0] == "quality-checklist-status":
+                return state
+            if args[0] == "quality-checklist-results":
+                return page
+            return original(args)
+
+        with patch.object(self.remote, "_remote_result", side_effect=respond):
+            result = evaluate_task(self.root, self.job, self.task, "input", store=self.remote, poll_seconds=0)
+        self.assertEqual((state, page), before, "reading results must not modify the collector response")
+        saved = self.remote.records.list("quality_checklist_jobs")
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["results"], result)
+        return result
+
+    def test_failed_nonempty_checklist_preserves_redacted_bounded_row_error(self):
+        checklist = {"status": "error", "definition_digest": "d", "source": "gold",
+                     "total": 5, "passed": 0, "failed": 0, "unchecked": 5}
+        error = ("ValueError: source_directory is outside configured evaluation input roots or is missing; "
+                 "api_key=not-for-display Authorization: Bearer private-bearer " + "x" * 2500)
+        result = self._evaluate_result_rows([{"task_id": "t", "trajectory_id": "a", "status": "failed",
+                                             "checklist": checklist, "error": error}])["a"]
+        self.assertEqual({key: value for key, value in result.items() if key != "error"}, checklist)
+        self.assertIn("source_directory is outside configured evaluation input roots", result["error"])
+        self.assertNotIn("not-for-display", result["error"])
+        self.assertNotIn("private-bearer", result["error"])
+        self.assertLessEqual(len(result["error"]), 2000)
+
+    def test_nested_error_precedes_row_and_job_errors(self):
+        result = self._evaluate_result_rows([{"task_id": "t", "trajectory_id": "a", "status": "failed",
+            "checklist": {"status": "incomplete", "definition_digest": "d", "error": "specific image unreadable; api_key=nested-secret"},
+            "error": "less specific row error"}], error="less specific job error")["a"]
+        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(result["definition_digest"], "d")
+        self.assertIn("specific image unreadable", result["error"])
+        self.assertNotIn("nested-secret", result["error"])
+        self.assertNotIn("less specific", result["error"])
+
+    def test_job_error_only_fills_unfinished_results(self):
+        complete = {"status": "complete", "definition_digest": "d", "source": "gold", "verdict": "success"}
+        result = self._evaluate_result_rows([
+            {"task_id": "t", "trajectory_id": "a", "status": "completed", "checklist": complete},
+            {"task_id": "t", "trajectory_id": "b", "status": "failed", "checklist": {"status": "error"}},
+            {"task_id": "t", "trajectory_id": "c", "status": "failed", "checklist": {"status": "error"}, "error": "individual failure"},
+        ], error="job storage unavailable; password=job-secret")
+        self.assertEqual(result["a"], complete)
+        self.assertIn("job storage unavailable", result["b"]["error"])
+        self.assertNotIn("job-secret", result["b"]["error"])
+        self.assertEqual(result["c"]["error"], "individual failure")
+
+    def test_failed_result_without_any_error_gets_explanation(self):
+        result = self._evaluate_result_rows([{"task_id": "t", "trajectory_id": "a", "status": "failed",
+                                             "checklist": {"status": "error"}}])["a"]
+        self.assertEqual(result["status"], "error")
+        self.assertTrue(result["error"])
+        self.assertRegex(result["error"], "[\u4e00-\u9fff]")
 
     def test_source_mapping_uses_identity_and_does_not_change_original(self):
         original = self.root / "_trajectory_for_evaluate.json"
