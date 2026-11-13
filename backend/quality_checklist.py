@@ -129,6 +129,24 @@ def _source_directory(task_id, trajectory, raw_root):
     return path
 
 
+def _checklist_task_text(task):
+    """Read the frozen GUI goal, leaving the Rubric instruction untouched."""
+    context = getattr(task, "context", None)
+    description = context.get("task_description") if isinstance(context, dict) else None
+    if isinstance(description, str) and description.strip():
+        return description
+    instruction = str(getattr(task, "instruction", None) or getattr(task, "description", None)
+                      or getattr(task, "task", None) or "")
+    # Older workbooks can lack context. Strip only the exact wrapper written by
+    # our producer, never an arbitrary 'Task:' substring or the original task.
+    from .DevelopRubrics.trajectory_tools.gui_trajectory_excel import SYSTEM_PROMPT
+    for newline in ("\n", "\r\n"):
+        prefix = SYSTEM_PROMPT + newline * 2 + "Task:" + newline
+        if instruction.startswith(prefix):
+            return instruction[len(prefix):]
+    return instruction
+
+
 def build_task(task_id, task, trajectories, *, raw_root=None):
     """Map frozen quality identities to original complete trajectory directories."""
     rows = []
@@ -156,7 +174,7 @@ def build_task(task_id, task, trajectories, *, raw_root=None):
     if len(case_ids) != 1 or len(key_elements) != 1:
         raise ValueError("同任务轨迹的原用例或验收条件不一致，不能共用 Checklist")
     return {"task_id": task_id, "case_id": next(iter(case_ids)),
-            "task": str(getattr(task, "instruction", None) or getattr(task, "description", None) or getattr(task, "task", None) or ""),
+            "task": _checklist_task_text(task),
             "key_elements": next(iter(key_elements)), "trajectories": rows}
 
 

@@ -4,6 +4,8 @@ Set PHONE_FACTORY_COLLECTOR_SOURCE to the matching collector checkout, and put
 its test dependencies on PYTHONPATH. No HTTP listener or phone is started.
 """
 import importlib.util
+from copy import deepcopy
+import hashlib
 import io
 import json
 import os
@@ -15,7 +17,7 @@ from urllib.error import HTTPError
 from unittest.mock import patch
 
 from backend import phonefactory_client as cli
-from backend.quality_checklist import evaluate_task
+from backend.quality_checklist import build_task, evaluate_task
 from backend.quality_fusion import enrich_task
 from backend.trajectories_tree.tree_builder import Node
 
@@ -133,6 +135,96 @@ class QualityCollectorContractTests(unittest.TestCase):
         self.assertTrue(any(path.endswith("/retry") for path in request_paths))
         self.assertEqual(fixture.hashes(), originals)
         self.assertFalse(list(fixture.service.runs.rglob("*.png")))
+
+    def test_real_producer_task_text_reaches_collector_and_replaces_wrong_definition(self):
+        # This joins the previously separate producer and CLI contracts. The
+        # collector's real _reference task comparison must run, not a fake that
+        # accepts any task attached to an otherwise readable source directory.
+        from backend.tests.test_quality_source_recovery import QualitySourceRecoveryTests
+
+        for engine in ("newagent", "pipelineagent"):
+            with self.subTest(engine=engine):
+                producer = QualitySourceRecoveryTests()
+                producer.setUp()
+                self.addCleanup(producer.doCleanups)
+                directory, grouped, workbook = producer.fixture(engine)
+                tasks, trajectories = producer.generate(grouped, workbook)
+                quality_task = tasks[producer.task_id]
+                original_task = deepcopy(quality_task.model_dump())
+                snapshot_bytes = workbook.with_suffix(".json").read_bytes()
+                original_hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                                   for p in directory.iterdir() if p.is_file()}
+                manifest = build_task(producer.task_id, quality_task, trajectories, raw_root=producer.raw)
+                self.assertEqual(manifest["task"], "打开目标页面")
+
+                fixture, remote, job, _, open_request, _, _ = self._bridge()
+                # The real collector inspects these generated original files.
+                # Only its model/profile execution remains the existing stub.
+                fixture.inputs = producer.raw
+                wrong = deepcopy(manifest)
+                wrong["task"] = quality_task.instruction
+                ident = producer.trajectory_id
+                ledger = fixture.service.ledger
+                with patch.object(cli.urllib.request, "urlopen", side_effect=open_request):
+                    failed = evaluate_task(fixture.root / "platform", job, wrong, "input-frozen",
+                                           store=remote, poll_seconds=0)
+                    self.assertIn("manifest task differs from source trajectory", failed[ident]["error"])
+                    self.assertFalse(any(stage == "evaluate" for stage, _ in fixture.calls))
+                    with ledger.connection() as c:
+                        old_id = c.execute("SELECT id FROM jobs").fetchone()[0]
+                    old_job = deepcopy(ledger.get(old_id))
+                    old_definitions = {p: p.read_bytes() for p in
+                                       fixture.service._directory(old_id).rglob("definition.json")}
+                    self.assertEqual(len(old_definitions), 1)
+
+                    correct = evaluate_task(fixture.root / "platform", {**job, "job_id": "retry-quality"},
+                                            manifest, "input-frozen", store=remote, poll_seconds=0)
+                    self.assertEqual(correct[ident]["status"], "complete", correct)
+                    self.assertNotEqual(correct[ident]["definition_digest"], failed[ident]["definition_digest"])
+                    call_count = len(fixture.calls)
+                    repeated = evaluate_task(fixture.root / "platform", job, manifest, "input-frozen",
+                                             store=remote, poll_seconds=0)
+                    self.assertEqual(repeated, correct)
+                    self.assertEqual(len(fixture.calls), call_count)
+
+                with ledger.connection() as c:
+                    jobs = list(c.execute("SELECT id,fingerprint FROM jobs"))
+                self.assertEqual(len(jobs), 2)
+                self.assertEqual(len({row[1] for row in jobs}), 2)
+                self.assertEqual(ledger.get(old_id), old_job)
+                self.assertEqual({p: p.read_bytes() for p in old_definitions}, old_definitions)
+                self.assertEqual(sum(stage == "definition" for stage, _ in fixture.calls), 2)
+                self.assertEqual(sum(stage == "evaluate" for stage, _ in fixture.calls), 1)
+                self.assertEqual(quality_task.model_dump(), original_task)
+                self.assertEqual(workbook.with_suffix(".json").read_bytes(), snapshot_bytes)
+                self.assertEqual({p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                                  for p in directory.iterdir() if p.is_file()}, original_hashes)
+                self.assertFalse(list(fixture.service.runs.rglob("*.jpg")))
+
+    def test_real_task_disagreement_is_not_replaced_by_source_text(self):
+        from backend.tests.test_quality_source_recovery import QualitySourceRecoveryTests
+
+        producer = QualitySourceRecoveryTests()
+        producer.setUp()
+        self.addCleanup(producer.doCleanups)
+        directory, grouped, workbook = producer.fixture("newagent")
+        tasks, trajectories = producer.generate(grouped, workbook)
+        quality_task = tasks[producer.task_id]
+        # A genuinely different frozen goal must remain different; the bridge
+        # must not replace it with the source text merely to make checks pass.
+        quality_task.context["task_description"] = "播放另一首歌曲"
+        original = (directory / "_trajectory_for_evaluate.json").read_bytes()
+        manifest = build_task(producer.task_id, quality_task, trajectories, raw_root=producer.raw)
+        self.assertEqual(manifest["task"], "播放另一首歌曲")
+        fixture, remote, job, _, open_request, _, _ = self._bridge()
+        fixture.inputs = producer.raw
+        with patch.object(cli.urllib.request, "urlopen", side_effect=open_request):
+            results = evaluate_task(fixture.root / "platform", job, manifest, "input-frozen",
+                                    store=remote, poll_seconds=0)
+        self.assertEqual(results[producer.trajectory_id]["status"], "error")
+        self.assertIn("manifest task differs from source trajectory", results[producer.trajectory_id]["error"])
+        self.assertFalse(any(stage == "evaluate" for stage, _ in fixture.calls))
+        self.assertEqual((directory / "_trajectory_for_evaluate.json").read_bytes(), original)
 
 
 if __name__ == "__main__":

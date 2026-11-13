@@ -19,7 +19,7 @@ from PIL import Image
 from backend.file_io import io_path, resolve_path
 from backend.preprocessing_service import convert_input, SHEET
 from backend.quality_checklist import build_task
-from backend.quality_input_builder import build_quality_workbook
+from backend.quality_input_builder import build_quality_workbook, SYSTEM_PROMPT
 from backend.stage_artifacts import load_quality_objects, read_workbook_payload, write_payload_workbook, write_sidecar
 from backend.trajectories_tree.tree_builder import load_trajectories
 
@@ -52,7 +52,7 @@ class QualitySourceRecoveryTests(unittest.TestCase):
         directory = self.raw / "runs" / run_id / relative
         directory.mkdir(parents=True, exist_ok=True)
         action = {"action": "click", "coordinate": [50, 70]}
-        contents = {"_trajectory_for_evaluate.json": {"agent_type": engine,
+        contents = {"_trajectory_for_evaluate.json": {"agent_type": engine, "task": "打开目标页面",
             "key_elements": "priority_1: 打开目标页面", "actions_flat": [{"global_step": 1, "action": action}]},
             "step001_vla_model_response.json": {"content": '<tool_call>' + json.dumps(action) +
                 '</tool_call><summary>进入目标页面</summary>'}}
@@ -96,7 +96,17 @@ class QualitySourceRecoveryTests(unittest.TestCase):
                 directory, grouped, output = self.fixture(engine)
                 before = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in directory.iterdir()}
                 tasks, trajectories = self.generate(grouped, output)
+                task_before = copy.deepcopy(tasks[self.task_id].model_dump())
+                snapshot_before = output.with_suffix(".json").read_bytes()
+                workbook_before = output.read_bytes()
                 manifest = build_task(self.task_id, tasks[self.task_id], trajectories, raw_root=self.raw)
+                self.assertEqual(manifest["task"], "打开目标页面")
+                self.assertEqual(manifest["task"], json.loads((directory / "_trajectory_for_evaluate.json").read_text(encoding="utf-8"))["task"])
+                self.assertEqual(tasks[self.task_id].instruction, SYSTEM_PROMPT + "\n\nTask:\n打开目标页面")
+                self.assertEqual(tasks[self.task_id].context["task_description"], "打开目标页面")
+                self.assertEqual(tasks[self.task_id].model_dump(), task_before)
+                self.assertEqual(output.with_suffix(".json").read_bytes(), snapshot_before)
+                self.assertEqual(output.read_bytes(), workbook_before)
                 self.assertEqual(manifest["trajectories"], [{"trajectory_id": self.trajectory_id,
                     "source_directory": str(resolve_path(directory))}])
                 self.assertEqual(manifest["key_elements"], "priority_1: 打开目标页面")
@@ -121,13 +131,51 @@ class QualitySourceRecoveryTests(unittest.TestCase):
         before = frozen.read_bytes()
         tasks, trajectories = load_quality_objects(frozen)
         model_input_before = copy.deepcopy(trajectories[0].model_dump())
+        rubric_task_before = copy.deepcopy(tasks[self.task_id].model_dump())
         manifest = build_task(self.task_id, tasks[self.task_id], trajectories, raw_root=str(self.raw))
+        self.assertEqual(manifest["task"], "打开目标页面")
         self.assertEqual(manifest["trajectories"][0]["source_directory"], str(resolve_path(directory)))
+        self.assertEqual(tasks[self.task_id].model_dump(), rubric_task_before)
         self.assertEqual(trajectories[0].model_dump(), model_input_before)
         self.assertEqual(frozen.read_bytes(), before)
         # No relative path is resolved against the process working directory.
         with self.assertRaisesRegex(ValueError, "source_root_missing"):
             build_task(self.task_id, tasks[self.task_id], trajectories)
+
+    def test_frozen_context_task_precedes_instruction_without_rewriting_source(self):
+        directory, _, _ = self.fixture("newagent")
+        original = directory / "_trajectory_for_evaluate.json"
+        before = original.read_bytes()
+        task = SimpleNamespace(instruction=SYSTEM_PROMPT + "\n\nTask:\n旧的目标说明",
+                               context={"task_description": "当前冻结任务，包含 Task: 字样", "extra": {"keep": True}})
+        task_before = copy.deepcopy(vars(task))
+        manifest = build_task(self.task_id, task, [self.trajectory(directory)], raw_root=self.raw)
+        self.assertEqual(manifest["task"], task.context["task_description"])
+        # A genuine task mismatch remains visible to the collector; do not silently
+        # replace the frozen task with the original trajectory's task to pass it.
+        self.assertNotEqual(manifest["task"], json.loads(original.read_text(encoding="utf-8"))["task"])
+        self.assertEqual(vars(task), task_before)
+        self.assertEqual(original.read_bytes(), before)
+
+    def test_legacy_task_text_only_unwraps_known_instruction_prefix(self):
+        goal = "打开目标页面，搜索 Task:\n目标关键词"
+        prefix = SYSTEM_PROMPT + "\n\nTask:\n"
+        unknown = "Different system instructions\n\nTask:\n" + goal
+        cases = [
+            (SimpleNamespace(instruction=prefix + goal, context={}), goal),
+            (SimpleNamespace(instruction=prefix.replace("\n", "\r\n") + goal, context={}), goal),
+            (SimpleNamespace(instruction=prefix + goal, context={"task_description": "   "}), goal),
+            (SimpleNamespace(instruction=goal, context={}), goal),
+            (SimpleNamespace(instruction=unknown, context={}), unknown),
+            (SimpleNamespace(description=goal, context={}), goal),
+            (SimpleNamespace(task=goal, context={}), goal),
+        ]
+        for task, expected in cases:
+            with self.subTest(task=vars(task)):
+                before = copy.deepcopy(vars(task))
+                manifest = build_task(self.task_id, task, [self.trajectory(self.raw)], raw_root=self.raw)
+                self.assertEqual(manifest["task"], expected)
+                self.assertEqual(vars(task), before)
 
     def test_missing_invalid_unreadable_and_identity_errors_name_the_trajectory(self):
         outside = self.root / "outside"
@@ -244,8 +292,12 @@ class QualitySourceRecoveryTests(unittest.TestCase):
         def remote(_root, queued, manifest, input_digest, **kwargs):
             observed.append(copy.deepcopy(manifest))
             self.assertEqual(queued["checklist_options"], options)
+            self.assertEqual(manifest["task"], "打开目标页面")
             self.assertEqual({row["source_directory"] for row in manifest["trajectories"]},
                              {str(resolve_path(path)) for path in directories})
+            for row in manifest["trajectories"]:
+                original = io_path(Path(row["source_directory"]) / "_trajectory_for_evaluate.json")
+                self.assertEqual(manifest["task"], json.loads(original.read_text(encoding="utf-8"))["task"])
             return {row["trajectory_id"]: {"status": "complete", "definition_digest": "frozen",
                 "source": "llm", "total": 1, "passed": 1, "failed": 0, "unchecked": 0,
                 "verdict": "success", "items": [{"id": "one", "checked": True, "result": "passed"}]}
