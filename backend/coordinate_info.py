@@ -19,7 +19,7 @@ from PIL import Image
 
 from .data_store import ArtifactStore, DATA_ROOT
 from .file_io import io_path, resolve_path
-from .trajectory_context import AnnotationVersionConflict, resolve_batch_context, row_trajectory_id
+from .trajectory_context import AnnotationVersionConflict, resolve_batch_context, row_task_id, row_trajectory_id
 
 _INDEX_LIMIT = 8
 _ROW_LIMIT = 100_000
@@ -186,7 +186,8 @@ def _batch_index(key, batch_id, version, root):
     try:
         context = resolve_batch_context(batch_id, version, root)
         rows = {(row_trajectory_id(row), str(row.get("image") or "").replace("\\", "/")):
-                {name: row[name] for name in ("image", "actions", "action", "agent_type", "trajectory_format", "normalizer_version", "coordinate_info") if name in row}
+                {**{name: row[name] for name in ("image", "actions", "action", "agent_type", "trajectory_format", "normalizer_version", "coordinate_info") if name in row},
+                 "task_id": row_task_id(row)}
                 for sheet in context.payload["sheets"].values() for row in sheet}
         cached = (context.raw_root, rows)
         with _INDEX_LOCK:
@@ -203,7 +204,7 @@ def _batch_index(key, batch_id, version, root):
             _INFLIGHT.pop(key, None)
 
 
-def batch_coordinate_info(batch_id, annotation_version, trajectory_id, image, *, root=None):
+def batch_coordinate_info(batch_id, annotation_version, trajectory_id, image, *, root=None, task_id=None):
     root = resolve_path(Path(root or DATA_ROOT))
     manifest = ArtifactStore(root).get(batch_id, "02_annotation", annotation_version)
     if manifest is None:
@@ -218,5 +219,36 @@ def batch_coordinate_info(batch_id, annotation_version, trajectory_id, image, *,
     row = rows.get((trajectory_id, image.replace("\\", "/")))
     if row is None:
         raise FileNotFoundError("当前标注版本中不存在该轨迹图片")
+    if task_id is not None and row.get("task_id") != task_id:
+        raise FileNotFoundError("该轨迹图片不属于当前任务")
     # Image I/O is outside annotation/index locks; image is a registered row key.
     return {"coordinate_info": resolve_coordinate_info(row, raw_root), "annotation_version": version}
+
+
+def tree_coordinate_info(batch_id, task_id, annotation_version, tree_version, trajectory_id, image, *, root=None):
+    """Read one selected step through the existing versioned annotation index.
+
+    The ordinary tree response binds both artifact versions. Rechecking their
+    small registry entries avoids reloading/revalidating the entire tree for
+    every node selection; evidence reads remain outside the batch lock.
+    """
+    root = resolve_path(Path(root or DATA_ROOT))
+    store = ArtifactStore(root)
+
+    def scope():
+        with store.batch_lock(batch_id):
+            tree = store.get(batch_id, "04_tree")
+            annotation = store.get(batch_id, "02_annotation")
+            if not tree or not annotation or tree.get("version") != tree_version or annotation.get("version") != annotation_version:
+                raise AnnotationVersionConflict("轨迹树或标框版本已变化，请刷新当前任务后重试")
+            if task_id not in tree.get("metadata", {}).get("task_ids", []):
+                raise FileNotFoundError("该任务不属于当前轨迹树")
+            return tuple(hashlib.sha256(json.dumps(item, sort_keys=True, default=str).encode()).hexdigest()
+                         for item in (tree, annotation))
+
+    expected = scope()
+    result = batch_coordinate_info(batch_id, annotation_version, trajectory_id, image, root=root, task_id=task_id)
+    if scope() != expected:
+        raise AnnotationVersionConflict("轨迹树或标框版本已变化，请刷新当前任务后重试")
+    return {**result, "coordinate_lookup_version": 1, "batch_id": batch_id, "task_id": task_id,
+            "tree_version": tree_version, "trajectory_id": trajectory_id, "image": image}

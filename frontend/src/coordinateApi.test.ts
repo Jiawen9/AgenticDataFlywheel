@@ -3,6 +3,16 @@ import { api } from './api'
 
 afterEach(() => vi.unstubAllGlobals())
 describe('coordinate API requests', () => {
+  it('uses the existing task tree route with a small coordinate view and immutable identities', async () => {
+    const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({ coordinate_info: { space: 'normalized' } })))
+    vi.stubGlobal('fetch', fetch)
+    await api.treeCoordinateInfo({ kind: 'tree', batch_id: 'batch1', task_id: 'task/1', annotation_version: 'v2', tree_version: 'v3', trajectory_id: '轨迹1', image: '轨迹1/step1.jpg' })
+    const request = new URL(fetch.mock.calls[0][0], 'http://test')
+    expect(request.pathname).toBe('/api/data-batches/batch1/tasks/task%2F1/tree')
+    expect(Object.fromEntries(request.searchParams)).toEqual({ view: 'coordinate', annotation_version: 'v2', tree_version: 'v3', trajectory_id: '轨迹1', image: '轨迹1/step1.jpg' })
+    expect(fetch.mock.calls[0][1].method).toBeUndefined()
+    expect(fetch.mock.calls[0][1].body).toBeUndefined()
+  })
   it('sends the batch, immutable version, trajectory and image identity without a local path parameter', async () => {
     const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({ coordinate_info: { space: 'pixel', width: 1080, height: 2400 }, annotation_version: 'v2' }), { status: 200 }))
     vi.stubGlobal('fetch', fetch)

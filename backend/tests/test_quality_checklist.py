@@ -172,9 +172,9 @@ class QualityChecklistTests(unittest.TestCase):
         self.assertEqual(source.read_bytes(), before)
 
     def test_unique_profile_default_and_multiple_profiles_require_selection(self):
-        with patch("backend.model_iteration.get_profiles", return_value={"profiles": [{"id": "r", "name": "r", "digest": "d"}]}):
+        with patch("backend.quality_checklist_config._profiles", return_value={"profiles": [{"id": "r", "name": "r", "digest": "d"}]}):
             self.assertEqual(settings(self.root, store=self.remote)["evaluation_profile_id"], "r")
-        with patch("backend.model_iteration.get_profiles", return_value={"profiles": [{"id": "r", "name": "r", "digest": "d"}, {"id": "r2", "name": "r2", "digest": "d2"}]}):
+        with patch("backend.quality_checklist_config._profiles", return_value={"profiles": [{"id": "r", "name": "r", "digest": "d"}, {"id": "r2", "name": "r2", "digest": "d2"}]}):
             self.assertEqual(settings(self.root, store=self.remote)["evaluation_profile_id"], "")
 
     def test_structured_key_elements_remain_json_not_python_repr(self):
@@ -188,9 +188,10 @@ class QualityChecklistTests(unittest.TestCase):
         config = default_config()
         for role in config:
             config[role].update(base_url="http://models/v1", model="actual-model")
-        profile = {"id": "rules", "name": "Rules", "digest": "a" * 64}
-        with patch("backend.model_iteration.get_profiles", return_value={"profiles": [profile]}), \
-             patch("backend.model_iteration.get_config", return_value=config):
+        from backend.quality_checklist_config import _profiles
+        profile = _profiles()["profiles"][0]
+        self.remote.records.put('model_iter_settings', 'evaluator', {'config': config})
+        with patch("backend.quality_checklist_config.preflight"):
             frozen = freeze_options(self.root, store=self.remote)
         config["text"]["model"] = "new-default"
         self.assertEqual(frozen["evaluator_config"]["text"]["model"], "actual-model")

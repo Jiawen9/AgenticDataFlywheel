@@ -8,6 +8,7 @@ export interface CoordinateInfo {
 }
 export type CoordinateSource =
   | { kind: 'batch'; batch_id: string; annotation_version?: string; trajectory_id: string; image: string }
+  | { kind: 'tree'; batch_id: string; task_id: string; annotation_version: string; tree_version: string; trajectory_id: string; image: string }
   | { kind: 'correction'; session_id: string; excel_row: number; expected_revision?: number }
 
 export interface TrajectoryScope {
@@ -15,7 +16,7 @@ export interface TrajectoryScope {
   annotation_version?: string
 }
 
-export type TaskStageStatus = 'pending' | 'succeeded' | 'stale' | 'invalidated' | 'pending_review' | 'failed' | 'running'
+export type TaskStageStatus = 'pending' | 'succeeded' | 'stale' | 'invalidated' | 'pending_review' | 'failed' | 'running' | 'queued' | 'interrupted'
 export interface StageCounts { completed: number; pending: number; stale: number; pending_review?: number }
 
 export interface StageArtifact {
@@ -144,7 +145,7 @@ export interface QualityJob {
   run_id: string
   task_ids: string[]
   status: 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted'
-  stage: 'queued' | 'preparing' | 'generating_rubric' | 'evaluating' | 'checklist_preparing' | 'checklist_evaluating' | 'fusing' | 'publishing' | 'succeeded' | 'failed' | 'interrupted'
+  stage: 'queued' | 'preparing' | 'generating_rubric' | 'evaluating' | 'checklist_queued' | 'checklist_preparing' | 'checklist_definition' | 'checklist_evaluating' | 'fusing' | 'publishing' | 'succeeded' | 'failed' | 'interrupted'
   created_at: string
   started_at: string | null
   completed_at: string | null
@@ -152,11 +153,26 @@ export interface QualityJob {
   current_trajectory: string | null
   completed_trajectories: number
   total_trajectories: number
+  completed_rubric_trajectories?: number
+  total_rubric_trajectories?: number
+  completed_checklist_trajectories?: number
+  failed_checklist_trajectories?: number
+  total_checklist_trajectories?: number
+  fusion_eligible_count?: number
+  results_available?: boolean
+  result_complete?: boolean
+  partial_results_available?: boolean
+  current_model?: string
+  current_model_role?: string
+  checklist_event?: { kind: 'stage' | 'request_start' | 'request_end' | 'request_error' | 'heartbeat'; role?: string; model?: string; call_id?: string; attempt?: number; timeout_seconds?: number; elapsed_seconds?: number }
   percent: number
   error: string | null
 }
 
 export interface QualityTaskSummary {
+  results_available?: boolean
+  partial_results_available?: boolean
+  result_state?: 'partial' | 'complete'
   task_id: string
   status: 'unreviewed' | TaskStageStatus
   rubric_ready: boolean
@@ -230,6 +246,8 @@ export interface QualityNodeScore {
   status: string
 }
 
+export interface QualityEvaluatorModel { base_url: string; model: string; api_key_env?: string }
+export interface QualityEvaluatorConfig { text: QualityEvaluatorModel; vision: QualityEvaluatorModel }
 export interface QualitySettings {
   evaluation_profile_id: string
   evaluation_profile_digest: string
@@ -237,9 +255,13 @@ export interface QualitySettings {
   supported: boolean
   reason?: string
   model_configured?: boolean
+  execution_backend?: 'platform'
+  evaluator_config?: QualityEvaluatorConfig
 }
 
 export interface TaskQualityResult {
+  partial_results_available?: boolean
+  result_state?: 'partial' | 'complete'
   run_id: string
   task_id: string
   completed_at: string
@@ -250,6 +272,8 @@ export interface TaskQualityResult {
   scoring_version?: string
   fusion_complete?: boolean
   fusion_eligible_count?: number
+  fusion_order?: string[]
+  trajectory_order?: string[]
   node_scores?: Record<string, QualityNodeScore>
 }
 
@@ -333,6 +357,9 @@ export interface SourceTrajectory {
 }
 
 export interface TrajectoryTreeNode {
+  coordinate_lookup_version?: number
+  annotation_version?: string
+  tree_version?: string
   id: number
   depth: number
   label: string

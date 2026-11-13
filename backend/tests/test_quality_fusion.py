@@ -2,7 +2,7 @@ import math
 import unittest
 from copy import deepcopy
 
-from backend.quality_fusion import enrich_task, fuse, node_values
+from backend.quality_fusion import completion_summary, enrich_task, fuse, node_values
 from backend.trajectories_tree.tree_builder import Node
 
 
@@ -28,6 +28,26 @@ class QualityFusionTests(unittest.TestCase):
         for g in [0, True, math.nan, 6]:
             self.assertFalse(fuse({"global_score": g}, checklist())["valid"])
         self.assertFalse(fuse({"global_score": 3, "dimension_global_scores": {"a": 0}}, checklist())["valid"])
+
+    def test_execution_error_has_one_primary_gap_not_invented_schema_mismatches(self):
+        result = fuse({"global_score": 4}, {"status": "error", "error": "source temporarily unavailable",
+                      "definition_digest": "same"}, definition_digest="same")
+        self.assertEqual(result["invalid_reasons"], ["checklist_incomplete"])
+        self.assertIsNone(result["score"])
+
+    def test_legacy_summary_retains_partial_availability_and_primary_error(self):
+        result = completion_summary({"tasks": [{"task_id": "t1", "scoring_version": "checklist_fusion_v1",
+            "fusion_complete": False, "fusion_eligible_count": 0, "results_available": True,
+            "primary_error": "source temporarily unavailable"}]})
+        self.assertFalse(result["result_complete"])
+        self.assertTrue(result["partial_results_available"])
+        self.assertIn("source temporarily unavailable", result["error"])
+
+    def test_missing_requested_task_is_not_success(self):
+        result = completion_summary({"tasks": []}, ["t-missing"])
+        self.assertFalse(result["result_complete"])
+        self.assertFalse(result["results_available"])
+        self.assertIn("t-missing", result["error"])
 
     def test_true_tree_occurrence_shape_deduplicates_trajectories_and_has_root_mean(self):
         # Uses the production tree serializer and its actual `trajectory` field.

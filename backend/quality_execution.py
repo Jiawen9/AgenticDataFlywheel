@@ -116,6 +116,43 @@ def update_job_progress(root: Path, job_id: str, token: str, changes: dict) -> d
             raise
 
 
+def save_partial_result(root: Path, job_id: str, task_id: str, source_tree_hash: str,
+                        input_fingerprint: str, result: dict) -> None:
+    """Persist viewable scores, fenced atomically with the worker lease.
+
+    This is not an artifact commit and cannot make a downstream stage ready.
+    """
+    context = _context.get()
+    token = context[2] if context and context[:2] == (Path(root), job_id) else None
+    records = RecordStore(root)
+    with records._connection(write=True) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            job = records._read(connection, "quality_jobs", job_id)
+            lease = records._read(connection, NAMESPACE, job_id)
+            if not job or job.get("status") != "running":
+                connection.rollback()
+                return
+            if lease and (not token or lease.get("state") != "active" or
+                          not secrets.compare_digest(str(lease.get("token", "")), token)):
+                raise QualityExecutionRevoked("本次质检执行已结束，不能更新部分结果")
+            if (job.get("source_tree_hashes", {}).get(task_id) != source_tree_hash or
+                    job.get("task_fingerprints", {}).get(task_id) != input_fingerprint):
+                raise QualityExecutionRevoked("部分评分与冻结输入不一致")
+            key = f"{job_id}:{task_id}"
+            previous = records._read(connection, "quality_partial_results", key) or {}
+            payload = {"job_id": job_id, "batch_id": job.get("batch_id") or job.get("run_id"),
+                       "task_id": task_id, "execution_token": token, "created_at": job.get("created_at", ""),
+                       "source_tree_hash": source_tree_hash, "input_fingerprint": input_fingerprint,
+                       "updated_at": utc_now(), "result": result}
+            records._save(connection, "quality_partial_results", key, payload,
+                          int(previous.get("storage_revision") or 0) + 1)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+
+
 def check_execution(root: Path, job_id: str, token: str, *, allow_committed: bool = False) -> dict:
     record = _matching(root, job_id, token, active=False)
     if record.get("state") not in ({"active", "committed"} if allow_committed else {"active"}):

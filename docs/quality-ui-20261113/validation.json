@@ -1,0 +1,220 @@
+{
+  "date": "2026-11-13",
+  "scope": "frontend_and_docs_only",
+  "frontend_tests": {
+    "files": 10,
+    "passed": 84,
+    "failed": 0,
+    "skipped": 0
+  },
+  "typecheck": "passed",
+  "production_build": "passed",
+  "browser_fixture": {
+    "scenarios": [
+      {
+        "name": "desktop-image",
+        "ready": true,
+        "viewport": {
+          "width": 1440,
+          "height": 1000
+        },
+        "document": {
+          "scrollWidth": 1425,
+          "clientWidth": 1425
+        },
+        "panel": {
+          "width": 460.796875,
+          "height": 718,
+          "x": 929.203125,
+          "y": 237.484375,
+          "color": "rgb(220, 231, 245)",
+          "background": "rgb(17, 24, 39)",
+          "display": "block",
+          "grid": "none",
+          "scrollWidth": 445,
+          "clientWidth": 445
+        },
+        "checklistCount": 6,
+        "highlightedNodes": 3,
+        "highlightedEdges": 2,
+        "coordinateRequests": 1,
+        "coordinateFailure": ""
+      },
+      {
+        "name": "desktop-score",
+        "ready": true,
+        "viewport": {
+          "width": 1440,
+          "height": 1000
+        },
+        "document": {
+          "scrollWidth": 1425,
+          "clientWidth": 1425
+        },
+        "panel": {
+          "width": 460.796875,
+          "height": 718,
+          "x": 929.203125,
+          "y": 237.484375,
+          "color": "rgb(220, 231, 245)",
+          "background": "rgb(17, 24, 39)",
+          "display": "block",
+          "grid": "none",
+          "scrollWidth": 445,
+          "clientWidth": 445
+        },
+        "checklistCount": 6,
+        "highlightedNodes": 3,
+        "highlightedEdges": 2,
+        "coordinateRequests": 1,
+        "coordinateFailure": ""
+      },
+      {
+        "name": "desktop-evidence",
+        "ready": true,
+        "viewport": {
+          "width": 1440,
+          "height": 1000
+        },
+        "document": {
+          "scrollWidth": 1425,
+          "clientWidth": 1425
+        },
+        "panel": {
+          "width": 460.796875,
+          "height": 718,
+          "x": 929.203125,
+          "y": 237.484375,
+          "color": "rgb(220, 231, 245)",
+          "background": "rgb(17, 24, 39)",
+          "display": "block",
+          "grid": "none",
+          "scrollWidth": 445,
+          "clientWidth": 445
+        },
+        "checklistCount": 6,
+        "highlightedNodes": 3,
+        "highlightedEdges": 2,
+        "coordinateRequests": 1,
+        "coordinateFailure": ""
+      },
+      {
+        "name": "mobile-score",
+        "ready": true,
+        "viewport": {
+          "width": 390,
+          "height": 1000
+        },
+        "document": {
+          "scrollWidth": 375,
+          "clientWidth": 375
+        },
+        "panel": {
+          "width": 275,
+          "height": 850,
+          "x": 87,
+          "y": 130.765625,
+          "color": "rgb(220, 231, 245)",
+          "background": "rgb(17, 24, 39)",
+          "display": "block",
+          "grid": "none",
+          "scrollWidth": 260,
+          "clientWidth": 260
+        },
+        "checklistCount": 6,
+        "highlightedNodes": 3,
+        "highlightedEdges": 2,
+        "coordinateRequests": 1,
+        "coordinateFailure": ""
+      },
+      {
+        "name": "mobile-evidence",
+        "ready": true,
+        "viewport": {
+          "width": 390,
+          "height": 1000
+        },
+        "document": {
+          "scrollWidth": 375,
+          "clientWidth": 375
+        },
+        "panel": {
+          "width": 275,
+          "height": 850,
+          "x": 87,
+          "y": 130.765625,
+          "color": "rgb(220, 231, 245)",
+          "background": "rgb(17, 24, 39)",
+          "display": "block",
+          "grid": "none",
+          "scrollWidth": 260,
+          "clientWidth": 260
+        },
+        "checklistCount": 6,
+        "highlightedNodes": 3,
+        "highlightedEdges": 2,
+        "coordinateRequests": 1,
+        "coordinateFailure": ""
+      },
+      {
+        "name": "desktop-coordinate-error",
+        "ready": true,
+        "viewport": {
+          "width": 1440,
+          "height": 1000
+        },
+        "document": {
+          "scrollWidth": 1425,
+          "clientWidth": 1425
+        },
+        "panel": {
+          "width": 460.796875,
+          "height": 718,
+          "x": 929.203125,
+          "y": 237.484375,
+          "color": "rgb(220, 231, 245)",
+          "background": "rgb(17, 24, 39)",
+          "display": "block",
+          "grid": "none",
+          "scrollWidth": 445,
+          "clientWidth": 445
+        },
+        "checklistCount": 6,
+        "highlightedNodes": 3,
+        "highlightedEdges": 2,
+        "coordinateRequests": 1,
+        "coordinateFailure": "坐标信息读取失败：离线模拟：坐标接口暂时不可读 重试读取坐标"
+      }
+    ],
+    "interaction": {
+      "onlyOneEvidenceOpen": true,
+      "expandedItem": "检查项 2：页面显示的内容与用户请求一致，且能够从实际截图中找到明确的对应信息，通过，收起依据",
+      "toggleOffCount": 0,
+      "zoomRetained": true,
+      "nodeRetained": true,
+      "toggleOnCount": 3,
+      "previewCoordinateReuse": true,
+      "coordinateRequests": 1,
+      "pixelPoint": [
+        [
+          "600",
+          "1000"
+        ],
+        [
+          "600",
+          "1000"
+        ]
+      ],
+      "sharedTerminalUsesHighest": true,
+      "label": true
+    },
+    "runtimeErrorCount": 0,
+    "externalRequestCount": 0
+  },
+  "intranet_gateway": "not_executed",
+  "real_coordinate_evidence": "pending",
+  "collector_changed": false,
+  "models_called": false,
+  "runtime_data_changed": false,
+  "preview_services_stopped": true
+}

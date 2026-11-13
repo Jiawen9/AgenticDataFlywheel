@@ -1,12 +1,13 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import type { QualityNodeScore, TrajectoryTreeNode } from '@/types'
-import { nodeScoreLabel } from '@/utils/qualityScores'
+import { nodeScoreLabel, trajectoryPath, treeTopology } from '@/utils/qualityScores'
 
 const props = defineProps<{
   root: TrajectoryTreeNode
   selectedId?: number
   nodeScores?: Record<string, QualityNodeScore>
+  highlightTrajectoryId?: string
 }>()
 
 const emit = defineEmits<{
@@ -31,6 +32,10 @@ const svg = ref<SVGSVGElement | null>(null)
 const viewport = ref({ x: 0, y: 0, scale: 1 })
 const dragging = ref(false)
 let lastPointer = { x: 0, y: 0 }
+const highlightedPath = computed(() => trajectoryPath(props.root, props.highlightTrajectoryId))
+const highlightedNodes = computed(() => new Set(highlightedPath.value.nodeIds))
+const highlightedEdges = computed(() => new Set(highlightedPath.value.edgeIds))
+const topology = computed(() => treeTopology(props.root))
 
 const layout = computed(() => {
   const nodes: LayoutNode[] = []
@@ -137,16 +142,14 @@ function selectNode(node: TrajectoryTreeNode) {
   emit('select', node)
 }
 
-watch(() => props.root, async () => {
+watch(topology, async () => {
   await nextTick()
   resetView()
 })
 
 onMounted(() => {
   void nextTick(resetView)
-  window.addEventListener('resize', resetView)
 })
-onBeforeUnmount(() => window.removeEventListener('resize', resetView))
 </script>
 
 <template>
@@ -167,13 +170,13 @@ onBeforeUnmount(() => window.removeEventListener('resize', resetView))
           :key="edge.id"
           :d="edge.path"
           class="reference-edge"
-          :class="{ 'reference-edge--branch': edge.branch }"
+          :class="{ 'reference-edge--branch': edge.branch, 'reference-edge--highlighted': highlightedEdges.has(edge.id) }"
         />
         <g
           v-for="item in layout.nodes"
           :key="item.node.id"
           class="reference-node"
-          :class="{ selected: selectedId === item.node.id }"
+          :class="{ selected: selectedId === item.node.id, 'reference-node--highlighted': highlightedNodes.has(item.node.id) }"
           :transform="`translate(${item.x}, ${item.y})`"
           role="button"
           tabindex="0"
@@ -219,8 +222,10 @@ onBeforeUnmount(() => window.removeEventListener('resize', resetView))
 .reference-tree__svg.is-dragging { cursor: grabbing; }
 .reference-edge { fill: none; stroke: #58708f; stroke-width: 2; }
 .reference-edge--branch { stroke: #ef8354; }
+.reference-edge--highlighted { stroke: #2dd4bf; stroke-width: 5; filter: drop-shadow(0 0 3px rgba(45,212,191,.4)); }
 .reference-node { cursor: pointer; outline: none; }
 .page-ring { fill: #111c30; stroke: #30435e; stroke-width: 4; pointer-events: none; }
+.reference-node--highlighted .page-ring { stroke: #2dd4bf; filter: drop-shadow(0 0 4px rgba(45,212,191,.4)); }
 .action-dot { stroke: #dce7f5; stroke-width: 1.5; transition: stroke-width .16s ease, filter .16s ease; }
 .action-dot--root { fill: #8b5cf6; }
 .action-dot--click { fill: #2f80ed; }

@@ -16,10 +16,13 @@ export function useBatchQualityWorkspace(client: Client, options: {
   const recommendation = ref<CorrectionRecommendation | null>(null)
   const selectedTaskId = ref(''), tree = ref<TrajectoryTreeNode | null>(null), quality = ref<TaskQualityResult | null>(null)
   const loadingBatches = ref(false), loadingTree = ref(false), loadingBatch = ref(false), error = ref('')
-  let epoch = 0, detailRequest = 0, listRequest = 0, disposed = false
+  let epoch = 0, detailRequest = 0, listRequest = 0, refreshRequest = 0, disposed = false
   const counts = computed(() => {
     const tasks = currentTree.value?.tasks ?? []
-    const completed = tasks.filter(task => summaries.value[task.task_id]?.status === 'succeeded').length
+    const completed = tasks.filter(task => {
+      const summary = summaries.value[task.task_id]
+      return summary?.status === 'succeeded' && summary.fusion_complete !== false && summary.result_state !== 'partial'
+    }).length
     const stale = tasks.filter(task => ['stale', 'invalidated'].includes(summaries.value[task.task_id]?.status ?? task.tree_status ?? task.status ?? '')).length
     return { completed, stale, pending: tasks.length - completed - stale }
   })
@@ -66,7 +69,9 @@ export function useBatchQualityWorkspace(client: Client, options: {
     const id = batchId.value, token = epoch, request = ++detailRequest
     selectedTaskId.value = taskId; tree.value = null; quality.value = null; loadingTree.value = true
     try {
-      const [built, reviewed] = await Promise.allSettled([client.tree(id, taskId), summaries.value[taskId]?.status === 'succeeded' ? client.taskQuality(id, taskId) : Promise.resolve(null)])
+      const summary = summaries.value[taskId]
+      const readable = summary?.status === 'succeeded' || summary?.results_available || summary?.partial_results_available
+      const [built, reviewed] = await Promise.allSettled([client.tree(id, taskId), readable ? client.taskQuality(id, taskId) : Promise.resolve(null)])
       if (disposed || token !== epoch || request !== detailRequest) return
       if (built.status === 'rejected') throw built.reason
       tree.value = built.value
@@ -79,9 +84,43 @@ export function useBatchQualityWorkspace(client: Client, options: {
     finally { if (!disposed && token === epoch && request === detailRequest) loadingTree.value = false }
   }
   async function refresh() {
-    const id = batchId.value, taskId = selectedTaskId.value
-    await selectBatch(id)
-    if (!disposed && batchId.value === id && taskId && readyTasks.value.some(task => task.task_id === taskId)) await viewTree(taskId)
+    const id = batchId.value, taskId = selectedTaskId.value, token = epoch
+    const request = ++refreshRequest, detail = detailRequest
+    if (!id || options.historyOnly?.() || options.waitingForTree?.()) { await selectBatch(id); return }
+    const current = () => !disposed && epoch === token && batchId.value === id && request === refreshRequest
+    const currentDetail = () => current() && selectedTaskId.value === taskId && detailRequest === detail
+    loadingBatch.value = true
+    error.value = ''
+    try {
+      // Refresh published data in place: unmounting the tree here also loses
+      // its viewport, the selected screenshot and expanded evidence.
+      const [built, reviewed, suggested] = await Promise.allSettled([
+        client.batchTree(id), client.runQuality(id),
+        options.waitingForQuality?.() ? Promise.resolve(null) : client.correctionRecommendation(id),
+      ])
+      if (!current()) return
+      if (built.status === 'rejected') throw built.reason
+      currentTree.value = built.value
+      if (reviewed.status === 'fulfilled' && reviewed.value) summaries.value = Object.fromEntries(reviewed.value.tasks.map(task => [task.task_id, task]))
+      else if (reviewed.status === 'rejected') error.value = (reviewed.reason as Error).message
+      recommendation.value = suggested.status === 'fulfilled' && !options.waitingForQuality?.() ? suggested.value : null
+      if (!taskId || !currentDetail() || loadingTree.value) return
+      if (!readyTasks.value.some(task => task.task_id === taskId)) { clearDetail(); return }
+      const summary = summaries.value[taskId]
+      const readable = summary?.status === 'succeeded' || summary?.results_available || summary?.partial_results_available
+      const [nextTree, nextQuality] = await Promise.allSettled([
+        client.tree(id, taskId), readable ? client.taskQuality(id, taskId) : Promise.resolve(null),
+      ])
+      if (!currentDetail()) return
+      if (nextTree.status === 'rejected') throw nextTree.reason
+      if (nextQuality.status === 'rejected' && !(nextQuality.reason instanceof ApiError && (
+        (nextQuality.reason.status === 409 && nextQuality.reason.message === '该任务尚无有效质检结果，请先完成质检') ||
+        (nextQuality.reason.status === 404 && nextQuality.reason.message === '该任务还没有质检结果')
+      ))) throw nextQuality.reason
+      tree.value = nextTree.value
+      quality.value = nextQuality.status === 'fulfilled' ? nextQuality.value : null
+    } catch (cause) { if (current()) error.value = (cause as Error).message }
+    finally { if (current()) loadingBatch.value = false }
   }
   async function refreshChoices() {
     if (options.historyOnly?.()) return

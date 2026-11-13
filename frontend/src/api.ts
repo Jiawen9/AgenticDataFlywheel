@@ -40,6 +40,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  treeCoordinateInfo(source: import('./types').CoordinateSource & { kind: 'tree' }): Promise<{ coordinate_info: import('./types').CoordinateInfo; annotation_version: string; tree_version: string; task_id: string; trajectory_id: string; image: string }> {
+    const { kind: _kind, batch_id, task_id, ...identity } = source
+    return request('/api/data-batches/' + encodeURIComponent(batch_id) + '/tasks/' + encodeURIComponent(task_id) + '/tree?' + new URLSearchParams({ view: 'coordinate', ...identity }), { cache: 'no-store' })
+  },
   coordinateInfo(source: import('./types').CoordinateSource & { kind: 'batch' }): Promise<{ coordinate_info: import('./types').CoordinateInfo; annotation_version: string }> {
     const { kind: _kind, ...body } = source
     return request('/api/coordinate-info', { method: 'POST', body: JSON.stringify(body) })
@@ -208,7 +212,7 @@ export const api = {
   qualitySettings(): Promise<import('./types').QualitySettings> {
     return request('/api/quality-jobs/settings', { cache: 'no-store' })
   },
-  saveQualitySettings(settings: Pick<import('./types').QualitySettings, 'evaluation_profile_id' | 'evaluation_profile_digest'>): Promise<import('./types').QualitySettings> {
+  saveQualitySettings(settings: Partial<Pick<import('./types').QualitySettings, 'evaluation_profile_id' | 'evaluation_profile_digest' | 'evaluator_config'>>): Promise<import('./types').QualitySettings> {
     return request('/api/quality-jobs/settings', { method: 'PUT', body: JSON.stringify(settings) })
   },
   qualityJob(jobId: string): Promise<QualityJob> {

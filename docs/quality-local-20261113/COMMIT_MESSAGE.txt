@@ -1,0 +1,7 @@
+feat(quality): migrate Checklist evaluation to platform backend and fix progress and coordinates
+
+将轨迹质检 Checklist 迁入平台独立子进程，直接只读原始轨迹，冻结本地模型与规则配置，保留 Rubric 检查点复用及旧作业重试关联。模型迭代与采集端保持原有链路。
+
+补齐原始用例身份、逐条部分结果、严格有效结果缓存、调度和输出异常收尾；按实际 Rubric/Checklist/融合进度展示，保留具体失败原因。质检树通过原 GET 路由查询单步坐标，避免重渲染重复请求并隔离迟到响应。
+
+验证及现场待验项见 docs/quality-local-20261113/VALIDATION.md；部署与旧十轨迹恢复见 CODEAGENT_PROMPT.txt。

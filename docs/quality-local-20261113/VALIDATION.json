@@ -1,0 +1,870 @@
+{
+  "date": "2026-11-13",
+  "scope": "platform trajectory quality only; no collector code or production data changes",
+  "backend": {
+    "unique_tests": 194,
+    "latest_passed": 194,
+    "skipped": 0,
+    "combined_before_final_fix": {
+      "modules": [
+        "backend.tests.test_quality_fusion",
+        "backend.tests.test_quality_process_supervision",
+        "backend.tests.test_batch_results",
+        "backend.tests.test_quality_frozen_retry",
+        "backend.tests.test_pipeline_quality_fusion",
+        "backend.tests.test_quality_source_recovery",
+        "backend.tests.test_quality_execution",
+        "backend.tests.test_quality_deadline_pipeline",
+        "backend.tests.test_quality_control_compatibility",
+        "backend.tests.test_quality_retry_errors",
+        "backend.tests.test_quality_local_runner",
+        "backend.tests.test_quality_checklist",
+        "backend.tests.test_quality_local_settings",
+        "backend.tests.test_quality_checklist_local",
+        "backend.tests.test_coordinate_info",
+        "backend.tests.test_batch_api"
+      ],
+      "count": 193,
+      "passed": 192,
+      "failed": 1,
+      "errors": 0,
+      "skipped": 0,
+      "seconds": 103.844,
+      "real_models": false,
+      "phones": false,
+      "environment": "Windows, existing platform Python; isolated local fixtures"
+    },
+    "targeted_after_final_fix": {
+      "modules": [
+        "backend.tests.test_quality_checklist_local",
+        "backend.tests.test_quality_local_runner"
+      ],
+      "count": 20,
+      "passed": 20,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "seconds": 71.953,
+      "real_models": false,
+      "phones": false,
+      "python_version": "3.12.13 (main, Aug  7 2026, 02:26:41) [MSC v.1944 64 bit (AMD64)]",
+      "environment": "Windows, existing platform Python; isolated local fixtures"
+    },
+    "final_fix": "Drain buffered request events after a fast child exits; deterministic real-child regression added",
+    "latest_results": [
+      {
+        "test": "backend.tests.test_quality_fusion.QualityFusionTests.test_execution_error_has_one_primary_gap_not_invented_schema_mismatches",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_fusion.QualityFusionTests.test_formula_and_original_scores_preserved",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_fusion.QualityFusionTests.test_fusion_ranks_count_then_quality_then_workbook_order",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_fusion.QualityFusionTests.test_invalid_checklist_and_no_evidence_never_become_zero_score",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_fusion.QualityFusionTests.test_legacy_summary_retains_partial_availability_and_primary_error",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_fusion.QualityFusionTests.test_missing_branch_makes_sibling_advantages_unavailable",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_fusion.QualityFusionTests.test_missing_requested_task_is_not_success",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_fusion.QualityFusionTests.test_mixed_gold_and_llm_definition_metadata_invalidates_task",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_fusion.QualityFusionTests.test_one_child_and_equal_siblings_have_zero_advantage",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_fusion.QualityFusionTests.test_root_mean_weights_trajectories_not_branch_means",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_fusion.QualityFusionTests.test_true_tree_occurrence_shape_deduplicates_trajectories_and_has_root_mean",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_process_supervision.QualityProcessTests.test_child_waiting_at_launch_gate_exits_on_parent_pipe_eof",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_process_supervision.QualityProcessTests.test_cleanup_failure_blocks_new_execution",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_process_supervision.QualityProcessTests.test_cleanup_failure_overrides_retryable_parent_callback_error",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_process_supervision.QualityProcessTests.test_committed_result_recovers_even_if_worker_never_reports_result",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_process_supervision.QualityProcessTests.test_concurrent_and_duplicate_requests_do_not_replace_first_deadline",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_process_supervision.QualityProcessTests.test_diagnostic_log_write_failure_does_not_stop_protocol_drain",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_process_supervision.QualityProcessTests.test_execution_tracks_legacy_manifest_business_batch",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_process_supervision.QualityProcessTests.test_explicitly_settled_legacy_request_does_not_kill_next_attempt",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_process_supervision.QualityProcessTests.test_finished_model_then_client_close_hangs_is_not_model_timeout",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_process_supervision.QualityProcessTests.test_finished_requests_can_run_successively_beyond_one_request_timeout",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_process_supervision.QualityProcessTests.test_heartbeat_does_not_extend_request_deadline",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_process_supervision.QualityProcessTests.test_local_checklist_progress_is_bounded_and_retains_real_counts",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_process_supervision.QualityProcessTests.test_missing_worker_identity_only_recovers_with_proven_launch_gate",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_process_supervision.QualityProcessTests.test_no_output_is_unresponsive_not_model_timeout",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_process_supervision.QualityProcessTests.test_parent_shutdown_revokes_before_stopping_worker",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_process_supervision.QualityProcessTests.test_rejected_duplicate_claim_does_not_drop_active_stop_event",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_process_supervision.QualityProcessTests.test_request_diagnostics_strip_secrets_and_bodies",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_process_supervision.QualityProcessTests.test_restart_reclaims_only_persisted_worker_and_unblocks_batch",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_process_supervision.QualityProcessTests.test_reused_pid_is_not_terminated",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_process_supervision.QualityProcessTests.test_revoked_and_terminal_progress_cannot_restore_job",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_process_supervision.QualityProcessTests.test_shutdown_cancels_quality_queue_not_shared_executor",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_process_supervision.QualityProcessTests.test_timeout_event_then_failed_cannot_cancel_cleanup_deadline",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_process_supervision.QualityProcessTests.test_transient_sqlite_lock_during_claim_fails_job_and_releases_worker",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_results.BatchJobTests.test_incomplete_fusion_can_retry_without_reusing_succeeded_job",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_results.BatchJobTests.test_overlapping_quality_requests_never_report_active_work_succeeded",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_results.BatchJobTests.test_overlapping_tree_requests_only_reserve_unclaimed_tasks",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_results.BatchJobTests.test_pending_b_can_finish_after_only_a_input_changes",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_results.BatchJobTests.test_quality_job_is_reused_and_stale_job_never_calls_worker",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_results.BatchJobTests.test_repeated_pending_tree_tasks_share_the_job",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_results.BatchResultsTests.test_a_then_b_preserves_both_in_every_merged_input",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_results.BatchResultsTests.test_alias_is_retired_when_its_task_changes",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_results.BatchResultsTests.test_changing_a_invalidates_only_a_and_late_a_is_rejected",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_results.BatchResultsTests.test_committed_annotation_outbox_recovers_invalidation_without_losing_b",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_results.BatchResultsTests.test_concurrent_disjoint_tasks_do_not_lose_results",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_results.BatchResultsTests.test_failed_stage_commit_does_not_leave_an_invalidation_event",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_results.BatchResultsTests.test_fusion_rescore_keeps_manual_drafts_but_updates_quality_record",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_results.BatchResultsTests.test_identical_task_reuses_result_without_new_revision",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_results.BatchResultsTests.test_late_quality_for_changed_task_cannot_overwrite_current",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_results.BatchResultsTests.test_live_quality_partial_is_viewable_but_cannot_become_stable_result",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_results.BatchResultsTests.test_outbox_survives_notification_failure_and_replays",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_results.BatchResultsTests.test_quality_partial_runs_merge_and_keep_other_task",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_frozen_retry.QualityFrozenRetryTests.test_changed_rubric_configuration_is_rejected_not_silently_frozen_again",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_frozen_retry.QualityFrozenRetryTests.test_changed_source_tree_or_input_is_rejected_before_enqueue",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_frozen_retry.QualityFrozenRetryTests.test_committed_partial_fusion_finishes_failed_without_erasing_scores",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_frozen_retry.QualityFrozenRetryTests.test_complete_remote_result_is_not_migrated",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_frozen_retry.QualityFrozenRetryTests.test_complete_result_is_reused_without_reevaluation",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_frozen_retry.QualityFrozenRetryTests.test_legacy_alias_uses_actual_batch_for_preflight_write_authority",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_frozen_retry.QualityFrozenRetryTests.test_legacy_none_stays_none_instead_of_enabling_checklist",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_frozen_retry.QualityFrozenRetryTests.test_managed_submit_rejects_before_freezing_or_contacting_remote",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_frozen_retry.QualityFrozenRetryTests.test_missing_job_wrong_batch_wrong_task_and_missing_fingerprint_are_rejected",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_frozen_retry.QualityFrozenRetryTests.test_partial_success_uses_frozen_options_and_preserves_original_job_and_tree",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_frozen_retry.QualityFrozenRetryTests.test_remote_retry_links_local_successor_and_reuses_rubric_identity",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_frozen_retry.QualityFrozenRetryTests.test_repeated_retry_returns_same_active_job_without_another_submission",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_frozen_retry.QualityFrozenRetryTests.test_retry_active_original_returns_original",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_frozen_retry.QualityFrozenRetryTests.test_retry_does_not_expand_into_previously_reused_tasks",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_frozen_retry.QualityFrozenRetryTests.test_retry_preserves_pipeline_write_authority",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_frozen_retry.QualityFrozenRetryTests.test_submit_rechecks_ownership_after_remote_freezing",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_pipeline_quality_fusion.PipelineFusionReadinessTests.test_bound_job_prevents_other_scoring_version_from_advancing_pipeline",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_pipeline_quality_fusion.PipelineFusionReadinessTests.test_failure_summary_distinguishes_stale_and_missing_results",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_pipeline_quality_fusion.PipelineFusionReadinessTests.test_failure_summary_is_bounded_and_redacts_provider_secrets",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_pipeline_quality_fusion.PipelineFusionReadinessTests.test_incomplete_job_exposes_checklist_reason_without_advancing",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_pipeline_quality_fusion.PipelineFusionReadinessTests.test_initial_submission_still_uses_normal_settings_freeze",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_pipeline_quality_fusion.PipelineFusionReadinessTests.test_local_successor_binding_uses_new_fingerprint_without_rewriting_remote_history",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_pipeline_quality_fusion.PipelineFusionReadinessTests.test_new_result_uses_its_frozen_options_and_requires_complete_fusion",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_pipeline_quality_fusion.PipelineFusionReadinessTests.test_old_job_and_result_keep_legacy_fingerprint",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_pipeline_quality_fusion.PipelineFusionReadinessTests.test_partial_result_never_advances_even_with_all_current_scores",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_pipeline_quality_fusion.PipelineFusionReadinessTests.test_retry_calls_bound_job_instead_of_new_submission",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_source_recovery.QualitySourceRecoveryTests.test_absolute_legacy_directory_needs_no_invented_root_and_missing_xml_is_allowed",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_source_recovery.QualitySourceRecoveryTests.test_bad_checklist_metadata_does_not_destroy_usable_rubric_input",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_source_recovery.QualitySourceRecoveryTests.test_both_engines_real_producer_loader_and_checklist_preserve_evidence",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_source_recovery.QualitySourceRecoveryTests.test_changed_source_conditions_do_not_silently_change_a_frozen_quality_input",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_source_recovery.QualitySourceRecoveryTests.test_existing_relative_snapshot_recovers_in_memory_without_changing_inputs",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_source_recovery.QualitySourceRecoveryTests.test_frozen_context_task_precedes_instruction_without_rewriting_source",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_source_recovery.QualitySourceRecoveryTests.test_legacy_task_text_only_unwraps_known_instruction_prefix",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_source_recovery.QualitySourceRecoveryTests.test_long_chinese_directory_uses_existing_io_adapter_without_changing_source",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_source_recovery.QualitySourceRecoveryTests.test_metadata_read_failure_is_not_reported_as_missing_directory",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_source_recovery.QualitySourceRecoveryTests.test_missing_invalid_unreadable_and_identity_errors_name_the_trajectory",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_source_recovery.QualitySourceRecoveryTests.test_old_short_id_recovers_original_case_from_frozen_annotation",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_source_recovery.QualitySourceRecoveryTests.test_worker_recovers_ten_old_relative_sources_and_reuses_rubric_checkpoints",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_execution.QualityExecutionTests.test_active_revoked_and_unconfirmed_processes_block_new_dispatch",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_execution.QualityExecutionTests.test_artifact_factory_failure_preserves_previous_files",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_execution.QualityExecutionTests.test_checkpoint_reused_across_executions_and_revoked_append_rejected",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_execution.QualityExecutionTests.test_commit_response_lost_recovers_artifact_and_rejects_late_writes",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_execution.QualityExecutionTests.test_final_artifact_and_execution_commit_are_one_transaction",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_execution.QualityExecutionTests.test_legacy_indexes_and_execution_commit_share_artifact_transaction",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_execution.QualityExecutionTests.test_managed_job_cannot_drop_its_token",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_execution.QualityExecutionTests.test_parent_exit_and_pid_reuse_revoke_write_access",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_execution.QualityExecutionTests.test_progress_checks_token_without_waiting_for_child_file_lock",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_execution.QualityExecutionTests.test_protocol_frame_survives_a_partial_legacy_log_line",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_execution.QualityExecutionTests.test_revoke_between_file_replacement_and_sqlite_commit_rolls_back",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_execution.QualityExecutionTests.test_revoke_does_not_wait_for_child_file_lock_and_blocks_following_writes",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_execution.QualityExecutionTests.test_revoked_execution_cannot_replace_existing_result",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_execution.QualityExecutionTests.test_revoked_worker_observer_refuses_model_request_before_submission",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_execution.QualityExecutionTests.test_rubric_generation_returning_after_revocation_cannot_save",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_execution.QualityExecutionTests.test_terminal_job_cannot_write_with_an_unrevoked_lease",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_execution.QualityExecutionTests.test_worker_needs_explicit_launch_frame_and_durable_matching_pid",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_deadline_pipeline.QualityDeadlinePipelineTests.test_real_deadline_stops_at_three_attempts_and_keeps_manual_retry",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_deadline_pipeline.RubricRepairDeadlineTests.test_json_repair_has_its_own_request_and_timeout_without_extra_retry",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_control_compatibility.QualityControlCompatibilityTests.test_deadline_change_does_not_invalidate_quality_content",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_control_compatibility.QualityControlCompatibilityTests.test_env_file_deadline_is_used_but_process_override_wins",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_control_compatibility.QualityControlCompatibilityTests.test_execution_failures_keep_their_specific_safe_diagnosis",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_control_compatibility.QualityControlCompatibilityTests.test_worker_diagnostics_are_safe_and_do_not_retry_unknown_hangs",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_retry_errors.QualityFailureTests.test_child_entry_sets_single_attempt_only_for_new_pipeline",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_retry_errors.QualityFailureTests.test_failed_and_restart_jobs_persist_only_sanitized_diagnostics",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_retry_errors.QualityFailureTests.test_new_pipeline_rubric_generation_makes_one_request",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_retry_errors.QualityFailureTests.test_quota_auth_input_and_unknown_are_not_retryable",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_retry_errors.QualityFailureTests.test_server_error_keeps_safe_status_and_request_id_through_wrapper",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_retry_errors.QualityFailureTests.test_subprocess_error_protocol_and_unstructured_exit",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_local_runner.LocalQualityRunnerTests.test_both_engines_retain_partial_results_then_reuse_native_and_rubric_checkpoints",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist.QualityChecklistTests.test_checklist_uses_frozen_plain_task_without_changing_rubric_input",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist.QualityChecklistTests.test_exact_legacy_gui_wrapper_is_removed_without_context",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist.QualityChecklistTests.test_failed_checklist_retry_keeps_request_and_uses_retry_endpoint",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist.QualityChecklistTests.test_failed_nonempty_checklist_preserves_redacted_bounded_row_error",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist.QualityChecklistTests.test_failed_result_without_any_error_gets_explanation",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist.QualityChecklistTests.test_frozen_config_is_independent_of_later_settings",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist.QualityChecklistTests.test_frozen_task_is_not_replaced_with_another_original_task",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist.QualityChecklistTests.test_job_error_only_fills_unfinished_results",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist.QualityChecklistTests.test_lost_acceptance_without_id_is_not_recreated_by_cleanup",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist.QualityChecklistTests.test_nested_error_precedes_row_and_job_errors",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist.QualityChecklistTests.test_parent_cleanup_is_generation_fenced_and_does_not_touch_new_owner",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist.QualityChecklistTests.test_plain_instruction_and_unknown_wrappers_are_not_guessed",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist.QualityChecklistTests.test_source_mapping_uses_identity_and_does_not_change_original",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist.QualityChecklistTests.test_structured_key_elements_remain_json_not_python_repr",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist.QualityChecklistTests.test_successful_remote_result_is_reused_without_repeat_evaluation",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist.QualityChecklistTests.test_unique_profile_default_and_multiple_profiles_require_selection",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_local_settings.LocalQualitySettingsTests.test_copy_existing_model_configuration_once_and_keep_independent",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_local_settings.LocalQualitySettingsTests.test_exact_profile_import_and_failed_first_import_does_not_hide_bundled_rules",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_local_settings.LocalQualitySettingsTests.test_explicit_missing_or_damaged_published_rules_do_not_fall_back",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_local_settings.LocalQualitySettingsTests.test_legacy_migration_inherits_frozen_models_and_keeps_old_record",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_local_settings.LocalQualitySettingsTests.test_missing_original_rule_does_not_fall_back_to_an_available_default",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_local_settings.LocalQualitySettingsTests.test_optional_environment_names_use_role_defaults_without_changing_input",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_local_settings.LocalQualitySettingsTests.test_partial_save_keeps_selected_profile_and_rejects_secret_values",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_local_settings.LocalQualitySettingsTests.test_preflight_missing_environment_fails_before_subprocess",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_local_settings.LocalQualitySettingsTests.test_preflight_returns_dependency_names_and_never_echoes_stderr",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist_local.LocalChecklistTests.test_actual_parent_crash_ends_native_child_then_retry_recovers",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist_local.LocalChecklistTests.test_broken_log_sink_fails_before_child_and_does_not_leak_slot",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist_local.LocalChecklistTests.test_cancel_waiter_never_consumes_slot_and_lease_releases_after_failure",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist_local.LocalChecklistTests.test_cancellation_stops_actual_child_and_releases_durable_slot",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist_local.LocalChecklistTests.test_chinese_long_profile_import_freeze_verify_preserves_logical_paths",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist_local.LocalChecklistTests.test_chinese_long_source_path_real_native_process",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist_local.LocalChecklistTests.test_failed_source_only_is_retried_and_successful_report_is_reused",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist_local.LocalChecklistTests.test_global_slots_are_shared_by_real_parent_processes",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist_local.LocalChecklistTests.test_invalid_completed_report_repaired_same_retry_in_new_attempt",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist_local.LocalChecklistTests.test_lease_enter_failure_releases_claim",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist_local.LocalChecklistTests.test_native_visual_checks_retained_but_terminal_summary_is_not_called",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist_local.LocalChecklistTests.test_real_native_process_report_reuse_and_readonly_original",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist_local.LocalChecklistTests.test_response_loss_reuses_valid_native_report_without_model",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist_local.LocalChecklistTests.test_source_change_and_report_tamper_do_not_reuse_or_call_model",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist_local.LocalChecklistTests.test_source_error_is_transient_and_all_invalid_skips_definition",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist_local.LocalChecklistTests.test_split_secret_log_output_is_redacted_and_write_failure_drains",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist_local.LocalChecklistTests.test_unconfirmed_cleanup_does_not_dispatch_next_trajectory_or_replace_child",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist_local.LocalChecklistTests.test_unconfirmed_live_child_does_not_block_stdout_close",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_coordinate_info.CoordinateEvidenceTests.test_batch_lookup_registered_identity_cached_and_versioned",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_coordinate_info.CoordinateEvidenceTests.test_cold_batch_index_single_flight_for_concurrent_steps",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_coordinate_info.CoordinateEvidenceTests.test_existing_group_route_embeds_only_selected_rows_outside_lock",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_coordinate_info.CoordinateEvidenceTests.test_existing_task_http_route_works_when_new_coordinate_route_is_unavailable",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_coordinate_info.CoordinateEvidenceTests.test_group_missing_source_keeps_text_and_does_not_authorize_coordinates",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_coordinate_info.CoordinateEvidenceTests.test_group_rejects_revision_changed_while_evidence_is_read",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_coordinate_info.CoordinateEvidenceTests.test_human80_schema_normalized_but_unknown_external_not_guessed",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_coordinate_info.CoordinateEvidenceTests.test_missing_evidence_and_historical_edited_action_are_unknown",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_coordinate_info.CoordinateEvidenceTests.test_native_compatibility_requires_engine_format_or_native_evidence",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_coordinate_info.CoordinateEvidenceTests.test_new_contract_bound_to_action_image_and_actual_canvas",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_coordinate_info.CoordinateEvidenceTests.test_noncoordinate_action_keeps_source_canvas_for_later_point_edit",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_coordinate_info.CoordinateEvidenceTests.test_patch_coordinate_reads_are_unlocked_and_late_edits_do_not_fail_save",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_coordinate_info.CoordinateEvidenceTests.test_pipeline_uses_original_image_not_xml_bounds_or_1000",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_coordinate_info.CoordinateEvidenceTests.test_pixel_edit_persist_export_and_reopen_both_workbooks",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_coordinate_info.CoordinateEvidenceTests.test_real_routes_and_stale_revision",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_coordinate_info.CoordinateEvidenceTests.test_revision_and_noop_preserve_original_pixel_action",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_coordinate_info.CoordinateEvidenceTests.test_tree_coordinate_existing_route_avoids_tree_rebuild_and_checks_scope",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_coordinate_info.CoordinateEvidenceTests.test_tree_coordinate_rejects_late_artifact_change",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_coordinate_info.CoordinateEvidenceTests.test_tree_route_survives_gateway_without_new_coordinate_post",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_coordinate_info.CoordinateEvidenceTests.test_unknown_blocks_only_coordinate_changes",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_api.BatchApiTests.test_all_invalidated_tasks_remain_visible_even_without_a_current_tree",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_api.BatchApiTests.test_annotation_without_any_tree_returns_all_pending_tasks_and_frontend_fields",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_api.BatchApiTests.test_changing_a_invalidates_its_current_reads_but_keeps_b_complete",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_api.BatchApiTests.test_collection_task_status_is_derived_from_effective_current_results",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_api.BatchApiTests.test_corrupt_current_payload_reports_conflict_instead_of_empty_success",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_api.BatchApiTests.test_current_download_follows_same_stage_and_old_token_is_gone",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_api.BatchApiTests.test_incomplete_fusion_is_readable_without_claiming_success",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_api.BatchApiTests.test_partial_build_keeps_unprocessed_tasks_in_the_same_batch",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_api.BatchApiTests.test_partial_quality_is_a_summary_plus_current_task_detail",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_batch_api.BatchApiTests.test_unknown_batch_and_unsafe_identifier_do_not_select_another_batch",
+        "status": "passed"
+      },
+      {
+        "test": "backend.tests.test_quality_checklist_local.LocalChecklistTests.test_short_real_child_events_delivered_after_first_poll_already_exited",
+        "status": "passed"
+      }
+    ]
+  },
+  "frontend": {
+    "targeted": {
+      "passed": 67,
+      "failed": 0
+    },
+    "full": {
+      "passed": 595,
+      "failed": 3
+    },
+    "baseline_model_iteration": {
+      "passed": 15,
+      "failed": 3
+    },
+    "known_baseline_failures": [
+      "late selected-run response",
+      "independent run cancellation confirmation",
+      "paused input preparation retry"
+    ],
+    "typecheck": "passed",
+    "vite_build": "passed"
+  },
+  "local_dependency_probe": {
+    "ok": false,
+    "missing": [
+      "cv2"
+    ],
+    "python": "3.12.13 (main, Aug  7 2026, 02:26:41) [MSC v.1944 64 bit (AMD64)]"
+  },
+  "pending": [
+    "Complete deployment environment dependencies",
+    "Intranet actual models and original rule digest",
+    "Actual existing ten-trajectory batch acceptance",
+    "icap gateway coordinate JSON and display"
+  ],
+  "real_models_called": false,
+  "phones_operated": false,
+  "services_restarted": false
+}

@@ -53,6 +53,23 @@ class PipelineFusionReadinessTests(TestCase):
              patch("backend.batch_results.current_quality_payload", return_value=payload):
             self.assertTrue(self.runtime.ready("quality", self.pipeline))
 
+    def test_local_successor_binding_uses_new_fingerprint_without_rewriting_remote_history(self):
+        old = {**self.options, "collector_server": "http://old.invalid", "version": 1}
+        local = {**self.options, "execution_backend": "platform", "version": 2, "runtime_digest": "local"}
+        self.runtime.records.put("quality_jobs", "old", {"job_id": "old", "task_ids": ["a"], "checklist_options": old})
+        self.runtime.records.put("quality_jobs", "local", {"job_id": "local", "task_ids": ["a"],
+            "origin_job_id": "old", "checklist_options": local})
+        before = self.runtime.records.get("quality_jobs", "old")
+        self.pipeline["steps"][0].update(job_ids=["local"], previous_job_ids=["old"], retry_job_id="old")
+        result = {**self.result, "checklist_options": local}
+        self.assertTrue(self.ready(result, local))
+        self.pipeline["steps"][0]["job_ids"] = ["old"]
+        self.assertFalse(self.ready(result, local))
+        self.assertEqual(self.runtime.records.get("quality_jobs", "old"), before)
+
+    def test_partial_result_never_advances_even_with_all_current_scores(self):
+        self.assertFalse(self.ready({**self.result, "result_state": "partial", "fusion_complete": False}))
+
     def test_incomplete_job_exposes_checklist_reason_without_advancing(self):
         self.pipeline["steps"][0].update(status="running", job_ids=["job"])
         self.runtime.records.put("quality_jobs", "job", {"job_id": "job", "batch_id": "batch",

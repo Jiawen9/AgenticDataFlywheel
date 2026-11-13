@@ -1,0 +1,84 @@
+{
+  "version": "1.1",
+  "description": "特殊场景评估规则库。evaluator 初始化时加载，拼入 system prompt。后续可扩展为完整 skill 库。",
+  "rules": [
+    {
+      "id": "playback_judgment",
+      "category": "media_playback",
+      "description": "播放状态判定——两条件逻辑",
+      "prompt_text": "**播放判定规则**：以下条件同时满足时判定为 PASSED——\n\n**条件 1（必须满足）**：画面上可见与任务匹配的**正确剧名/标题**。\n\n**条件 2（满足任一即可）**：\n  a) 选集/季列表可见，且其中一集处于激活/高亮状态（VIP 锁定也算——说明找到了正确内容）。\n  b) 播放/暂停按钮或进度条（SeekBar）可见，表明视频正在播放。\n  c) 可见「已看X集」「继续观看」「观看至X集」等文字，表明已有观看进度。\n\n**VIP/广告是正常流程**：VIP 充值页和贴片广告是正常 app 行为。agent 找到了正确内容，即使付费墙或广告挡住了播放画面也不算失败。画面上半部分是广告并不否定播放——条件 1（正确标题）+ 条件 2a（选集有激活项）足以判定通过。仅在剧名完全不匹配或无任何播放证据时才判失败。"
+    },
+    {
+      "id": "reversible_condition",
+      "category": "settings_toggles_filters",
+      "description": "可逆条件（筛选/设置/开关）验证策略",
+      "prompt_text": "**可逆条件**（设置、开关、筛选、播放模式、选集切换）：检查**最后一个包含相关页面的截图**，不一定是最终 action 的截图。如果筛选操作在中间步骤完成、最终截图是播放页，应从筛选 action 的 before/after 截图验证。VLM 无法判断小图标状态时，先用 detect_image_changes 定位变化区域，再 inspect 标注图。不要因为最终截图（可能是播放/详情页）看不到筛选面板就判可逆条件失败。"
+    },
+    {
+      "id": "one_way_condition",
+      "category": "navigation_actions",
+      "description": "单向操作（打开/搜索/播放）验证策略",
+      "prompt_text": "**单向操作**（打开 App、搜索、播放、评论、添加到列表、发送）：检查执行该操作的 action 的截图。最终截图仍能反映则最好，如果不能，从操作自身的 after-screenshot 验证。"
+    },
+    {
+      "id": "action_overlay_evidence",
+      "category": "operation_verification",
+      "description": "使用 action overlay 截图验证 agent 操作位置",
+      "prompt_text": "**Action overlay 配对检查**：使用 fetch_step_detail(detail_type='action_overlay') 查看 agent 的精确点击位置（红点标注）。对于播放验证、开关切换等场景，**强制同时加载 overlay + screenshot_after 两张图一起发给 VLM**——调用 inspect_image_region(image_path=<after>, overlay_path=<overlay>, target_keyword=\"...\")。VLM 将对照两张图：overlay 显示 agent 做了什么操作（红点位置），after 显示操作后的结果。两张图一起看比单独看任一张更强。"
+    },
+    {
+      "id": "path_verification",
+      "category": "navigation",
+      "description": "路径验证：榜单/列表类任务需确认经过了对应页面",
+      "prompt_text": "**路径验证（榜单/列表/搜索类任务）**：如果 checklist item 描述的是「找到 XX 榜单/XX 列表的 YY」或类似的导航操作，必须验证 agent **确实访问了该页面**（查找列表标题、排名标签、列表特有的 UI 元素）。最终详情页上的标签或角标**不足以**判定通过——必须找到至少一张截图显示 agent 在实际的列表/榜单页面。例如：任务要求从「热搜榜」找剧，但 agent 从「热播榜」进入后详情页恰好标注了「热搜总榜第 1 名」→ 路径错误，应判失败。"
+    },
+    {
+      "id": "cross_step_evidence",
+      "category": "evidence_search",
+      "description": "跨 step 搜索证据——不局限于 subtask 边界",
+      "prompt_text": "**跨 step 搜索**：一个 subtask 的目标可能在它记录的最后一步**之前或之后**的步骤中实现。当预期步骤找不到证据时，检查周围步骤（global_step ± 2~3）。也检查附近步骤的 screenshot_before——它往往比 screenshot_after 更好地捕捉中间状态。subtask 名称只是提示，实际画面可能出现在相邻步骤中。"
+    },
+    {
+      "id": "playback_ui_tree_verification",
+      "category": "media_playback",
+      "description": "用 UI tree 验证播放状态——截图被遮挡时的主要证据来源",
+      "prompt_text": "**用 UI tree 验证播放**：当截图无法清晰判断播放状态时（广告遮挡控件、文字太小），通过 fetch_step_detail(detail_type='ui_tree_after_extracted', global_step=N) 加载处理后的 UI tree。UI tree 提供**确切的文本和控件类型**——它不受视觉遮挡影响。检查以下条件：\n1. 存在 text=「正在播放」或 class=SeekBar 或 class=ProgressBar 的节点 → 确认正在播放，无论截图显示什么。\n2. 附近的节点（同一 ViewGroup，bounds 坐标接近）包含预期的剧名/标题 → 确认播放的是正确内容。\n3. ⚠️ 注意：UI tree 的 selected/checked/focused 属性对国产 App（腾讯视频、抖音等）不可靠——许多 App 使用自定义 View 渲染选中态，不会设置 Android accessibility 属性。当 UI tree 的 selected/checked 与截图视觉冲突时，以截图为准。"
+    },
+    {
+      "id": "visual_verification_limited",
+      "category": "vlm_limitations",
+      "description": "VLM 视觉判断受限时的 fallback 策略",
+      "prompt_text": "**VLM 视觉受限时**（小图标、开关状态）：先用 detect_image_changes 找到变化区域，再 inspect 标注后的 diff 图。如果仍无法确认，在 evidence 字段中标注局限性（如「VLM 在此分辨率下无法区分该图标状态」），然后综合所有可用信号（周围 UI 上下文、操作语义、before/after 差异）做出判定。不要用点击次数或切换序列逻辑作为唯一证据。"
+    },
+    {
+      "id": "fallback_screenshot_discovery",
+      "category": "evidence_search",
+      "description": "轨迹缺失截图时的磁盘扫描 fallback",
+      "prompt_text": "**fetch_step_detail 返回错误时**：首先调用 detail_type='list_all_screenshots' 扫描磁盘上所有可用截图。磁盘上存在但 trajectory 未记录的截图**仍然是有效证据**。列出后使用 global_step 加载任何可能包含所需证据的额外截图。"
+    },
+    {
+      "id": "term_equivalence",
+      "category": "semantic_matching",
+      "description": "术语等价——以下词组在评估时视为等价，不因名称不同而判失败",
+      "prompt_text": "**术语等价表**——以下词组在任务判定中视为**等价**，agent 找到其中任一都算正确：\n  - 「收官之战」=「收官宴」=「收官」\n  - 「第X集」=「第X期」=「X」  （集号和期号可互换）\n  - 「热播」=「热播榜」=「热门」  （同一榜单的不同称呼）\n  - 「VIP」=「会员」=「付费」\n  - 「选集」=「剧集列表」=「分集」\n判定时如果 checklist 写的是其中一种表述而实际页面显示的是另一种，不应因此判失败。"
+    },
+    {
+      "id": "term_distinction",
+      "category": "semantic_matching",
+      "description": "术语区分——以下词组不可混淆，名称不同意味着 agent 走了错误路径",
+      "prompt_text": "**术语区分表**——以下词组**不可混淆**，它们指向不同的页面/功能：\n  - 「热搜榜」≠「热播榜」（一个是搜索热度排名，一个是播放量排名，是不同的榜单 tab）\n  - 「飙升榜」≠「热搜榜」（不同的排名维度）\n  - 「电影」≠「电视剧」（不同的内容频道）\n  - 「MV」≠「歌曲」≠「短视频」\n  - 「评论」≠「弹幕」\n判定时如果任务要求进入「热搜榜」但 agent 实际进入了「热播榜」，即使最终播放的剧集相同也应判对应 checklist item 失败——因为路径错误。参考 term_equivalence 规则区分哪些是等价表述、哪些是不同榜单。"
+    },
+    {
+      "id": "booking_completion_rule",
+      "category": "task_completion",
+      "description": "预约/挂号类：确认预约信息页 = 成功",
+      "prompt_text": "**预约/挂号类任务判定**：agent 到达「确认预约信息」页面，且页面显示正确的医院、科室、日期等信息 → 判定为 PASSED。验证码输入、卡号输入、手机号验证是 app 自身的安全机制，agent 无法自动完成，不应因此判失败。只要关键预约信息（医院+科室+日期+医生）正确显示在确认页面上，即视为任务完成。"
+    },
+    {
+      "id": "query_empty_result_rule",
+      "category": "task_completion",
+      "description": "查询类：暂无记录 = 成功",
+      "prompt_text": "**查询/查看类任务判定（适用于所有 App）**：对于以下类型的任务，agent 的目标是**正确导航到目标页面**，而不是保证页面中一定有数据：\n  - 收藏列表（我的收藏、收藏的节目/视频/文章）\n  - 预约记录（我的预约、挂号记录）\n  - 观看/浏览历史（播放记录、浏览足迹）\n  - 点赞/订阅/关注列表\n  - 订单/交易记录（我的订单、充值记录）\n  - 健康档案（用药清单、门诊记录、检查报告）\n  - 任何其他「查看我的 XXX」类型的任务\n\n判定规则：agent 正确导航到了目标页面（URL/页面标题/页面特征匹配）→ 即使页面显示「暂无记录」「暂无数据」「空空如也」「没有收藏」等空状态，也应判定为 **PASSED**。\n\n关键判断依据：**路径正确性**，而非**数据是否存在**。数据为空不代表 agent 操作有误——用户可能确实没有收藏/预约/购买过任何内容。仅在以下情况判失败：\n  a) agent 导航到错误页面（如进入了「历史记录」而非「收藏列表」）\n  b) agent 设置了错误的筛选条件（如任务要求查看「节目」收藏但 agent 停留在「视频」tab 且未尝试切换）\n  c) agent 在到达目标页面前提前终止或卡在其他页面\n\n⚠️ checklist 生成时注意：对查看类任务，checklist item 应描述「进入了 XX 页面」而非「XX 页面显示了 YY 内容」。如果已有 checklist item 描述页面内容，应用此规则覆盖判定。"
+    }
+  ]
+}

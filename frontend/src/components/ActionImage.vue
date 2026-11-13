@@ -32,9 +32,11 @@ const props = withDefaults(
 )
 const emit = defineEmits<{ 'editing-change': [editing: boolean] }>()
 
-const coordinates = useCoordinateInfo(() => props.coordinateInfo ? undefined : props.coordinateSource, () => props.agentType)
+const kind = computed(() => actionKind(props.action))
+const needsCoordinates = computed(() => props.showOverlay && ['click', 'long_press', 'swipe'].includes(kind.value))
+const coordinates = useCoordinateInfo(() => !needsCoordinates.value || props.coordinateInfo ? undefined : props.coordinateSource, () => props.agentType)
 const coordinateInfo = computed(() => props.coordinateInfo ?? coordinates.coordinateInfo.value)
-const coordinateNotice = computed(() => coordinateInfo.value.space === 'unknown'
+const coordinateNotice = computed(() => !needsCoordinates.value ? '' : coordinateInfo.value.space === 'unknown'
   ? coordinateInfo.value.reason || '坐标信息不足，保留原图及标框' : coordinates.error.value)
 
 const naturalWidth = ref(1080)
@@ -47,7 +49,6 @@ const saving = ref(false)
 const dragStart = ref<Point | null>(null)
 const draftBBox = ref<BBox | null>(null)
 const markerId = `arrow-${Math.random().toString(36).slice(2)}`
-const kind = computed(() => actionKind(props.action))
 const bbox = computed(() => parseBBox(props.actionsBox))
 const clickPoint = computed(() =>
   actionPoint(props.action.coordinate, naturalWidth.value, naturalHeight.value, coordinateInfo.value),
@@ -254,7 +255,7 @@ function onLoad(event: Event) {
       </div>
     </div>
     <el-empty v-else description="截图加载失败" :image-size="72" />
-    <p v-if="showOverlay && coordinateNotice" class="action-image__coordinate-notice" role="status">{{ coordinateNotice }}</p>
+    <p v-if="coordinateNotice" class="action-image__coordinate-notice" role="status">{{ coordinateNotice }} <button v-if="coordinates.error.value && coordinateSource && !coordinates.conflict.value" type="button" :disabled="coordinates.loading.value" @click="coordinates.reload">重试读取坐标</button></p>
     <el-dialog v-if="allowZoom" v-model="previewVisible" title="截图放大预览" width="min(1200px, 96vw)" append-to-body destroy-on-close>
       <div class="action-image__zoom-viewport">
         <ActionImage v-if="previewVisible" :image-url="imageUrl" :action="action" :actions-box="actionsBox"

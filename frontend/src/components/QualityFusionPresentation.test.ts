@@ -33,7 +33,7 @@ describe('fusion result and tree display', () => {
       expect(html).toContain('Rubric 总分 G')
       expect(html).toContain('4.50 / 5')
       expect(html).toContain('2 / 3 · 66.7%')
-      expect(html).toContain('partial_success')
+      expect(html).toContain('部分成功')
       expect(html).toContain('原有逐步评价')
       expect(html).toContain('目标证据')
     }
@@ -56,7 +56,7 @@ describe('fusion result and tree display', () => {
     expect(html).toContain('暂无有效评分')
     expect(html).toContain('2.85 / 5')
     expect(html).toContain('checklist_incomplete')
-    expect(html).toContain('状态：error')
+    expect(html).toContain('状态：评测失败')
     expect(html).toContain('质检轨迹缺少可供采集服务只读访问的原件目录')
     expect(html).not.toContain('0.900')
     const treeHtml = await renderToString(createSSRApp(ReferenceTrajectoryTree, {

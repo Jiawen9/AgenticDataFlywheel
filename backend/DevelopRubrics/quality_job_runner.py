@@ -37,6 +37,7 @@ from backend import pipeline_diagnostics as diagnostics
 from backend.quality_execution import (
     execution_context, execution_write_guard, check_execution, commit_record_entry,
     committed_result, QualityExecutionRevoked,
+    save_partial_result,
 )
 from adarubric.llm.request_control import observe_requests, RequestConfigurationError
 
@@ -270,8 +271,20 @@ async def _run_frozen(run_id: str, task_ids: list[str], job_id: str,
             queued["task_fingerprints"].get(task) != input_fingerprints.get(task) for task in task_ids):
         raise StaleTaskInput("质检配置已变化，请重新提交")
     completed = 0
+    checklist_completed = 0
+    checklist_failed = 0
     summaries: list[dict[str, Any]] = []
     task_results: list[dict[str, Any]] = []
+
+    def report_progress(**changes):
+        percent = (5 + round(45 * completed / max(total, 1)) + round(45 * checklist_completed / max(total, 1))
+                   if checklist_options else 20 + round(75 * completed / max(total, 1)))
+        progress(completed_trajectories=completed, total_trajectories=total,
+                 completed_rubric_trajectories=completed, total_rubric_trajectories=total,
+                 completed_checklist_trajectories=checklist_completed,
+                 failed_checklist_trajectories=checklist_failed,
+                 total_checklist_trajectories=total if checklist_options else 0,
+                 percent=min(95, percent), **changes)
 
     for task_index, task_id in enumerate(task_ids, 1):
         task = tasks.get(task_id)
@@ -287,9 +300,65 @@ async def _run_frozen(run_id: str, task_ids: list[str], job_id: str,
         by_id = {item.trajectory_id: item for item in trajectories}
         if terminals != set(by_id):
             raise ValueError(f"tree/workbook trajectory mismatch for {task_id}: tree={sorted(terminals)}, workbook={sorted(by_id)}")
+        serialized = {}
+        checklists = {item.trajectory_id: {"status": "pending"} for item in trajectories}
+        definition_digest = None
+        task_result = {"run_id": run_id, "task_id": task_id, "quality_job_id": job_id,
+                       "trajectory_count": len(trajectories), "evaluations": serialized}
+
+        def partial_result():
+            if current is None:
+                return
+            from backend.quality_fusion import enrich_task
+            value = {**task_result, "evaluations": dict(serialized)}
+            if checklist_options:
+                value = enrich_task(value, tree, checklists, [item.trajectory_id for item in trajectories], definition_digest)
+                value["checklist_options"] = checklist_options
+            save_partial_result(DATA_ROOT, job_id, task_id, current["tree_hashes"][task_id],
+                                input_fingerprints[task_id], value)
+
+        partial_result()
+        checklist_task = None
+        if checklist_options:
+            from backend.quality_checklist import build_task, evaluate_task, digest
+            from backend.quality_fusion import enrich_task
+            try:
+                report_progress(stage="checklist_preparing", current_task=task_id)
+                checklist_task = build_task(task_id, task, trajectories, raw_root=manifest.get("raw_root"),
+                                            source_annotation=manifest.get("source_annotation"), allow_partial=True)
+            except QualityExecutionRevoked:
+                raise
+            except Exception as exc:
+                safe_error = diagnostics.format_exception(exc).get("message") or type(exc).__name__
+                checklists = {item.trajectory_id: {"status": "error", "error": safe_error[:1000],
+                              "failure": failure_from_exception(exc)} for item in trajectories}
+                # Preserve already paid-for Rubric checkpoints, but do not call
+                # a model for a task whose source cannot currently be evaluated.
+                checkpoint_key = quality_task_fingerprints(current).get(task_id) if current is not None else None
+                checkpoint = (short_cache_directory(DATA_ROOT, run_id, "quality_checkpoint", checkpoint_key,
+                    CHECKPOINT_ROOT / run_id) / f"{task_id}.jsonl" if checkpoint_key else CHECKPOINT_ROOT / run_id / f"{task_id}.jsonl")
+                existing = EVAL.load_existing_evaluations_jsonl(checkpoint)
+                signature = EVAL._settings_signature(EVAL._evaluation_settings(config))
+                for trajectory in trajectories:
+                    key = EVAL._evaluation_key(task_id=task_id, run_number=1,
+                        trajectory_id=trajectory.trajectory_id, settings_signature=signature)
+                    if key in existing:
+                        serialized[trajectory.trajectory_id] = json.loads(existing[key].model_dump_json(exclude={"rubric_used"}))
+                        completed += 1
+                task_result = enrich_task(task_result, tree, checklists, [item.trajectory_id for item in trajectories])
+                task_result.update(checklist_options=checklist_options, primary_error=safe_error[:1000], completed_at=_now())
+                checklist_completed += len(trajectories)
+                checklist_failed += len(trajectories)
+                partial_result()
+                task_results.append(task_result)
+                summaries.append({**{key: task_result[key] for key in ("task_id", "completed_at", "trajectory_count",
+                    "scoring_version", "fusion_complete", "fusion_eligible_count", "primary_error") if key in task_result},
+                    "results_available": bool(serialized)})
+                report_progress(stage="fusing", current_task=task_id, results_available=bool(serialized))
+                continue
         rubric_path = _matching_rubric(task_id)
         if rubric_path is None:
-            progress(stage="generating_rubric", current_task=task_id, task_index=task_index, percent=max(5, round(15 * completed / max(total, 1))))
+            report_progress(stage="generating_rubric", current_task=task_id, task_index=task_index)
             with diagnostics.trace_context(task_id=task_id, concurrency=1):
                 rubric_path = await _generate_rubric(task, trajectories, config, workbook)
         else:
@@ -303,6 +372,7 @@ async def _run_frozen(run_id: str, task_ids: list[str], job_id: str,
             EVAL.initialize_evaluations_jsonl(checkpoint, resume=True)
             existing = EVAL.load_existing_evaluations_jsonl(checkpoint)
             settings = EVAL._evaluation_settings(config)
+            task_result.update(rubric=json.loads(rubric.model_dump_json()), rubric_path=str(rubric_path), evaluation_settings=settings)
             signature = EVAL._settings_signature(settings)
             cached_count = 0
             for trajectory in trajectories:
@@ -314,24 +384,23 @@ async def _run_frozen(run_id: str, task_ids: list[str], job_id: str,
                 )
                 if key in existing:
                     cached_count += 1
+                    serialized[trajectory.trajectory_id] = json.loads(existing[key].model_dump_json(exclude={"rubric_used"}))
             completed += cached_count
             if cached_count:
                 diagnostics.log_event("quality_checkpoint_reused", task_id=task_id, source_path=str(checkpoint),
                                       reused_trajectory_count=cached_count)
-                progress(
-                    stage="evaluating", current_task=task_id, task_index=task_index,
-                    completed_trajectories=completed, total_trajectories=total,
-                    percent=20 + round(75 * completed / max(total, 1)),
-                )
+                partial_result()
+                report_progress(stage="evaluating", current_task=task_id, task_index=task_index, results_available=True)
 
             def on_trajectory_complete(evaluation: Any) -> None:
                 nonlocal completed
                 completed += 1
-                progress(
+                serialized[evaluation.trajectory_id] = json.loads(evaluation.model_dump_json(exclude={"rubric_used"}))
+                partial_result()
+                report_progress(
                     stage="evaluating", current_task=task_id,
                     current_trajectory=evaluation.trajectory_id, task_index=task_index,
-                    completed_trajectories=completed, total_trajectories=total,
-                    percent=20 + round(75 * completed / max(total, 1)),
+                    results_available=True,
                 )
 
             temperature = float(config.get("evaluation_temperature", 0.0))
@@ -363,37 +432,71 @@ async def _run_frozen(run_id: str, task_ids: list[str], job_id: str,
         average = sum(item.global_score for item in evaluations) / len(evaluations)
         passed = sum(1 for item in evaluations if item.passed_threshold)
         task_result = {
-            "run_id": run_id, "task_id": task_id, "completed_at": _now(),
+            "run_id": run_id, "task_id": task_id, "quality_job_id": job_id, "completed_at": _now(),
             "rubric": json.loads(rubric.model_dump_json()), "rubric_path": str(rubric_path),
             "evaluation_settings": settings, "trajectory_count": len(evaluations),
             "average_score": average, "passed_count": passed, "evaluations": serialized,
         }
         if checklist_options:
-            from backend.quality_checklist import build_task, evaluate_task, digest
-            from backend.quality_fusion import enrich_task
+            source_digest = input_fingerprints.get(task_id) or digest({"tree": tree, "task": checklist_task})
+            local = checklist_options.get("execution_backend") == "platform"
+            completed_before, failed_before = checklist_completed, checklist_failed
+            task_completed_count = 0
+            def checklist_progress(**changes):
+                nonlocal checklist_completed, checklist_failed, checklists, definition_digest, task_completed_count
+                observed = changes.get("completed_checklist_trajectories")
+                if type(observed) is int:
+                    task_completed_count = max(0, min(len(trajectories), observed))
+                if local:
+                    from backend.quality_checklist_local import get_task_results, get_task_definition
+                    # The executor confirms its ordered candidates one by one.
+                    # Old ledger rows are not new progress until revalidated.
+                    confirmed = {item["trajectory_id"] for item in checklist_task["trajectories"][:task_completed_count]}
+                    checklists.update({ident: row for ident, row in
+                        get_task_results(DATA_ROOT, queued, checklist_task, source_digest).items() if ident in confirmed})
+                    definition = get_task_definition(DATA_ROOT, queued, checklist_task, source_digest) or {}
+                    definition_digest = definition.get("definition_digest")
+                    partial_result()
+                checklist_completed = completed_before + task_completed_count
+                checklist_failed = failed_before + sum(row.get("status") in {"error", "failed", "incomplete"} for row in checklists.values())
+                for field in ("completed_checklist_trajectories", "failed_checklist_trajectories", "total_checklist_trajectories",
+                              "completed_trajectories", "total_trajectories", "percent"):
+                    changes.pop(field, None)
+                report_progress(**changes)
             try:
-                progress(stage="checklist_preparing", current_task=task_id)
-                checklist_task = build_task(task_id, task, trajectories, raw_root=manifest.get("raw_root"))
-                source_digest = input_fingerprints.get(task_id) or digest({"tree": tree, "task": checklist_task})
                 checklists = evaluate_task(DATA_ROOT, queued, checklist_task, source_digest,
-                                          progress=progress, check=lambda: _check_quality_execution())
+                                          progress=checklist_progress, check=lambda: _check_quality_execution())
+                if local:
+                    from backend.quality_checklist_local import get_task_definition
+                    definition_digest = (get_task_definition(DATA_ROOT, queued, checklist_task, source_digest) or {}).get("definition_digest")
             except QualityExecutionRevoked:
                 raise
             except Exception as exc:
                 # Keep Rubric results and diagnostics; one failed Checklist must
                 # not erase completed trajectories or older published artifacts.
                 safe_error = diagnostics.format_exception(exc).get("message") or type(exc).__name__
-                checklists = {item.trajectory_id: {"status": "error", "error": safe_error[:1000]} for item in trajectories}
-            definitions = {item.get("definition_digest") for item in checklists.values() if item.get("status") == "complete"}
-            definition_digest = next(iter(definitions)) if len(definitions) == 1 else "definition_mismatch"
-            progress(stage="fusing", current_task=task_id)
+                for item in trajectories:
+                    if checklists.get(item.trajectory_id, {}).get("status") != "complete":
+                        checklists[item.trajectory_id] = {"status": "error", "error": safe_error[:1000], "failure": failure_from_exception(exc)}
+            if not local:
+                definitions = {item.get("definition_digest") for item in checklists.values() if item.get("definition_digest")}
+                definition_digest = next(iter(definitions)) if len(definitions) == 1 else None
+            checklist_completed = completed_before + len(trajectories)
+            checklist_failed = failed_before + sum(row.get("status") != "complete" for row in checklists.values())
+            report_progress(stage="fusing", current_task=task_id)
             task_result = enrich_task(task_result, tree, checklists,
                                       [item.trajectory_id for item in trajectories], definition_digest)
             task_result["checklist_options"] = checklist_options
+            partial_result()
         task_results.append(task_result)
         summary_fields = ("task_id", "completed_at", "trajectory_count", "average_score", "passed_count",
                           "scoring_version", "fusion_complete", "fusion_eligible_count", "checklist_definition_digest")
-        summaries.append({key: task_result[key] for key in summary_fields if key in task_result})
+        summary = {key: task_result[key] for key in summary_fields if key in task_result}
+        summary["results_available"] = bool(serialized)
+        if checklist_options and not task_result.get("fusion_complete"):
+            from backend.quality_fusion import completion_summary
+            summary["primary_error"] = completion_summary({"tasks": [task_result]}).get("error")
+        summaries.append(summary)
 
     progress(stage="publishing", completed_trajectories=completed, total_trajectories=total, percent=97)
     if current is not None:

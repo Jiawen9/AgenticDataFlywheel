@@ -16,6 +16,30 @@ const source = (name: string, version = 'v1'): CoordinateSource => ({ kind: 'bat
 afterEach(() => { scopes.splice(0).forEach(scope => scope.stop()); vi.restoreAllMocks() })
 
 describe('visible step coordinate lookup', () => {
+  it('keeps an error stable across identical source rerenders and retries only on request', async () => {
+    const request = vi.spyOn(api, 'coordinateInfo').mockRejectedValue(new ApiError('gateway 404', 404))
+    const view = setup(source('stable-error')); await flush()
+    const message = view.error.value
+    for (let n = 0; n < 4; n++) { view.selection.value = { ...source('stable-error') }; await flush() }
+    expect(request).toHaveBeenCalledTimes(1)
+    expect(view.error.value).toBe(message)
+    request.mockResolvedValue({ coordinate_info: { space: 'pixel', width: 1200, height: 2640 }, annotation_version: 'v1' })
+    view.reload(); await flush()
+    expect(request).toHaveBeenCalledTimes(2); expect(view.error.value).toBe('')
+    expect(view.coordinateInfo.value.width).toBe(1200)
+  })
+  it('uses the existing task-tree GET and binds cached coordinates to the tree version', async () => {
+    const request = vi.spyOn(api, 'treeCoordinateInfo').mockImplementation(async src => ({ ...src, coordinate_info: { space: 'pixel', width: 1200, height: 2664 } }))
+    const oldPost = vi.spyOn(api, 'coordinateInfo')
+    const identity = { kind: 'tree' as const, batch_id: 'tree-source', task_id: 'task/1', tree_version: 'tree1', annotation_version: 'ann1', trajectory_id: 'traj1', image: 'traj1/step1.jpg' }
+    const view = setup(identity); await flush()
+    setup({ ...identity }); await flush(); expect(request).toHaveBeenCalledTimes(1)
+    view.selection.value = { ...identity, tree_version: 'tree2' }; await flush()
+    expect(request).toHaveBeenCalledTimes(2); expect(oldPost).not.toHaveBeenCalled()
+    request.mockResolvedValue({ ...identity, coordinate_info: { space: 'pixel', width: 1200, height: 2664 } })
+    view.selection.value = { ...identity, task_id: 'another-task' }; await flush()
+    expect(view.conflict.value).toBe(true); expect(view.coordinateInfo.value.space).toBe('unknown')
+  })
   it('deduplicates visible requests and caches by batch, annotation version, trajectory and image', async () => {
     const request = vi.spyOn(api, 'coordinateInfo').mockImplementation(async src => ({ coordinate_info: { space: 'pixel', width: 1080, height: 2400 }, annotation_version: src.annotation_version! }))
     const a = setup(source('cache')), b = setup(source('cache'))
