@@ -133,6 +133,44 @@ class QualityChecklistTests(unittest.TestCase):
         self.assertEqual(result["key_elements"], "priority_1: target")
         self.assertEqual(original.read_bytes(), before)
 
+    def test_checklist_uses_frozen_plain_task_without_changing_rubric_input(self):
+        from backend.DevelopRubrics.trajectory_tools.gui_trajectory_excel import SYSTEM_PROMPT
+        text = "打开爱奇艺，进入我的页面\n确认登录状态。"
+        task = SimpleNamespace(instruction=f"{SYSTEM_PROMPT}\n\nTask:\n{text}",
+                               context={"task_description": text})
+        before = deepcopy(vars(task))
+        trajectory = SimpleNamespace(trajectory_id="a", metadata={"source_directory": str(self.root)})
+        result = build_task("t", task, [trajectory])
+        self.assertEqual(result["task"], text)
+        self.assertEqual(vars(task), before)
+
+    def test_exact_legacy_gui_wrapper_is_removed_without_context(self):
+        from backend.DevelopRubrics.trajectory_tools.gui_trajectory_excel import SYSTEM_PROMPT
+        trajectory = SimpleNamespace(trajectory_id="a", metadata={"source_directory": str(self.root)})
+        for newline in ("\n", "\r\n"):
+            with self.subTest(newline=repr(newline)):
+                text = "搜索 Task: 文本，再返回主页"
+                instruction = SYSTEM_PROMPT + newline * 2 + "Task:" + newline + text
+                task = SimpleNamespace(instruction=instruction, context={})
+                self.assertEqual(build_task("t", task, [trajectory])["task"], text)
+                self.assertEqual(task.instruction, instruction)
+
+    def test_plain_instruction_and_unknown_wrappers_are_not_guessed(self):
+        trajectory = SimpleNamespace(trajectory_id="a", metadata={"source_directory": str(self.root)})
+        for text in ("打开搜索，输入 Task: 示例", "Unknown instructions\n\nTask:\n打开页面"):
+            with self.subTest(text=text):
+                task = SimpleNamespace(instruction=text, context={})
+                self.assertEqual(build_task("t", task, [trajectory])["task"], text)
+
+    def test_frozen_task_is_not_replaced_with_another_original_task(self):
+        source = self.root / "_trajectory_for_evaluate.json"
+        source.write_text(json.dumps({"task": "另一项任务", "key_elements": "打开页面"}), encoding="utf-8")
+        before = source.read_bytes()
+        trajectory = SimpleNamespace(trajectory_id="a", metadata={"source_directory": str(self.root)})
+        task = SimpleNamespace(instruction="Rubric instruction", context={"task_description": "本次冻结任务"})
+        self.assertEqual(build_task("t", task, [trajectory])["task"], "本次冻结任务")
+        self.assertEqual(source.read_bytes(), before)
+
     def test_unique_profile_default_and_multiple_profiles_require_selection(self):
         with patch("backend.model_iteration.get_profiles", return_value={"profiles": [{"id": "r", "name": "r", "digest": "d"}]}):
             self.assertEqual(settings(self.root, store=self.remote)["evaluation_profile_id"], "r")
