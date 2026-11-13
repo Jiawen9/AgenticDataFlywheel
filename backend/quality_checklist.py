@@ -1,6 +1,7 @@
 """Platform bridge to the existing collector Checklist evaluator (no local fork)."""
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 import json
 import os
@@ -215,6 +216,25 @@ def cancel_remote_jobs(root, job_id, *, store=None):
         records.update("quality_checklist_jobs", key, update)
 
 
+def _result_checklist(row, state):
+    """Keep the collector's failure reason beside its partial checklist.
+
+    Collector failures carry error on the result row, while checklist still
+    contains its frozen definition and counts. A truthy partial checklist must
+    not hide that error or inherit another trajectory's job-level failure.
+    """
+    raw = row.get("checklist")
+    checklist = deepcopy(raw) if isinstance(raw, dict) and raw else {"status": "error"}
+    error = checklist.get("error")
+    if checklist.get("status") != "complete":
+        error = error or row.get("error") or state.get("error") or (
+            "Checklist 未返回完整评测结果；采集端轨迹状态：" + str(row.get("status") or "unknown"))
+    if error:
+        from .pipeline_diagnostics import sanitize
+        checklist["error"] = str(sanitize(error))[:2000]
+    return checklist
+
+
 def evaluate_task(root, job, task_manifest, input_digest, *, progress=None, check=None, store=None, poll_seconds=2):
     """Resume one deterministic remote job; completed candidates stay immutable."""
     store = store or _store(root)
@@ -282,7 +302,7 @@ def evaluate_task(root, job, task_manifest, input_digest, *, progress=None, chec
                 ident = row.get("trajectory_id")
                 if row.get("task_id") != task_manifest["task_id"] or ident not in expected or ident in results:
                     raise ValueError("Checklist result identity differs from frozen input")
-                results[ident] = row.get("checklist") or {"status": "error", "error": row.get("error") or "checklist_result_missing"}
+                results[ident] = _result_checklist(row, state)
             offset += len(items)
             if not page.get("has_more"):
                 break
