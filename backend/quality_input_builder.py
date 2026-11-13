@@ -6,7 +6,7 @@ from contextlib import suppress
 from contextvars import copy_context
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from backend.file_io import io_path
+from backend.file_io import io_path, resolve_path
 
 from typing import Any, Callable
 
@@ -44,7 +44,7 @@ def build_quality_workbook(*, grouped: dict[str, list[tuple[str, list[Any]]]], t
         summarizer = QwenSummarizer(values["MODEL_NAME"], values["MODEL_URL"], values["YUNAI_API_KEY"], FINAL_ANSWER_CACHE,
                                     http_options=model_http_options(values))
     try:
-        return _build_quality_workbook(grouped=grouped, task_goals=task_goals, output=output,
+        return _build_quality_workbook(grouped=grouped, task_goals=task_goals, trajectory_root=trajectory_root, output=output,
             progress=progress, summarizer=summarizer, max_concurrent=max_concurrent, model=values["MODEL_NAME"])
     finally:
         if owned:
@@ -53,10 +53,13 @@ def build_quality_workbook(*, grouped: dict[str, list[tuple[str, list[Any]]]], t
 
 
 def _build_quality_workbook(*, grouped: dict[str, list[tuple[str, list[Any]]]],
-                            task_goals: dict[str, str], output: Path,
+                            task_goals: dict[str, str], trajectory_root: Path, output: Path,
                             progress: Callable[[dict[str, Any]], None] | None,
                             summarizer: Any, max_concurrent: int,
                             model: str) -> tuple[int, int, int]:
+    if not Path(trajectory_root).is_absolute():
+        raise ValueError("质检输入原件根目录必须为明确的绝对路径")
+    raw_root = resolve_path(trajectory_root)
     tasks = {task_id: TaskRecord(task_id, task_goals.get(task_id, task_id)) for task_id in grouped}
     prepared: list[tuple[str, str, str, str, list[StepRecord]]] = []
     for task_id, items in grouped.items():
@@ -77,7 +80,11 @@ def _build_quality_workbook(*, grouped: dict[str, list[tuple[str, list[Any]]]],
                      "source_identity": step.identity_dict() if hasattr(step, "identity_dict") else {}}, step.observation,
                     str(Path(screenshot).with_name(f"{prefix}_model_request.json")),
                     str(Path(screenshot).with_name(f"{prefix}_model_response.json")), screenshot, ""))
-            source_directory = str(Path(retained_steps[0].image).parent)
+            image_path = Path(retained_steps[0].image)
+            source_path = resolve_path(image_path if image_path.is_absolute() else raw_root / image_path)
+            if not source_path.is_relative_to(raw_root):
+                raise ValueError(f"质检任务 {task_id} / 轨迹 {trajectory_id} 的原件目录超出登记根目录")
+            source_directory = str(source_path.parent)
             prepared.append((task_id, task_text, trajectory_id, source_directory, records))
 
     total = len(prepared)

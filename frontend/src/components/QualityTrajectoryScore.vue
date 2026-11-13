@@ -16,7 +16,7 @@ const dimensions = computed<DimensionEvaluation[]>(() => {
 <template>
   <div class="trajectory-score" data-testid="trajectory-score">
     <template v-if="evaluation">
-      <div class="fused"><span>本条轨迹融合分 F</span><strong>{{ fused === null ? '未评测' : fused.toFixed(3) }}</strong></div>
+      <div class="fused"><span>本条轨迹融合分 F</span><strong>{{ fused === null ? (evaluation.fusion ? '暂无有效评分' : '未评测') : fused.toFixed(3) }}</strong></div>
       <p v-if="evaluation.fusion?.invalid_reasons?.length" class="score-note">{{ evaluation.fusion.invalid_reasons.join('；') }}</p>
       <p v-else-if="!evaluation.fusion" class="score-note">历史结果尚未进行 Checklist 融合评分。</p>
       <div class="score-section"><b>Rubric 总分 G</b><strong>{{ scoreText(evaluation.global_score, 2) }} / 5</strong><span>{{ evaluation.passed_threshold ? 'Rubric 达标' : 'Rubric 未达标' }}</span></div>

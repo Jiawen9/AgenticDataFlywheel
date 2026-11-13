@@ -156,7 +156,7 @@ describe('business batch quality workspace', () => {
 
 
 describe('Pipeline quality waiting', () => {
-  it('does not request missing upstream artifacts, and loads each result only after readiness', async () => {
+  it('waits for the tree, but reads partial scoring before downstream readiness', async () => {
     let treePending = true, qualityPending = true
     const { client, flow } = setup({ waitingForTree: () => treePending, waitingForQuality: () => qualityPending })
     await flow.loadBatches('one')
@@ -166,12 +166,96 @@ describe('Pipeline quality waiting', () => {
     expect(client.runQuality).not.toHaveBeenCalled()
     treePending = false; await flow.refresh()
     expect(client.batchTree).toHaveBeenCalledWith('one')
-    expect(client.runQuality).not.toHaveBeenCalled()
+    expect(client.runQuality).toHaveBeenCalledWith('one')
+    expect(client.correctionRecommendation).not.toHaveBeenCalled()
     expect(flow.currentTree.value?.batch_id).toBe('one')
     qualityPending = false; await flow.refresh()
     expect(client.runQuality).toHaveBeenCalledWith('one')
     expect(client.correctionRecommendation).toHaveBeenCalledWith('one')
     flow.dispose()
+  })
+
+  it('exposes ten partial evaluations and Checklist errors after the Pipeline quality stage fails', async () => {
+    const { client, flow } = setup({ waitingForQuality: () => true })
+    const sourceError = '质检轨迹缺少可供采集服务只读访问的原件目录'
+    const evaluations = Object.fromEntries(Array.from({ length: 10 }, (_, index) => [`tr${index}`, {
+      trajectory_id: `tr${index}`, global_score: 2.8548, step_evaluations: [],
+      checklist: { status: 'error', error: sourceError },
+      fusion: { valid: false, score: null, invalid_reasons: ['checklist_incomplete'] },
+    }]))
+    client.runQuality.mockResolvedValue({ run_id: 'one', tasks: [{ task_id: 'A', status: 'succeeded', rubric_ready: true, scoring_version: 'checklist_fusion_v1', fusion_complete: false, fusion_eligible_count: 0 }] })
+    client.taskQuality.mockResolvedValue({ run_id: 'one', task_id: 'A', evaluations,
+      node_scores: { '1': { q: null, scored_count: 0, total_count: 10, status: 'unavailable' } },
+    } as TaskQualityResult)
+    await flow.selectBatch('one'); await flow.viewTree('A')
+    expect(client.taskQuality).toHaveBeenCalledWith('one', 'A')
+    expect(Object.keys(flow.quality.value?.evaluations ?? {})).toHaveLength(10)
+    expect(flow.quality.value?.evaluations.tr0?.global_score).toBe(2.8548)
+    expect(flow.quality.value?.evaluations.tr0?.checklist?.error).toBe(sourceError)
+    expect(flow.quality.value?.node_scores?.['1']?.scored_count).toBe(0)
+    expect(flow.error.value).toBe('')
+    expect(client.correctionRecommendation).not.toHaveBeenCalled()
+    expect(flow.recommendation.value).toBeNull()
+  })
+
+  it('refreshes a selected task from pending to partial without requiring whole-batch success', async () => {
+    const { client, flow } = setup({ waitingForQuality: () => true })
+    await flow.selectBatch('one'); await flow.viewTree('A')
+    expect(client.taskQuality).not.toHaveBeenCalled()
+    expect(flow.error.value).toBe('')
+    client.runQuality.mockResolvedValue({ run_id: 'one', tasks: [{ task_id: 'A', status: 'succeeded', rubric_ready: true, fusion_complete: false }] })
+    await flow.refresh()
+    expect(flow.selectedTaskId.value).toBe('A')
+    expect(client.taskQuality).toHaveBeenCalledWith('one', 'A')
+    expect(flow.quality.value?.task_id).toBe('A')
+    expect(client.correctionRecommendation).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    [409, '该任务尚无有效质检结果，请先完成质检'],
+    [404, '该任务还没有质检结果'],
+  ])('keeps the tree when a previously available quality result becomes absent (%s)', async (status, message) => {
+    const { client, flow } = setup({ waitingForQuality: () => true })
+    client.runQuality.mockResolvedValue({ run_id: 'one', tasks: [{ task_id: 'A', status: 'succeeded', rubric_ready: true }] })
+    client.taskQuality.mockRejectedValue(new ApiError(String(message), Number(status)))
+    await flow.selectBatch('one'); await flow.viewTree('A')
+    expect(flow.tree.value?.id).toBe(1)
+    expect(flow.quality.value).toBeNull()
+    expect(flow.error.value).toBe('')
+  })
+
+  it.each([404, 409, 500])('does not hide unrelated quality request failures (%s)', async status => {
+    const { client, flow } = setup({ waitingForQuality: () => true })
+    client.runQuality.mockResolvedValue({ run_id: 'one', tasks: [{ task_id: 'A', status: 'succeeded', rubric_ready: true }] })
+    client.taskQuality.mockRejectedValue(new ApiError('真实请求错误', status))
+    await flow.selectBatch('one'); await flow.viewTree('A')
+    expect(flow.tree.value?.id).toBe(1)
+    expect(flow.quality.value).toBeNull()
+    expect(flow.error.value).toBe('真实请求错误')
+  })
+
+  it('ignores a late failed-task detail after switching tasks in the same batch', async () => {
+    const { client, flow } = setup({ waitingForQuality: () => true }), old = deferred<TaskQualityResult>()
+    client.runQuality.mockResolvedValue({ run_id: 'one', tasks: ['A', 'B'].map(task_id => ({ task_id, status: 'succeeded', rubric_ready: true })) })
+    await flow.selectBatch('one')
+    client.taskQuality.mockReturnValueOnce(old.promise)
+    const first = flow.viewTree('A')
+    await flow.viewTree('B')
+    old.resolve({ run_id: 'one', task_id: 'A' } as TaskQualityResult); await first
+    expect(flow.selectedTaskId.value).toBe('B')
+    expect(flow.tree.value?.label).toBe('B')
+    expect(flow.quality.value?.task_id).toBe('B')
+  })
+
+  it('discards a late recommendation if quality becomes incomplete while it is loading', async () => {
+    let waiting = false
+    const { client, flow } = setup({ waitingForQuality: () => waiting }), old = deferred<CorrectionRecommendation>()
+    client.correctionRecommendation.mockReturnValueOnce(old.promise)
+    const loading = flow.selectBatch('one')
+    waiting = true
+    old.resolve({ batch_id: 'one', status: 'ready', tasks: [] } as unknown as CorrectionRecommendation)
+    await loading
+    expect(flow.recommendation.value).toBeNull()
   })
 })
 

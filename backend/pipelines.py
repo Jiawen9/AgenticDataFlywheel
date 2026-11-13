@@ -245,6 +245,56 @@ class PipelineRuntime:
             return True
         return False
 
+    def quality_incomplete_message(self, pipeline):
+        """Explain the current result gap without changing readiness or retry policy."""
+        from .batch_results import current_tree_payload, current_quality_payload, quality_task_fingerprints
+        batch = pipeline["batch_id"]
+        trees = current_tree_payload(batch, self.root)
+        quality = current_quality_payload(batch, self.root)
+        results = {item["task_id"]: item for item in quality.get("tasks", [])}
+        counts = {item["task_id"]: int(item.get("trajectory_count") or 0) for item in trees.get("tasks", [])}
+        step = next((item for item in pipeline.get("steps", []) if item["id"] == "quality"), {})
+        jobs = self.records.get_many("quality_jobs", step.get("job_ids", []))
+        frozen = {task: job.get("checklist_options") for job in jobs for task in job.get("task_ids", [])}
+        reasons = []
+        for task in pipeline["task_ids"]:
+            if len(reasons) >= 3:
+                break
+            result = results.get(task)
+            if not result:
+                reasons.append(f"任务 {task} 尚无与当前轨迹树匹配的质检结果")
+                continue
+            options = frozen[task] if task in frozen else result.get("checklist_options")
+            expected = quality_task_fingerprints(trees, checklist_options=options).get(task)
+            if quality.get("task_fingerprints", {}).get(task) != expected:
+                reasons.append(f"任务 {task} 的评分输入或配置版本不匹配")
+                continue
+            evaluations = result.get("evaluations") or {}
+            if len(evaluations) != counts.get(task) or not evaluations:
+                reasons.append(f"任务 {task} 评分结果数量 {len(evaluations)}/{counts.get(task, 0)}")
+            if options and result.get("scoring_version") != "checklist_fusion_v1":
+                reasons.append(f"任务 {task} 尚无本次要求的 Checklist 融合结果")
+            elif result.get("scoring_version") == "checklist_fusion_v1":
+                if not options:
+                    reasons.append(f"任务 {task} 缺少冻结的 Checklist 配置")
+                if not result.get("fusion_complete"):
+                    for trajectory, evaluation in evaluations.items():
+                        fusion = evaluation.get("fusion") or {}
+                        if fusion.get("valid") is True:
+                            continue
+                        checklist = evaluation.get("checklist") or {}
+                        reason = (f"Checklist：{checklist['error']}" if checklist.get("error") else
+                                  "评分缺项：" + "、".join(str(code) for code in fusion.get("invalid_reasons", []))
+                                  if fusion.get("invalid_reasons") else "尚无有效融合评分")
+                        reasons.append(f"任务 {task} / 轨迹 {trajectory}：{reason}")
+                        if len(reasons) >= 3:
+                            break
+            if len(reasons) >= 3:
+                break
+        # Errors may contain provider text. Reuse the existing credential scrubber.
+        summary = "；".join(str(diagnostics.sanitize(reason))[:400] for reason in reasons[:3])
+        return "质检结果不完整，暂不能进入下一步：" + (summary or "部分结果尚未完成有效性对账，请查看质检详情")
+
     def jobs(self, step, pipeline):
         if step == "collection":
             return self.collection_runs(pipeline["batch_id"])
@@ -270,6 +320,10 @@ class PipelineRuntime:
         if step == "tree":
             return self.tree.submit(pipeline["task_ids"], batch_id=pipeline["batch_id"])
         if step == "quality":
+            quality_step = next(item for item in pipeline["steps"] if item["id"] == "quality")
+            previous = quality_step.get("retry_job_id") or next(reversed(quality_step.get("job_ids", [])), None)
+            if retry and previous:
+                return self.quality.retry(previous, batch_id=pipeline["batch_id"], task_ids=pipeline["task_ids"])
             return self.quality.submit(task_ids=pipeline["task_ids"], batch_id=pipeline["batch_id"])
         if step == "cot":
             from .pipeline_release import validate_confirmation
@@ -604,6 +658,8 @@ class PipelineManager:
                 self._done(step)
                 return
             if known:
+                if key == "quality" and hasattr(self.runtime, "quality_incomplete_message"):
+                    raise PipelineError(self.runtime.quality_incomplete_message(p))
                 raise PipelineError("作业已结束但整批有效结果不完整，不能继续发布")
         if self.runtime.configurations().get(key) != p["config_fingerprints"].get(key):
             raise PipelineError("处理配置已变化，请结束流程后重新创建")

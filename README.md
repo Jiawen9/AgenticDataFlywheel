@@ -1,13 +1,88 @@
 # Agentic Data Flywheel
 
-一个前后端分离的 GUI Agent 轨迹数据飞轮工程，包含场景任务生成、失败任务扩增、轨迹 Excel
-导出、动作 bbox 标注、受限中间态过滤、任务级轨迹树构建，以及 Vue 轨迹采集与质检界面。
+**项目总文档 · 最近核对：2026-11-13。** 本文件是项目架构、开发交接、配置、使用和当前进展的统一入口，随功能改动持续更新。专题文档保留接口和实现细节，不替代本文件中的项目现状。
 
-运行数据统一读写项目根目录的 `backend_workspace/`：SQLite 保存当前状态，JSON 在流程间流转，各阶段保留 Excel 核对表。后端不扫描旧目录、不从旧 JSON 恢复状态；必需 JSON 缺失时明确失败，不回退 Excel。目录、命令、显式资源准备和产物读取接口见[统一数据存储说明](DATA_STORAGE.md)。
+一个前后端分离的 GUI Agent 轨迹数据飞轮工程，覆盖任务生成与扩增、手机采集与回传、轨迹预处理与标框、建树与质检、专家纠偏、COT、数据发布、云道上传和训练数据总览。
 
-手机工厂新增采集、设备监控与模型迭代评估，运行结果通过 HTTP 回传平台。配置与接入见[手机工厂集成说明](PHONE_FACTORY.md)，采集服务器部署见[独立 9011 服务说明](backend/collector_service/README.md)。
+平台运行数据默认位于项目根目录的 `backend_workspace/`，可用 `ADF_DATA_ROOT` 指定：SQLite 保存当前状态，JSON 在流程间流转，各阶段保留 Excel 核对表。后端不扫描旧目录、不从旧 JSON 恢复状态；必需 JSON 缺失时明确失败，不回退 Excel。目录、命令、显式资源准备和产物读取接口见[统一数据存储说明](DATA_STORAGE.md)。
+
+手机工厂提供采集、设备监控与模型迭代评估，运行结果通过 HTTP 回传平台。平台接入入口见[手机工厂说明](PHONE_FACTORY.md)。实际采集端单独交付，部署以现场启动工程、能力接口和匹配的增量包为准；[仓库内独立服务说明](backend/collector_service/README.md)描述该参考实现，不能据此直接覆盖内网运行工程。
 
 自动流程、采集及评测页面的摘要索引、分页、缓存与创新前端接入见[页面加载说明](PAGE_LOADING.md)。
+
+## 系统边界与数据主线
+
+| 部分 | 职责与修改位置 |
+| --- | --- |
+| 创新平台前端 | 独立维护的接入方；沿用其 API_BASE_URL、网关前缀、路由及组件体系。本仓库提供接口适配说明，不全量覆盖其源码。 |
+| 本仓库自用前端 | `frontend/`，Vue + TypeScript + Vite；处理表单、展示和轮询。 |
+| 平台后端与 CLI | `backend/`，FastAPI；管理批次、作业、数据、质检、修正和发布；通过 `phonefactory_client.py` 调用采集服务。 |
+| 独立采集／评测服务 | 实际启动的采集工程，负责设备执行、封存和对外接口，也包含只读评测器。常用端口为 9011；平台后端常用 8765，实际地址以配置为准。 |
+| 执行引擎 | NewAgent、PipelineAgent 位于采集工程中。评测服务变更不必然意味着手机执行逻辑变化，交付必须分别说明。 |
+
+```mermaid
+flowchart LR
+    I[创新平台前端] --> B[平台后端]
+    F[自用前端] --> B
+    B --> C[平台 CLI]
+    C --> S[独立采集／评测服务]
+    S --> E[NewAgent／PipelineAgent]
+    E --> P[手机]
+    S --> V[只读轨迹评测器]
+    S -->|轨迹回传、状态与报告| B
+```
+
+主数据链路：任务来源 → 冻结采集计划与结果批次 → 逐条原件回传 → 预处理／标框 → Observation／轨迹树 → Rubric／Checklist 质检 → 人工纠偏／COT → 冻结发布 → 云道上传／看板汇总。
+
+已有轨迹独立评测直接读取可访问的原件，日志和报告另存，不重新操作手机，也不通过复制整批轨迹准备输入。采集执行、回传、归档、评测和上传各自记录状态；其中一项成功不代表其余项目完成。
+
+开发时必须区分：任务来源、结果批次、逻辑运行、计划实例（原用例＋手机＋重复序号）、执行尝试、封存产物和结果快照。重试回传不重新采集；续采追加执行尝试并保留旧证据；默认配置只初始化新运行，历史重放和续采使用原冻结配置。
+
+## 模块与专题索引
+
+| 主题 | 入口文档 |
+| --- | --- |
+| 数据目录、阶段产物、数据库与发布保护 | [DATA_STORAGE.md](DATA_STORAGE.md) |
+| 手机工厂和平台集成 | [PHONE_FACTORY.md](PHONE_FACTORY.md)、[采集运行](backend/COLLECTION_RUNS.md) |
+| 任务来源、采集批次 | [统一任务输入](backend/task_generation/COLLECTION_INPUT.md)、[来源批次](backend/task_generation/COLLECTION_BATCHES.md) |
+| 预处理与外部轨迹接入 | [批次预处理](backend/PREPROCESSING.md)、[已有 Rollout 导入](backend/ROLLOUT_IMPORTS.md) |
+| 自动流程、阶段恢复与诊断 | [AUTOMATIC_PIPELINE.md](AUTOMATIC_PIPELINE.md)；新融合选轨规则见下一行 |
+| Rubric／Checklist 融合、Top-1、树节点 Q | [QUALITY_FUSION.md](QUALITY_FUSION.md) |
+| 坐标展示与人工取点 | [COORDINATE_DISPLAY.md](backend/COORDINATE_DISPLAY.md) |
+| 页面摘要、分页、缓存与后端索引 | [PAGE_LOADING.md](PAGE_LOADING.md) |
+| 云道上传、脚本配置与上传范围 | [INTERNAL_UPLOAD.md](backend/data_publishing/INTERNAL_UPLOAD.md) |
+| 外部表格发布、历史数据和训练看板 | [EXTERNAL_IMPORTS.md](backend/data_publishing/EXTERNAL_IMPORTS.md)、[训练数据总览](backend/training_data_overview/README.md) |
+
+专题中的历史验收记录只证明当时版本。接口字段、能力版本、目录和有效模型配置以目标版本代码及现场能力响应为准；发现不一致时应同步修正文档，不能直接把旧示例当成新部署步骤。
+
+## 配置与交付约定
+
+| 配置 | 管理位置 |
+| --- | --- |
+| 平台预处理、建树、Rubric、COT | 平台 `backend/.env` 和各模块配置；Rubric 专用 Python 由 `ADARUBRIC_PYTHON` 指定，见下文。 |
+| 手机执行模型与 Pipeline 规划模型 | 手机工厂配置及采集端能力；新请求显式覆盖时按角色冻结，不能顺带改其它内部角色。 |
+| Checklist 文本／视觉评测模型 | 平台“模型迭代评估”中保存地址、实际模型名、密钥环境变量名；质检复用这份配置，在质检页选规则版本。真实密钥由采集服务进程环境提供。 |
+| 云道上传 | 平台后端配置上传 Python、脚本、token、region、bucket；页面允许调整目标前缀，见上传专题。 |
+| 数据根与访问地址 | `ADF_DATA_ROOT`、平台／采集服务地址及前端代理；端口和模型名示例不是必须使用的固定值。 |
+
+默认交付边界为平台直接改源码、采集端单独增量包、创新平台提供适配说明；每次仍须写明本次实际范围。增量包核对基线，不同基线逐段合并，保留内网配置和增强。开发、离线测试、部署和真机验收分别记录；不把测试通过写成已部署。新增文件必须与修改文件一起同步，不只复制已有同名文件。
+
+平台当前状态与过程件分别保存在 `<DATA_ROOT>/system/app.sqlite` 和 `<DATA_ROOT>/batches/`；回传原件在 `<DATA_ROOT>/raw/collection_batches/`，外部原始输入通常在 `<DATA_ROOT>/raw/rollout_trajectories/`。独立采集工程的 `.http_runs`、归档和设备工作目录不属于平台数据根。清理需按明确运行／批次及其归属执行，不连带删除共享手机工程、平台原件或外部输入。
+
+缺 XML 等质量问题保留原件并判断用途；身份、路径、清单、摘要不一致则隔离。训练预处理和发布资格不因放宽原件接收而自动变化。耗时扫描、压缩、下载和模型请求进入后台；页面优先读摘要，缓存只用于展示，控制操作仍核对权威状态。
+
+## 当前进展与维护记录
+
+| 日期 | 改动及范围 | 验证／部署状态 |
+| --- | --- | --- |
+| 2026-11-13 | 融合评分恢复：修复质检原件相对路径解析，兼容旧树快照；自动流程重试继承原 Checklist 冻结配置，失败时展示具体原因和部分评分。仅平台后端、自用前端。 | 后端两组 119／50 项（去重 153 项）、前端 37 项及类型检查／构建通过；含旧快照 10 条轨迹补 Checklist、Rubric 不重复调用且原件／快照／检查点不变。内网 `b261112-004` 待实际重试验收。无需重采、重预处理或重建树，不需要新采集端包。恢复与适配见 [QUALITY_FUSION.md](QUALITY_FUSION.md#原件路径恢复与失败结果展示2026-11-13)。 |
+| 2026-11-12 | 质检融合：平台接入现有 Checklist，计算 F/Q，更新 Top-1，保护旧草稿；9011 新增只读质检后台任务。 | 平台已写入工作区、采集端增量包已生成。后端两组 82／38 项、采集端 49 项、前端 87 项及类型检查／构建通过。真实模型、内网网关和浏览器视觉待验；本地未执行部署。详见 [QUALITY_FUSION.md](QUALITY_FUSION.md)。 |
+| 2026-11-12 | 平台标框复核：明确执行像素与输出归一化坐标，校验实际动作点，补齐失败响应和转换诊断、有界纠正及托管重试预算。 | 76 项相关后端测试通过，含 1200×2640、点击 (1080,238) 的现场几何条件。真实截图内容与模型返回待内网复现核验。同步范围为平台后端，说明见[标框诊断](backend/PREPROCESSING.md#标框固定步骤失败的诊断与纠正2026-11-12)。 |
+| 2026-11-12 | 建立本 README 作为项目总文档，补齐架构、索引、配置与维护约定，修正过时的质检／上传描述，并同步自动流程专题中的新旧排序规则。 | 仅文档改动；核对本地链接、代码入口和 Markdown 结构，不重跑业务测试。 |
+
+本轮下一步：现场已接入 Checklist 能力的环境只需同步本次平台前后端，在原自动流程重试质检阶段，核对现有 10 条轨迹的 F/Q、错误展示、Rubric 复用及原件不变。首次安装融合评分能力仍需按专题先部署支持 `quality_checklist_jobs.version=1` 的采集端。本次未执行内网部署；现场完成后在本节追加实际结果，不能提前标成已通过。其它历史模块的本地测试和现场状态见对应专题，不由这条记录推断。
+
+**后续维护方式：** 每次相关功能修改都先读本文件，完成后在同一次交付中更新受影响的项目现状、配置／边界和本节记录；详细接口、排障步骤、测试命令放入对应专题并在总索引链接。记录至少写日期、功能、涉及哪一端、同步步骤、已验证项和待验项。单纯文案／样式修正只写必要摘要，不强制重跑采集全链。近期记录保持简短，历史通过 Git 和专题追溯，不把所有聊天内容复制成无限增长的流水账。
 
 ## 主要能力
 
@@ -20,7 +95,9 @@
 - 在网页中浏览任务、轨迹、步骤截图和动作标注。
 - 在线修改 bbox，保存当前标注并形成同版本 JSON/Excel 中间产物。
 - 批量提交任务建树，在质检页面查看分叉、occurrence 和中间态审计。
+- 复用现有 Checklist 评测器，展示 Rubric 维度、融合分 F 和各步骤 Q；新结果按 F 推荐 Top-1。
 - 在网页中直接修正 Action 和步骤，并按 SFT/RL/原生数据分流导出；SOP/COT 由后续模型生成。
+- 冻结发布表格与选中轨迹范围，后台上传云道并汇总训练数据看板。
 
 ## 目录结构
 
@@ -131,7 +208,7 @@ python backend\trajectories_preprocessing.py --batch-id processing-demo-001
 3. 为目标动作生成候选 bbox，并调用 Qwen 复核。
 4. 在同一执行目录生成标框表，并保存标框阶段 JSON/Excel 快照；各批次与执行互不覆盖。
 
-模型响应会写入本地缓存。调用中断后可再次执行命令续跑；任一目标动作标框失败时，
+有效模型响应会写入本地缓存，无效响应及坐标转换过程保存为独立、有界的标框诊断。调用中断后可再次执行命令续跑；任一目标动作标框失败时，
 不会发布不完整的标注 Excel。
 
 如需自定义输入、输出或配置文件，可查看全部参数：
@@ -232,23 +309,25 @@ backend_workspace/system/task_generation/
 
 ### 轨迹质检
 
-1. 选择一次成功建树形成的时间串任务集。
+1. 选择已有当前建树结果的业务批次。
 2. 选择具体任务，查看以桌面为统一起点的 action 前缀树。
-3. 点击节点查看 action、summary、bbox、分类信息和所有 occurrence 截图。
-4. 在中间态审计中查看未计入树的短暂广告、加载或弹窗步骤。
+3. 选择 Checklist 规则并提交质检；Rubric 使用平台现有配置，Checklist 使用“模型迭代评估”保存的文本／视觉模型配置。
+4. 点击节点查看 action、summary、bbox、分类和 occurrence 截图。新评分每个节点显示 Q，终点按轨迹分别显示维度、G、Checklist 和 F；历史结果不伪造 F/Q。
+5. 在中间态审计中查看未计入树的短暂广告、加载或弹窗步骤。
 
-建树结果保存在：
+当前 Observation、轨迹树、质检分别保存到业务批次的阶段产物：
 
 ```text
-backend_workspace/system/trajectory_tree_runs/<完成时间串>/
+<DATA_ROOT>/batches/<batch_id>/03_observation/
+<DATA_ROOT>/batches/<batch_id>/04_tree/
+<DATA_ROOT>/batches/<batch_id>/05_quality/
 ```
 
-作业状态只保存到 SQLite，不再写状态 JSON 镜像。阶段树和 Observation 保存在 `backend_workspace/batches/`。这些都是本地运行产物，
-不会提交到 GitHub。
+作业状态保存在 SQLite；产物文件名、摘要和来源以各阶段 manifest 为准，不从时间戳目录猜测当前结果。公式、字段和部署见 [QUALITY_FUSION.md](QUALITY_FUSION.md)。这些都是本地运行产物，不提交 GitHub。
 
 ### 轨迹修正
 
-进入“轨迹纠偏 → 专家动作纠偏”，选择已质检批次。当前每个任务仍按原规则选取质检 Top-1；同分时保留原工作簿顺序。已有批次自动恢复原草稿和入选轨迹，不用新推荐覆盖；来源变化的人工修改保留为待复核，采用或放弃后才能继续该任务导出。
+进入“轨迹纠偏 → 专家动作纠偏”，选择已质检批次。新融合结果按有效 F 选择每任务 Top-1，同分保留原工作簿顺序；历史 Rubric 结果保留原排序。已有批次自动恢复原草稿和入选轨迹，不用新推荐覆盖；来源变化的人工修改保留为待复核，采用或放弃后才能继续该任务导出。自动发布先选 Top-1，再检查其 G 是否达到原阈值，不回退选择第二名。
 
 页面按“任务行（用例编号）→ 轨迹行 → 修正台”展开，首次进入和刷新默认全部收起。可同时展开多个任务，但整页只展开一个轨迹修正台，展开轨迹才加载步骤与截图。任务统计与轨迹统计分开；前端已预留一任务多轨迹的结构，本次没有开放 Top-3 筛选。
 
@@ -273,7 +352,7 @@ backend_workspace/system/trajectory_correction/
 
 进入“专家工作台 → 数据发布”后，可以把 1～N 个尚未发布的纠偏会话登记为一个数据集。发布前，每个会话必须已经通过 COT 工作台右上角的“导出数据集”生成至少一份 `full_dataset` Excel；系统始终选取该会话最新的一份完整导出，不重新生成或合并 Excel。
 
-创建时填写可读的数据集名称，系统生成唯一的 `rel_<随机哈希>` 发布 ID。发布记录保存在：
+创建时填写可读的数据集名称，系统生成唯一发布编号。发布记录保存在：
 
 ```text
 backend_workspace/system/app.sqlite
@@ -282,9 +361,9 @@ backend_workspace/releases/<release_id>/              # 冻结的发布文件
 
 记录包含冻结 Excel 的路径、SHA256、行数和上游会话/导出版本关系；发布时复制所选表格，不复制原始轨迹目录。发布成功后批次永久结束处理，前端清理对应批次的选择、草稿、缓存和轮询，刷新及其他标签页也不会重新出现。后端仍保留原始文件、各阶段过程件和人工修改；已发布文件和来源 JSON 独立冻结，下载、统计和 S3 上传继续可用。后续生产使用新的 batch_id。列表和下载只读取当前根目录登记的发布文件，不合并原旧 workspace 的发布记录。
 
-页面下半部分展示新存储中已登记的数据集，支持按名称或发布 ID 搜索、按云道S3上传状态筛选、查看路径与哈希、下载发布 Excel。点击“云道S3上传”由后端按登记顺序读取全部已发布 Excel、核验 SHA256 并调用上传适配器；浏览器只提交发布编号和目标参数。每份回执立即保存，失败后停止，重试跳过已成功文件；刷新可恢复进度，服务重启后可手动重试中断任务。
+页面展示已登记的数据集，支持搜索、上传状态筛选、查看路径和摘要、下载发布 Excel。云道上传由后台读取冻结表格及其中选中的完整轨迹目录，目录内原有文件和子目录全部保留；不读取后来变化的页面勾选。同一任务采了 10 条、发布表选中 2 条，就上传这 2 条完整目录。旧完整表若包含全部轨迹，应以实际发布范围为准。
 
-默认适配器未配置，页面明确提示“云道S3上传尚未配置”并禁用按钮。同事只需完成 [internal_uploader.py](backend/data_publishing/internal_uploader.py) 的配置检查、登录与上传；参数、回执、幂等规则及无网络自测见 [云道S3上传接入文档](backend/data_publishing/INTERNAL_UPLOAD.md)。无需读取编号或自行拼接路径，不上传原始轨迹目录。
+在平台后端电脑配置实际 `s3_uploader.py` 和执行 Python，使用 `ADF_YUNDAO_*` 环境配置；目标前缀可在页面修改。脚本由后台逐目录调用，不额外复制或打包轨迹，显示已完成目录数、实际速度及脱敏错误。重试跳过已确认成功目录，关闭页面不停止上传。未配置或路径不可读时明确提示。参数、目录布局和恢复见 [云道S3上传接入文档](backend/data_publishing/INTERNAL_UPLOAD.md)。
 
 不传 target 的既有上传调用继续保留模拟行为：遍历新存储中已登记的发布 Excel 和轨迹根目录、统计进度但不发送文件。模拟状态及以下模拟地址仅在详情中明确标注，不计入云道S3成功数量；这不启用旧目录读取：
 
@@ -292,7 +371,7 @@ backend_workspace/releases/<release_id>/              # 冻结的发布文件
 s3://training-data/gui-agent-datasets/rel_a84f91c25d3e4b67/
 ```
 
-模拟目标地址可通过 `backend/.env` 中的 `DATASET_S3_BUCKET` 和 `DATASET_S3_PREFIX` 调整；当前 `DATASET_UPLOAD_MODE` 保持为 `mock`。上传作业状态只保存到 SQLite，不写 JSON 镜像或恢复旧上传任务。服务重启后未完成作业会标记为中断，可在页面重新上传。以上数据不提交到 GitHub。
+`DATASET_S3_BUCKET`、`DATASET_S3_PREFIX` 和历史 mock 模式只控制模拟行为，不能代替真实云道的 `ADF_YUNDAO_*` 配置。上传作业状态保存在 SQLite；真实目录上传在重启后先核对旧进程，再恢复或标记中断，不能直接启动第二份。以上数据不提交到 GitHub。
 
 需要接入平台外的人工采集数据时，点击“上传外部表格”，上传完整步骤明细 Excel，补充来源和数据日期，校验预览后创建发布。每次有效上传建立一个已完成的新批次，自动累计进入汇总和看板；不会覆盖已有发布或清理平台批次草稿。格式、去重、接口和恢复说明见[外部完整表导入](backend/data_publishing/EXTERNAL_IMPORTS.md)。
 
@@ -398,8 +477,6 @@ backend_workspace/system/
 缓存，中断后重新执行同一命令即可续跑。默认关闭 embedding 相似度校验，但仍校验
 Rubric JSON、任务 ID、维度数量、权重和 1–5 评分等级。
 
-## 数据与密钥说明
-
 ## 11. 批量轨迹质检
 
 ### 建树时预生成质检输入
@@ -409,15 +486,13 @@ post-action observation。所有步骤完成后，系统再为每条轨迹生成
 `final_answer`。有序的 action 与 observation 会在 AdaRubric 评价时自动组成 history，
 不需要额外模型调用。
 
-质检输入作为建树快照保存在：
+当前质检输入冻结在建树阶段结果的 `quality_input` 中，完整文件以该阶段 manifest 为准：
 
 ```text
-backend_workspace/system/trajectory_tree_runs/<run_id>/rubric_trajectories.json
-backend_workspace/system/trajectory_tree_runs/<run_id>/rubric_trajectories.xlsx
+<DATA_ROOT>/batches/<batch_id>/04_tree/result.json
 ```
 
-因此新任务集进入质检时不会再次生成 observation 和 final answer，只需生成缺失的 Rubric
-并执行评分。质检必须读取所选任务集随附的 JSON，不回退全局工作簿、旧任务集或旧目录。
+进入质检后复用建树产生的 observation 和 final answer，生成缺失的 Rubric 并评分；新融合任务另由 9011 读取原始轨迹完成 Checklist 检查。Rubric 输入读取本次冻结 JSON，不回退全局工作簿、旧任务集或旧目录。
 任一 observation、final answer 或工作簿生成失败时，本次建树任务集不会发布；已完成缓存会保留供重新提交续跑。
 
 轨迹质检依赖 Python 3.10 以上版本运行 AdaRubric。后端本身仍可使用原有 Python 环境，
@@ -429,21 +504,22 @@ ADARUBRIC_PYTHON=D:\anaconda3\envs\guigent\python.exe
 
 使用流程：
 
-1. 在“轨迹采集”页完成建树，形成一个时间串任务集。
-2. 进入“轨迹质检”，选择该任务集；页面会列出其中全部任务。
-3. 勾选一个或多个任务，点击“提交轨迹质检”。后端会全局串行执行模型作业，并显示当前任务、轨迹和完成进度。
-4. 读取该任务集声明的质检 JSON；文件缺失、损坏或缺少所需 observation/final answer 时明确报错，不从 Excel 补读或重新生成视觉结果。缺少 Rubric 时按质检流程生成，已完成的本批次模型响应和逐轨迹 checkpoint 可复用。
-5. 作业成功后点击“查看轨迹树”。已质检的终点叶子会显示 0–5 分：绿色表示通过，红色表示未通过；点击叶子可查看各维度得分、理由和逐步评价。
+1. 在“轨迹采集”页完成批次建树，进入“轨迹质检”选择该批次。
+2. 保存模型迭代评估的文本／视觉模型配置，在质检页选择 Checklist 规则；只有一份有效规则时可以自动选择。
+3. 勾选任务并提交。后台按冻结配置执行 Rubric 与 Checklist，页面显示对应阶段；每任务的所有候选复用一份 Checklist。
+4. Rubric JSON 缺失、损坏或缺少所需 observation/final answer 时明确报错。已完成模型响应和 checkpoint 可复用；Checklist 失败保留 G 与原因，不把缺分填成 0，重试复用已经完成的结果。
+5. 查看轨迹树：每个步骤显示经过该节点的有效 F 平均值 Q（三位小数）及部分覆盖情况；终点分别显示每条轨迹的各维度、G、Checklist 的 k/M 和 F。A 只保存，不显示在节点上。
 
-最新成功结果保存到：
+当前质检结果及状态分别保存到：
 
 ```text
-backend_workspace/system/trajectory_quality_results/<建树任务集 ID>/
+<DATA_ROOT>/batches/<batch_id>/05_quality/
+<DATA_ROOT>/system/app.sqlite
 ```
 
-质检当前状态只保存在 SQLite，不写作业 JSON 镜像；完整 JSON/Excel 当前过程件位于 `backend_workspace/batches/`。服务重启后，未完成作业会标记为
-`interrupted`；重新提交相同任务即可从缓存和 checkpoint 续跑。批量作业只有在本次所选任务全部成功后才发布，
-失败不会覆盖已有成功结果；重新质检部分任务时也只更新这些任务。
+平台服务重启后未完成作业会标记为 `interrupted`；重新提交相同输入可复用缓存、Rubric checkpoint 和同编号远端 Checklist 任务。部分 Checklist 缺分会保存已有评分并明确标识，自动流程不把融合未完成当成可推进。重新质检只更新相关任务；有效人工草稿保持原选择，真实输入变化仍需按原规则复核。
+
+## 数据与密钥说明
 
 代码仓只保存源码、测试、文档和配置示例。以下内容始终保留在本机：
 

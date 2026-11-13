@@ -302,6 +302,7 @@ class CotJobManager:
                     generator.client = generator.client.with_options(max_retries=0)
                 if reviewer is not None:
                     reviewer.client = reviewer.client.with_options(max_retries=0)
+                    reviewer.max_output_attempts = 1
             completed = int(payload.get("completed_steps") or 0)
             completed_bbox = int(payload.get("completed_bbox") or 0)
             completed_cot = int(payload.get("completed_cot") or 0)

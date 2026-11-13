@@ -80,6 +80,7 @@ class PreprocessingSingleAttemptTests(unittest.TestCase):
         try:
             fixture.complete()
             calls = []
+            reviewers = []
 
             class FakeClient:
                 def with_options(self, **kwargs):
@@ -92,6 +93,7 @@ class PreprocessingSingleAttemptTests(unittest.TestCase):
             class FakeReviewer(AcceptingReviewer):
                 def __init__(self, **kwargs):
                     self.client = FakeClient()
+                    reviewers.append(self)
                     calls.append(("created", kwargs["model"]))
 
             RecordStore(fixture.root).put("pipelines", "pl_one_shot", {
@@ -110,6 +112,7 @@ class PreprocessingSingleAttemptTests(unittest.TestCase):
                 fixture.queue.drain()
             self.assertEqual(manager.get(job["job_id"])["status"], "succeeded")
             self.assertIn(("options", {"max_retries": 0}), calls)
+            self.assertEqual(reviewers[0].max_output_attempts, 1)
             self.assertIn(("close", None), calls)
             self.assertEqual(manager.get(job["job_id"])["pipeline_id"], "pl_one_shot")
         finally:
@@ -117,6 +120,32 @@ class PreprocessingSingleAttemptTests(unittest.TestCase):
 
 
 class CotRestartRetryEvidenceTests(unittest.TestCase):
+    def test_cot_box_reviewer_uses_pipeline_budget_only_when_managed(self):
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from backend.trajectory_correction import cot_jobs
+
+        for managed in (True, False):
+            with self.subTest(managed=managed):
+                client = Mock()
+                client.with_options.return_value = client
+                reviewer = SimpleNamespace(client=client, max_output_attempts=3)
+                manager = cot_jobs.CotJobManager.__new__(cot_jobs.CotJobManager)
+                manager.get = Mock(return_value={"session_id": "session", "generate_bbox": True,
+                    "configuration_fingerprint": "same", "pipeline_id": "pipeline", "targets": []})
+                manager._progress = Mock()
+                manager._configuration_fingerprint = Mock(return_value="same")
+                manager.generator_factory = Mock(return_value=object())
+                with patch.object(cot_jobs, "load_session", return_value={}), \
+                     patch.object(cot_jobs, "active_session_lock", return_value=nullcontext()), \
+                     patch.object(cot_jobs, "_bbox_reviewer", return_value=reviewer), \
+                     patch.object(cot_jobs, "retry_enabled_for_pipeline", return_value=managed), \
+                     patch.object(cot_jobs, "publish_cot_snapshot", return_value={}):
+                    manager._run_with_diagnostics("job")
+                self.assertEqual(reviewer.max_output_attempts, 1 if managed else 3)
+                self.assertEqual(manager._progress.call_args.args[1]["status"], "succeeded")
+
     def test_interrupted_cot_job_records_restart_evidence(self):
         import tempfile
 

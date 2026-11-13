@@ -10,7 +10,8 @@ export function fusionScore(evaluation?: TrajectoryQualityEvaluation | null): nu
 
 export function nodeScoreLabel(score?: QualityNodeScore, root = false): string {
   const q = unitScore(score?.q), prefix = root ? '任务均分 Q' : 'Q'
-  if (q === null || !score?.scored_count) return `${prefix} 待评分`
+  if (!score) return `${prefix} 待评分`
+  if (q === null || !score.scored_count) return `${prefix} 暂无有效评分`
   const coverage = score.scored_count < score.total_count ? ` · ${score.scored_count}/${score.total_count}` : ''
   return `${prefix} ${q.toFixed(3)}${coverage}`
 }
@@ -31,7 +32,7 @@ export function detailText(value: unknown): string {
 
 export function qualityJobStageLabel(job: Pick<QualityJob, 'status' | 'stage'>): string {
   if (job.status === 'queued') return '排队等待'
-  if (job.status === 'succeeded') return '质检完成'
+  if (job.status === 'succeeded') return '评分作业已结束'
   if (job.status === 'interrupted') return '服务重启中断'
   if (job.status === 'failed') return '质检失败'
   const labels: Partial<Record<QualityJob['stage'], string>> = {

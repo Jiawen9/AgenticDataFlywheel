@@ -1,6 +1,6 @@
 import { activeBatchItems, publishedBatch } from '@/utils/batchLifecycle'
 import { computed, ref } from 'vue'
-import type { api } from '@/api'
+import { ApiError, type api } from '@/api'
 import { resolveBatchSelection } from '@/utils/batchSelection'
 import type { CorrectionRecommendation, PreprocessingBatch, QualityTaskSummary, TaskQualityResult, TrajectoryTreeNode, TreeRun } from '@/types'
 
@@ -8,7 +8,7 @@ type Client = Pick<typeof api, 'preprocessingBatches' | 'batchTree' | 'runQualit
 export function useBatchQualityWorkspace(client: Client, options: {
   historyOnly?: () => boolean
   waitingForTree?: () => boolean
-  waitingForQuality?: () => boolean
+  waitingForQuality?: () => boolean // Gates recommendations, never reading existing scores.
 } = {}) {
   const retiredIds = new Set<string>()
   const batches = ref<PreprocessingBatch[]>([]), batchId = ref('')
@@ -34,14 +34,16 @@ export function useBatchQualityWorkspace(client: Client, options: {
     }
     if (options.waitingForTree?.()) { loadingBatch.value = false; return }
     loadingBatch.value = true
-    const results = await Promise.allSettled([client.batchTree(id), options.waitingForQuality?.() ? Promise.resolve(null) : client.runQuality(id), options.waitingForQuality?.() ? Promise.resolve(null) : client.correctionRecommendation(id)])
+    // A failed or still-running batch can already have valid per-task results,
+    // including Checklist errors. Completeness only gates downstream selection.
+    const results = await Promise.allSettled([client.batchTree(id), client.runQuality(id), options.waitingForQuality?.() ? Promise.resolve(null) : client.correctionRecommendation(id)])
     if (disposed || epoch !== token) return
     const [built, reviewed, suggested] = results
     if (built.status === 'fulfilled') currentTree.value = built.value
     else error.value = (built.reason as Error).message
     if (reviewed.status === 'fulfilled' && reviewed.value) summaries.value = Object.fromEntries(reviewed.value.tasks.map(task => [task.task_id, task]))
     else if (reviewed.status === 'rejected' && !error.value) error.value = (reviewed.reason as Error).message
-    if (suggested.status === 'fulfilled') recommendation.value = suggested.value
+    if (suggested.status === 'fulfilled' && !options.waitingForQuality?.()) recommendation.value = suggested.value
     loadingBatch.value = false
   }
   async function loadBatches(preferredId?: string, legacyRunId?: string) {
@@ -64,9 +66,15 @@ export function useBatchQualityWorkspace(client: Client, options: {
     const id = batchId.value, token = epoch, request = ++detailRequest
     selectedTaskId.value = taskId; tree.value = null; quality.value = null; loadingTree.value = true
     try {
-      const [built, reviewed] = await Promise.all([client.tree(id, taskId), summaries.value[taskId]?.status === 'succeeded' ? client.taskQuality(id, taskId) : Promise.resolve(null)])
+      const [built, reviewed] = await Promise.allSettled([client.tree(id, taskId), summaries.value[taskId]?.status === 'succeeded' ? client.taskQuality(id, taskId) : Promise.resolve(null)])
       if (disposed || token !== epoch || request !== detailRequest) return
-      tree.value = built; quality.value = reviewed
+      if (built.status === 'rejected') throw built.reason
+      tree.value = built.value
+      if (reviewed.status === 'fulfilled') quality.value = reviewed.value
+      else if (!(reviewed.reason instanceof ApiError && (
+        (reviewed.reason.status === 409 && reviewed.reason.message === '该任务尚无有效质检结果，请先完成质检') ||
+        (reviewed.reason.status === 404 && reviewed.reason.message === '该任务还没有质检结果')
+      ))) throw reviewed.reason
     } catch (cause) { if (!disposed && token === epoch && request === detailRequest) error.value = (cause as Error).message }
     finally { if (!disposed && token === epoch && request === detailRequest) loadingTree.value = false }
   }
