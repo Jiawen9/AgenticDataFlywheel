@@ -110,12 +110,58 @@ class QualitySourceRecoveryTests(unittest.TestCase):
                 self.assertEqual(manifest["trajectories"], [{"trajectory_id": self.trajectory_id,
                     "source_directory": str(resolve_path(directory))}])
                 self.assertEqual(manifest["key_elements"], "priority_1: 打开目标页面")
+                self.assertEqual(manifest['case_id'], 'original-case')
+                self.assertEqual(trajectories[0].metadata['collection_case_id'], 'original-case')
+                self.assertEqual(trajectories[0].metadata['source_metadata_sha256'], before['_trajectory_for_evaluate.json'])
                 identity = trajectories[0].metadata["source_identity"]
                 self.assertEqual(identity["trajectory_id"], self.trajectory_id)
                 self.assertEqual(identity["agent_type"], engine)
                 self.assertEqual(identity["collection_run_id"], "cr261112-001")
                 self.assertEqual(identity["source_trajectory_id"], "original-phone-trajectory")
+                self.assertEqual(identity['collection_case_id'], 'original-case')
                 self.assertEqual(before, {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in directory.iterdir()})
+
+    def test_old_short_id_recovers_original_case_from_frozen_annotation(self):
+        directory, grouped, output = self.fixture('newagent')
+        tasks, trajectories = self.generate(grouped, output)
+        metadata = trajectories[0].metadata
+        for key in ('checklist_input_version', 'collection_case_id', 'key_elements', 'source_metadata_sha256'):
+            metadata.pop(key, None)
+        metadata['source_identity'].pop('collection_case_id', None)
+        source = {'sheets': {'VLA trajectories': [{'task_id': self.task_id,
+            'trajectory_id': self.trajectory_id, 'collection_case_id': 'original-case'}]}}
+        before = copy.deepcopy((source, metadata))
+        manifest = build_task(self.task_id, tasks[self.task_id], trajectories, raw_root=self.raw, source_annotation=source)
+        self.assertEqual(manifest['case_id'], 'original-case')
+        self.assertEqual((source, metadata), before)
+
+    def test_changed_source_conditions_do_not_silently_change_a_frozen_quality_input(self):
+        directory, grouped, output = self.fixture('pipelineagent')
+        tasks, trajectories = self.generate(grouped, output)
+        original = directory / '_trajectory_for_evaluate.json'
+        data = json.loads(original.read_text(encoding='utf-8'))
+        data['key_elements'] = 'changed requirement'
+        original.write_text(json.dumps(data), encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'source_changed'):
+            build_task(self.task_id, tasks[self.task_id], trajectories, raw_root=self.raw)
+
+    def test_bad_checklist_metadata_does_not_destroy_usable_rubric_input(self):
+        directory, grouped, output = self.fixture('newagent')
+        original_bytes = (directory / '_trajectory_for_evaluate.json').read_bytes()
+        (directory / '_trajectory_for_evaluate.json').write_text('{broken', encoding='utf-8')
+        tasks, trajectories = self.generate(grouped, output)
+        self.assertTrue(trajectories[0].final_answer)
+        self.assertTrue(trajectories[0].metadata['source_metadata_error'])
+        with self.assertRaisesRegex(ValueError, 'source_metadata_unreadable'):
+            build_task(self.task_id, tasks[self.task_id], trajectories, raw_root=self.raw)
+        partial = build_task(self.task_id, tasks[self.task_id], trajectories, raw_root=self.raw, allow_partial=True)
+        self.assertIn('source_metadata_unreadable', partial['trajectories'][0]['source_error'])
+        self.assertEqual(partial['case_id'], 'original-case')
+        frozen_bytes = output.with_suffix('.json').read_bytes()
+        (directory / '_trajectory_for_evaluate.json').write_bytes(original_bytes)
+        recovered = build_task(self.task_id, tasks[self.task_id], trajectories, raw_root=self.raw, allow_partial=True)
+        self.assertNotIn('source_error', recovered['trajectories'][0])
+        self.assertEqual(output.with_suffix('.json').read_bytes(), frozen_bytes)
 
     def test_existing_relative_snapshot_recovers_in_memory_without_changing_inputs(self):
         directory, grouped, output = self.fixture("newagent")

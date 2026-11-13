@@ -46,6 +46,37 @@ class BatchResultsTests(unittest.TestCase):
         self.assertEqual(records.get("correction_sessions", "manual"), saved)
         self.assertEqual(records.get("quality_results", self.batch + ":A")["scoring_version"], "checklist_fusion_v1")
 
+    def test_live_quality_partial_is_viewable_but_cannot_become_stable_result(self):
+        from backend.batch_results import quality_task_fingerprints
+        from backend.quality_execution import (start_execution, execution_context, save_partial_result,
+                                               revoke_execution, QualityExecutionRevoked)
+        self.build("A")
+        trees = current_tree_payload(self.batch, self.root)
+        options = {"version": 2, "execution_backend": "platform"}
+        fp = quality_task_fingerprints(trees, checklist_options=options)
+        records = RecordStore(self.root)
+        records.put("quality_jobs", "new-local", {"job_id": "new-local", "batch_id": self.batch,
+            "status": "running", "created_at": "2026-11-13T10:00:00Z", "task_ids": ["A"],
+            "source_tree_hashes": trees["tree_hashes"], "task_fingerprints": fp, "checklist_options": options})
+        lease = start_execution(self.root, "new-local", self.batch)
+        score = {"task_id": "A", "scoring_version": "checklist_fusion_v1", "fusion_complete": True,
+                 "evaluations": {"A-1": {"global_score": 4, "fusion": {"valid": True, "score": .9}}}}
+        with execution_context(self.root, "new-local", lease["token"]):
+            save_partial_result(self.root, "new-local", "A", trees["tree_hashes"]["A"], fp["A"], score)
+        value = current_quality_payload(self.batch, self.root)
+        self.assertFalse(value["tasks"][0]["fusion_complete"], "partial progress is never a publication commit")
+        self.assertEqual(value["tasks"][0]["evaluations"]["A-1"]["global_score"], 4)
+        self.assertNotIn("execution_token", str(value))
+        self.assertEqual(current_quality_payload(self.batch, self.root, include_partial=False)["tasks"], [])
+        revoke_execution(self.root, "new-local", lease["token"], "stopped")
+        with self.assertRaises(QualityExecutionRevoked):
+            with execution_context(self.root, "new-local", lease["token"]):
+                save_partial_result(self.root, "new-local", "A", trees["tree_hashes"]["A"], fp["A"], score)
+        # Revocation preserves already observed evidence for diagnosis.
+        self.assertEqual(len(current_quality_payload(self.batch, self.root)["tasks"]), 1)
+        records.update("quality_partial_results", "new-local:A", lambda row: row.update(source_tree_hash="different"))
+        self.assertEqual(current_quality_payload(self.batch, self.root)["tasks"], [])
+
     def incoming(self, task):
         annotation = {**self.annotation, "sheets": {"VLA trajectories": [
             row for row in self.annotation["sheets"]["VLA trajectories"] if row["task_id"] == task]}}

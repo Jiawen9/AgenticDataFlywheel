@@ -21,6 +21,7 @@ class QualityFrozenRetryTests(TestCase):
         self.jobs = QualityJobManager(self.root / "system" / "quality_jobs",
                                       executor=self.executor, data_root=self.root)
         self.options = {"scoring_version": "checklist_fusion_v1", "evaluation_profile_id": "original",
+                        "version": 2, "execution_backend": "platform", "runtime_digest": "local-runtime",
                         "evaluation_profile_digest": "frozen", "collector_server": "http://original.invalid",
                         "evaluator_config": {"vision": {"model": "actual-original-id"}}}
         return self.jobs
@@ -65,6 +66,59 @@ class QualityFrozenRetryTests(TestCase):
         two = self.jobs.retry(first["job_id"])
         self.assertEqual(one["job_id"], two["job_id"])
         self.assertEqual(len(self.executor.pending), 1)
+
+    def test_remote_retry_links_local_successor_and_reuses_rubric_identity(self):
+        from backend.batch_results import quality_task_fingerprints
+        self.manager()
+        local_options = deepcopy(self.options)
+        self.options.pop("execution_backend")
+        self.options["version"] = 1
+        first = self.submit()
+        self.finish(first)
+        before = self.jobs.get(first["job_id"])
+        rubric_key = quality_task_fingerprints(current_tree_payload(self.batch, self.root))
+        with patch("backend.quality_checklist.migrate_options", return_value=local_options) as migrate, \
+             patch("backend.quality_checklist.freeze_options", side_effect=AssertionError("must not read defaults")):
+            retry = self.jobs.retry(first["job_id"])
+            repeated = self.jobs.retry(first["job_id"])
+        self.assertEqual(retry["job_id"], repeated["job_id"])
+        self.assertEqual(retry["origin_job_id"], first["job_id"])
+        self.assertEqual(retry["migration_version"], 1)
+        self.assertEqual(retry["checklist_options"], local_options)
+        self.assertNotEqual(retry["task_fingerprints"], first["task_fingerprints"])
+        self.assertEqual(retry["source_tree_hashes"], first["source_tree_hashes"])
+        self.assertEqual(self.jobs.get(first["job_id"]), before)
+        self.assertEqual(quality_task_fingerprints(current_tree_payload(self.batch, self.root)), rubric_key)
+        self.assertEqual(len(self.executor.pending), 1)
+        migrate.assert_called_with(self.root, self.options)
+
+    def test_complete_remote_result_is_not_migrated(self):
+        self.manager()
+        self.options.pop("execution_backend")
+        self.options["version"] = 1
+        job = self.submit()
+        self.finish(job, complete=True)
+        with patch("backend.quality_checklist.migrate_options", side_effect=AssertionError("valid result stays immutable")):
+            self.assertEqual(self.jobs.retry(job["job_id"])["job_id"], job["job_id"])
+
+    def test_committed_partial_fusion_finishes_failed_without_erasing_scores(self):
+        self.manager()
+        job = self.submit()
+        def runner(*args, **kwargs):
+            return merge_quality_results(self.batch, [{"task_id": "A", "scoring_version": "checklist_fusion_v1",
+                "fusion_complete": False, "fusion_eligible_count": 0,
+                "evaluations": {"A-1": {"global_score": 4, "checklist": {"status": "error", "error": "model unavailable"},
+                                           "fusion": {"valid": False, "invalid_reasons": ["checklist_incomplete"]}}}}],
+                job["source_tree_hashes"], job["task_fingerprints"], job_id=job["job_id"], completed_at="now", root=self.root)
+        self.jobs.runner = runner
+        self.jobs._run(job["job_id"], self.batch, ["A"])
+        saved = self.jobs.get(job["job_id"])
+        self.assertEqual(saved["status"], "failed")
+        self.assertFalse(saved["result_complete"])
+        self.assertTrue(saved["partial_results_available"])
+        self.assertIn("model unavailable", saved["error"])
+        from backend.batch_results import current_quality_payload
+        self.assertEqual(current_quality_payload(self.batch, self.root)["tasks"][0]["evaluations"]["A-1"]["global_score"], 4)
 
     def test_retry_active_original_returns_original(self):
         self.manager()

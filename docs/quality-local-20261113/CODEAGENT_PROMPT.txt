@@ -1,0 +1,33 @@
+任务：将轨迹质检 Checklist 迁到平台后端，并修复部分结果、进度和质检树坐标。
+
+一、范围
+仅操作实际提供平台 API 的 AgenticDataFlywheel 工程及其自用前端。以本次平台文件差异清单为准逐段合并，不全量覆盖内部增强。不要修改提供手机采集服务的工程、模型迭代评估、任务分配、App 复位或已有轨迹。不要给采集端部署本轮源码或要求采集端增加能力。
+本次新增 backend/ChecklistEvaluator 是纯评测工程，包含规则、模型客户端、只读证据和报告校验，不是手机 Agent。新质检不访问 9011。仅停止历史远端质检时保留旧接口兼容。
+
+二、合并与配置（连续完成，不逐个节点请求确认）
+1. 记录平台当前源码版本及工作区差异，合并本次新增与修改文件。保留本机 backend/.env、数据目录、历史作业与内部 API_BASE_URL。仅备份确实修改的源码文件；不要复制整个项目、backend_workspace、.http_runs、node_modules 或全部轨迹。
+2. 不热覆盖正在执行的质检代码。开发、合并隔离副本、离线验证可以先做；正式切换前只确认平台质检处于安全窗口。若旧质检仍活动，按平台现有停止入口停止该质检并对账，不能停止手机采集。服务部署须遵守现场已有授权。
+3. 平台后端设置 ADF_CHECKLIST_PYTHON 为绝对解释器路径；未配置时使用平台 Python。推荐独立评测虚拟环境，安装 backend/ChecklistEvaluator/requirements.txt，不要升级手机采集的 Python 环境。先执行该解释器的 backend/ChecklistEvaluator/preflight.py，核对输出 ok=true。它只导入依赖，不调用模型。现有 ADARUBRIC_PYTHON 保持原值。
+4. 将旧质检实际使用的规则按原 ID 和 digest 导入平台。先读取旧作业冻结的 checklist_options 或原规则快照；不能直接选包内默认规则代替内网规则。导入命令在平台根目录执行：
+   python -m backend.ChecklistEvaluator.import_profile --source-profiles "实际原规则根目录" --profile-id "原规则ID" --expected-digest "原冻结摘要"
+   默认导入 DATA_ROOT/resources/checklist_profiles；若 backend/.env 配置 ADF_CHECKLIST_PROFILES_DIR，工具与平台均使用该目录。也可显式 --destination-profiles。只复制规则文件，不复制原轨迹；同摘要重复导入复用，同编号异内容不覆盖。
+5. 在平台后端环境或 backend/.env 配置原模型所需的密钥环境变量。默认名称为 PHONE_FACTORY_EVALUATOR_TEXT_API_KEY 和 PHONE_FACTORY_EVALUATOR_VISION_API_KEY；自定义名称按旧冻结配置保留。实际密钥不得进入前端、测试日志、配置摘要和交付报告。不要修改实际模型 ID。质检页支持分别设置文本/视觉 URL、模型名、环境变量名及规则；第一次继承平台已保存的评测默认值，之后与模型迭代配置独立。
+6. 同步自用前端源代码并构建/启动正确版本。创新平台前端如需接入，只做本项目 QUALITY_FUSION.md“接口适配”所列字段及调用方式适配；沿用其已有 API_BASE_URL、/v1 等前缀，不新增猜测基址，不覆盖其路由框架。
+
+三、定向离线验证
+仅运行本轮受影响测试，不重跑 5440 实例、不启动真实手机任务、不生成大量采集数据。测试使用临时目录，用完由测试释放。
+平台虚拟环境在项目根目录运行以下关键用例；如导入 adarubric 路径需要补充，PYTHONPATH 加入项目根与 backend/DevelopRubrics（Windows 分号分隔）：
+   python -m unittest backend.tests.test_quality_local_settings backend.tests.test_quality_source_recovery backend.tests.test_quality_checklist_local backend.tests.test_quality_local_runner backend.tests.test_quality_frozen_retry backend.tests.test_quality_process_supervision
+其余受影响套件及本地结果见 VALIDATION.md。前端执行本轮相关测试与 npm run build 一次。若完整前端测试触发 ModelIterationPanel 已有的三个失败，先对照验证报告，不扩大修改模型迭代生产代码；如现场基线不同，记录真实结果。
+核对原始 collection_case_id、验收条件从预处理/树输入到 Checklist；平台短编号不能代替 Gold 原编号。不要删门禁或伪造零分来使流程继续。业务失败可有有效分数，技术错误显示根因并保留部分结果。
+
+四、b261112-004 恢复与小规模现场验收
+1. 不重采、不重新预处理、不重建树；保留旧快照、作业、报告及 Rubric 检查点。
+2. 若原质检仍 running，先通过质检停止入口停止并对账，仅操作这一条质检。确认原始输入未改变，再点击该质检的“重试”。平台创建关联本地作业，继承旧冻结模型/规则，不读取当前页面的新默认值；自动流程绑定随新作业更新。
+3. 用现有 10 条轨迹确认 Rubric 检查点复用、Checklist 实际模型调用、逐条出结果、F/Q 及覆盖数量显示，失败原因可见。新任务的 checklist_options.execution_backend 应为 platform；这批新质检不能产生 9011 的 Checklist 能力/目录/任务查询。模型迭代及历史远端停止请求不在此判据内。
+4. 核对 F=(通过数+0.5×G/5)/(总数+0.5)，Q 为经过节点的有效 F 均值；未评分不填零。部分结果可查看，但不完整结果不能自动发布。
+5. 选一条 Pipeline 和一条 NewAgent 已有步骤检查坐标。Network 应使用原有 tree GET 路径，加 view=coordinate、annotation_version、tree_version、trajectory_id、image；实际响应须为正确 JSON。相同节点轮询不重复请求，失败后只手动重试；切换节点旧响应不能覆盖。不要只隐藏错误文字来宣称修复网关。
+6. 比对少量原始轨迹文件及旧输入摘要，确认只读不变；新日志/报告位于 DATA_ROOT/system/qc，规则快照 system/qc_profiles。不要创建完整轨迹副本或整批 ZIP。
+
+五、回报
+给出合并文件、配置项名称（无密钥）、离线结果、现场 10 条结果及未验项。离线模拟模型不代表真实模型/网关通过。遇到实质基线冲突再澄清，不因普通合并和测试反复停下来。若现场模型/网关无法访问，完成其余工作并明确列为待验。

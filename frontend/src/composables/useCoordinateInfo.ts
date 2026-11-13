@@ -1,6 +1,6 @@
 import { computed, ref, toValue, watch, type MaybeRefOrGetter } from 'vue'
 import { api, ApiError } from '@/api'
-import type { CoordinateInfo, CoordinateSource, TrajectoryScope } from '@/types'
+import type { CoordinateInfo, CoordinateSource, TrajectoryScope, TrajectoryTreeNode } from '@/types'
 
 const cache = new Map<string, CoordinateInfo>()
 const pending = new Map<string, Promise<CoordinateInfo>>()
@@ -12,7 +12,14 @@ export function batchCoordinateSource(scope: TrajectoryScope | undefined, trajec
     : undefined
 }
 
+export function treeCoordinateSource(batchId: string, taskId: string, tree: TrajectoryTreeNode | null | undefined, trajectory: string, image: string): CoordinateSource | undefined {
+  return batchId && taskId && tree?.coordinate_lookup_version === 1 && tree.annotation_version && tree.tree_version && trajectory && image
+    ? { kind: 'tree', batch_id: batchId, task_id: taskId, annotation_version: tree.annotation_version, tree_version: tree.tree_version, trajectory_id: trajectory, image }
+    : undefined
+}
+
 export function coordinateSourceKey(source: CoordinateSource): string {
+  if (source.kind === 'tree') return JSON.stringify(['tree', source.batch_id, source.task_id, source.annotation_version, source.tree_version, source.trajectory_id, source.image])
   return source.kind === 'batch'
     ? JSON.stringify(['batch', source.batch_id, source.annotation_version ?? '', source.trajectory_id, source.image])
     : JSON.stringify(['correction', source.session_id, source.excel_row, source.expected_revision ?? ''])
@@ -25,12 +32,16 @@ async function load(source: CoordinateSource): Promise<CoordinateInfo> {
   const active = pending.get(key)
   if (active) return active
   const task = (async () => {
-    const response = source.kind === 'batch'
-      ? await api.coordinateInfo(source)
-      : await api.correctionCoordinateInfo(source.session_id, source.excel_row, source.expected_revision)
-    if (source.kind === 'batch' && source.annotation_version && 'annotation_version' in response
+    const response = source.kind === 'tree' ? await api.treeCoordinateInfo(source)
+      : source.kind === 'batch' ? await api.coordinateInfo(source)
+        : await api.correctionCoordinateInfo(source.session_id, source.excel_row, source.expected_revision)
+    if (source.kind !== 'correction' && source.annotation_version && 'annotation_version' in response
         && response.annotation_version !== source.annotation_version) {
       throw new ApiError('标框版本已变化，请刷新步骤后重试', 409)
+    }
+    if (source.kind === 'tree' && (!('tree_version' in response) || !('task_id' in response) || !('trajectory_id' in response) || !('image' in response) || response.tree_version !== source.tree_version
+        || response.task_id !== source.task_id || response.trajectory_id !== source.trajectory_id || response.image !== source.image)) {
+      throw new ApiError('轨迹树或步骤身份已变化，请刷新当前任务后重试', 409)
     }
     if (source.kind === 'correction' && source.expected_revision !== undefined && 'storage_revision' in response
         && response.storage_revision !== source.expected_revision) {
@@ -38,7 +49,7 @@ async function load(source: CoordinateSource): Promise<CoordinateInfo> {
     }
     const info = response.coordinate_info
     // A request for the latest version is not an immutable cache identity.
-    if ((source.kind === 'batch' && source.annotation_version) || (source.kind === 'correction' && source.expected_revision !== undefined)) {
+    if ((source.kind !== 'correction' && source.annotation_version) || (source.kind === 'correction' && source.expected_revision !== undefined)) {
       cache.set(key, info)
       while (cache.size > MAX_CACHE) cache.delete(cache.keys().next().value!)
     }
@@ -55,7 +66,8 @@ export function useCoordinateInfo(source: MaybeRefOrGetter<CoordinateSource | un
   const error = ref('')
   const conflict = ref(false)
   const retry = ref(0)
-  watch(() => [toValue(source) ? coordinateSourceKey(toValue(source)!) : '', toValue(agentType), retry.value], async (_, __, cleanup) => {
+  // Compare primitive identities, not a new array/source object on each parent render.
+  watch([() => { const value = toValue(source); return value ? coordinateSourceKey(value) : '' }, () => toValue(agentType), () => retry.value], async (_, __, cleanup) => {
     let current = true
     cleanup(() => { current = false })
     resolved.value = null
@@ -83,5 +95,10 @@ export function useCoordinateInfo(source: MaybeRefOrGetter<CoordinateSource | un
     if (agent === 'newagent') return { space: 'normalized' }
     return { space: 'unknown', reason: error.value || (loading.value ? '正在读取坐标信息' : '坐标信息不足') }
   })
-  return { coordinateInfo, loading, error, conflict, reload: () => { retry.value++ } }
+  return { coordinateInfo, loading, error, conflict, reload: () => {
+    const value = toValue(source)
+    if (!value || loading.value) return
+    cache.delete(coordinateSourceKey(value))
+    retry.value++
+  } }
 }

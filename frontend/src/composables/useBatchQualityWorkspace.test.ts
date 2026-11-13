@@ -19,6 +19,54 @@ function setup(options: Parameters<typeof useBatchQualityWorkspace>[1] = {}) {
   return { client, flow }
 }
 describe('business batch quality workspace', () => {
+  it('does not race a background detail refresh against an explicit tree selection', async () => {
+    const { client, flow } = setup(), slow = deferred<TrajectoryTreeNode>()
+    await flow.selectBatch('one')
+    client.tree.mockReturnValueOnce(slow.promise)
+    const selected = flow.viewTree('A')
+    await flow.refresh()
+    expect(client.tree).toHaveBeenCalledTimes(1)
+    expect(flow.loadingTree.value).toBe(true)
+    slow.resolve({ id: 1, label: 'selected-tree' } as TrajectoryTreeNode); await selected
+    expect(flow.tree.value?.label).toBe('selected-tree')
+    expect(flow.loadingTree.value).toBe(false)
+  })
+  it('keeps the mounted tree and current task while refreshing scores', async () => {
+    const { client, flow } = setup(), slow = deferred<TreeRun>()
+    client.runQuality.mockResolvedValue({ run_id: 'current', tasks: [{ task_id: 'A', status: 'succeeded', rubric_ready: true }] })
+    await flow.selectBatch('one'); await flow.viewTree('A')
+    const tree = flow.tree.value, quality = flow.quality.value
+    client.batchTree.mockReturnValueOnce(slow.promise)
+    const request = flow.refresh()
+    expect(flow.tree.value).toBe(tree); expect(flow.quality.value).toBe(quality)
+    expect(flow.selectedTaskId.value).toBe('A'); expect(flow.loadingTree.value).toBe(false)
+    slow.resolve(built('one')); await request
+    expect(flow.tree.value?.label).toBe('A'); expect(flow.selectedTaskId.value).toBe('A')
+  })
+  it('does not steal a task selected while a background refresh is pending', async () => {
+    const { client, flow } = setup(), slow = deferred<TreeRun>()
+    client.batchTree.mockResolvedValue(built('one', ['A', 'B']))
+    await flow.selectBatch('one'); await flow.viewTree('A')
+    client.batchTree.mockReturnValueOnce(slow.promise)
+    const request = flow.refresh()
+    await flow.viewTree('B')
+    slow.resolve(built('one', ['A', 'B'])); await request
+    expect(flow.selectedTaskId.value).toBe('B'); expect(flow.tree.value?.label).toBe('B')
+  })
+  it('keeps prior data on refresh failure and rejects an older refresh detail', async () => {
+    const { client, flow } = setup(), slow = deferred<TrajectoryTreeNode>()
+    await flow.selectBatch('one'); await flow.viewTree('A')
+    const current = flow.tree.value
+    client.batchTree.mockRejectedValueOnce(new Error('temporary connection failure'))
+    await flow.refresh()
+    expect(flow.tree.value).toBe(current); expect(flow.error.value).toContain('temporary')
+    client.tree.mockReturnValueOnce(slow.promise)
+    const request = flow.refresh()
+    await vi.waitFor(() => expect(client.tree).toHaveBeenCalledTimes(2))
+    await flow.selectBatch('two'); await flow.viewTree('A')
+    slow.resolve({ id: 99, label: 'old-tree' } as TrajectoryTreeNode); await request
+    expect(flow.batchId.value).toBe('two'); expect(flow.tree.value?.id).toBe(1)
+  })
   it('does not cancel an unaffected batch selection while its older batch list arrives', async () => {
     const { client, flow } = setup(), pending = deferred<PreprocessingBatch[]>()
     client.preprocessingBatches.mockReturnValueOnce(pending.promise)
@@ -156,6 +204,14 @@ describe('business batch quality workspace', () => {
 
 
 describe('Pipeline quality waiting', () => {
+  it.each(['running', 'failed', 'interrupted'] as const)('reads explicit partial results in %s state without counting completion', async status => {
+    const { client, flow } = setup({ waitingForQuality: () => true })
+    client.runQuality.mockResolvedValue({ run_id: 'one', tasks: [{ task_id: 'A', status, rubric_ready: true, fusion_complete: false, partial_results_available: true }] })
+    await flow.selectBatch('one'); await flow.viewTree('A')
+    expect(client.taskQuality).toHaveBeenCalledWith('one', 'A')
+    expect(flow.counts.value.completed).toBe(0)
+    expect(client.correctionRecommendation).not.toHaveBeenCalled()
+  })
   it('waits for the tree, but reads partial scoring before downstream readiness', async () => {
     let treePending = true, qualityPending = true
     const { client, flow } = setup({ waitingForTree: () => treePending, waitingForQuality: () => qualityPending })

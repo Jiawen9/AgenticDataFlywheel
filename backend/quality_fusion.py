@@ -29,6 +29,10 @@ def fuse(evaluation: dict, checklist: dict, *, definition_digest: str | None = N
         reasons.append("rubric_evidence_invalid")
     if checklist.get("status") != "complete":
         reasons.append("checklist_incomplete")
+        # A failed invocation has no report to validate. Do not turn one known
+        # execution failure into invented definition/count/verdict mismatches.
+        return {"version": 1, "lambda": LAMBDA, "score": None, "valid": False,
+                "invalid_reasons": list(dict.fromkeys(reasons))}
     definition = checklist.get("definition_digest")
     if not isinstance(definition, str) or not definition or definition_digest and definition != definition_digest:
         reasons.append("checklist_definition_mismatch")
@@ -109,4 +113,46 @@ def enrich_task(task: dict, tree: dict, checklists: dict, workbook_order: list[s
                   fusion_order=rank_trajectories(evaluations, workbook_order))
     result["fusion_complete"] = all(evaluations.get(ident, {}).get("fusion", {}).get("valid") for ident in workbook_order)
     result["fusion_eligible_count"] = len(result["fusion_order"])
+    return result
+
+
+def completion_summary(report: dict, task_ids: list[str] | None = None) -> dict:
+    """Separate committed/viewable evidence from complete fusion results."""
+    selected = set(task_ids or [])
+    tasks = [task for task in report.get("tasks", [])
+             if not selected or task.get("task_id") in selected]
+    fusion_tasks = [task for task in tasks if task.get("scoring_version") == SCORING_VERSION]
+    incomplete = [task for task in fusion_tasks if not task.get("fusion_complete")]
+    missing = sorted(selected - {task.get("task_id") for task in tasks}) if "tasks" in report else []
+    available = any(task.get("evaluations") or task.get("results_available") for task in tasks)
+    result = {"result_complete": not incomplete and not missing,
+              "results_available": available,
+              "partial_results_available": bool(incomplete or missing) and available,
+              "fusion_eligible_count": sum(int(task.get("fusion_eligible_count") or 0) for task in fusion_tasks)}
+    if not incomplete and not missing:
+        return result
+    reasons = [f"任务 {task}：缺少本次评分结果" for task in missing[:3]]
+    failure = None
+    for task in incomplete:
+        if len(reasons) >= 3:
+            break
+        if task.get("primary_error") and not task.get("evaluations"):
+            reasons.append(f"任务 {task.get('task_id')}：{task['primary_error']}")
+        for ident, row in (task.get("evaluations") or {}).items():
+            if (row.get("fusion") or {}).get("valid"):
+                continue
+            checklist = row.get("checklist") or {}
+            error = checklist.get("error") or row.get("error")
+            if not error:
+                error = "评分缺项：" + "、".join((row.get("fusion") or {}).get("invalid_reasons") or ["评分尚未完成"])
+            reasons.append(f"任务 {task.get('task_id')} / 轨迹 {ident}：{error}")
+            failure = failure or checklist.get("failure")
+            if len(reasons) == 3:
+                break
+        if len(reasons) == 3:
+            break
+    from .pipeline_diagnostics import sanitize
+    from .pipeline_retry_errors import failure_from_payload
+    result["error"] = str(sanitize("质检未完整完成，已有结果已保留：" + "；".join(reasons or ["部分轨迹尚无有效融合评分"])))[:2400]
+    result["failure"] = failure_from_payload(failure or {"category": "unknown", "code": "quality_result_incomplete"})
     return result

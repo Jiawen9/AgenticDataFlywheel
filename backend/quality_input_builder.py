@@ -62,6 +62,7 @@ def _build_quality_workbook(*, grouped: dict[str, list[tuple[str, list[Any]]]],
     raw_root = resolve_path(trajectory_root)
     tasks = {task_id: TaskRecord(task_id, task_goals.get(task_id, task_id)) for task_id in grouped}
     prepared: list[tuple[str, str, str, str, list[StepRecord]]] = []
+    frozen_sources: dict[str, dict] = {}
     for task_id, items in grouped.items():
         task_text = tasks[task_id].task_text
         for trajectory_id, source_steps in items:
@@ -85,6 +86,16 @@ def _build_quality_workbook(*, grouped: dict[str, list[tuple[str, list[Any]]]],
             if not source_path.is_relative_to(raw_root):
                 raise ValueError(f"质检任务 {task_id} / 轨迹 {trajectory_id} 的原件目录超出登记根目录")
             source_directory = str(source_path.parent)
+            from .quality_source_identity import source_metadata
+            identity = records[0].action_input.get("source_identity", {})
+            try:
+                frozen_sources[trajectory_id] = source_metadata(source_directory, identity)
+            except (OSError, ValueError) as exc:
+                # Checklist evidence problems must not erase usable Rubric/tree input.
+                from .pipeline_diagnostics import sanitize
+                frozen_sources[trajectory_id] = {"checklist_input_version": 0,
+                    "collection_case_id": identity.get("collection_case_id", ""),
+                    "key_elements": "", "source_metadata_error": str(sanitize(str(exc)))[:1000]}
             prepared.append((task_id, task_text, trajectory_id, source_directory, records))
 
     total = len(prepared)
@@ -126,10 +137,12 @@ def _build_quality_workbook(*, grouped: dict[str, list[tuple[str, list[Any]]]],
         final_answer = final_answers[index]
         if final_answer is None:
             raise RuntimeError(f"missing trajectory summary: {trajectory_id}")
+        identity = records[0].action_input.get("source_identity", {})
+        frozen_source = frozen_sources[trajectory_id]
         trajectories.append(TrajectoryRecord(trajectory_id, task_id, source_directory, final_answer,
             {"source_directory": source_directory, "observation_model": model,
              "observation_prompt_version": intermediate_state_classifier.PROMPT_VERSION,
-             "source_identity": records[0].action_input.get("source_identity", {})}, records))
+             "source_identity": identity, **frozen_source}, records))
     write_workbook(output, tasks, trajectories)
     write_sidecar(output, _quality_payload(tasks, trajectories))
     return len(tasks), len(trajectories), sum(len(item.steps) for item in trajectories)

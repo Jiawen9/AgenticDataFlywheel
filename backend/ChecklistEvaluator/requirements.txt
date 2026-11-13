@@ -1,0 +1,8 @@
+# Install in a NEW evaluator-only Python 3.10+ venv. Never upgrade the phone venv.
+# Versions are pinned to make offline wheel preparation/review repeatable.
+openai==1.109.1
+httpx==0.28.1
+Pillow==11.3.0
+numpy==2.2.6
+opencv-python-headless==4.12.0.88
+qwen-vl-utils==0.0.14

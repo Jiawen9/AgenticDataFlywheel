@@ -1,0 +1,78 @@
+{
+ "AT-XWZX-JRTT-013": {
+  "task": "打开今日头条的热榜板块，查看一下头条热榜榜单第一的内容。",
+  "app": "今日头条",
+  "milestones": [
+   {"id": "m1", "name": "进入热榜板块", "state_type": "page", "entities": ["热榜", "头条热榜"], "verify": "页面可见「热榜/头条热榜」标题或榜单排名列表"},
+   {"id": "m2", "name": "查看榜单第一内容", "state_type": "content_page", "entities": ["榜单第一名标题"], "verify": "点击序号1条目并进入其详情/内容页；今日头条热榜点击后可能进入搜索界面，该等价路径不影响结果判定；确认最终展示内容标题与热榜榜首标题匹配"}
+  ]
+ },
+ "AT-YYSP-QQYY-021": {
+  "task": "去查看一下QQ音乐乐馆的飙升榜的歌曲列表。",
+  "app": "QQ音乐",
+  "milestones": [
+   {"id": "m1", "name": "进入乐馆板块", "state_type": "page", "entities": ["乐馆"], "verify": "页面可见「乐馆」入口并进入"},
+   {"id": "m2", "name": "进入飙升榜", "state_type": "page", "entities": ["飙升榜"], "verify": "页面出现「飙升榜」榜单入口或标题"},
+   {
+    "id": "m3",
+    "name": "进入飙升榜详情页并看到歌曲列表",
+    "state_type": "list_detail",
+    "entities": ["飙升榜", "歌曲名"],
+    "verify": "进入独立的「飙升榜」榜单详情页，页面主标题或页眉明确显示「飙升榜」，并且该详情页中的歌曲排名列表至少有部分歌曲名可见",
+    "not_count": [
+     "仅停留在Charts聚合页",
+     "仅看到飙升榜卡片或预览列表",
+     "页面同时展示多个榜单且没有进入飙升榜详情"
+    ],
+    "evidence_requirements": [
+     "页面身份是独立的飙升榜详情页，而不是Charts聚合页",
+     "可见飙升榜歌曲排名及至少部分歌曲名"
+    ],
+    "acceptance_mode": "terminal_state_with_page_identity"
+   }
+  ]
+ },
+ "AT-YYSP-TX-031": {
+  "task": "使用腾讯视频看剧，找到电视剧热搜榜单的第二部剧进行播放。",
+  "app": "腾讯视频",
+  "milestones": [
+   {"id": "m1", "name": "进入电视剧热搜榜", "state_type": "page", "entities": ["电视剧热搜榜"], "verify": "进入的是「电视剧热搜榜」榜单页，而非其他榜单/搜索页"},
+   {"id": "m2", "name": "第二部剧剧名可见", "state_type": "list", "entities": ["第二部剧名"], "verify": "榜单中序号2的剧名清晰可见"},
+   {"id": "m3", "name": "进入第二部剧播放页", "state_type": "detail_page", "entities": ["第二部剧名"], "verify": "播放页剧名与电视剧热搜榜第二部剧完全一致"}
+  ]
+ },
+ "AT-YYSP-HG-20": {
+  "task": "我喜欢黄宥天版本的“攻略苗疆少年”，打开红果搜索观看。",
+  "app": "红果短剧",
+  "milestones": [
+   {"id": "m1", "name": "播放的短剧是《攻略苗疆少年》", "state_type": "playing", "entities": ["攻略苗疆少年"], "verify": "播放中的短剧剧名为「攻略苗疆少年」"},
+   {"id": "m2", "name": "播放的是黄宥天版本", "state_type": "entity_match", "entities": ["黄宥天"], "verify": "播放的短剧为黄宥天主演/版本（而非其他演员或近似剧）"}
+  ]
+ },
+ "AT-YYSP-HG-19": {
+  "task": "去红果搜索一部刘萧旭主演的民国爱情主题的短剧并播放。",
+  "app": "红果短剧",
+  "milestones": [
+   {"id": "m1", "name": "搜索结果匹配目标短剧", "state_type": "search_result", "entities": ["刘萧旭", "民国爱情"], "verify": "搜索结果剧名为刘萧旭主演的民国爱情题材短剧"},
+   {"id": "m2", "name": "进入对应短剧播放页", "state_type": "detail_page", "entities": ["剧名"], "verify": "播放页剧名与搜索结果的短剧一致"}
+  ]
+ },
+ "AT-YYSP-KG-015": {
+  "task": "打开酷狗音乐，搜索“王菲”，进入歌手详情页，查看其最新专辑。",
+  "app": "酷狗音乐",
+  "milestones": [
+   {"id": "m1", "name": "进入歌手王菲详情页", "state_type": "detail_page", "entities": ["王菲"], "verify": "进入王菲歌手详情页（歌手名=王菲）"},
+   {"id": "m2", "name": "进入王菲的专辑列表", "state_type": "list", "entities": ["王菲"], "verify": "王菲详情页可见其专辑列表"},
+   {"id": "m3", "name": "点击最新专辑进入详情页", "state_type": "content", "entities": ["最新专辑名"], "verify": "必须点击王菲最新专辑并进入其专辑详情页；仅停留在专辑列表页（专辑名可见）不算达成"}
+  ]
+ },
+ "AT-YYSP-TX-038": {
+  "task": "使用腾讯视频看剧，找到电视剧飙升榜单的第五部剧进行播放。",
+  "app": "腾讯视频",
+  "milestones": [
+   {"id": "m1", "name": "进入电视剧飙升榜", "state_type": "page", "entities": ["电视剧飙升榜"], "verify": "进入的是「电视剧飙升榜」榜单页，而非热搜榜/热播榜等其他榜单或搜索页"},
+   {"id": "m2", "name": "第五部剧剧名可见", "state_type": "list", "entities": ["第五部剧名"], "verify": "榜单中序号5的剧名清晰可见"},
+   {"id": "m3", "name": "进入第五部剧播放页", "state_type": "detail_page", "entities": ["第五部剧名"], "verify": "播放页剧名与电视剧飙升榜第五部剧完全一致"}
+  ]
+ }
+}

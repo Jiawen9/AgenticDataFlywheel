@@ -114,7 +114,9 @@ class BatchApiTests(unittest.TestCase):
         value = self.get("tree")
         self.assertEqual(value["task_count"], 2)
         self.assertEqual({task["task_id"]: task["tree_status"] for task in value["tasks"]}, {"A": "succeeded", "B": "pending"})
-        self.assertEqual(self.get("tasks/A/tree"), trees["A"])
+        actual = self.get("tasks/A/tree")
+        self.assertEqual({key: actual[key] for key in trees["A"]}, trees["A"])
+        self.assertEqual(actual["coordinate_lookup_version"], 1)
         self.assertEqual(self.client.get(f"/api/data-batches/{self.batch}/tasks/B/tree").status_code, 409)
         self.tree(["A", "B"])
         self.assertEqual([task["tree_status"] for task in self.get("tree")["tasks"]], ["succeeded", "succeeded"])
@@ -136,6 +138,22 @@ class BatchApiTests(unittest.TestCase):
         self.assertEqual(self.get("tasks/A/quality"), results[0])
         self.assertEqual(self.client.get(f"/api/data-batches/{self.batch}/tasks/B/quality").status_code, 409)
 
+    def test_incomplete_fusion_is_readable_without_claiming_success(self):
+        self.tree(["A"])
+        values = self.quality(["A"])
+        for status, partial in (("running", True), ("failed", True), ("succeeded", False)):
+            row = {**values[0], "status": status, "fusion_complete": False}
+            if partial:
+                row.update(result_state="partial", partial_results_available=True)
+            with patch.object(batch_api, "current_quality_payload", return_value={"tasks": [row]}):
+                task = next(item for item in self.get("quality")["tasks"] if item["task_id"] == "A")
+                self.assertEqual(task["status"], "running" if status == "running" else "failed")
+                self.assertTrue(task["results_available"])
+                self.assertTrue(task["partial_results_available"])
+                self.assertEqual(self.get("tasks/A/quality")["evaluations"], values[0]["evaluations"])
+                summary = next(item for item in batch_api.task_status_summaries(self.batch) if item["task_id"] == "A")
+                self.assertEqual(summary["quality_status"], task["status"])
+
     def test_changing_a_invalidates_its_current_reads_but_keeps_b_complete(self):
         self.tree(["A", "B"])
         self.quality(["A", "B"])
@@ -151,7 +169,10 @@ class BatchApiTests(unittest.TestCase):
         self.assertFalse(quality["A"]["rubric_ready"])
         for suffix in ("tree", "quality"):
             self.assertEqual(self.client.get(f"/api/data-batches/{self.batch}/tasks/A/{suffix}").status_code, 409)
-        self.assertEqual((self.get("tasks/B/tree"), self.get("tasks/B/quality")), before_b)
+        after_b = self.get("tasks/B/tree"), self.get("tasks/B/quality")
+        for version_key in ("annotation_version", "tree_version"):
+            self.assertNotEqual(after_b[0].pop(version_key), before_b[0].pop(version_key))
+        self.assertEqual(after_b, before_b)
 
     def test_all_invalidated_tasks_remain_visible_even_without_a_current_tree(self):
         self.tree(["A", "B"])

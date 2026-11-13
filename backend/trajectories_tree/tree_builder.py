@@ -200,6 +200,7 @@ class Step:
     observation: str = ""
     excluded_intermediate_terminate: bool = False
     task_id: str = ""
+    collection_case_id: str = ""
     source_trajectory_id: str = ""
     collection_run_id: str = ""
     collected_at: str = ""
@@ -213,6 +214,7 @@ class Step:
     def identity_dict(self) -> dict[str, Any]:
         return {key: value for key, value in {
             "task_id": self.task_id, "trajectory_id": self.trajectory,
+            "collection_case_id": self.collection_case_id,
             "source_trajectory_id": self.source_trajectory_id,
             "collection_run_id": self.collection_run_id, "collected_at": self.collected_at,
             "agent_type": self.agent_type, "agent_version": self.agent_version,
@@ -418,6 +420,7 @@ def load_trajectories(path: Path, sheet_name: str | None, *, allow_excel_import:
             action_text=action_text, action=parse_action(action_text),
             summary=str(values.get("summary") or ""), actions_box=str(values.get("actions_box") or ""),
             task_id=row_task_id(values), source_trajectory_id=str(values.get("source_trajectory_id") or ""),
+            collection_case_id=str(values.get("collection_case_id") or ""),
             collection_run_id=str(values.get("collection_run_id") or ""), collected_at=str(values.get("collected_at") or ""),
             agent_type=str(values.get("agent_type") or ""), agent_version=str(values.get("agent_version") or ""),
             trajectory_format=str(values.get("trajectory_format") or ""), normalizer_version=str(values.get("normalizer_version") or ""),

@@ -1,4 +1,4 @@
-"""Platform bridge to the existing collector Checklist evaluator (no local fork)."""
+"""Quality input adapter and local Checklist dispatch; historical remote cleanup only."""
 from __future__ import annotations
 
 from copy import deepcopy
@@ -27,48 +27,7 @@ def _store(root):
     return PhoneFactoryStore(root)
 
 
-def settings(root, *, store=None):
-    from .model_iteration import get_profiles
-    store = store or _store(root)
-    saved = store.records.get("quality_settings", "checklist") or {}
-    capability = store._remote_result(["capabilities"])
-    supported = capability.get("quality_checklist_jobs", {}).get("version") == 1
-    profiles = get_profiles(store)["profiles"] if supported else []
-    selected = next((p for p in profiles if p["id"] == saved.get("evaluation_profile_id") and p["digest"] == saved.get("evaluation_profile_digest")), None)
-    if not saved and len(profiles) == 1:
-        selected = profiles[0]
-    return {"evaluation_profile_id": selected["id"] if selected else "",
-            "evaluation_profile_digest": selected["digest"] if selected else "",
-            "profiles": profiles, "supported": supported,
-            "reason": "" if supported else "请先升级采集端的质检 Checklist 能力"}
-
-
-def save_settings(root, value, *, store=None):
-    from .phone_factory import PhoneFactoryError
-    if not isinstance(value, dict) or set(value) != {"evaluation_profile_id", "evaluation_profile_digest"}:
-        raise PhoneFactoryError("质检设置只接受评测规则版本及摘要")
-    store = store or _store(root)
-    current = settings(root, store=store)
-    if not any(p["id"] == value["evaluation_profile_id"] and p["digest"] == value["evaluation_profile_digest"] for p in current["profiles"]):
-        raise PhoneFactoryError("规则版本不存在或已变化，请刷新后选择", 409)
-    store.records.put("quality_settings", "checklist", dict(value))
-    return {**current, **value}
-
-
-def freeze_options(root, *, store=None):
-    from .model_iteration import get_config, normalize_config
-    from .evaluation_job_previews import endpoint
-    from .phone_factory import PhoneFactoryError
-    store = store or _store(root)
-    current = settings(root, store=store)
-    if not current["supported"]:
-        raise PhoneFactoryError(current["reason"], 409)
-    if not current["evaluation_profile_id"]:
-        raise PhoneFactoryError("请先在轨迹质检中选择 Checklist 规则版本", 409)
-    return {"version": 1, "scoring_version": SCORING_VERSION,
-            "collector_server": endpoint(), "evaluator_config": normalize_config(get_config(store), required=True),
-            "evaluation_profile_id": current["evaluation_profile_id"],
-            "evaluation_profile_digest": current["evaluation_profile_digest"]}
+from .quality_checklist_config import settings, save_settings, freeze_options, migrate_options
 
 
 def _source_error(code, task_id, trajectory_id, message):
@@ -147,35 +106,69 @@ def _checklist_task_text(task):
     return instruction
 
 
-def build_task(task_id, task, trajectories, *, raw_root=None):
-    """Map frozen quality identities to original complete trajectory directories."""
-    rows = []
-    case_ids = set()
-    key_elements = set()
+def build_task(task_id, task, trajectories, *, raw_root=None, source_annotation=None, allow_partial=False):
+    """Freeze a task standard while isolating an unreadable candidate when requested."""
+    rows, case_ids, key_elements = [], set(), set()
+    from .quality_source_identity import annotation_identities, source_metadata
+    legacy_cases = annotation_identities(source_annotation, task_id)
     for trajectory in trajectories:
         metadata = trajectory.metadata or {}
-        directory = _source_directory(task_id, trajectory, raw_root)
         source = metadata.get("source_identity") or {}
-        case_ids.add(str(source.get("case_id") or source.get("task_id") or task_id))
-        elements = metadata.get("key_elements") or (getattr(task, "context", {}) or {}).get("key_elements")
-        if not elements:
-            original = io_path(directory / "_trajectory_for_evaluate.json")
-            try:
-                original_value = json.loads(original.read_text(encoding="utf-8-sig"))
-            except FileNotFoundError:
-                original_value = {}
-            except (OSError, ValueError) as exc:
-                raise _source_error("source_metadata_unreadable", task_id, trajectory.trajectory_id,
-                                    f"原件元数据无法读取：{original.name}；{exc}") from exc
-            elements = original_value.get("key_elements")
-        key_elements.add(elements if isinstance(elements, str) else
-                         json.dumps(elements, ensure_ascii=False, sort_keys=True) if elements else "")
-        rows.append({"trajectory_id": trajectory.trajectory_id, "source_directory": str(directory)})
-    if len(case_ids) != 1 or len(key_elements) != 1:
+        case_hint = (metadata.get('collection_case_id') or source.get('collection_case_id') or
+                     legacy_cases.get(trajectory.trajectory_id) or source.get('case_id'))
+        try:
+            directory = _source_directory(task_id, trajectory, raw_root)
+            if metadata.get('checklist_input_version') == 1:
+                frozen = metadata
+                if frozen.get('source_metadata_error'):
+                    raise _source_error('source_metadata_unreadable', task_id, trajectory.trajectory_id,
+                                        frozen['source_metadata_error'])
+                expected = frozen.get('source_metadata_sha256')
+                if expected:
+                    try:
+                        actual = hashlib.sha256(io_path(directory / '_trajectory_for_evaluate.json').read_bytes()).hexdigest()
+                    except OSError as exc:
+                        raise _source_error('source_metadata_unreadable', task_id, trajectory.trajectory_id, str(exc)) from exc
+                    if actual != expected:
+                        raise _source_error('source_changed', task_id, trajectory.trajectory_id, '轨迹元数据与冻结输入摘要不符')
+            else:
+                recovered = {**source}
+                if trajectory.trajectory_id in legacy_cases:
+                    recovered['collection_case_id'] = legacy_cases[trajectory.trajectory_id]
+                try:
+                    frozen = source_metadata(directory, recovered)
+                except (OSError, ValueError) as exc:
+                    raise _source_error('source_metadata_unreadable', task_id, trajectory.trajectory_id, str(exc)) from exc
+            elements = (frozen.get('key_elements') if metadata.get('checklist_input_version') == 1 else
+                        metadata.get('key_elements') or (getattr(task, 'context', {}) or {}).get('key_elements') or frozen.get('key_elements'))
+            case_ids.add(str(frozen.get('collection_case_id') or case_hint or source.get('task_id') or task_id))
+            key_elements.add(elements if isinstance(elements, str) else
+                             json.dumps(elements, ensure_ascii=False, sort_keys=True) if elements else "")
+            rows.append({"trajectory_id": trajectory.trajectory_id, "source_directory": str(directory)})
+        except (ValueError, OSError) as exc:
+            if not allow_partial:
+                raise
+            from .pipeline_diagnostics import sanitize
+            if case_hint:
+                case_ids.add(str(case_hint))
+            failed_directory = str(metadata.get('source_directory') or '')
+            if failed_directory:
+                try:
+                    candidate = logical_path(failed_directory)
+                    if not candidate.is_absolute() and raw_root is not None:
+                        candidate = logical_path(raw_root) / candidate
+                    if candidate.is_absolute():
+                        failed_directory = str(resolve_path(candidate))
+                except (OSError, ValueError):
+                    pass
+            rows.append({'trajectory_id': trajectory.trajectory_id,
+                         'source_directory': failed_directory,
+                         'source_error': str(sanitize(str(exc)))[:2000]})
+    if len(case_ids) > 1 or len(key_elements) > 1:
         raise ValueError("同任务轨迹的原用例或验收条件不一致，不能共用 Checklist")
-    return {"task_id": task_id, "case_id": next(iter(case_ids)),
+    return {"task_id": task_id, "case_id": next(iter(case_ids), str(task_id)),
             "task": _checklist_task_text(task),
-            "key_elements": next(iter(key_elements)), "trajectories": rows}
+            "key_elements": next(iter(key_elements), ''), "trajectories": rows}
 
 
 def _control_store(root):
@@ -201,6 +194,8 @@ def cancel_remote_jobs(root, job_id, *, store=None):
     """
     records = RecordStore(root)
     index = records.get("quality_checklist_by_job", job_id) or {}
+    if not index.get('keys'):
+        return
     control = store or _control_store(root)
     deadline = time.monotonic() + 10
     for key in index.get("keys", []):
@@ -253,7 +248,7 @@ def _result_checklist(row, state):
     return checklist
 
 
-def evaluate_task(root, job, task_manifest, input_digest, *, progress=None, check=None, store=None, poll_seconds=2):
+def _evaluate_remote_task(root, job, task_manifest, input_digest, *, progress=None, check=None, store=None, poll_seconds=2):
     """Resume one deterministic remote job; completed candidates stay immutable."""
     store = store or _store(root)
     frozen = job["checklist_options"]
@@ -338,3 +333,12 @@ def evaluate_task(root, job, task_manifest, input_digest, *, progress=None, chec
         except Exception:
             pass
         raise
+
+
+def evaluate_task(root, job, task_manifest, input_digest, *, progress=None, check=None, store=None, poll_seconds=2):
+    if job.get("checklist_options", {}).get("execution_backend") == "platform":
+        from .quality_checklist_local import evaluate_task as local_evaluate
+        return local_evaluate(root, job, task_manifest, input_digest, progress=progress, check=check)
+    # Kept for explicitly historical active jobs; new admission and retry are local.
+    return _evaluate_remote_task(root, job, task_manifest, input_digest, progress=progress,
+                                 check=check, store=store, poll_seconds=poll_seconds)

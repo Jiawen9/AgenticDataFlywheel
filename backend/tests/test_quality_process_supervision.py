@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import json
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -65,6 +66,26 @@ while True:
         self.assertEqual(state["state"], "revoked")
         self.assertTrue(state["process"]["exited"])
         self.assertTrue(any("heartbeat_at" in frame for frame in self.frames))
+
+    def test_diagnostic_log_write_failure_does_not_stop_protocol_drain(self):
+        with patch.object(quality_jobs.diagnostics, "append_text", side_effect=PermissionError("fixture log denied")):
+            result = self.worker("print('PROGRESS {\"stage\":\"evaluating\",\"percent\":50}',flush=True)\n"
+                                 "print('RESULT {\"warnings\":[]}',flush=True)")
+        self.assertEqual(result, {"warnings": []})
+        self.assertTrue(any(frame.get("percent") == 50 for frame in self.frames))
+
+    def test_local_checklist_progress_is_bounded_and_retains_real_counts(self):
+        value = quality_jobs._safe_progress_frame({"stage": "checklist_definition",
+            "completed_rubric_trajectories": 10, "total_rubric_trajectories": 10,
+            "completed_checklist_trajectories": 2, "failed_checklist_trajectories": 1,
+            "total_checklist_trajectories": 10, "current_model_role": "vision", "current_model": "actual-model",
+            "checklist_event": {"kind": "request_end", "role": "vision", "elapsed_seconds": 2,
+                                "prompt": "must not leak", "api_key": "must not leak"}})
+        self.assertEqual(value["completed_checklist_trajectories"], 2)
+        self.assertEqual(value["failed_checklist_trajectories"], 1)
+        self.assertEqual(value["stage"], "checklist_definition")
+        self.assertNotIn("prompt", value["checklist_event"])
+        self.assertNotIn("api_key", value["checklist_event"])
 
     def test_timeout_event_then_failed_cannot_cancel_cleanup_deadline(self):
         script = """
@@ -252,6 +273,55 @@ print('RESULT {"warnings":[]}',flush=True)
             self.assertEqual(executor.submit(lambda: 42).result(timeout=5), 42)
         finally:
             release.set();executor.shutdown()
+
+    def test_transient_sqlite_lock_during_claim_fails_job_and_releases_worker(self):
+        for operation in ("read", "write"):
+            with self.subTest(operation=operation), ThreadPoolExecutor(max_workers=1) as executor:
+                root = self.root / operation
+                runner = Mock(return_value={"tasks": [{"task_id": "task"}]})
+                manager = quality_jobs.QualityJobManager(root / "jobs", runner=runner,
+                    executor=executor, data_root=root)
+                try:
+                    for ident in ("locked", "next"):
+                        manager.records.put("quality_jobs", ident, {"job_id": ident, "run_id": "batch",
+                            "task_ids": ["task"], "status": "queued", "stage": "queued"})
+                    original = manager.records.get if operation == "read" else manager.records.put
+                    injected = []
+                    def transient(*args, **kwargs):
+                        target = len(args) > 1 and args[0] == "quality_jobs" and args[1] == "locked"
+                        if operation == "write":
+                            target = target and len(args) > 2 and args[2].get("status") == "running"
+                        if target and not injected:
+                            injected.append(True)
+                            raise sqlite3.OperationalError("database is locked")
+                        return original(*args, **kwargs)
+                    with patch.object(manager.records, "get" if operation == "read" else "put", side_effect=transient):
+                        executor.submit(manager._run_with_diagnostics, "locked", "batch", ["task"]).result(timeout=5)
+                    self.assertEqual(injected, [True])
+                    self.assertEqual(manager.get("locked")["status"], "failed")
+                    self.assertTrue(manager.get("locked")["failure"])
+                    self.assertNotIn("locked", manager._stop_events)
+                    runner.assert_not_called()
+                    executor.submit(manager._run_with_diagnostics, "next", "batch", ["task"]).result(timeout=5)
+                    self.assertEqual(manager.get("next")["status"], "succeeded")
+                    self.assertFalse(manager._stop_events)
+                    runner.assert_called_once()
+                finally:
+                    manager.shutdown()
+
+    def test_rejected_duplicate_claim_does_not_drop_active_stop_event(self):
+        runner = Mock()
+        manager = quality_jobs.QualityJobManager(self.root / "jobs", runner=runner, data_root=self.root)
+        try:
+            manager.records.put("quality_jobs", "active", {"job_id": "active", "run_id": "batch", "status": "running"})
+            active = threading.Event()
+            manager._stop_events["active"] = active
+            manager._run_with_diagnostics("active", "batch", ["task"])
+            self.assertIs(manager._stop_events["active"], active)
+            self.assertFalse(active.is_set())
+            runner.assert_not_called()
+        finally:
+            manager.shutdown()
 
     def test_request_diagnostics_strip_secrets_and_bodies(self):
         safe = quality_jobs._safe_request_frame({"local_request_id": "r", "event": "started",

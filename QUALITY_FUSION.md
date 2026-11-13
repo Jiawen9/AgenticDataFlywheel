@@ -1,10 +1,10 @@
 # 轨迹质检：Checklist 融合与树节点 Q
 
-本次只扩展平台质检和采集端的只读评测服务。Rubric 生成、步骤观察、采集执行、App 复位、模型覆盖和原始轨迹保持原有行为。创新平台前端需按本文适配，不能覆盖其 API 基址、路由或组件体系。
+最近更新：2026-11-13。轨迹质检由平台后端的 `DevelopRubrics` 与 `ChecklistEvaluator` 执行；新质检不再请求采集端能力、目录或评测服务。模型迭代评估、手机采集、App 复位和采集端源码本轮保持不变。创新平台沿用其 API 基址、路由及组件体系。
 
 ## 分数和推荐
 
-同一任务的候选轨迹共用一份冻结 Checklist。沿用当前模型迭代评测的 gold 优先、否则生成清单的流程；记录真实来源及规则摘要。逐轨迹证据检查及 verdict 仍由现有评测器完成。
+同一任务的候选轨迹共用一份冻结 Checklist。迁入原生评测器的 gold 优先、否则生成清单流程；记录真实来源及规则摘要。逐轨迹证据检查及 verdict 仍由现有评测器完成。
 
 - G：原 Rubric 综合分，保留各维度和各步骤评分。
 - k/M：已通过条件数 / 冻结条件总数，百分比仅表示条件通过比例。
@@ -22,15 +22,34 @@
 
 终点仍按轨迹分别展示 Rubric 维度、G、Checklist、verdict 和 F。同一路径完全匹配时可能共享终点，不能把终点平均值冒充单条轨迹分。
 
-## 部署与配置
+## 本地工程与配置
 
-先合入支持 `quality_checklist_jobs.version=1` 的 9011 增量，再同步平台前后端与 CLI。使用“模型迭代评估”已有的评测模型配置；质检页选择评测规则版本，只有一份规则时可自动选择。配置在新质检提交时冻结，续查和重试不读取后来的页面默认值。
+后端新增 `ChecklistEvaluator` 独立工程，只迁入评测、模型、规则和只读证据模块，不引入手机 Agent／ADB。平台已有质检调度管理作业，Checklist 使用隔离 Python 子进程，避免 `agent/config` 导入和环境变量污染 Rubric 或 FastAPI。
 
-平台向采集端传输轨迹身份和原件目录的小清单，不复制图片、不重新采集。采集端必须能只读访问这些原件目录，且目录符合其现有允许读取范围。不同电脑部署时需事先配置共享路径；不以隐式上传或复制作为回退。
+- `ADF_CHECKLIST_PYTHON` 指向平台电脑的解释器，未配置时使用平台解释器；安装 `backend/ChecklistEvaluator/requirements.txt`，原 `ADARUBRIC_PYTHON` 不变。
+- 在质检页独立配置 text/vision 的 URL、实际模型 ID、密钥环境变量名与本地规则。首次迁移复制原模型迭代默认值，此后互不覆盖；真实密钥只在平台后端环境／backend/.env 中提供。
+- 原规则按原 ID/digest 导入 `DATA_ROOT/resources/checklist_profiles`；可用 `ADF_CHECKLIST_PROFILES_DIR` 指定别处。工具 `python -m backend.ChecklistEvaluator.import_profile --source-profiles <实际原规则根> --profile-id <原ID> --expected-digest <原摘要>` 只导入小型规则并验证摘要，不覆盖同编号不同内容，不复制轨迹。
+- 同步新增文件和修改文件。在平台质检安全窗口重启后端并同步前端；本轮不交付采集端包，也不要求重启手机采集服务。
+
+原件直接只读，路径适配在内存中进行；不复制或解压整批轨迹。日志、报告、小型清单存于 `DATA_ROOT/system/qc/<短摘要>/`，规则快照存于 `system/qc_profiles/`，逐轨迹状态和全局并发租约复用 `system/app.sqlite`。原 Rubric 检查点仍在 `cache/rubric_outputs/`，正式质检结果仍发布为 05_quality 版本。旧采集端数据保留不动。
+
+默认两个跨进程执行槽。模型／文件计算在 SQLite 短事务外进行；取消、失败和重启核对进程身份与代次。子进程持续排空输出并及时刷新，日志限量脱敏；单次请求和无进展阶段有界监管，无整批固定截止。
+
+质检专用 `quality_only_v1` 保留判定所需视觉事实、证据引用和 verdict，跳过判定完成后仅供报告展示的重复视觉／文本总结。未请求的总结明确标注，不冒充已生成。
+
+## 旧批次恢复与进度
+
+`b261112-004` 只重试原质检阶段。先按旧输入指纹确认未变化，再创建关联的本地执行作业，继承原冻结模型和规则；旧记录、原件和快照不改。Rubric 复用原检查点，不重采、预处理或建树。
+
+原始 collection_case_id 和验收条件随新输入冻结；旧快照从已登记的 source_annotation 行恢复原编号，按 raw_root 解析相对目录，不能用平台短编号猜原始用例。定义身份变化时同任务重新建立 Checklist 并重评，不能混用旧标准。
+
+本地重试只复用通过完整契约验证的结果。缺 verdict 等无效报告在本次重试生成新尝试，旧报告保留；临时 source_error 不进入稳定缓存键，修复一条不让其它有效条全部重评。仍活动的旧质检先停止并对账，只涉及该质检作业，不停止手机。
+
+页面分别显示 Rubric 完成、Checklist 结束／失败及融合有效数，并显示真实模型阶段、角色和耗时。过程结果按输入指纹与执行代次隔离，失败或中断也可查看已有分数；最终提交且完整有效才能推进。不能将 worker 正常退出或 Rubric 完成 95% 当作整体评分成功。
 
 ## 接口适配
 
-平台新增 `GET/PUT /api/quality-jobs/settings`；保存字段为 `evaluation_profile_id`、`evaluation_profile_digest`。新质检仍通过原提交入口。任务结果新增：
+沿用 `GET/PUT /api/quality-jobs/settings`。GET 增加 execution_backend=platform、evaluator_config、model_configured、本地 profiles；PUT 支持只保存 evaluator_config 或规则 ID/digest，模型为 text/vision 各自的 base_url/model/api_key_env，不接受真实密钥。提交、停止、重试路径不变。任务结果包含：
 
 - `scoring_version: checklist_fusion_v1`、`trajectory_order`、`fusion_order`。
 - `evaluations[trajectory_id].checklist`：状态、来源、定义摘要、total/passed/failed/unchecked、verdict 和逐项结果。
@@ -40,71 +59,45 @@
 
 新前端缺少这些字段时按旧 Rubric 数据展示，不用 G 假造 Q 或 F。树的建树分和质检 Q 分别展示。轮询沿用当前页面选择保护；不要因新响应切走用户正在看的轨迹。
 
-9011 独立接口：
+质检摘要和任务详情仍为 `/api/data-batches/{batch}/quality` 与 `/tasks/{task}/quality`，不可绑定到整批 quality=succeeded 后才读取。根据真实作业状态和结果可用标志展示部分结果；查看结果与后续操作权限分开。
 
-| 方法与路径 | 用途 |
+### 详情阅读与最高 F 高亮（2026-11-13）
+
+自用前端桌面右栏为 `clamp(380px, 32vw, 480px)`，内部独立滚动；窄屏上下排列。评分区域使用局部深色配色，不修改全站折叠组件。截图保持比例，可打开现有放大预览。
+
+F、Rubric 维度分、Checklist 通过数及结论常驻。Checklist 有多少条就显示多少条摘要，原始描述默认最多两行；点击单项才展开完整描述、理由及证据，同一时间展开一项。同一轨迹的评分刷新保持展开项，切换轨迹或树输入版本后收起。缺项、缺证据及技术错误如实显示，不调用模型生成摘要。
+
+最高分高亮只比较本任务真实终点轨迹的有效原始 F，不按显示小数比较，不拼接各层最大 Q。并列顺序沿用结果 `fusion_order`／`trajectory_order`，旧结果回退树的来源顺序；一次突出一条，可切换并列项或关闭高亮。最高轨迹的根到终点为青绿色，当前选中节点为黄色，节点 Q 不变。部分评分显示“当前已评分最高”和有效覆盖 X/N；无有效 F 时不高亮，不用 G 替代。
+
+点击共享节点优先选择高亮轨迹的截图及终点结果，仍能手动切换。用户显式切换并列轨迹时，若当前节点包含该轨迹，截图同步切换；后台评分刷新不抢走手动选择。刷新保留已展示内容并隔离过期响应，树拓扑未变时保留缩放和拖动位置；仅高亮或分数变化不触发后端重建树、模型请求或新增查询。
+
+本轮仅前端和文档，部署及验证见 [页面交付说明](docs/quality-ui-20261113/README.md)。坐标功能仍依赖上一轮兼容后端；下节的真实网关及点击位置验收不可省略。
+
+### 树图片坐标
+
+默认 `GET /api/data-batches/{batch}/tasks/{task}/tree` 保持树结构并追加坐标能力、tree_version 和 annotation_version。选择步骤后同一路径增加 `view=coordinate`、两个版本、trajectory_id、image，返回单步 coordinate_info 及绑定身份，不新增网关路由。
+
+单步模式复用现有版本索引，不重算整批树或遍历图片。前端以稳定基本值监听，相同内容的新对象不会重发；根节点、关闭 overlay、无坐标动作不查，放大复用数据。切换节点丢弃旧响应；失败保持原因和手动重试，不随状态轮询反复请求。来源未知不猜坐标。
+
+创新平台必须保留自己的 API_BASE_URL 和网关前缀，并按实际 JSON 响应验证本路由；本地测试不能证明 icap 配置正确，HTML/CORS 仍需按真实响应定位。
+
+## 验证与部署资料
+
+本轮定向回归覆盖两引擎真实预处理／建树输入、旧十轨迹 Rubric 复用、原编号及条件冻结、真实隔离子进程与模拟模型、锁竞争、日志异常、取消／重启／迟到结果、无效缓存恢复、坐标版本与前端轮询。日志与测试结果见 [VALIDATION.md](docs/quality-local-20261113/VALIDATION.md)，内网步骤见 [CODEAGENT_PROMPT.txt](docs/quality-local-20261113/CODEAGENT_PROMPT.txt)。
+
+本地测试不调用真实模型、不操作手机；内网用现有十轨迹验证实际 Checklist、F/Q、原件不变及 icap 展示。未完成现场验证前，不宣称内网成功或质检准确率提升。
+
+### 本轮审查修复的原因
+
+| 问题 | 处理 |
 | --- | --- |
-| POST /quality-checklist-jobs | multipart：request JSON 文本 + manifest_file UTF-8 JSON 文件；异步受理 |
-| GET /quality-checklist-jobs/{id} | 小型状态摘要 |
-| GET /quality-checklist-jobs/{id}/results?offset=0&limit=50 | 分页读取结果 |
-| GET /quality-checklist-jobs/{id}/reports/{report_id} | 只读评测报告 |
-| POST /quality-checklist-jobs/{id}/cancel | 仅停止对应质检评测 |
-| POST /quality-checklist-jobs/{id}/retry | 重试未完成部分，复用已完成结果 |
+| 调度台账读取异常后活动槽未释放 | 本地持久租约，领取异常、退出、重启均对账 |
+| 日志写入失败导致 PIPE 堵塞 | 持续 drain、及时 flush、明确失败与有界收尾 |
+| complete 但无 verdict 的结果永久复用 | 完整契约验证后才缓存，新尝试修复无效结果 |
+| 小清单半写后永久冲突 | 原子提交，未完成写入可恢复 |
+| Rubric 完成即 95%、部分结果被标成功 | 分阶段真实计数、部分可看、失败明确结束 |
+| 所有轨迹技术失败时伪造定义不一致 | 冻结定义为准，优先展示实际 primary_error |
+| 原始 case_id 丢失、条件未冻结 | 修复输入身份流转及旧快照恢复 |
+| 坐标新对象触发重复请求 | 稳定监听、版本缓存、原 GET 路由单步响应 |
 
-请求包含 request_id、evaluator_config、evaluation_profile_id/digest；清单包含 schema_version、quality_job_id、input_digest，以及各 task_id/case_id/task/key_elements 和 trajectory_id/source_directory。相同请求编号与内容重放复用任务，改变内容冲突。运行数据和规则快照属于采集端独立质检任务，不伪装成手机采集运行。
-
-## 验证范围
-
-定向测试覆盖公式、全通过优先、原表同分顺序、无效分数、真实建树 occurrences、Q 去重、分支不均衡、A 边界、历史选择保护和 CLI multipart。另验证采集端排队、重放、取消、重试、只读原件，以及前端类型检查和构建。具体执行结果见交付验证记录。内网真实模型和网关验收需单独完成，离线测试不代表质检准确率或设备验收。
-
-## 原件路径恢复与失败结果展示（2026-11-13）
-
-现场 `b261112-004 / t261112-002` 已有 10 条 Rubric 结果、101 个节点记录，但融合有效数为 0；Checklist 在准备阶段报“质检轨迹缺少可供采集服务只读访问的原件目录”。原因是质检输入生成器漏用 `trajectory_root`，把截图的相对父目录交给了要求绝对目录的 Checklist 接口。这条错误本身不表示原件丢失或模型调用失败。
-
-修复仅涉及平台后端与自用前端，不需要新采集端增量包。新质检输入按登记根目录解析来源；已冻结的相对目录在 Checklist 构造阶段按该快照 `raw_root` 内存解析，不依赖工作目录，不改原件、旧树快照、步骤内容或 Rubric 检查点键。目录缺失、路径非法、根目录缺失、身份冲突、文件不可读分别返回包含任务和轨迹的具体原因。不会为此复制轨迹、补造 XML 或重采手机。
-
-自动流程的质检重试使用原绑定作业的 Checklist 模型、规则、服务地址和输入指纹；不读取后来的页面默认配置。输入或 Rubric 配置已变化时仍明确报错，不能把旧评分套到新输入。尚未成功的任务继续评分，完整结果及有效 Rubric 检查点按现有规则复用。
-
-自用前端在树已可用后就读取当前有效的质检摘要和详情，包括部分评分、Checklist 错误及 Q 覆盖数量。自动流程整批成功仍是获取修正候选和推进下一阶段的条件；查看结果不会放宽发布资格。已有节点评分记录但没有有效 F 时显示“暂无有效评分”，与尚未读取结果区分。
-
-**本批恢复：** 同步平台后端和自用前端，在安全窗口重启对应服务；进入 `b261112-004` 原自动流程，对失败的质检阶段执行原有重试操作。保留原批次、采集、预处理、树、Rubric 检查点和冻结模型配置；无需新建采集或重建树。补做 Checklist 后核对 10 条轨迹的 F、节点 Q 和人工修正入口。如果原件实际不可读或远端模型失败，页面会显示对应原因，不能预先承诺全部评测通过。
-
-**创新平台适配：** 本次不新增路由。沿用 `GET /api/data-batches/{batch_id}/quality` 和任务详情 `GET /api/data-batches/{batch_id}/tasks/{task_id}/quality`，不要将这两个只读请求绑定到整批 Pipeline `quality=succeeded`；推荐/修正操作仍保留该门禁。展示 `evaluations.*.checklist.error`、`fusion.invalid_reasons`、`node_scores` 及覆盖数，原件路径错误仍经既有 error 字段返回。切换批次或任务丢弃旧响应，未就绪与真实请求失败分别处理。
-
-本地验证与内网验收分开记录：定向测试使用临时样本和模拟模型，不操作手机；真实验收使用现有批次的 10 条轨迹，不重跑大批次采集。
-
-本次后端两组 119／50 项通过（去重 153 项），前端 37 项通过，`vue-tsc -b && vite build` 通过。核心恢复测试使用真实质量输入生成／读取与 worker 执行路径，模拟远端 Checklist 完成；验证 10 条旧相对路径输入恢复完整 F/Q，Rubric 模型未调用、旧快照／检查点／原件字节不变。Windows 超过 260 字符的中文目录测试已执行。构建仅有依赖注释及包体积提示；真实模型、共享路径权限和内网页面验收待完成。
-
-## Checklist 目录配置与原始错误（2026-11-13）
-
-后续现场确认：`b261112-004` 的原件目录实际存在，但采集服务的允许读取范围仅有 `D:/vlaphonefactory/result-generate` 和 `result-modeliter`。平台回传目录位于另一个工程下，因此采集服务在准备阶段拒绝读取，尚未进行逐轨迹 Checklist 核验。5 项条件均未核验不等于任务业务失败，也不表示截图或 XML 缺失。
-
-这一现场使用的目录配置如下。在启动 **9011 的进程环境**中设置，安全窗口用原命令重启服务，再重试原质检阶段：
-
-```bash
-export PHONE_FACTORY_EVALUATION_INPUT_ROOTS='["D:/vlaphonefactory/result-generate","D:/vlaphonefactory/result-modeliter","D:/vla2platform/AgenticDataFlywheel/backend_workspace/raw/collection_batches"]'
-```
-
-上面是已核对的现场路径示例，其余环境使用自己的实际目录，并保留原有输入根目录。`export` 只影响本终端及它启动的进程；需要持续生效时写入实际服务启动脚本或 PyCharm 运行配置的环境变量。平台的 `.env` 不会自动传入另一个采集服务进程；采集服务启动器未明确加载 `.env` 时，也不能只把变量写进文件就认为已生效。通过 `GET /evaluation_sources` 返回的 `allowed_roots` 核对实际服务配置。不同电脑部署先保证原件路径可访问；不得以猜目录、隐式复制原件或关闭身份校验作回退。
-
-平台同时修复了原始错误丢失：采集端失败行的 `error` 位于顶层，非空的 `checklist` 只保留定义与计数。平台现在将顶层错误合并到 `evaluations.*.checklist.error`，已有 Checklist 内层错误优先；作业级错误只作为未完成条目的后备原因，完整轨迹不受其它轨迹错误影响。错误脱敏并限长，原响应、规则及分数不改写。旧失败评分快照不会自动改写；原阶段重试后生成带真实原因的新结果。
-
-缺项处理语义不变：已有 Rubric 和有效部分结果仍可查看；F/Q 依赖实际可用的融合结果；本轮没有修改整批推进或发布条件。`checklist_definition_mismatch` 在全批没有完成结果时也可能是派生提示，不能单凭它断言规则真的混用。排查时优先读取原始异常。当前现场无需关闭评分条件，补齐输入目录配置后再补做 Checklist 即可。
-
-此项新增生产改动仅为平台 `backend/quality_checklist.py`，无新前端或采集端源码改动；此前修复漏参的采集端包仍需保留。代码测试与真实模型验收分别记录，不承诺目录配置修正后模型服务必然成功。
-
-本地定向验证：31 项通过、无跳过，包括平台桥接单测 12 项、真实 CLI/Flask 契约 3 项、融合及自动推进回归 16 项。新增现场模式测试使用真实 `allowed_roots()` 环境配置：已有原件初始拒绝读取，设置正确根目录后重试同一请求，复用原 Checklist 定义、生成两条完整结果且原件摘要不变。模型仍使用替身，现场模型验收待执行。
-
-## Checklist 任务文本适配（2026-11-13）
-
-现场在目录配置修正后继续报 `manifest task differs from source trajectory`。平台的质检输入同时保存纯任务 `context.task_description` 与 Rubric 专用 `instruction`，后者是系统提示词加 `Task:` 加原任务。此前 Checklist 错取完整 instruction，采集服务与原件 JSON 的纯 task 比较时就不相等；这是字段适配错误，不是原件质量或模型评分失败。
-
-修复限定为平台 `backend/quality_checklist.py`：优先使用冻结的非空 `context.task_description`。缺少该字段的旧输入仅移除平台已知的完整系统提示词包装，兼容 LF/CRLF；不按任意 `Task:` 子串拆分，不从原件或新页面配置偷换冻结任务。纯 instruction 继续兼容，任务中原有换行、`Task:` 字样保留。Rubric 的 instruction、上下文、旧工作簿/JSON快照、原件和检查点键均不修改。
-
-平台现有 Checklist 请求指纹包含完整任务清单。因此修正任务文本后，在同一批次的原质检阶段重试，会自动创建新的内部 Checklist 请求并生成正确清单；此前按包装文本生成的清单、旧请求及历史错误保留，不复用或就地改写。正确请求再次重试仍按已有幂等机制复用。Rubric 输入未变，已完成的 Rubric 检查点继续复用。
-
-部署：同步平台后端并重启平台服务，在 `b261112-004` 原自动流程重试质检；无需重新采集、预处理、建树，也无需本次新增的采集端/CLI/前端代码或环境变量。此前采集端漏参修复与已核对的目录配置继续保留。真正属于其它任务的轨迹仍由原有任务绑定检查拒绝，不能把该检查删除来掩盖字段错误。
-
-定向验收需串起真实预处理产物、质检输入生成/读取、Checklist 清单、平台 CLI multipart 和采集端 `_reference` 任务校验；不能仅单测路径或手工构造纯任务跳过适配层。现场使用现有轨迹重试核对 Checklist、F/Q；本地替身模型的测试不代表真实模型已通过。本次不调整进度百分比、评分公式或整批推进规则。
-
-本次本地验证：59 项通过、无跳过（桥接单测 16、输入恢复/冻结重试/评分推进回归 38、实际 CLI/Flask 契约 5）。契约覆盖 NewAgent 与 Pipeline 真实预处理产物和原任务比较：旧包装文本复现同一错误，纯任务进入新的 Checklist 作业并完成，旧定义及原件不变，正确请求再次使用已有结果。十轨迹恢复测试确认 Rubric 模型未调用、冻结快照及检查点字节不变。测试未调用真实模型或手机；内网仅需原批次质检重试验收。本次无前端代码变更，不重复前端构建。
+历史说明：早期版本通过 9011 执行 Checklist，曾要求 allowed_roots 和采集端漏参修复。以上远端配置不再是新平台质检的前置条件；仅保留历史任务读取／停止兼容，模型迭代原有流程仍按其专题维护。

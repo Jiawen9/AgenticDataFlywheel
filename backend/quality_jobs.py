@@ -38,7 +38,7 @@ Progress = Callable[[dict[str, Any]], None]
 QualityRunner = Callable[..., dict[str, Any]]
 
 
-_PROGRESS_STAGES = {"preparing", "generating_rubric", "evaluating", "checklist_preparing", "checklist_evaluating", "fusing", "publishing"}
+_PROGRESS_STAGES = {"preparing", "generating_rubric", "evaluating", "checklist_queued", "checklist_preparing", "checklist_definition", "checklist_evaluating", "fusing", "publishing"}
 _PROGRESS_IDENT = re.compile(r"^[A-Za-z0-9_.:-]{1,96}$")
 _HEARTBEAT_TIMEOUT = 60.0
 _REQUEST_CLEANUP_GRACE = 15.0
@@ -58,7 +58,7 @@ def _safe_request_frame(value: Any) -> dict[str, Any]:
         item = value.get(key)
         if isinstance(item, str) and _PROGRESS_IDENT.fullmatch(item):
             safe[key] = item
-    if value.get("operation") in {"rubric_generate", "rubric_repair", "trajectory_score", "model_request", "client_cleanup"}:
+    if value.get("operation") in {"rubric_generate", "rubric_repair", "trajectory_score", "model_request", "client_cleanup", "checklist_definition", "checklist_evaluate"}:
         safe["operation"] = value["operation"]
     for key in ("started_at", "deadline_at"):
         item = value.get(key)
@@ -105,11 +105,23 @@ def _safe_progress_frame(value: Any) -> dict[str, Any]:
         item = value.get(key)
         if isinstance(item, str) and _PROGRESS_IDENT.fullmatch(item):
             safe[key] = item
-    for key in ("task_index", "total_tasks", "completed_trajectories",
-                "total_trajectories", "percent"):
+    for key in ("task_index", "total_tasks", "completed_trajectories", "completed_rubric_trajectories",
+                "total_rubric_trajectories", "completed_checklist_trajectories", "failed_checklist_trajectories",
+                "total_checklist_trajectories", "fusion_eligible_count", "total_trajectories", "percent"):
         item = value.get(key)
         if type(item) is int and 0 <= item <= 10000000:
             safe[key] = item
+    for key in ("current_model", "current_model_role"):
+        item = value.get(key)
+        if isinstance(item, str) and len(item) <= 160:
+            safe[key] = str(diagnostics.sanitize(item))
+    event = value.get("checklist_event")
+    if isinstance(event, dict):
+        allowed = {key: event[key] for key in ("kind", "role", "model", "call_id", "attempt", "timeout_seconds", "elapsed_seconds") if key in event}
+        safe["checklist_event"] = diagnostics.sanitize(allowed)
+    for key in ("results_available", "partial_results_available", "result_complete"):
+        if type(value.get(key)) is bool:
+            safe[key] = value[key]
     return safe
 
 
@@ -128,6 +140,15 @@ class QualitySubprocessError(RuntimeError):
 
 def _now() -> str:
     return datetime.now(ZoneInfo("Asia/Shanghai")).isoformat()
+
+
+def _result_changes(report: dict, task_ids: list[str]) -> dict:
+    from .quality_fusion import completion_summary
+    summary = completion_summary(report, task_ids)
+    complete = summary["result_complete"]
+    return {"status": "succeeded" if complete else "failed", "stage": "succeeded" if complete else "failed",
+            "completed_at": _now(), "percent": 100, "error": None, "failure": None,
+            "diagnostic_log": [], "warnings": report.get("warnings", []), **summary}
 
 
 def _env_values(path: Path) -> dict[str, str]:
@@ -208,16 +229,25 @@ def _run_quality_subprocess(run_id: str, task_ids: list[str], *, job_id: str, pr
         raise
     events = queue.Queue()
     reader_done = threading.Event()
+    reader_failure = []
+    log_failure = []
     def read_output():
         try:
             assert process.stdout is not None
             for line in process.stdout:
-                if trace:
-                    diagnostics.append_text(f"jobs/{job_id}/{trace['execution_id']}/worker-output.log", line)
+                if trace and not log_failure:
+                    try:
+                        diagnostics.append_text(f"jobs/{job_id}/{trace['execution_id']}/worker-output.log", line)
+                    except Exception as exc:
+                        # Keep draining the pipe even if diagnostic storage fails;
+                        # otherwise the child can block writing its final result.
+                        log_failure.append(type(exc).__name__)
                 # The diagnostic tee is independent of the bounded progress protocol.
                 if line.startswith("RESULT ") or (line.startswith(("PROGRESS ", "ERROR ", "REQUEST ", "HEARTBEAT "))
                                                    and len(line) <= 65536):
                     events.put(line.rstrip())
+        except Exception as exc:
+            reader_failure.append(type(exc).__name__)
         finally:
             reader_done.set()
             if process.stdout is not None:
@@ -246,6 +276,10 @@ def _run_quality_subprocess(run_id: str, task_ids: list[str], *, job_id: str, pr
         reader.start()
         while True:
             now = time.monotonic()
+            if reader_failure:
+                failure = {"category": "unknown", "code": "quality_output_read_failed"}
+                cleanup_required = True
+                break
             expired = next((frame for deadline, frame in active.values()
                             if now >= deadline + _REQUEST_CLEANUP_GRACE), None)
             if stop_event is not None and stop_event.is_set():
@@ -417,8 +451,7 @@ class QualityJobManager:
                 committed = (quality_execution.committed_result(self.data_root, payload["job_id"])
                              if cleanup.get(payload["job_id"], True) else None)
                 if committed is not None and cleanup.get(payload["job_id"], True):
-                    payload.update(status="succeeded", stage="succeeded", percent=100, completed_at=_now(),
-                                   error=None, failure=None, warnings=committed.get("warnings", []))
+                    payload.update(_result_changes(committed, payload.get("task_ids", [])))
                     self._write(payload)
                     continue
                 failure = failure_from_payload({"category": "service_restart"} if cleanup.get(payload["job_id"], True)
@@ -480,7 +513,7 @@ class QualityJobManager:
         original_batch = previous.get("batch_id")
         if not original_batch or (batch_id is not None and batch_id != original_batch):
             raise ValueError("原质检作业不属于当前批次，不能重试")
-        with active_batch_lock(original_batch, self.data_root), self._lock:
+        def validate():
             from .pipeline_access import ensure_pipeline_write
             ensure_pipeline_write(original_batch, self.data_root)
             previous = self.get(job_id)
@@ -499,15 +532,42 @@ class QualityJobManager:
                    or trees.get("tree_hashes", {}).get(task) != source_hashes[task]
                    for task in original_tasks):
                 raise StaleTaskInput("原质检作业的冻结输入或评分配置已变化，请重新提交质检")
-            return self._submit_batch(original_batch, original_tasks, trees,
-                                      checklist_options=frozen_options)
+            return previous, original_tasks, trees, frozen_options
 
-    def _submit_batch(self, batch_id, task_ids, trees, *, checklist_options=None):
+        with active_batch_lock(original_batch, self.data_root), self._lock:
+            previous, original_tasks, trees, frozen_options = validate()
+            if previous.get("status") in {"queued", "running"}:
+                return previous
+            published = current_quality_payload(original_batch, self.data_root, include_partial=False)
+            results = {row["task_id"]: row for row in published.get("tasks", [])}
+            if previous.get("status") == "succeeded" and all(
+                    published.get("task_fingerprints", {}).get(task) == previous["task_fingerprints"][task]
+                    and (not frozen_options or results.get(task, {}).get("fusion_complete")) for task in original_tasks):
+                return previous
+
+        # Profile materialization is local filesystem work; do not hold the
+        # publication lock. Validate the old input again before enqueueing.
+        migrated = bool(frozen_options and frozen_options.get("execution_backend") != "platform")
+        if migrated:
+            from .quality_checklist import migrate_options
+            next_options = migrate_options(self.data_root, frozen_options)
+        else:
+            next_options = frozen_options
+        with active_batch_lock(original_batch, self.data_root), self._lock:
+            previous, original_tasks, trees, verified_options = validate()
+            if verified_options != frozen_options:
+                raise StaleTaskInput("原质检作业的冻结配置已变化，请刷新后重试")
+            return self._submit_batch(original_batch, original_tasks, trees, checklist_options=next_options,
+                retry_metadata={"origin_job_id": job_id,
+                                "migration_version": 1 if migrated else 0,
+                                "origin_execution_backend": (frozen_options or {}).get("execution_backend", "collector")})
+
+    def _submit_batch(self, batch_id, task_ids, trees, *, checklist_options=None, retry_metadata=None):
         if any(task not in trees["trees"] for task in task_ids):
             raise ValueError("所选任务没有当前轨迹树")
         fingerprints = quality_task_fingerprints(trees, checklist_options=checklist_options)
         expected = {task: fingerprints[task] for task in task_ids}
-        published = current_quality_payload(batch_id, self.data_root)
+        published = current_quality_payload(batch_id, self.data_root, include_partial=False)
         incomplete = {item["task_id"] for item in published.get("tasks", []) if item.get("scoring_version") == "checklist_fusion_v1" and not item.get("fusion_complete")}
         current = {task: value for task, value in published.get("task_fingerprints", {}).items() if task not in incomplete}
         jobs = [job for job in self.list_jobs() if (job.get("batch_id") or job.get("run_id")) == batch_id]
@@ -530,7 +590,8 @@ class QualityJobManager:
         return self._submit_job(batch_id, pending, {"batch_id": batch_id, "task_fingerprints": {task: expected[task] for task in pending} if pending else expected,
             "source_tree_hashes": {task: trees["tree_hashes"][task] for task in pending},
             "requested_task_ids": task_ids, "reused_task_ids": [task for task in task_ids if task not in pending],
-            **({"checklist_options": checklist_options, "scoring_version": "checklist_fusion_v1"} if checklist_options else {})})
+            **({"checklist_options": checklist_options, "scoring_version": "checklist_fusion_v1"} if checklist_options else {}),
+            **(retry_metadata or {})})
 
     def _submit_job(self, run_id, task_ids, extra=None):
         if self._closed:
@@ -584,13 +645,15 @@ class QualityJobManager:
 
     def _run_with_diagnostics(self, job_id: str, run_id: str, task_ids: list[str]) -> None:
         stop_event = threading.Event()
-        with self._lock:
-            if self._closed or (self.get(job_id) or {}).get("status") != "queued":
-                return
-            self._stop_events[job_id] = stop_event
-            self._progress(job_id, {"status": "running", "stage": "preparing", "started_at": _now()})
         token = None
         try:
+            # Claim reads and the first state write can fail as well. They must
+            # share the worker's failure finalization and in-memory cleanup.
+            with self._lock:
+                if self._closed or (self.get(job_id) or {}).get("status") != "queued":
+                    return
+                self._stop_events[job_id] = stop_event
+                self._progress(job_id, {"status": "running", "stage": "preparing", "started_at": _now()})
             with batch_operation(run_id, "quality_worker", self.data_root):
                 job = self.get(job_id) or {}
                 if job.get("source_tree_hashes"):
@@ -617,9 +680,7 @@ class QualityJobManager:
             committed = (quality_execution.committed_result(self.data_root, job_id, token)
                          if token and (execution or {}).get("process", {}).get("exited") is True else None)
             if committed is not None:
-                self._progress(job_id, {"status": "succeeded", "stage": "succeeded", "completed_at": _now(),
-                                       "percent": 100, "error": None, "failure": None,
-                                       "warnings": committed.get("warnings", [])})
+                self._progress(job_id, _result_changes(committed, task_ids))
                 return
             status = "stale" if isinstance(exc, StaleTaskInput) else "failed"
             failure = failure_from_payload(getattr(exc, "failure", None)) if getattr(exc, "failure", None) else failure_from_exception(exc)
@@ -633,10 +694,9 @@ class QualityJobManager:
             return
         finally:
             with self._lock:
-                self._stop_events.pop(job_id, None)
-        self._progress(job_id, {"status": "succeeded", "stage": "succeeded", "completed_at": _now(), "percent": 100,
-                                "error": None, "failure": None, "diagnostic_log": [],
-                                "warnings": report.get("warnings", []) if isinstance(report, dict) else []})
+                if self._stop_events.get(job_id) is stop_event:
+                    self._stop_events.pop(job_id, None)
+        self._progress(job_id, _result_changes(report if isinstance(report, dict) else {}, task_ids))
 
     def shutdown(self) -> None:
         with self._lock:

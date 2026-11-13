@@ -6,7 +6,7 @@ import QualityFusionSettings from './QualityFusionSettings.vue'
 const mocks = vi.hoisted(() => ({ load: vi.fn(), save: vi.fn() }))
 vi.mock('@/api', () => ({ api: { qualitySettings: mocks.load, saveQualitySettings: mocks.save } }))
 const profile = { id: 'v1', name: '冻结规则', digest: 'digest-v1' }
-const settings = (selected = true): QualitySettings => ({ supported: true, profiles: [profile], evaluation_profile_id: selected ? profile.id : '', evaluation_profile_digest: selected ? profile.digest : '' })
+const settings = (selected = true): QualitySettings => ({ supported: true, profiles: [profile], model_configured: true, execution_backend: 'platform', evaluator_config: { text: { base_url: 'http://text/v1', model: 'text-model', api_key_env: '' }, vision: { base_url: 'http://vision/v1', model: 'vision-model', api_key_env: 'VISION_KEY' } }, evaluation_profile_id: selected ? profile.id : '', evaluation_profile_digest: selected ? profile.digest : '' })
 const flush = async () => { for (let index = 0; index < 5; index++) { await Promise.resolve(); await nextTick() } }
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(done => { resolve = done }); return { resolve, promise } }
 const mounted: ReturnType<typeof mount>[] = []
@@ -23,10 +23,28 @@ beforeEach(() => { vi.resetAllMocks(); mocks.load.mockResolvedValue(settings()) 
 afterEach(() => { mounted.splice(0).forEach(view => view.app.unmount()) })
 
 describe('quality profile settings', () => {
-  it('accepts the backend default profile and never writes a second copy of model settings', async () => {
+  it('loads platform-local settings without writing or reading model-iteration settings', async () => {
     const view = mount(); await flush()
     expect(view.ready.at(-1)).toBe(true)
     expect(mocks.save).not.toHaveBeenCalled()
+  })
+  it('saves only edited local model configuration and requires saving before submission', async () => {
+    const view = mount(); await flush()
+    view.state.models.text.model = 'new-text-model'; await flush()
+    expect(view.ready.at(-1)).toBe(false)
+    const config = { ...settings().evaluator_config!, text: { ...settings().evaluator_config!.text, model: 'new-text-model' } }
+    mocks.save.mockResolvedValue({ ...settings(), evaluator_config: config })
+    await view.state.saveModels(); await flush()
+    expect(mocks.save).toHaveBeenCalledWith({ evaluator_config: config })
+    expect(view.ready.at(-1)).toBe(true)
+  })
+  it('keeps unsaved model changes on a profile-only save and rejects a half-filled model', async () => {
+    const view = mount(); await flush()
+    view.state.models.text.model = ''; await view.state.saveModels()
+    expect(mocks.save).not.toHaveBeenCalled(); expect(view.state.error).toContain('同时填写')
+    view.state.models.text.model = 'unsaved-model'; mocks.save.mockResolvedValue(settings())
+    await view.state.selectProfile('v1'); await flush()
+    expect(view.state.models.text.model).toBe('unsaved-model'); expect(view.ready.at(-1)).toBe(false)
   })
   it('requires an explicit valid profile and persists only its identity before enabling submit', async () => {
     mocks.load.mockResolvedValue(settings(false))

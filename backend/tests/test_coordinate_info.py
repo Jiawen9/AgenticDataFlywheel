@@ -331,3 +331,70 @@ class CoordinateEvidenceTests(unittest.TestCase):
             self.assertEqual(saved.status_code, 200, saved.text)
             self.assertEqual(saved.json()["row"]["coordinate_info"]["space"], "pixel")
 
+
+    def publish_tree(self):
+        from backend.batch_results import annotation_task_fingerprints
+        store, annotation = self.publish()
+        payload = {'sheets': {'VLA trajectories': [self.row]}}
+        tree_payload = {'trees': {'task': {'id': 0, 'children': [], 'task_id': 'task'}},
+                        'source_task_fingerprints': annotation_task_fingerprints(payload)}
+        tree = store.publish('batch', '04_tree', tree_payload, metadata={'task_ids': ['task', 'other-task']})
+        return store, annotation, tree
+
+    def test_tree_coordinate_existing_route_avoids_tree_rebuild_and_checks_scope(self):
+        from backend import batch_api
+        store, annotation, tree = self.publish_tree()
+        app = FastAPI(); app.include_router(batch_api.router)
+        url = '/api/data-batches/batch/tasks/task/tree'
+        query = {'view': 'coordinate', 'annotation_version': annotation['version'], 'tree_version': tree['version'],
+                 'trajectory_id': 'trajectory', 'image': self.image}
+        with patch.object(batch_api, 'store', store), TestClient(app) as client:
+            initial = client.get(url)
+            self.assertEqual(initial.status_code, 200, initial.text)
+            self.assertEqual(initial.json()['annotation_version'], annotation['version'])
+            self.assertEqual(initial.json()['tree_version'], tree['version'])
+            self.assertEqual(initial.json()['coordinate_lookup_version'], 1)
+            with patch.object(batch_api, 'current_tree_payload', side_effect=AssertionError('single coordinate cannot rebuild full tree')):
+                with patch.object(coordinates, 'resolve_batch_context', wraps=coordinates.resolve_batch_context) as lookup:
+                    for _ in range(2):
+                        response = client.get(url, params=query)
+                        self.assertEqual(response.status_code, 200, response.text)
+                        self.assertEqual(response.json()['coordinate_info']['width'], 2160)
+                        self.assertEqual(response.json()['task_id'], 'task')
+                        self.assertEqual(response.headers['cache-control'], 'no-store')
+                    self.assertEqual(lookup.call_count, 1)
+                self.assertEqual(client.get(url, params={**query, 'tree_version': 'old'}).status_code, 409)
+                self.assertEqual(client.get(url, params={**query, 'annotation_version': 'old'}).status_code, 409)
+                self.assertEqual(client.get(url, params={**query, 'image': '../../missing.jpg'}).status_code, 404)
+                self.assertEqual(client.get(url, params={'view': 'coordinate'}).status_code, 422)
+                self.assertEqual(client.get(url.replace('/task/', '/other-task/'), params=query).status_code, 404)
+                self.response.unlink()
+                response = client.get(url, params=query)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()['coordinate_info']['space'], 'unknown')
+
+    def test_tree_coordinate_rejects_late_artifact_change(self):
+        store, annotation, tree = self.publish_tree()
+        original = coordinates.resolve_coordinate_info
+        def changed(*args, **kwargs):
+            store.publish('batch', '04_tree', {'trees': {}}, metadata={'task_ids': []})
+            return original(*args, **kwargs)
+        with patch.object(coordinates, 'resolve_coordinate_info', side_effect=changed):
+            with self.assertRaises(AnnotationVersionConflict):
+                coordinates.tree_coordinate_info('batch', 'task', annotation['version'], tree['version'], 'trajectory', self.image, root=self.root)
+
+    def test_tree_route_survives_gateway_without_new_coordinate_post(self):
+        from backend import batch_api
+        from fastapi.responses import HTMLResponse
+        store, annotation, tree = self.publish_tree()
+        app = FastAPI(); app.include_router(batch_api.router)
+        @app.middleware('http')
+        async def gateway(request, call_next):
+            if request.url.path == '/api/coordinate-info':
+                return HTMLResponse('<html>Not Found</html>', status_code=404)
+            return await call_next(request)
+        with patch.object(batch_api, 'store', store), TestClient(app) as client:
+            self.assertEqual(client.post('/api/coordinate-info').status_code, 404)
+            response = client.get('/api/data-batches/batch/tasks/task/tree', params={'view': 'coordinate', 'annotation_version': annotation['version'], 'tree_version': tree['version'], 'trajectory_id': 'trajectory', 'image': self.image})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()['coordinate_info']['height'], 3840)
