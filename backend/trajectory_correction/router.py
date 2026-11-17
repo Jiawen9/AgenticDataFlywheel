@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse
 from ..data_store import RevisionConflict
 from ..batch_lifecycle import BatchPublishedError
 
-from .schemas import CreateCotJobRequest, CreateSessionRequest, ExportStateRequest, RowPatchRequest, ReviewRequest, RevisionRequest
+from .schemas import CreateCotJobRequest, CreateSessionRequest, ExportStateRequest, RowPatchRequest, ReviewRequest, RevisionRequest, DatasetExportRequest
 from .quality_selection import (
     QualitySelectionError,
     correction_batches,
@@ -265,8 +265,11 @@ def correction_export(session_id: str, request: RevisionRequest) -> dict[str, ob
 
 
 @router.post("/sessions/{session_id}/dataset-export")
-def correction_dataset_export(session_id: str, request: RevisionRequest) -> dict[str, object]:
+def correction_dataset_export(session_id: str, request: DatasetExportRequest) -> dict[str, object]:
     try:
+        if request.export_profile is not None:
+            from .service import export_selected_session
+            return export_selected_session(session_id, request.expected_revision, export_profile=request.export_profile, cot_policy=request.cot_policy)
         return export_dataset_session(session_id, request.expected_revision)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

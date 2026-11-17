@@ -104,7 +104,9 @@ class CollectionTransferTests(unittest.TestCase):
         self.remote.build_archive()
         result = self.manager.sync(self.run_id)
         self.assertEqual(result["status"], "completed")
-        copied = Path(result["output_dir"]) / relative
+        from backend.short_paths import collection_entry
+        _, mapping = collection_entry(self.root, self.run, entry)
+        copied = Path(result["output_dir"]) / mapping[relative]
         self.assertGreater(len(str(copied)), 300)
         self.assertEqual(workbook_digest(copied), workbook_digest(file))
         self.assertNotIn("\\\\?\\", json.dumps(result))

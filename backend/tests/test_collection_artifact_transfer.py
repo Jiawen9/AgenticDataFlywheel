@@ -145,7 +145,8 @@ class ArtifactTransferTests(unittest.TestCase):
         result = self.manager.sync(self.run_id)
         self.assertEqual(result["transferred_trajectory_count"], 1)
         self.assertNotEqual(result["status"], "completed")
-        self.assertTrue((Path(result["output_dir"]) / "task-one/artifact1/step001_vla_input.jpg").is_file())
+        source = self.manager.artifact_source(self.run_id, "artifact1")
+        self.assertTrue((Path(source["root"]) / source["file_paths"]["task-one/artifact1/step001_vla_input.jpg"]).is_file())
         with self.assertRaises(CollectionRunError):
             self.runs.ready_input("batch-one")
         self.remote.add(index=2)
@@ -205,7 +206,11 @@ class ArtifactTransferTests(unittest.TestCase):
         result = self.drain()
         self.assertEqual((result["status"], result["collection_status"]), ("completed", "cancelled"))
         self.assertEqual(result["transferred_diagnostic_count"], 11)
-        self.assertTrue((self.runs.raw_root("batch-one") / "diagnostics" / self.run_id / "artifact2").is_dir())
+        from backend.short_paths import collection_entry, collection_layout
+        entry = self.remote.manifests["artifact2"]["diagnostic"]
+        local, _ = collection_entry(self.root, self.run, entry, "diagnostic")
+        alias = collection_layout(self.root, self.run["batch_id"], self.run_id)["directory"]
+        self.assertTrue((self.runs.raw_root("batch-one") / "diagnostics" / alias / local["relative_dir"]).is_dir())
         self.assertEqual(result["errors"][0]["repeat_index"], 2)
         self.assertEqual(len(self.runs.ready_input("batch-one")["trajectories"]), 1)
 

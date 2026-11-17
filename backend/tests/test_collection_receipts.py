@@ -119,7 +119,8 @@ class ReceiptTests(unittest.TestCase):
         self.assertEqual(self.remote.get_collection_manifest(self.run_id), original)
         self.assertEqual(self.manager.records.get("collection_source_final_manifests", self.run_id)["manifest"], original)
         self.assertEqual(self.manager.artifact_rows(self.run_id)[0]["execution_status"], "completed")
-        self.assertTrue((Path(saved["output_dir"]) / "task-one/artifact1/_trajectory_for_evaluate.json").is_file())
+        source = self.manager.artifact_source(self.run_id, "artifact1")
+        self.assertTrue((Path(source["root"]) / source["file_paths"]["task-one/artifact1/_trajectory_for_evaluate.json"]).is_file())
 
     def test_zero_action_final_image_is_evaluable_not_training(self):
         key = self.remote.add()

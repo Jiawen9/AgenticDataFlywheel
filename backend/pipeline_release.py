@@ -115,7 +115,7 @@ def build_selection(batch_id, task_ids, mode, threshold=None, *, root=None):
             else:
                 excluded.append({"task_id": task_id, "best_score": choices[0]["global_score"],
                                  "reason": "Top-1 轨迹未达到 Rubric 总分阈值"})
-        return {"status": "ready", "batch_id": batch_id, "storage_batch_id": batch_id,
+        return {"schema_version": 2, "status": "ready", "batch_id": batch_id, "storage_batch_id": batch_id,
                 "tree_run_id": batch_id, "run_id": batch_id, "mode": mode, "threshold": threshold,
                 "task_ids": expected, "tasks": selected, "candidates": candidates, "excluded": excluded,
                 "selected_trajectories": {item["task_id"]: item["trajectory_id"] for item in selected},
@@ -168,11 +168,11 @@ def prepare_manual(batch_id, selection, *, root=None):
         previous_choices = dict(session.get("group_exports", {}))
         reconcile(session, session.get("snapshot_payload") or {"groups": []}, snapshot, selection["task_fingerprints"])
         defaults = {item["group_id"] for item in selection["tasks"]}
-        # Preserve a valid explicit one-per-task selection from an existing draft.
+        # Preserve every explicit choice, including a deliberate deselection.
         for task_id in selection["task_ids"]:
             groups = [group for group in snapshot["groups"] if group["task_id"] == task_id]
             previous = [group["group_id"] for group in groups if previous_choices.get(group["group_id"])]
-            chosen = set(previous) if len(previous) == 1 else defaults
+            chosen = set(previous) if any(group["group_id"] in previous_choices for group in groups) else defaults
             for group in groups:
                 session["group_exports"][group["group_id"]] = group["group_id"] in chosen
         session.update(batch_id=batch_id, storage_batch_id=batch_id, tree_run_id=batch_id,
@@ -215,16 +215,19 @@ def confirm_manual(session_id, selection=None, *, expected_revision=None, root=N
         for task_id in choice["task_ids"]:
             groups = [group for group in session["snapshot_payload"]["groups"]
                       if group["task_id"] == task_id and session.get("group_exports", {}).get(group["group_id"], False)]
-            if len(groups) != 1:
-                raise ValueError(f"任务 {task_id} 必须且只能选择一条导出轨迹")
-            group = groups[0]
-            if not any(not session.get("row_edits", {}).get(str(row["excel_row"]), {}).get("deleted") for row in group["rows"]):
-                raise ValueError(f"任务 {task_id} 的入选轨迹没有有效步骤")
-            candidate = next((item for item in choice["candidates"] if item["group_id"] == group["group_id"]), None)
-            if candidate is None:
-                raise ValueError("入选轨迹不属于本次质检候选")
-            selected.append(deepcopy(candidate))
-        choice.update(tasks=selected, selected_trajectories={item["task_id"]: item["trajectory_id"] for item in selected})
+            if not groups:
+                raise ValueError(f"任务 {task_id} 请至少选择一条导出轨迹")
+            for group in groups:
+                if not any(not session.get("row_edits", {}).get(str(row["excel_row"]), {}).get("deleted") for row in group["rows"]):
+                    raise ValueError(f"任务 {task_id} 的入选轨迹没有有效步骤")
+                candidate = next((item for item in choice["candidates"] if item["group_id"] == group["group_id"]), None)
+                if candidate is None:
+                    raise ValueError("入选轨迹不属于本次质检候选")
+                selected.append(deepcopy(candidate))
+        from .trajectory_correction.selected_export import selected_identity
+        choice.update(schema_version=2, tasks=selected,
+            selected_trajectory_ids=selected_identity(selected), selected_groups=[item["group_id"] for item in selected],
+            selected_trajectories={task: ids[0] for task, ids in selected_identity(selected).items()})
         return {"session_id": session_id, "selection": choice, "manual_fingerprint": _manual_fingerprint(session),
                 "group_ids": [item["group_id"] for item in selected],
                 "task_fingerprints": deepcopy(session["task_fingerprints"]), "session_revision": session["storage_revision"],
@@ -388,7 +391,14 @@ def _publish_pipeline_with_diagnostics(pipeline, *, root=None, registry=None):
             snapshot = session["snapshot_payload"]
         elif sessions:
             session = _existing_edit_view(sessions[0], snapshot)
-        payload = _export_payload(selection, snapshot, table, session, pipeline_id)
+        if pipeline.get("export_profile") == "corrected_selection_v1":
+            from .trajectory_correction.selected_export import project_selected
+            tree, quality, _, _, _ = _validate_source(selection, root)
+            payload = project_selected(session=session, snapshot=snapshot, table=table, selection=selection,
+                cot_policy=pipeline.get("cot_policy", "generate"), tree_payload={**tree, "artifact": store.get(batch_id, "04_tree")}, quality_payload=quality)
+            payload.update(pipeline_id=pipeline_id, source_kind="pipeline_selection")
+        else:
+            payload = _export_payload(selection, snapshot, table, session, pipeline_id)
         release_root = root / "releases"
         release_root.mkdir(parents=True, exist_ok=True)
         final, staging = release_root / release_id, release_root / ("." + release_id + ".tmp")
@@ -396,7 +406,8 @@ def _publish_pipeline_with_diagnostics(pipeline, *, root=None, registry=None):
         intent_key = "pipeline:" + pipeline_id
         intent = records.get("release_intents", intent_key)
         request_hash = fingerprint({"pipeline": pipeline_id, "batch": batch_id, "selection": selection,
-                                    "confirmation": pipeline.get("confirmation"), "name": pipeline["name"]})
+                                    "confirmation": pipeline.get("confirmation"), "name": pipeline["name"],
+                                    **({"export_profile": pipeline["export_profile"], "cot_policy": pipeline.get("cot_policy")} if pipeline.get("export_profile") else {})})
         if intent and intent.get("request_hash") != request_hash:
             raise RevisionConflict("同一 Pipeline 的发布内容不能在重试时改变")
         if not intent:
@@ -422,8 +433,9 @@ def _publish_pipeline_with_diagnostics(pipeline, *, root=None, registry=None):
                 "excel_paths": [{"path": registry.project_path(final / "001" / filename),
                     "data_path": f"releases/{release_id}/001/{filename}", "filename": filename, "sha256": _sha(excel),
                     "rows": sum(len(rows) for rows in payload["sheets"].values()), "created_at": created_at}],
-                "trajectory_paths": [], "task_count": len(payload["groups"]), "trajectory_count": len(payload["groups"]),
-                "step_count": sum(len(rows) for rows in payload["sheets"].values()), "selection": selection,
+                "trajectory_paths": [], "task_count": len({group["task_id"] for group in payload["groups"]}), "trajectory_count": len(payload["groups"]),
+                "step_count": sum(len(rows) for rows in payload["sheets"].values()), "selection": payload.get("selection", selection),
+                "export_profile": pipeline.get("export_profile"), "cot_policy": pipeline.get("cot_policy"),
                 "upload_status": "not_uploaded", "upload_job_id": None, "upload_error": None, "s3_uri": None,
                 "uploaded_at": None, "uploaded_files": 0, "uploaded_bytes": 0}
             release = freeze_release_provenance(root, release, staging)

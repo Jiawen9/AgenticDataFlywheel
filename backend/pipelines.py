@@ -420,6 +420,11 @@ class PipelineManager:
         mode, start = data.get("mode"), data.get("start_mode")
         if mode not in {"manual", "automatic"} or start not in {"collect", "existing"}:
             raise PipelineError("请选择有效的模式和起点", 422)
+        profile, cot_policy = data.get("export_profile"), data.get("cot_policy")
+        if profile not in {None, "corrected_selection_v1"} or cot_policy not in {None, "generate", "skip"}:
+            raise PipelineError("不支持的导出或 COT 策略", 422)
+        if cot_policy is not None and profile is None:
+            raise PipelineError("COT 策略需要明确的导出配置", 422)
         name = str(data.get("name") or "").strip()
         if not name or len(name) > 200:
             raise PipelineError("流程名称须为 1～200 个字符", 422)
@@ -455,6 +460,7 @@ class PipelineManager:
                 raise PipelineError("该批次已有执行中作业，请完成后再启动 Pipeline")
             snapshot = self.runtime.snapshot(batch)
             pipeline = {"pipeline_id": identifier, "id_scheme": ID_SCHEME, "batch_id": batch, "name": name, "mode": mode,
+                **({"export_profile": profile, "cot_policy": cot_policy or "generate"} if profile else {}),
                 "start_mode": start, "threshold": threshold if mode == "automatic" else None,
                 "task_ids": snapshot["task_ids"], "batch_snapshot": snapshot, "collection_config": options,
                 "config_fingerprints": configuration, "retry_policy": dict(RETRY_POLICY),
@@ -864,7 +870,9 @@ class PipelineManager:
                         p.update(session_id=manual["session_id"], selection=manual["selection"], status="waiting_for_correction")
                         step.update(status="waiting", message="请完成修正并确认继续")
                 elif key == "cot":
-                    if p["mode"] == "automatic":
+                    if p.get("cot_policy") == "skip":
+                        self._done(step, "OPD：跳过 COT，导出全部保留步骤且 thought 为空", skipped=True)
+                    elif p["mode"] == "automatic":
                         self._done(step, "自动模式保留原始内容", skipped=True)
                     else:
                         self._job_step(p, step)

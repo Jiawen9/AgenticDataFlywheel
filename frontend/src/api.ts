@@ -293,8 +293,8 @@ export const api = {
   correctionExport(sessionId: string, expectedRevision?: number): Promise<CorrectionExport> {
     return request(`/api/correction/sessions/${encodeURIComponent(sessionId)}/export`, { method: 'POST', body: JSON.stringify({ expected_revision: expectedRevision }) })
   },
-  correctionDatasetExport(sessionId: string, expectedRevision?: number): Promise<CorrectionExport> {
-    return request(`/api/correction/sessions/${encodeURIComponent(sessionId)}/dataset-export`, { method: 'POST', body: JSON.stringify({ expected_revision: expectedRevision }) })
+  correctionDatasetExport(sessionId: string, expectedRevision?: number, options?: { export_profile: 'corrected_selection_v1'; cot_policy: 'generate' | 'skip' }): Promise<CorrectionExport> {
+    return request(`/api/correction/sessions/${encodeURIComponent(sessionId)}/dataset-export`, { method: 'POST', body: JSON.stringify({ expected_revision: expectedRevision, ...options }) })
   },
   async datasetReleaseCandidates(): Promise<DatasetReleaseCandidate[]> {
     return activeBatchItems((await request<{ candidates: DatasetReleaseCandidate[] }>('/api/dataset-releases/candidates', { cache: 'no-store' })).candidates)
@@ -330,6 +330,10 @@ export const api = {
 
 export function treeRunScope(run: Pick<TreeRun, 'batch_id' | 'annotation_version'> | undefined): TrajectoryScope | undefined {
   return run?.batch_id ? { batch_id: run.batch_id } : undefined
+}
+
+export function datasetTrainingDownloadUrl(jobId: string, kind: 'jsonl' | 'report'): string {
+  return `${API_BASE}/api/dataset-upload-jobs/${encodeURIComponent(jobId)}?download=${kind}`
 }
 
 export function imageUrl(relativePath: string, scope?: TrajectoryScope): string {

@@ -34,6 +34,7 @@ watch([batchSearch, batchLimit], () => { batchPage.value = 1 })
 const loading = ref(true)
 const pageError = ref('')
 const actionPrompt = ref(false)
+const exportPolicy = ref<'generate' | 'skip'>('generate')
 let resolveDecision: ((decision: ActionDecision) => void) | null = null
 let batchRequest = 0, routeSelectionRequest = 0
 let initialized = false, choicesRequest = 0
@@ -152,27 +153,20 @@ async function toggleDeleted(row: CorrectionRow) {
   })
 }
 
-async function exportData() {
+async function exportData(complete = false) {
   const sessionId = session.value?.session_id
-  const result = await ws.exportData()
+  const result = await ws.exportData(complete ? exportPolicy.value : undefined)
   if (result && sessionId && session.value?.session_id === sessionId) {
     window.open(correctionDownloadUrl(sessionId, result.filename), '_blank', 'noopener')
     ElMessage.success('导出完成，文件也可从导出历史下载')
   }
 }
 
-async function chooseExport(taskId: string, groupId: string) {
+async function chooseExport(_taskId: string, groupId: string) {
   if (pipelineReadOnly.value || !session.value) return
   const group = session.value.groups.find(value => value.group_id === groupId)
   if (!group) return
-  if (!pipelineContext.managed.value) { await ws.toggleExport(group); return }
-  if (!await ws.prepareTransition() || group.export) return
-  const task = tasks.value.find(value => value.task_id === taskId)
-  for (const trajectory of task?.trajectories || []) {
-    if (trajectory.group.export && trajectory.group.group_id !== groupId) await ws.toggleExport(trajectory.group)
-  }
-  const current = session.value?.groups.find(value => value.group_id === groupId)
-  if (current && !current.export) await ws.toggleExport(current)
+  await ws.toggleExport(group)
 }
 async function confirmCorrection() {
   if (!session.value || !pipelineContext.canCorrect.value || !await ws.prepareTransition()) return
@@ -254,9 +248,14 @@ onBeforeUnmount(() => {
       <DisplayId v-if="selectedBatchId" kind="batch" :id="selectedBatchId" />
       <el-button :disabled="busy || loading" @click="refreshBatch">刷新当前结果</el-button>
       <span class="save-status" role="status">{{ savingCount ? '正在保存…' : hasUnsaved ? '有未保存修改' : session ? '草稿已加载' : '' }}</span>
-      <el-button v-if="!pipelineContext.managed.value && !pipelineContext.isPipelineRoute.value" type="success" :loading="savingCount > 0" :disabled="!session || busy || loading" @click="exportData">导出 SFT / RL / 原生数据（全量已选）</el-button>
+      <template v-if="!pipelineContext.managed.value && !pipelineContext.isPipelineRoute.value">
+        <el-select v-model="exportPolicy" aria-label="已选轨迹导出方式" style="width:230px" :disabled="busy"><el-option value="generate" label="普通：保留有效 COT" /><el-option value="skip" label="OPD：不生成 COT，thought 为空" /></el-select>
+        <el-button type="success" :loading="savingCount > 0" :disabled="!session || busy || loading" @click="exportData(true)">导出已选完整轨迹</el-button>
+        <el-button :loading="savingCount > 0" :disabled="!session || busy || loading" @click="exportData(false)">旧版 SFT / RL / 原生分流导出</el-button>
+      </template>
       <el-button v-if="pipelineContext.canCorrect.value" type="success" :loading="pipelineContext.controlling.value" :disabled="!session || busy || loading" @click="confirmCorrection">完成修正并继续</el-button>
     </section>
+    <p class="form-hint">同一任务可选择多条轨迹；完整导出保留全部未删除步骤。普通导出仅使用已保存的有效 COT，不会自动调用模型。</p>
     <el-pagination v-model:current-page="batchPage" v-model:page-size="batchLimit" :page-sizes="[10,20,50]" :total="batchRead.total.value" layout="total, sizes, prev, pager, next" />
     <el-alert v-if="batchRead.error.value" :title="batchRead.error.value" type="warning" :closable="false" />
     <el-alert v-if="batchRead.data.value && !batchRead.data.value.counts_complete" title="历史批次摘要正在准备，已有摘要仍可查看。" type="info" :closable="false" />
@@ -294,7 +293,7 @@ onBeforeUnmount(() => {
                     <el-tag size="small" :type="trajectory.passed_threshold ? 'success' : 'warning'">{{ trajectory.passed_threshold ? 'Rubric 达标' : 'Rubric 未达标' }}</el-tag>
                     <el-tag v-if="trajectory.group.pending_review" type="warning">人工修改待复核</el-tag>
                     <span>{{ trajectory.group.active_row_count }}/{{ trajectory.group.row_count }} 步 · 已改 {{ trajectory.group.edited_row_count }} 步</span>
-                    <el-button class="trajectory-export" size="small" :type="trajectory.group.export ? 'success' : 'default'" plain :disabled="pipelineReadOnly || busy || trajectory.group.pending_review" @click.stop="chooseExport(task.task_id, trajectory.group.group_id)">{{ pipelineContext.managed.value ? (trajectory.group.export ? '已选择' : '选择此轨迹') : (trajectory.group.export ? '取消导出' : '加入导出') }}</el-button>
+                    <el-button class="trajectory-export" size="small" :type="trajectory.group.export ? 'success' : 'default'" plain :disabled="pipelineReadOnly || busy || trajectory.group.pending_review" @click.stop="chooseExport(task.task_id, trajectory.group.group_id)">{{ trajectory.group.export ? '取消导出' : '加入导出' }}</el-button>
                   </div>
                 </template>
                 <div v-if="openGroupId === trajectory.group.group_id" v-loading="loadingGroup" class="trajectory-detail">

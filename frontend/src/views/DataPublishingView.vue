@@ -34,7 +34,9 @@ const submitting = ref(false)
 const uploadDialogVisible = ref(false)
 const uploadRelease = ref<DatasetRelease | null>(null)
 const destinationPrefix = ref('')
-const retryUploadId = computed(() => uploadRetryJobId(uploadRelease.value?.internal_upload, destinationPrefix.value))
+const trainingJsonl = ref(false)
+const retryUploadId = computed(() => Boolean(uploadRelease.value?.internal_upload?.training_jsonl) === trainingJsonl.value
+  ? uploadRetryJobId(uploadRelease.value?.internal_upload, destinationPrefix.value) : undefined)
 const uploadDestination = computed(() => retryUploadId.value && uploadRelease.value?.internal_upload?.destination
   ? uploadRelease.value.internal_upload.destination : capabilities.value.internal)
 const pollError = ref('')
@@ -238,6 +240,7 @@ async function startUpload(release: DatasetRelease) {
   if (disposed || epoch !== detailEpoch) return
   uploadRelease.value = release
   destinationPrefix.value = uploadDestinationPrefix(release.internal_upload, capabilities.value)
+  trainingJsonl.value = Boolean(release.internal_upload?.training_jsonl)
   uploadDialogVisible.value = true
 }
 
@@ -249,6 +252,7 @@ async function confirmUpload() {
   try {
     const job = await api.uploadDatasetRelease(release.release_id, 'internal', folders ? {
       include_trajectories: true, destination_prefix: destinationPrefix.value.trim(),
+      ...(trainingJsonl.value ? { training_jsonl: true } : {}),
       ...(retryUploadId.value ? { retry_job_id: retryUploadId.value } : {}),
     } : undefined)
     localStorage.setItem(ACTIVE_UPLOAD_KEY, job.job_id)
@@ -407,10 +411,12 @@ onBeforeUnmount(() => { if (typeof document !== 'undefined') document.removeEven
           <p class="upload-scope">按冻结发布表包含的轨迹上传完整目录，不读取当前页面勾选。例如同一用例 10 条轨迹中发布 2 条，只上传这 2 条的完整文件。旧“完整数据集”表可能包含全部轨迹，实际范围会在后台定位后展示。</p>
           <el-form label-position="top" @submit.prevent="confirmUpload">
             <el-form-item label="云道目标前缀"><el-input v-model="destinationPrefix" data-testid="upload-destination-prefix" :disabled="submitting" placeholder="例如 data/gui_data/flywheel_data/（空白表示 bucket 根目录）" /></el-form-item>
+            <el-form-item label="训练文件"><el-switch v-model="trainingJsonl" data-testid="training-jsonl-switch" :disabled="submitting || capabilities.internal.training_jsonl_version !== 1" active-text="生成并上传训练 JSONL" /><small v-if="capabilities.internal.training_jsonl_version !== 1">需要同步支持训练导出的后端。</small></el-form-item>
           </el-form>
           <p class="upload-scope">Bucket：{{ uploadDestination.bucket || '后端配置' }} · Region：{{ uploadDestination.region || '后端配置' }}</p>
           <p class="upload-scope">目标：<code>s3://{{ uploadDestination.bucket || 'bucket' }}/{{ destinationPrefix.replace(/^\/+|\/+$/g, '') }}{{ destinationPrefix.replace(/^\/+|\/+$/g, '') ? '/' : '' }}&lt;批次编号&gt;/</code></p>
           <p class="upload-scope">发布表格放入“发布表格/序号/”，轨迹按“用例/轨迹/”保存。直接传输现有目录，不额外复制本地数据。</p>
+          <p v-if="trainingJsonl" class="upload-scope">轨迹目录上传成功后生成训练 JSONL，图片引用实际 S3 地址。保留原表坐标，缺框使用动作 JSON；无法读取图片或动作无效的样本逐条列入报告。原表与轨迹上传结果独立保留。</p>
           <p v-if="uploadRelease.internal_upload?.folder_upload && ['failed', 'interrupted'].includes(internalStatus(uploadRelease))" class="upload-scope">已填入上次目标。保持目标重试可跳过成功目录；更改目标会创建新上传任务。</p>
         </template>
         <p v-else class="upload-scope">外部导入记录沿用表格上传，不查找或上传外部轨迹目录。</p>

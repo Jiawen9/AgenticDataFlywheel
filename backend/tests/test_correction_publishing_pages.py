@@ -65,7 +65,7 @@ class ReadPageTests(unittest.TestCase):
         self.assertEqual(releases["items"][0]["excel_count"], 1)
         self.assertEqual(releases["items"][0]["trajectory_paths"], [])
         self.assertNotIn("file_results", releases["items"][0]["internal_upload"])
-        self.assertEqual(candidates["items"][0]["reason"], "尚未导出完整数据集 Excel")
+        self.assertEqual(candidates["items"][0]["reason"], "尚未导出所选完整轨迹或完整数据集 Excel")
 
     def test_summary_filters_and_revision_follow_same_transaction(self):
         self.session()

@@ -19,6 +19,8 @@ class CreatePipelineRequest(BaseModel):
     start_mode: str
     threshold: float | None = Field(default=None, ge=0, le=5, strict=True)
     collection_config: dict | None = None
+    export_profile: str | None = None
+    cot_policy: str | None = None
 
 class ControlPipelineRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -58,7 +60,12 @@ def list_pipelines(request: Request, batch_id: str | None = None, active_only: b
 
 @router.post("", status_code=201)
 def create_pipeline(body: CreatePipelineRequest, request: Request):
-    return _call(lambda: {"pipeline": _manager(request).create(body.model_dump())})
+    value = body.model_dump()
+    # Preserve the digest of requests sent before the optional export contract.
+    for key in ("export_profile", "cot_policy"):
+        if value[key] is None:
+            value.pop(key)
+    return _call(lambda: {"pipeline": _manager(request).create(value)})
 
 @router.get("/{pipeline_id}")
 def get_pipeline(pipeline_id: str, request: Request):

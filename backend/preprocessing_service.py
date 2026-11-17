@@ -54,7 +54,7 @@ def verify_input(snapshot: dict, root: Path) -> None:
     for trajectory in snapshot["trajectories"]:
         run_id = trajectory["collection_run_id"]
         for item in trajectory["files"]:
-            path = contained_path(raw_root, "runs", run_id, item["path"])
+            path = contained_path(raw_root, "runs", trajectory.get("storage_run_dir", run_id), item["path"])
             if path in seen:
                 continue
             seen.add(path)
@@ -81,6 +81,7 @@ def convert_input(snapshot: dict, progress: Callable[[dict], None], *, data_root
     progress({"stage": "converting", "total_steps": len(work), "completed_steps": 0})
     for index, (trajectory, step, response) in enumerate(work):
         run_id = trajectory["collection_run_id"]
+        storage_run = trajectory.get("storage_run_dir", run_id)
         source_id = trajectory["source_trajectory_id"]
         event = {"stage": "converting", "total_steps": len(work), "completed_steps": index,
                  "current_task": trajectory["task_id"], "current_trajectory": source_id,
@@ -107,22 +108,23 @@ def convert_input(snapshot: dict, progress: Callable[[dict], None], *, data_root
             skipped.append({"collection_run_id": run_id, "trajectory_id": source_id,
                             "step": step, "reason": reason})
         else:
-            response_path = contained_path(raw_root, "runs", run_id, response["path"])
+            response_path = contained_path(raw_root, "runs", storage_run, response["path"])
             try:
                 action, summary = extract_response_fields(response_path)
             except (OSError, ValueError, json.JSONDecodeError) as exc:
                 action, summary = "", ""
                 warnings.append(f"{run_id}/{source_id}/step{step:03d}：{exc}")
-            identity = [snapshot["batch_id"], run_id, trajectory["task_id"], trajectory["relative_dir"]]
+            identity = [snapshot["batch_id"], run_id, trajectory["task_id"],
+                        trajectory.get("source_relative_dir", trajectory["relative_dir"])]
             trajectory_id = "tr_" + hashlib.sha256(json.dumps(
                 identity, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
             rows.append({"agent_type": trajectory.get("agent_type", "newagent"),
                          **{key: trajectory[key] for key in PROVENANCE_FIELDS if key in trajectory},
                          "文件夹名": source_id,
-                         "image": (Path("runs") / run_id / image).as_posix(),
-                         "xml": (Path("runs") / run_id / xml).as_posix(),
+                         "image": (Path("runs") / storage_run / image).as_posix(),
+                         "xml": (Path("runs") / storage_run / xml).as_posix(),
                          "action": action, "summary": summary,
-                         "logprobs_path": (Path("runs") / run_id / logprobs).as_posix() if logprobs in files else "",
+                         "logprobs_path": (Path("runs") / storage_run / logprobs).as_posix() if logprobs in files else "",
                          "task_id": trajectory["task_id"], "trajectory_id": trajectory_id,
                          "source_trajectory_id": source_id, "collection_run_id": run_id,
                          "collected_at": trajectory.get("collected_at"),

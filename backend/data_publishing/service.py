@@ -103,10 +103,10 @@ class DatasetReleaseRegistry:
         exports = [
             item
             for item in session.get("exports", [])
-            if isinstance(item, dict) and item.get("kind") == "full_dataset"
+            if isinstance(item, dict) and item.get("kind") in {"full_dataset", "corrected_selection"}
         ]
         if not exports:
-            raise ValueError("尚未导出完整数据集 Excel")
+            raise ValueError("尚未导出所选完整轨迹或完整数据集 Excel")
         latest = max(exports, key=lambda item: str(item.get("created_at", "")))
         current_fingerprint = session_fingerprint(session)
         if latest.get("content_fingerprint") and latest["content_fingerprint"] != current_fingerprint:
@@ -141,7 +141,7 @@ class DatasetReleaseRegistry:
             except (TypeError, ValueError):
                 continue
         return {
-            "task_count": len([item for item in tasks if isinstance(item, dict)]),
+            "task_count": len({str(item.get("task_id") or index) for index, item in enumerate(tasks) if isinstance(item, dict)}),
             "trajectory_count": trajectories,
             "step_count": rows,
         }
@@ -283,7 +283,9 @@ class DatasetReleaseRegistry:
                 sessions.append(session)
                 sources.append({"kind": "correction_session", "id": session_id,
                                 "revision": session.get("storage_revision"), "tree_run_id": session.get("tree_run_id"),
-                                "export_id": latest.get("export_id"), "artifact": latest.get("artifact")})
+                                "export_id": latest.get("export_id"), "artifact": latest.get("artifact"),
+                                "export_profile": latest.get("export_profile"), "cot_policy": latest.get("cot_policy"),
+                                "selection": deepcopy(latest.get("selection"))})
 
             batch_ids = [session_batch_id(item, self.data_root) for item in sessions]
             if len(set(batch_ids)) != len(batch_ids):

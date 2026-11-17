@@ -33,6 +33,7 @@ class UploadReleaseRequest(BaseModel):
     include_trajectories: bool = False
     destination_prefix: str | None = Field(default=None, max_length=1024)
     retry_job_id: str | None = Field(default=None, min_length=1, max_length=128)
+    training_jsonl: bool = False
 
 
 router = APIRouter(prefix="/api", tags=["data-publishing"])
@@ -161,7 +162,8 @@ def upload_dataset_release(release_id: str, request: Optional[UploadReleaseReque
             release_id, target=request.target if request else None,
             include_trajectories=request.include_trajectories if request else False,
             destination_prefix=request.destination_prefix if request else None,
-            retry_job_id=request.retry_job_id if request else None)}
+            retry_job_id=request.retry_job_id if request else None,
+            training_jsonl=request.training_jsonl if request else False)}
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except InternalUploadConflict as exc:
@@ -171,8 +173,22 @@ def upload_dataset_release(release_id: str, request: Optional[UploadReleaseReque
 
 
 @router.get("/dataset-upload-jobs/{job_id}")
-def dataset_upload_job(job_id: str) -> dict[str, object]:
+def dataset_upload_job(job_id: str, download: Literal["jsonl", "report"] | None = None) -> dict[str, object]:
+    if download is not None:
+        return dataset_training_file(job_id, download)
     job = upload_manager.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="数据集上传作业不存在")
     return {"job": job}
+
+
+@router.get("/dataset-upload-jobs/{job_id}/training/{kind}")
+def dataset_training_file(job_id: str, kind: Literal["jsonl", "report"]) -> FileResponse:
+    try:
+        path = upload_manager.training_file(job_id, kind)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    from ..file_io import io_path
+    return FileResponse(io_path(path), filename=path.name, media_type="application/x-ndjson" if kind == "jsonl" else "application/json")

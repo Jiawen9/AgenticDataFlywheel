@@ -176,6 +176,9 @@ def _overlay_row(session_id: str, session: dict[str, Any], base: dict[str, Any])
     row["original_actions_box"] = baseline_box
     row["bbox_edited"] = str(row.get("actions_box", "")) != str(row["original_actions_box"])
     row["bbox_source"] = str(edit.get("bbox_source", "manual" if row["bbox_edited"] else "original"))
+    for field in ("bbox_action_hash", "bbox_image"):
+        if field in edit:
+            row[field] = edit[field]
     row["thought"] = str(row.get("original_thought", ""))
     row["summary_source"] = "original"
     row["thought_source"] = "original"
@@ -230,15 +233,7 @@ def _overlay_row(session_id: str, session: dict[str, Any], base: dict[str, Any])
 
 
 def _group_summary(session_id: str, session: dict[str, Any], group: dict[str, Any]) -> dict[str, Any]:
-    pending = [item for item in session.get("pending_review", {}).values() if str(item.get("task_id", "")) == str(group.get("task_id", ""))]
-    if not group.get("task_id") and session.get("pending_review"):
-        reviews = reviews_for_group(session, _snapshot(session), group)
-    elif pending:
-        snapshot = session.get("snapshot_payload") or _snapshot(session)
-        keys = {row.get("step_key") for item in snapshot.get("groups", []) for row in item.get("rows", [])}
-        reviews = [{**item, "can_adopt": item.get("step_key") in keys and item.get("task_id") not in session.get("stale_tasks", [])} for item in pending]
-    else:
-        reviews = []
+    reviews = reviews_for_group(session, session.get("snapshot_payload") or _snapshot(session), group) if session.get("pending_review") else []
     rows = [_overlay_row(session_id, session, row) for row in group["rows"]]
     active = [row for row in rows if not row["deleted"]]
     return {
@@ -364,18 +359,21 @@ def create_session(tree_run_id: str | None = None, *, batch_id: str | None = Non
             table_payload = {key: deepcopy(raw_payload[key]) for key in ("schema_version", "columns", "sheets") if key in raw_payload}
             existing = next((item for item in list_sessions() if not item.get("archived")
                 and str(item.get("storage_batch_id") or item.get("batch_id") or item.get("tree_run_id")) == selected_batch), None)
-            if (existing is not None and not existing.get("stale_tasks")
+            candidate_ids = sorted((str(item["task_id"]), str(item["trajectory_id"]))
+                for item in selection.get("candidates", selection.get("tasks", [])))
+            if (existing is not None and existing.get("candidate_scope_version") == 2 and not existing.get("stale_tasks")
+                    and ("candidates" not in selection or existing.get("candidate_ids") == [list(pair) for pair in candidate_ids])
                     and fingerprint(existing.get("workbook_payload")) == fingerprint(table_payload)
                     and existing.get("task_fingerprints", {}) == selection.get("task_fingerprints", {})):
                 # A draft owns its chosen trajectories. Re-scoring identical inputs
                 # must not replace a user's work when the page refreshes.
                 return _public_session(existing, _snapshot(existing), summary=_summary)
             full_snapshot = load_snapshot(workbook_path, asset_root=package_root, source_kind="annotated_workbook")
-            snapshot = identified(filter_snapshot(full_snapshot, selection))
-            source_key = fingerprint({"table": table_payload, "selection": selection.get("selected_trajectories"),
+            snapshot = identified(filter_snapshot(full_snapshot, selection, include_candidates=True))
+            source_key = fingerprint({"table": table_payload, "selection": selection.get("selected_trajectories"), "candidates": candidate_ids,
                                       "tasks": selection.get("task_fingerprints", {})})
             if existing is not None:
-                if existing.get("input_fingerprint") == source_key and not existing.get("stale_tasks"):
+                if existing.get("candidate_scope_version") == 2 and existing.get("input_fingerprint") == source_key and not existing.get("stale_tasks"):
                     return _public_session(existing, _snapshot(existing), summary=_summary)
                 old_snapshot = _snapshot(existing)
                 reconcile(existing, old_snapshot, snapshot, selection.get("task_fingerprints", {}))
@@ -388,7 +386,8 @@ def create_session(tree_run_id: str | None = None, *, batch_id: str | None = Non
                 reconcile(session, {"groups": []}, snapshot, selection.get("task_fingerprints", {}))
             session.update(batch_id=selected_batch, storage_batch_id=selected_batch,
                 tree_run_id=str(selection.get("tree_run_id") or identifier), selection=selection,
-                workbook_payload=table_payload, input_fingerprint=source_key, published=False)
+                workbook_payload=table_payload, input_fingerprint=source_key, published=False, candidate_scope_version=2,
+                candidate_ids=[list(pair) for pair in candidate_ids])
             input_dir = CORRECTION_INPUTS_DIR / session["session_id"]
             io_path(input_dir).mkdir(parents=True, exist_ok=True)
             # The database owns the current draft; these files only serve Excel export.
@@ -749,9 +748,13 @@ def patch_row(session_id: str, excel_row: int, payload: dict[str, Any], *, _coor
             if normalized_box == baseline_box:
                 edit.pop("actions_box", None)
                 edit.pop("bbox_source", None)
+                edit.pop("bbox_action_hash", None)
+                edit.pop("bbox_image", None)
             else:
                 edit["actions_box"] = normalized_box
                 edit["bbox_source"] = "manual"
+                edit["bbox_action_hash"] = fingerprint(action_value)
+                edit["bbox_image"] = str(base.get("image", ""))
             # COT is generated from the expert action JSON and screenshot.  A bbox
             # edit does not change that semantic input, so keep the generated text.
 
@@ -893,13 +896,14 @@ def _export_view(session: dict, snapshot: dict) -> tuple[dict, dict]:
         for row in group["rows"]:
             if str(row["excel_row"]) not in mapping:
                 raise ValueError("有效修正步骤无法关联完整数据表")
+            row.setdefault("source_excel_row", row["excel_row"])
             row["excel_row"] = int(mapping[str(row["excel_row"])])
     for field in ("row_edits", "cot", "bbox_baselines"):
         value[field] = {mapping[row]: deepcopy(edit) for row, edit in session.get(field, {}).items() if row in mapping}
-    # Source group choices can use legacy or stable IDs; carry them by task.
-    old_groups = {str(group.get("task_id") or identified({"groups": [group]})["groups"][0]["task_id"]): group for group in snapshot["groups"]}
+    # Carry choices by task and trajectory, never by the task alone.
+    old_groups = {(str(group.get("task_id") or identified({"groups": [group]})["groups"][0]["task_id"]), str(group.get("meta_task", ""))): group for group in snapshot["groups"]}
     value["group_exports"] = {group["group_id"]: bool(session.get("group_exports", {}).get(
-        old_groups[group["task_id"]]["group_id"], old_groups[group["task_id"]].get("export", False))) for group in groups}
+        old_groups[(group["task_id"], str(group.get("meta_task", "")))]["group_id"], old_groups[(group["task_id"], str(group.get("meta_task", "")))].get("export", False))) for group in groups}
     value["pending_review"] = {}
     value["stale_tasks"] = []
     value["task_fingerprints"] = {task: item for task, item in session.get("task_fingerprints", {}).items() if task in valid}
@@ -909,10 +913,12 @@ def _export_view(session: dict, snapshot: dict) -> tuple[dict, dict]:
     return value, frozen
 
 
-def _existing_export(session: dict, kind: str) -> dict | None:
+def _existing_export(session: dict, kind: str, cot_policy: str | None = None) -> dict | None:
     current_key = session_fingerprint(session)
     store = ArtifactStore(storage_root())
     for record in session.get("exports", []):
+        if cot_policy is not None and record.get("cot_policy") != cot_policy:
+            continue
         if str(record.get("kind") or "selected") != kind or record.get("content_fingerprint") != current_key:
             continue
         ref = record.get("artifact") or {}
@@ -946,9 +952,11 @@ def _existing_export(session: dict, kind: str) -> dict | None:
 def _remember_export(session_id: str, history: dict) -> dict:
     replaced = []
     kind = history.get("kind", "selected")
+    def same_kind(item):
+        return str(item.get("kind") or "selected") == kind and (kind != "corrected_selection" or item.get("cot_policy") == history.get("cot_policy"))
     def apply(current):
-        replaced.extend(item for item in current.get("exports", []) if str(item.get("kind") or "selected") == kind)
-        current["exports"] = [history] + [item for item in current.get("exports", []) if str(item.get("kind") or "selected") != kind]
+        replaced.extend(item for item in current.get("exports", []) if same_kind(item))
+        current["exports"] = [history] + [item for item in current.get("exports", []) if not same_kind(item)]
     session = update_session(session_id, apply)
     directory = resolve_path(CORRECTION_EXPORTS_DIR / session_id)
     for item in replaced:
@@ -1010,6 +1018,49 @@ def export_session(session_id: str, expected_revision: int | None = None) -> dic
     history["artifact"] = publish_stage_snapshot(session, snapshot, "06_correction")
     _remember_export(session_id, history)
     return {**history, "summary": result["summary"], "storage_revision": load_session(session_id).get("storage_revision")}
+
+
+@_locked_session
+def export_selected_session(session_id: str, expected_revision: int | None = None, *, export_profile="corrected_selection_v1", cot_policy="generate") -> dict[str, Any]:
+    from .selected_export import EXPORT_PROFILE, project_selected, selection_records
+    from ..batch_results import current_tree_payload, current_quality_payload
+    if export_profile != EXPORT_PROFILE or cot_policy not in {"generate", "skip"}:
+        raise ValueError("不支持的已选轨迹导出策略")
+    session = _session_or_raise(session_id)
+    _check_revision(session, expected_revision)
+    existing = _existing_export(session, "corrected_selection", cot_policy)
+    if existing is not None:
+        return existing
+    session, snapshot = _export_view(session, _snapshot(session))
+    chosen = [group for group in snapshot["groups"] if session.get("group_exports", {}).get(group["group_id"], group.get("export", False))]
+    batch = session_batch_id(session)
+    selection = {**deepcopy(session.get("selection", {})), "batch_id": batch,
+                 "tree_run_id": session.get("tree_run_id"),
+                 "tasks": selection_records(chosen, session.get("selection", {}).get("candidates", []))}
+    payload = project_selected(session=session, snapshot=snapshot, table=session["workbook_payload"],
+        selection=selection, cot_policy=cot_policy, tree_payload={**current_tree_payload(batch, storage_root()), "artifact": ArtifactStore(storage_root()).get(batch, "04_tree")},
+        quality_payload=current_quality_payload(batch, storage_root()))
+    payload["content_fingerprint"] = session["export_fingerprint"]
+    export_id = allocate_id("e", storage_root())
+    output_dir = CORRECTION_EXPORTS_DIR / session_id
+    io_path(output_dir).mkdir(parents=True, exist_ok=True)
+    filename = f"data_{export_id}.xlsx"
+    destination = output_dir / filename
+    write_payload_workbook(destination, payload)
+    store = ArtifactStore(storage_root())
+    artifact = store.publish(batch, "07_cot", payload, workbooks={"full_dataset.xlsx": destination},
+        source_refs=[ref for stage in ("04_tree", "05_quality") if (ref := store.get(batch, stage))],
+        metadata={"session_id": session_id, "export_profile": export_profile, "cot_policy": cot_policy})
+    sheets = {name: len(rows) for name, rows in payload["sheets"].items()}
+    history = {"export_id": export_id, "kind": "corrected_selection", "export_profile": export_profile,
+        "cot_policy": cot_policy, "content_fingerprint": session["export_fingerprint"],
+        "selection": payload["selection"], "filename": filename, "sha256": hashlib.sha256(io_path(destination).read_bytes()).hexdigest(),
+        "artifact": artifact, "created_at": utc_now(), "sheets": sheets,
+        "summary": {"rows": sum(sheets.values()), "groups": len(payload["groups"]),
+                    "tasks": len({group["task_id"] for group in payload["groups"]})},
+        "download_url": f"/api/correction/sessions/{session_id}/exports/{filename}"}
+    saved = _remember_export(session_id, history)
+    return {**history, "storage_revision": saved.get("storage_revision")}
 
 
 @_locked_session

@@ -42,4 +42,15 @@ describe('folder upload progress', () => {
     expect(uploadDestinationPrefix({ status: 'failed' } as DatasetInternalUpload, cap)).toBe('new/')
     expect(uploadDestinationPrefix(undefined, cap)).toBe('new/')
   })
+  it('shows independent training counts and actual download links after a transport failure', async () => {
+    const html = await render({ ...base, job_id: 'j261117-001', training_jsonl: true, training: {
+      status: 'failed', included_count: 9, excluded_count: 1, bbox_fallback_count: 3,
+      key_step_count: 2, refined_count: 1, file_path: 'frozen/train.jsonl', report_path: 'frozen/report.json', error: '训练文件上传失败',
+    } })
+    expect(html).toContain('有效样本 9 · 排除 1 · 动作 JSON 兜底 3')
+    expect(html).toContain('/api/dataset-upload-jobs/j261117-001?download=jsonl')
+    expect(html).toContain('/api/dataset-upload-jobs/j261117-001?download=report')
+    expect(html).toContain('训练文件上传失败')
+    expect(html).toContain('已完成目录：1/3')
+  })
 })

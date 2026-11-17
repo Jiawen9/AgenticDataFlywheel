@@ -43,7 +43,7 @@ const models = reactive(modelDraft())
 const newagentModels = reactive(modelDraft())
 const activeModels = computed(() => draft.agent_type === 'newagent' ? newagentModels : models)
 const collectionIssue = computed(() => agentBlockedReason(agentCapabilities.value, draft.agent_type, draft.capture_logprobs) || modelBlockedReason(agentCapabilities.value, draft.agent_type, activeModels.value) || repeatBlockedReason(agentCapabilities.value, draft.agent_type, draft.repeat_times))
-const draft = reactive({ agent_type: 'newagent' as AgentType, repeat_times: 1, name: '', batch_id: '', start_mode: 'existing' as 'existing' | 'collect', mode: 'manual' as 'manual' | 'automatic', threshold: 3, phone_id: '', app: '', vla: '', sampling_enabled: false, temperature: 1, top_p: 1, use_experience_lib: false, capture_logprobs: false })
+const draft = reactive({ agent_type: 'newagent' as AgentType, repeat_times: 1, name: '', batch_id: '', start_mode: 'existing' as 'existing' | 'collect', mode: 'manual' as 'manual' | 'automatic', cot_policy: 'generate' as 'generate' | 'skip', threshold: 3, phone_id: '', app: '', vla: '', sampling_enabled: false, temperature: 1, top_p: 1, use_experience_lib: false, capture_logprobs: false })
 let disposed = false, choicesGeneration = 0
 const requests = new Map<string, string>()
 const icons = { TrendCharts, DataAnalysis, Collection, Upload, Cpu, Promotion }
@@ -146,7 +146,7 @@ async function importedRollout(result: RolloutImportResult) {
 function openCreate() {
   batchSearch.value = ''
   createError.value = ''; dialogVisible.value = true
-  Object.assign(draft, { name: '', batch_id: '', start_mode: 'existing', mode: 'manual', threshold: 3, phone_id: '', app: '', vla: '' })
+  Object.assign(draft, { name: '', batch_id: '', start_mode: 'existing', mode: 'manual', cot_policy: 'generate', threshold: 3, phone_id: '', app: '', vla: '' })
   void loadChoices()
 }
 async function create() {
@@ -154,6 +154,7 @@ async function create() {
   if (draft.start_mode === 'collect' && collectionIssue.value) { createError.value = collectionIssue.value; return }
   submitting.value = true; createError.value = ''
   const body: Omit<CreatePipeline, 'request_id'> = { name: draft.name.trim(), batch_id: draft.batch_id, start_mode: draft.start_mode, mode: draft.mode,
+    export_profile: 'corrected_selection_v1', cot_policy: draft.mode === 'manual' ? draft.cot_policy : 'generate',
     ...(draft.mode === 'automatic' ? { threshold: draft.threshold } : {}),
     ...(draft.start_mode === 'collect' ? { collection_config: { ...modelOptions(draft.agent_type, activeModels.value), agent_type: draft.agent_type, repeat_times: draft.repeat_times, phone_id: draft.phone_id, app: draft.app, vla: draft.vla.trim(), config: { sampling_enabled: draft.sampling_enabled, temperature: draft.temperature, top_p: draft.top_p, use_experience_lib: draft.use_experience_lib, capture_logprobs: draft.capture_logprobs } } } : {}),
   }
@@ -207,7 +208,7 @@ onBeforeUnmount(() => { disposed = true; stopRetryClock(); choicesGeneration++; 
       </header>
       <div v-if="pipeline" class="run-workspace" data-testid="pipeline-run-status">
         <div class="run-summary">
-          <span>{{ pipeline.mode === 'manual' ? '人工修正模式 · 每任务一条 Top1' : '自动发布模式 · Top1 的 Rubric G ≥ ' + pipeline.threshold }}</span>
+          <span>{{ pipeline.mode === 'manual' ? '人工修正模式 · 默认 Top1，可增选' : '自动发布模式 · Top1 的 Rubric G ≥ ' + pipeline.threshold }}</span>
           <span>本轮执行：{{ done }}/{{ pipeline.steps.length }} 步骤已处理</span>
           <el-progress :percentage="pipeline.steps.length ? Math.round(done / pipeline.steps.length * 100) : 0" :show-text="false" />
         </div>
@@ -279,7 +280,8 @@ onBeforeUnmount(() => { disposed = true; stopRetryClock(); choicesGeneration++; 
         <p v-if="draft.start_mode === 'collect'" class="form-hint">本次流程会创建独立结果批次，后续预处理、质检和发布仅处理本次采集。</p>
         <el-form-item v-if="draft.start_mode === 'existing'"><el-button :disabled="choicesLoading || submitting" data-testid="open-rollout-import" @click="rolloutImportVisible = true">导入已有 Rollout</el-button><span class="form-hint">已有本地轨迹尚未登记时，从这里添加新批次。</span></el-form-item>
         <el-form-item label="处理模式" required><el-radio-group v-model="draft.mode"><el-radio-button value="manual">人工修正</el-radio-button><el-radio-button value="automatic">自动发布</el-radio-button></el-radio-group></el-form-item>
-        <p class="form-hint">{{ draft.mode === 'manual' ? '每任务选择一条 Top1，修正关卡等待人工确认；无需修改的轨迹也会导出。' : '每任务选择一条达标的最高分轨迹，未达标任务跳过；发布成功后整个批次结束处理。' }}</p>
+        <p class="form-hint">{{ draft.mode === 'manual' ? '默认每任务 Top1，可额外勾选多条；确认后导出每条的全部保留步骤。' : '每任务选择一条达标的最高分轨迹，未达标任务跳过；发布成功后整个批次结束处理。' }}</p>
+        <el-form-item v-if="draft.mode === 'manual'" label="修正后处理"><el-radio-group v-model="draft.cot_policy"><el-radio-button value="generate">生成 COT</el-radio-button><el-radio-button value="skip">OPD：跳过 COT</el-radio-button></el-radio-group><p v-if="draft.cot_policy === 'skip'" class="form-hint">保留全部未删除步骤，导出 thought 为空，不调用 COT 或标框模型。</p></el-form-item>
         <el-form-item v-if="draft.mode === 'automatic'" label="Rubric G 阈值（0～5）" required><el-input-number v-model="draft.threshold" :min="0" :max="5" :step="0.1" /></el-form-item>
         <template v-if="draft.start_mode === 'collect'">
           <el-form-item label="采集引擎"><CollectionAgentSelect v-model="draft.agent_type" :capabilities="agentCapabilities" /></el-form-item>

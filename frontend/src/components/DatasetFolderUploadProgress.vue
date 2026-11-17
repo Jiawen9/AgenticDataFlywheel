@@ -3,6 +3,7 @@ import { computed, ref, watch } from 'vue'
 import type { DatasetFolderUpload } from '@/types'
 import { byteProgress, directoryProgress } from '@/utils/datasetFolderUpload'
 import { datasetUploadMessage } from '@/utils/datasetUploadMessage'
+import { datasetTrainingDownloadUrl } from '@/api'
 
 const props = defineProps<{ upload: DatasetFolderUpload; stage?: string }>()
 const page = ref(1)
@@ -27,6 +28,7 @@ function size(value: number | undefined) {
     <p v-if="upload.destination" class="destination">云道目标：<code>s3://{{ upload.destination.bucket }}/{{ upload.destination.prefix }}</code></p>
     <p v-if="stage === 'resolving'">正在定位发布表包含的轨迹目录…</p>
     <p v-else-if="stage === 'recovering'">正在核对上次上传进程，避免重复启动。</p>
+    <p v-else-if="stage === 'generating_training'">表格与轨迹已上传，正在生成训练 JSONL…</p>
     <p v-if="upload.source_summary?.trajectory_count !== undefined">实际上传范围：{{ upload.source_summary.case_count }} 个用例 · {{ upload.source_summary.trajectory_count }} 条完整轨迹 · {{ upload.source_summary.excel_count }} 份发布表格</p>
     <template v-if="upload.total_items && upload.total_items > 0">
       <div class="directory-count">已完成目录：{{ upload.completed_items || 0 }}/{{ upload.total_items }} <span>目录进度 {{ percent }}%</span></div>
@@ -40,6 +42,18 @@ function size(value: number | undefined) {
       <progress :value="bytePercent" max="100" aria-label="当前脚本字节上传进度" />
     </template>
     <p v-if="upload.progress?.message" class="output-message">{{ upload.progress.message }}</p>
+    <section v-if="upload.training_jsonl" class="training-results" aria-label="训练 JSONL 结果">
+      <b>训练 JSONL</b>
+      <p v-if="upload.training?.included_count !== undefined">有效样本 {{ upload.training.included_count }} · 排除 {{ upload.training.excluded_count || 0 }} · 动作 JSON 兜底 {{ upload.training.bbox_fallback_count || 0 }}</p>
+      <p v-if="upload.training?.key_step_count !== undefined">关键步骤 {{ upload.training.key_step_count }} · 关键步未知 {{ upload.training.unknown_key_step_count || 0 }} · 人工修正 {{ upload.training.refined_count || 0 }}</p>
+      <p v-if="upload.training?.s3_uri"><code>{{ upload.training.s3_uri }}</code></p>
+      <p v-if="upload.training?.error" class="failed">{{ datasetUploadMessage(upload.training.error) }}</p>
+      <div v-if="upload.job_id" class="training-downloads">
+        <a v-if="upload.training?.file_path" :href="datasetTrainingDownloadUrl(upload.job_id, 'jsonl')" target="_blank" rel="noopener">下载训练 JSONL</a>
+        <a v-if="upload.training?.report_path" :href="datasetTrainingDownloadUrl(upload.job_id, 'report')" target="_blank" rel="noopener">下载排除与转换报告</a>
+      </div>
+      <p v-if="!upload.training">等待表格与轨迹目录上传完成后生成；原始上传结果单独保留。</p>
+    </section>
     <button v-if="items.length" class="details-toggle" :aria-expanded="detailsOpen" @click="detailsOpen = !detailsOpen">{{ detailsOpen ? '收起' : '查看' }}目录上传结果（{{ items.length }}）</button>
     <section v-if="detailsOpen" aria-label="目录上传结果">
       <ul>
@@ -57,6 +71,9 @@ function size(value: number | undefined) {
 
 <style scoped>
 .folder-progress { display: grid; gap: 10px; font-size: 13px; min-width: 0; }
+.training-results { display: grid; gap: 8px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; }
+.training-downloads { display: flex; flex-wrap: wrap; gap: 16px; }
+.training-downloads a { color: var(--accent-deep); }
 p { margin: 0; overflow-wrap: anywhere; }
 .destination, .current-item, .output-message { color: var(--muted); }
 .directory-count, li > div, .pagination { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }

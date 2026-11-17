@@ -5,6 +5,7 @@ import hashlib
 from fastapi.responses import FileResponse
 from .collection_runs import _identifier
 from .phone_factory import PhoneFactoryError
+from .file_io import io_path, resolve_path, is_link_or_junction
 
 
 def dispatch(runtime, parts, data, mode):
@@ -37,22 +38,22 @@ def dispatch(runtime, parts, data, mode):
     name = data.get("path", "")
     if not isinstance(name, str) or name not in source["files"]:
         raise PhoneFactoryError("文件不在已校验产物清单中", 404)
-    relative = PurePosixPath(name)
+    relative = PurePosixPath(source.get("file_paths", {}).get(name, name))
     if relative.is_absolute() or ".." in relative.parts or "\\" in name or ":" in name:
         raise PhoneFactoryError("原件路径无效", 409)
-    root = Path(source["root"]).resolve()
+    root = resolve_path(source["root"])
     path = root.joinpath(*relative.parts)
-    if not path.resolve().is_relative_to(root) or any(p.is_symlink() or (hasattr(p, "is_junction") and p.is_junction())
+    if not resolve_path(path).is_relative_to(root) or any(is_link_or_junction(p)
             for p in (path, *path.parents) if p != root and p.is_relative_to(root)):
         raise PhoneFactoryError("原件路径发生变化", 409)
     size, expected = source["files"][name]
-    if not path.is_file() or path.stat().st_size != size:
+    if not io_path(path).is_file() or io_path(path).stat().st_size != size:
         raise PhoneFactoryError("原件缺失或大小发生变化", 409)
     checksum = hashlib.sha256()
-    with path.open("rb") as handle:
+    with io_path(path).open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             checksum.update(chunk)
     if checksum.hexdigest() != expected:
         raise PhoneFactoryError("原件摘要发生变化", 409)
-    return FileResponse(path, filename=path.name, media_type="application/octet-stream",
+    return FileResponse(io_path(path), filename=path.name, media_type="application/octet-stream",
                         headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})

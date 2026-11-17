@@ -212,7 +212,7 @@ class PipelineReleaseTests(unittest.TestCase):
         self.assertEqual(sum(row["step数量"] for row in rows), 6)
         self.assertEqual({row["APP"] for row in rows}, {"App A", "App B"})
 
-    def test_manual_can_select_alternate_and_requires_exactly_one(self):
+    def test_manual_can_select_alternate_or_multiple_and_freezes_each_group(self):
         pipeline = self.pipeline("manual")
         manual = publishing.prepare_manual(self.batch, pipeline["selection"], root=self.root)
         session = self.records.get("correction_sessions", manual["session_id"])
@@ -231,8 +231,9 @@ class PipelineReleaseTests(unittest.TestCase):
         for group in session["snapshot_payload"]["groups"]:
             session["group_exports"][group["group_id"]] = True
         self.records.put("correction_sessions", session["session_id"], session)
-        with self.assertRaisesRegex(ValueError, "只能选择一条"):
-            publishing.confirm_manual(session["session_id"], root=self.root)
+        multiple = publishing.confirm_manual(session["session_id"], root=self.root)
+        self.assertEqual(len(multiple["group_ids"]), 4)
+        self.assertEqual(set(multiple["selection"]["selected_trajectory_ids"]["A"]), {"a-first", "a-second"})
 
     def test_deleted_step_remaps_manual_metadata_and_preserves_handwritten_cot(self):
         pipeline = self.pipeline("manual")

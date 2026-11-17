@@ -16,6 +16,11 @@ class RevisionRequest(BaseModel):
     expected_revision: int = Field(ge=1)
 
 
+class DatasetExportRequest(RevisionRequest):
+    export_profile: str | None = None
+    cot_policy: str = "generate"
+
+
 class ReviewRequest(RevisionRequest):
     decision: str
 
