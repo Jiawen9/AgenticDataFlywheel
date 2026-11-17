@@ -15,6 +15,13 @@ const mocks = vi.hoisted(() => ({
   },
 }))
 
+vi.mock('@/composables/useGenerationPages', async () => {
+  const { ref } = await import('vue')
+  return {
+    useGenerationHistory: () => ({ query: ref({ limit: 10 }), page: ref(1), total: ref(51), snapshot: ref({ items: [] }), startPolling: vi.fn(), read: vi.fn(), update: vi.fn() }),
+    useGenerationResultPage: () => ({ query: ref({ limit: 10 }), snapshot: ref({ counts: { active: 27 }, total: 15 }), metadata: () => ({ counts: { active: 27 }, total: 15 }), read: vi.fn(), update: vi.fn() }),
+  }
+})
 vi.mock('@/composables/useAugmentationPreview', () => ({ useAugmentationPreview: () => mocks.review }))
 vi.mock('@/components/CollectionBatchSubmission.vue', async () => {
   const { defineComponent, h } = await import('vue')
@@ -95,7 +102,7 @@ describe('augmentation collection submission placement', () => {
     expect(html).toContain('历史来源记录不完整，单独展示')
 
     expect(mocks.submissionProps?.job).toMatchObject({ job_id: job.job_id, kind: 'augmentation' })
-    expect(mocks.submissionProps?.resultCount).toBe(1)
+    expect(mocks.submissionProps?.resultCount).toBe(27)
     expect(mocks.submissionProps?.busy).toBe(false)
     expect(mocks.submissionProps?.protect).toBe(protect)
     expect(mocks.submissionProps?.runProtected).toBe(runExternalAction)

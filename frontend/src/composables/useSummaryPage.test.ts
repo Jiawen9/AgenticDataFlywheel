@@ -70,6 +70,16 @@ describe('shared summary reads', () => {
     await vi.advanceTimersByTimeAsync(5000); expect(load).toHaveBeenCalledTimes(2)
     await vi.advanceTimersByTimeAsync(25000); expect(load).toHaveBeenCalledTimes(3)
   })
+  it('persists release progress without upload targets, credentials or receipts', async () => {
+    await sharedRead(summaryKey('releases'), async () => ({ ...page(), items: [{ release_id: 'r1', internal_upload: {
+      status: 'running', completed_items: 2, total_items: 5, folder_upload: true,
+      destination: 'private-bucket', token: 'private-token', file_results: [{ path: 'private-file' }],
+    } }] }), { persist: true })
+    const serialized = Object.values(sessionStorage).filter(value => typeof value === 'string').join('')
+    expect(serialized).toContain('"completed_items":2')
+    expect(serialized).toContain('"status":"running"')
+    expect(serialized).not.toContain('private-')
+  })
 })
 
 

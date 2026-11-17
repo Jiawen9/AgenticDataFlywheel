@@ -8,7 +8,7 @@ import * as polling from '@/composables/useFactoryPolling'
 import * as collectionAgents from '@/utils/collectionAgents'
 import type { FactoryState, PhoneMonitor } from '@/phoneFactoryApi'
 
-const api = vi.hoisted(() => ({ state: vi.fn(), adbDevices: vi.fn(), remoteStatus: vi.fn(), monitor: vi.fn() }))
+const api = vi.hoisted(() => ({ monitorState: vi.fn(), state: vi.fn(), adbDevices: vi.fn(), remoteStatus: vi.fn(), monitor: vi.fn() }))
 // Vitest's Node transform emits SSR components; compile this component's actual
 // client render function for the lightweight Vue host below (no DOM dependency).
 const source = readFileSync(new URL('./PhoneFactoryView.vue', import.meta.url), 'utf8')
@@ -72,9 +72,11 @@ beforeEach(() => {
   fakeDocument = { hidden: false, body: { classList: { add: vi.fn(), remove: vi.fn() } }, ...events(documentEvents) }
   vi.stubGlobal('document', fakeDocument); vi.stubGlobal('window', events(windowEvents))
   state = { phones: ['p1', 'p2'], apps: ['App A', 'App B'], phoneApps: [{ phone_id: 'p1', app: 'App A', status: '运行中' }, { phone_id: 'p1', app: 'App B', status: '运行中' }, { phone_id: 'p2', app: 'App A', status: '空闲' }], vla: [], tasks: [{ description: 'task', filename: 'task.xlsx', status: '运行中' }] }
-  api.state.mockImplementation(async () => state)
-  api.adbDevices.mockImplementation(async () => ({ ok: true, devices: state.phones.includes('p1') ? [{ serial: 'p1', model: 'Phone One', battery: 72 }] : [] }))
-  api.remoteStatus.mockImplementation(async (ids: string[]) => ({ ok: true, statuses: ids.map(phone_id => ({ phone_id, status: phone_id === 'p1' ? '运行中' : '空闲' })) }))
+  api.monitorState.mockImplementation(async () => ({
+    devices: state.phones.map(id => ({ id, apps: state.phoneApps.filter(row => row.phone_id === id).map(row => row.app),
+      model: id === 'p1' ? 'Phone One' : '', battery: id === 'p1' ? 72 : null, connected: id === 'p1', status: id === 'p1' ? '运行中' : '空闲' })),
+    task_count: state.tasks.length, observed_at: '2026-11-17T08:00:00Z', stale: false, refreshing: false, error: null,
+  }))
   api.monitor.mockImplementation(async () => snapshot())
 })
 afterEach(() => { mounted.splice(0).forEach(app => app.unmount()); vi.useRealTimers(); vi.unstubAllGlobals() })
@@ -82,6 +84,10 @@ afterEach(() => { mounted.splice(0).forEach(app => app.unmount()); vi.useRealTim
 describe('phone factory monitoring', () => {
   it('restores three counters and all device fields without counting App associations as phones', async () => {
     const { root, device } = await mount()
+    expect(api.state).not.toHaveBeenCalled()
+    expect(api.adbDevices).not.toHaveBeenCalled()
+    expect(api.remoteStatus).not.toHaveBeenCalled()
+    expect(api.monitor).not.toHaveBeenCalled()
     expect(text(find(root, 'factory-connected-count'))).toBe('1')
     expect(text(find(root, 'factory-phone-count'))).toBe('2')
     expect(text(find(root, 'factory-task-count'))).toBe('1')
@@ -97,11 +103,11 @@ describe('phone factory monitoring', () => {
     const { root, device } = await mount()
     click(device('p1')); await settle()
     await vi.advanceTimersByTimeAsync(3000)
-    expect(api.monitor).toHaveBeenCalledTimes(4); expect(api.state).toHaveBeenCalledTimes(1)
+    expect(api.monitor).toHaveBeenCalledTimes(4); expect(api.monitorState).toHaveBeenCalledTimes(1)
     click(find(root, 'factory-monitor-refresh')); await settle()
-    expect(api.monitor).toHaveBeenCalledTimes(5); expect(api.state).toHaveBeenCalledTimes(1)
+    expect(api.monitor).toHaveBeenCalledTimes(5); expect(api.monitorState).toHaveBeenCalledTimes(1)
     await vi.advanceTimersByTimeAsync(7000)
-    expect(api.state).toHaveBeenCalledTimes(2)
+    expect(api.monitorState).toHaveBeenCalledTimes(2)
     expect(api.monitor).toHaveBeenCalledTimes(12)
   })
 
@@ -139,7 +145,7 @@ describe('phone factory monitoring', () => {
     pending.resolve(snapshot()); await vi.advanceTimersByTimeAsync(5000)
     expect(api.monitor).toHaveBeenCalledTimes(1)
     expect(all(root).some(item => item.tag === 'dialog')).toBe(false)
-    expect(api.state).toHaveBeenCalledTimes(1)
+    expect(api.monitorState).toHaveBeenCalledTimes(1)
   })
 
   it('closes and stops a monitor when its device disappears from fresh device state', async () => {
@@ -157,11 +163,11 @@ describe('phone factory monitoring', () => {
     const { device, app } = await mount()
     click(device('p1')); await settle()
     visibility(true); await vi.advanceTimersByTimeAsync(30000)
-    expect(api.monitor).toHaveBeenCalledTimes(1); expect(api.state).toHaveBeenCalledTimes(1)
+    expect(api.monitor).toHaveBeenCalledTimes(1); expect(api.monitorState).toHaveBeenCalledTimes(1)
     visibility(false); await settle()
-    expect(api.monitor).toHaveBeenCalledTimes(2); expect(api.state).toHaveBeenCalledTimes(2)
+    expect(api.monitor).toHaveBeenCalledTimes(2); expect(api.monitorState).toHaveBeenCalledTimes(2)
     windowEvents.get('focus')?.forEach(handler => handler()); await settle()
-    expect(api.monitor).toHaveBeenCalledTimes(3); expect(api.state).toHaveBeenCalledTimes(3)
+    expect(api.monitor).toHaveBeenCalledTimes(3); expect(api.monitorState).toHaveBeenCalledTimes(3)
     app.unmount(); mounted.splice(mounted.indexOf(app), 1)
     await vi.advanceTimersByTimeAsync(30000)
     expect(api.monitor).toHaveBeenCalledTimes(3); expect(documentEvents.get('visibilitychange')?.size).toBe(0)
@@ -182,4 +188,25 @@ describe('phone factory monitoring', () => {
     await vi.advanceTimersByTimeAsync(1000)
     expect(text(find(root, 'phone-live-log'))).toBe('暂无采集日志')
   })
+  it('keeps observed devices on refresh errors and marks age, instead of claiming offline', async () => {
+    const { root } = await mount()
+    api.monitorState.mockRejectedValueOnce(new Error('timeout'))
+    await vi.advanceTimersByTimeAsync(10000)
+    expect(text(root)).toContain('保留上次观察')
+    expect(text(root)).toContain('状态过期')
+    expect(text(find(root, 'factory-connected-count'))).toBe('1')
+    expect(text(root)).toContain('状态运行中')
+  })
+
+  it('shows unobserved phones as unknown and waits for a background observation', async () => {
+    api.monitorState.mockResolvedValueOnce({ devices: [{ id: 'p1', apps: [], model: '', connected: null, battery: null, status: '未知' }], task_count: 0, observed_at: null, stale: true, refreshing: true, error: null })
+    const { root } = await mount()
+    expect(text(root)).toContain('状态未知')
+    expect(text(root)).not.toContain('离线')
+    expect(text(find(root, 'factory-connected-count'))).toBe('—')
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(text(find(root, 'factory-connected-count'))).toBe('1')
+    expect(api.monitor).not.toHaveBeenCalled()
+  })
+
 })

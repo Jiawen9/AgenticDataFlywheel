@@ -19,6 +19,7 @@ from ..data_store.paths import contained_path
 from ..data_store.registry import utc_now
 from ..pipeline_retry_errors import failure_from_exception
 from .converter import ALL_DATA_COLUMNS, convert_release
+from .read_cache import OverviewReadCache
 
 log = logging.getLogger(__name__)
 CONVERSIONS = "training_overview_conversions"
@@ -168,12 +169,17 @@ class TrainingOverviewManager:
         self._conversion_lock = threading.Lock()
         self._futures = {}
         self._started = False
+        self._reads = OverviewReadCache(self.records, CATALOG, CONVERSIONS, summarize)
+        self._read_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="overview-read-warmup")
+        self._read_future = None
+        self._closed = False
 
     def start(self) -> None:
         with self._lock:
             if self._started:
                 return
             self._started = True
+            self._warm_reads()
             # Only registered releases. Existing failed conversions await explicit retry.
             for release in self.registry.list_releases():
                 current = self.records.get(CONVERSIONS, release["release_id"])
@@ -184,8 +190,19 @@ class TrainingOverviewManager:
                         log.exception("训练数据汇总恢复失败：%s", release["release_id"])
 
     def close(self) -> None:
+        self._closed = True
         if self._owns_executor:
             self._executor.shutdown(wait=True)
+        self._read_executor.shutdown(wait=True)
+
+    def _warm_reads(self):
+        if not self._closed and (self._read_future is None or self._read_future.done()):
+            try:
+                self._read_future = self._read_executor.submit(self.query)
+            except RuntimeError:
+                # Cache warmup is optional: publication has already committed.
+                # A shutting-down/unavailable executor cannot undo its files.
+                log.warning("训练总览缓存预热暂不可用；下次读取将按版本构建", exc_info=True)
 
     def submit(self, release_id: str, *, recover: bool = False) -> dict:
         with self._lock:
@@ -285,6 +302,8 @@ class TrainingOverviewManager:
             diagnostics.record_job_snapshot(state, "overview", self.root)
             diagnostics.log_event("conversion_committed", release_id=release_id, files=files,
                                   trajectory_count=len(converted["rows"]))
+            if self._started:
+                self._warm_reads()
         except BaseException:
             for candidate in (temporary, final):
                 if candidate.is_dir() and candidate.resolve().is_relative_to(base.resolve()):
@@ -292,17 +311,7 @@ class TrainingOverviewManager:
             raise
 
     def query(self, **filters) -> dict:
-        # These two record sets must describe the same committed revision.
-        if not self.records.database_path.exists():
-            return summarize(None, [], filters)
-        with self.records._connection() as connection:
-            connection.execute("BEGIN")
-            catalog = self.records._read(connection, CATALOG, "current")
-            exists = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='records'").fetchone()
-            conversions = [json.loads(row[0]) for row in connection.execute(
-                "SELECT payload FROM records WHERE namespace=? ORDER BY record_key", (CONVERSIONS,))] if exists else []
-            connection.rollback()
-        return summarize(catalog, conversions, filters)
+        return self._reads.query(filters)
 
     def workbook(self) -> Path:
         catalog = self.records.get(CATALOG, "current")

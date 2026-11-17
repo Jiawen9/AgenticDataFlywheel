@@ -11,6 +11,7 @@ import componentSource from './QualityView.vue?raw'
 const fixture = vi.hoisted(() => ({ flow: {} as Record<string, unknown> }))
 vi.mock('vue-router', () => ({ useRoute: () => ({ query: {} }), useRouter: () => ({ replace: vi.fn(), push: vi.fn() }) }))
 vi.mock('@/api', () => ({ api: { qualityJobs: vi.fn(async () => []) }, imageUrl: (path: string) => path, treeRunScope: () => ({}) }))
+vi.mock('@/businessPageApi', () => ({ jobPage: vi.fn(async () => ({ items: [] })) }))
 vi.mock('@/composables/useBatchQualityWorkspace', () => ({ useBatchQualityWorkspace: () => fixture.flow }))
 vi.mock('@/composables/usePipelineContext', () => ({ usePipelineContext: () => ({ readOnly: ref(false), isPipelineRoute: ref(false), managed: ref(false), historyOnly: ref(false), pipeline: ref(null), refresh: vi.fn() }) }))
 vi.mock('@/composables/useBatchLifecycle', () => ({ useBatchLifecycle: () => ({ notice: ref(null), checkBatch: vi.fn(async () => true) }) }))
@@ -76,10 +77,11 @@ function mount(tied = false) {
   fixture.flow = { batches: ref([{ batch_id: 'batch', task_count: 1 }]), batchId: ref('batch'), currentTree: ref({ run_id: 'batch', task_count: 1, tasks: [task] }),
     summaries: ref({ task: { status: 'succeeded', rubric_ready: true, fusion_complete: true } }), recommendation: ref(null),
     selectedTaskId: ref('task'), tree, quality, loadingBatches: ref(false), loadingTree: ref(false), counts: ref({ completed: 1, pending: 0, stale: 0 }),
-    readyTasks: ref([task]), error: ref(''), loadBatches: vi.fn(), refreshChoices: vi.fn(), dispose: vi.fn() }
+    readyTasks: ref([task]), error: ref(''), loadBatches: vi.fn(), refreshChoices: vi.fn(), dispose: vi.fn(),
+    choices: null, taskPage: ref(1), taskSize: ref(10), taskTotal: ref(1), taskSearch: ref(''), readyTaskIds: ref(['task']), changeTaskPage: vi.fn(), searchTasks: vi.fn(), loadRecommendation: vi.fn() }
   const app = renderer.createApp(ClientView)
   const pass = defineComponent({ setup: (_props, { slots, attrs }) => () => h('div', attrs, slots.default?.()) })
-  for (const name of ['button', 'alert', 'empty', 'tag', 'checkbox', 'progress', 'option']) app.component('el-' + name, pass)
+  for (const name of ['pagination', 'input', 'button', 'alert', 'empty', 'tag', 'checkbox', 'progress', 'option']) app.component('el-' + name, pass)
   app.component('el-select', defineComponent({ props: ['modelValue'], emits: ['update:modelValue', 'change'],
     setup: (props, { emit, slots, attrs }) => () => h('test-select', { ...attrs, value: props.modelValue, onPick: (value: unknown) => {
       emit('update:modelValue', value); emit('change', value)

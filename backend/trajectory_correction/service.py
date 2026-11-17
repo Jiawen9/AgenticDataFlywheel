@@ -230,7 +230,15 @@ def _overlay_row(session_id: str, session: dict[str, Any], base: dict[str, Any])
 
 
 def _group_summary(session_id: str, session: dict[str, Any], group: dict[str, Any]) -> dict[str, Any]:
-    reviews = reviews_for_group(session, _snapshot(session), group)
+    pending = [item for item in session.get("pending_review", {}).values() if str(item.get("task_id", "")) == str(group.get("task_id", ""))]
+    if not group.get("task_id") and session.get("pending_review"):
+        reviews = reviews_for_group(session, _snapshot(session), group)
+    elif pending:
+        snapshot = session.get("snapshot_payload") or _snapshot(session)
+        keys = {row.get("step_key") for item in snapshot.get("groups", []) for row in item.get("rows", [])}
+        reviews = [{**item, "can_adopt": item.get("step_key") in keys and item.get("task_id") not in session.get("stale_tasks", [])} for item in pending]
+    else:
+        reviews = []
     rows = [_overlay_row(session_id, session, row) for row in group["rows"]]
     active = [row for row in rows if not row["deleted"]]
     return {
@@ -248,10 +256,16 @@ def _group_summary(session_id: str, session: dict[str, Any], group: dict[str, An
         "active_row_count": len(active),
         "edited_row_count": sum(1 for row in rows if row["edited"]),
         "action_edit_count": sum(1 for row in rows if row["action_edited"]),
+        "cot_row_count": sum(1 for row in active if row["action_edited"] or row["bbox_edited"]),
+        "generated_row_count": sum(1 for row in active if (row["action_edited"] or row["bbox_edited"]) and row.get("cot_status") == "generated"),
     }
 
 
-def _public_session(session: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+def _public_session(session: dict[str, Any], snapshot: dict[str, Any], *, summary: bool = False) -> dict[str, Any]:
+    if summary:
+        from .read_models import project_session
+        return {**project_session({**session, "snapshot_payload": snapshot}), "storage_revision": session.get("storage_revision"),
+                "source": None, "selection": session.get("selection"), "groups": [], "exports": []}
     groups = [_group_summary(session["session_id"], session, group) for group in snapshot["groups"]]
     source_id = str(session["source_id"])
     return {
@@ -328,7 +342,7 @@ def _input_for_batch(identifier: str):
         yield path, assets, {}
 
 
-def create_session(tree_run_id: str | None = None, *, batch_id: str | None = None) -> dict[str, Any]:
+def create_session(tree_run_id: str | None = None, *, batch_id: str | None = None, _summary: bool = False) -> dict[str, Any]:
     identifier = str(batch_id or tree_run_id or "").strip()
     if not identifier:
         raise ValueError("请选择业务批次")
@@ -355,14 +369,14 @@ def create_session(tree_run_id: str | None = None, *, batch_id: str | None = Non
                     and existing.get("task_fingerprints", {}) == selection.get("task_fingerprints", {})):
                 # A draft owns its chosen trajectories. Re-scoring identical inputs
                 # must not replace a user's work when the page refreshes.
-                return _public_session(existing, _snapshot(existing))
+                return _public_session(existing, _snapshot(existing), summary=_summary)
             full_snapshot = load_snapshot(workbook_path, asset_root=package_root, source_kind="annotated_workbook")
             snapshot = identified(filter_snapshot(full_snapshot, selection))
             source_key = fingerprint({"table": table_payload, "selection": selection.get("selected_trajectories"),
                                       "tasks": selection.get("task_fingerprints", {})})
             if existing is not None:
                 if existing.get("input_fingerprint") == source_key and not existing.get("stale_tasks"):
-                    return _public_session(existing, _snapshot(existing))
+                    return _public_session(existing, _snapshot(existing), summary=_summary)
                 old_snapshot = _snapshot(existing)
                 reconcile(existing, old_snapshot, snapshot, selection.get("task_fingerprints", {}))
                 session = existing
@@ -389,7 +403,7 @@ def create_session(tree_run_id: str | None = None, *, batch_id: str | None = Non
                 "workbook_json_sha256": hashlib.sha256(table_bytes).hexdigest(),
                 "workbook_sha256": hashlib.sha256(io_path(path).read_bytes()).hexdigest()}
             save_session(session)
-            return _public_session(session, _snapshot(session))
+            return _public_session(session, _snapshot(session), summary=_summary)
 
 
 def _check_revision(session: dict, expected_revision: int | None) -> None:
@@ -495,20 +509,52 @@ def review_group(session_id: str, group_id: str, decision: str, expected_revisio
             "storage_revision": session.get("storage_revision")}
 
 
-def get_session(session_id: str) -> dict[str, Any]:
+def get_session(session_id: str, *, summary: bool = False) -> dict[str, Any]:
     session = _session_or_raise(session_id)
     if session.get("pipeline_selection"):
         from ..pipeline_release import pipeline_session_source_current
         if pipeline_session_source_current(session, root=storage_root()):
             # Terminating a Pipeline does not erase its saved choices or edits.
-            return _public_session(session, _snapshot(session))
+            return _public_session(session, _snapshot(session), summary=summary)
     batch_id = str(session.get("storage_batch_id") or session.get("batch_id") or session.get("tree_run_id"))
     if ArtifactStore(storage_root()).get(batch_id, "04_tree") is not None:
         try:
-            return create_session(batch_id=batch_id)
+            return create_session(batch_id=batch_id, _summary=summary)
         except QualitySelectionUnavailable:
             pass  # Keep old edits visible while the changed task is reprocessed.
-    return _public_session(session, _snapshot(session))
+    return _public_session(session, _snapshot(session), summary=summary)
+
+
+def get_session_header(session_id: str) -> dict[str, Any]:
+    from .read_models import project_session
+    session = _session_or_raise(session_id)
+    if not isinstance(session.get("snapshot_payload"), dict) and session.get("source_snapshot"):
+        session = {**session, "snapshot_payload": _snapshot(session)}
+    return {**project_session(session), "storage_revision": session.get("storage_revision"),
+            "source": None, "selection": session.get("selection"), "groups": [], "exports": []}
+
+
+def get_group_page(session_id: str, *, offset=0, limit=10, search="", status="", unit="group") -> dict[str, Any]:
+    from .read_models import page_values
+    session = _session_or_raise(session_id)
+    snapshot = _snapshot(session)
+    query = search.strip().casefold()
+    # Filter base metadata before overlaying only the requested page. Never build COT history here.
+    groups = [group for group in snapshot["groups"] if not query or query in " ".join(
+        str(group.get(key) or "") for key in ("task_id", "group_id", "task", "meta_task")).casefold()]
+    pending_tasks = set(session.get("stale_tasks", [])) | {item.get("task_id") for item in session.get("pending_review", {}).values()}
+    if status in {"pending_review", "ready"}:
+        groups = [group for group in groups if (group.get("task_id") in pending_tasks) == (status == "pending_review")]
+    count = len(groups)
+    visible = groups[offset:offset + limit]
+    if unit == "task":
+        identities = list(dict.fromkeys(str(group.get("task_id") or group.get("task")) for group in groups))
+        count = len(identities)
+        selected = set(identities[offset:offset + limit])
+        visible = [group for group in groups if str(group.get("task_id") or group.get("task")) in selected]
+    page = page_values([], offset=offset, limit=limit, total=count, revision=session.get("storage_revision"))
+    page["items"] = [_group_summary(session_id, session, group) for group in visible]
+    return page
 
 
 def get_groups(session_id: str) -> list[dict[str, Any]]:
@@ -537,20 +583,23 @@ def get_group(session_id: str, group_id: str) -> dict[str, Any]:
     return result
 
 
-def get_cot(session_id: str) -> dict[str, Any]:
+def get_cot(session_id: str, *, group_id: str | None = None) -> dict[str, Any]:
     """Return generated COT rows for a correction session."""
     session = _session_or_raise(session_id)
     snapshot = _snapshot(session)
     groups: list[dict[str, Any]] = []
     for group in snapshot["groups"]:
+        if group_id is not None and group.get("group_id") != group_id:
+            continue
+        summary = _group_summary(session_id, session, group)
         rows = [_overlay_row(session_id, session, row) for row in group["rows"]]
         rows.sort(key=lambda item: int(item.get("step", 0)))
         groups.append({
             "group_id": group["group_id"],
             "trajectory_id": group["meta_task"],
             "task_id": group.get("task_id", ""),
-            "pending_review": _group_summary(session_id, session, group)["pending_review"],
-            "pending_review_count": _group_summary(session_id, session, group)["pending_review_count"],
+            "pending_review": summary["pending_review"],
+            "pending_review_count": summary["pending_review_count"],
             "task": group["task"],
             "rows": [
                 {

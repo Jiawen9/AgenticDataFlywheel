@@ -1,12 +1,16 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { onBeforeRouteLeave } from 'vue-router'
+import { onBeforeRouteLeave, useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Download, Refresh, Search, Setting } from '@element-plus/icons-vue'
+import { Download, Refresh, Setting } from '@element-plus/icons-vue'
 import { api, ApiError, sceneTreeDownloadUrl, taskGenerationDownloadUrl } from '@/api'
 import type { KnowledgeBaseSummary, TaskGenerationTreeNode } from '@/types'
 import { executionUnitCount, leaves, normalizeTree, selectionsFor } from '@/utils/scenarioTree'
 import { generationJobOptionLabel, isGenerationActive, jobLabels, reconcileApps, stageLabel, unitLabel, type AppSelection } from '@/utils/taskGeneration'
+import { generationResources } from '@/generationReadApi'
+import { useGenerationHistory, useGenerationResultPage } from '@/composables/useGenerationPages'
+import GenerationHistoryPager from '@/components/GenerationHistoryPager.vue'
+import type { SummaryQuery } from '@/utils/summaryCache'
 import { useTaskGenerationReview } from '@/composables/useTaskGenerationReview'
 import TaskGenerationScope from '@/components/TaskGenerationScope.vue'
 import TaskGenerationResults from '@/components/TaskGenerationResults.vue'
@@ -18,7 +22,14 @@ const { displayId, matches } = useDisplayIdentifiers()
 const pickerQuery = ref('')
 const filterJobPicker = (query: string) => { pickerQuery.value = query }
 
-const mode = ref<'new' | 'records'>('new')
+const route = useRoute()
+const mode = ref<'new' | 'records'>('records')
+const history = useGenerationHistory('task_generation')
+const resultPages = useGenerationResultPage()
+const historyTotal = history.total
+const historyPage = history.page
+const historyQuery = history.query
+const resourceController = new AbortController()
 const tree = ref<TaskGenerationTreeNode[]>([])
 const version = ref('')
 const knowledgeBases = ref<KnowledgeBaseSummary[]>([])
@@ -30,12 +41,10 @@ const resourceError = ref('')
 const resourceOpen = ref(false)
 const replacing = ref(false)
 const submitting = ref(false)
-const jobQuery = ref('')
-const jobStatus = ref('')
 const selectedGenerationJobId = ref('')
 let disposed = false
 const kbNames = { scene_tree: '场景树', control_prior: '操控先验', resource_prior: '资源先验' }
-const review = useTaskGenerationReview(api, {
+const review = useTaskGenerationReview({ ...api, taskGenerationJobs: history.read, taskGenerationResults: resultPages.read }, {
   error: message => ElMessage.error(message),
   decide: async () => {
     try {
@@ -53,20 +62,25 @@ const review = useTaskGenerationReview(api, {
   },
 })
 const { jobs, selectedJob, results, errors, listError, detailError, loading: detailLoading, refreshing, busy, editingId, editingText, dirty } = review
+const historyIndexState = computed(() => history.snapshot.value?.index_state)
+const resultMeta = computed(() => resultPages.metadata(results.value))
+jobs.value = history.snapshot.value?.items || []
 const selectedTypes = computed(() => leaves(tree.value).filter(node => selectedApps.value[node.id]?.length))
 const selections = computed(() => selectionsFor(tree.value, selectedTypes.value.map(node => node.id), selectedApps.value))
 const ready = computed(() => Boolean(version.value && !resourceError.value && !resourceLoading.value && !replacing.value && !submitting.value && executionUnitCount(selections.value) > 0 && Number.isInteger(generateN.value) && generateN.value >= 1 && generateN.value <= 20))
 const validResources = computed(() => knowledgeBases.value.filter(item => item.valid).length)
-const filteredJobs = computed(() => jobs.value.filter(job => (!jobStatus.value || job.status === jobStatus.value) && matches(jobQuery.value, 'job', job.job_id, '', job.created_at, jobLabels[job.status])))
+const filteredJobs = computed(() => jobs.value)
 const pickerJobs = computed(() => jobs.value.filter(job => matches(pickerQuery.value, 'job', job.job_id, '', generationJobOptionLabel(job))))
 const activeJob = computed(() => selectedJob.value && isGenerationActive(selectedJob.value) ? selectedJob.value : null)
-const collectionTaskCount = computed(() => results.value.filter(row => !row.deleted).length)
+const collectionTaskCount = computed(() => resultMeta.value?.counts.active ?? 0)
+async function changeHistory(patch: SummaryQuery) { history.update(patch); await review.refreshJobs() }
+async function changeResults(patch: SummaryQuery) { if (await review.protect()) { resultPages.update(patch); await review.reloadResults() } }
 
 async function refreshResources() {
   if (resourceLoading.value) return
   resourceLoading.value = true
   try {
-    const [bases, payload] = await Promise.all([api.taskGenerationKnowledgeBases(), api.taskGenerationTree()])
+    const { knowledge_bases: bases, tree: payload } = await generationResources(resourceController.signal, Boolean(resourceError.value))
     if (disposed) return
     const next = normalizeTree(payload.scenes)
     const reconciled = reconcileApps(next, selectedApps.value)
@@ -95,6 +109,7 @@ async function replaceKnowledgeBase(kind: KnowledgeBaseSummary['kind'], event: E
 async function switchMode(next: 'new' | 'records') {
   if (mode.value === next || submitting.value || !(await review.protect())) return
   mode.value = next
+  if (next === 'new' && !version.value) void refreshResources()
 }
 async function selectGenerationJob(jobId: string) {
   const previousId = selectedJob.value?.job_id || ''
@@ -123,23 +138,30 @@ async function exportResults() {
   link.href = taskGenerationDownloadUrl(result.jobId, result.exported.filename); link.download = result.exported.filename; link.click()
 }
 function beforeUnload(event: BeforeUnloadEvent) { if (dirty.value || busy.value || submitting.value) { event.preventDefault(); event.returnValue = '' } }
-watch(() => selectedJob.value?.job_id, jobId => { selectedGenerationJobId.value = jobId || '' }, { immediate: true, flush: 'sync' })
+watch(() => selectedJob.value?.job_id, jobId => { selectedGenerationJobId.value = jobId || ''; if (jobId) { try { sessionStorage.setItem('adf.generation.selected', jobId) } catch { /* optional selection */ } } }, { immediate: true, flush: 'sync' })
 onBeforeRouteLeave(async () => !submitting.value && await review.protect())
-onMounted(() => { void refreshResources(); void review.refreshJobs(); window.addEventListener('beforeunload', beforeUnload) })
-onBeforeUnmount(() => { disposed = true; review.dispose(); window.removeEventListener('beforeunload', beforeUnload) })
+onMounted(() => {
+  void review.refreshJobs()
+  let preferred = typeof route.query.job_id === 'string' ? route.query.job_id : ''
+  try { preferred ||= sessionStorage.getItem('adf.generation.selected') || '' } catch { /* optional selection */ }
+  if (preferred) void review.restoreJob(preferred)
+  window.addEventListener('beforeunload', beforeUnload)
+})
+onBeforeUnmount(() => { disposed = true; resourceController.abort(); review.dispose(); window.removeEventListener('beforeunload', beforeUnload) })
 </script>
 
 <template>
   <div class="page task-generation-page">
-    <header class="generation-header"><div><span class="eyebrow">任务池 / TASK GENERATION</span><h1>任务生成</h1><p>从场景能力中选择任务类型与 App，生成、审核并导出任务。</p></div><el-button :icon="Setting" @click="resourceOpen = true">管理生成资源</el-button></header>
-    <div class="generation-tabs" role="tablist" aria-label="任务生成工作区"><button role="tab" :aria-selected="mode === 'new'" :class="{ active: mode === 'new' }" @click="switchMode('new')">新建生成</button><button role="tab" :aria-selected="mode === 'records'" :class="{ active: mode === 'records' }" @click="switchMode('records')">生成记录 <span>{{ jobs.length }}</span><i v-if="jobs.some(isGenerationActive)" aria-label="存在活动作业"></i></button><span v-if="dirty" class="dirty-note">有未保存的任务修改</span></div>
+    <header class="generation-header"><div><span class="eyebrow">任务池 / TASK GENERATION</span><h1>任务生成</h1><p>从场景能力中选择任务类型与 App，生成、审核并导出任务。</p></div><el-button :icon="Setting" @click="resourceOpen = true; refreshResources()">管理生成资源</el-button></header>
+    <div class="generation-tabs" role="tablist" aria-label="任务生成工作区"><button role="tab" :aria-selected="mode === 'new'" :class="{ active: mode === 'new' }" @click="switchMode('new')">新建生成</button><button role="tab" :aria-selected="mode === 'records'" :class="{ active: mode === 'records' }" @click="switchMode('records')">生成记录 <span>{{ historyTotal }}</span><i v-if="jobs.some(isGenerationActive)" aria-label="存在活动作业"></i></button><span v-if="dirty" class="dirty-note">有未保存的任务修改</span></div>
     <section v-show="mode === 'new'" class="generation-panel" aria-label="新建生成">
-      <div class="resource-strip"><span>知识库 <b>{{ version ? version.slice(0, 8) : '未加载' }}</b></span><span :class="{ 'resource-warning': validResources < 3 }">{{ resourceLoading ? '正在加载…' : `${validResources} / 3 项资源可用` }}</span><el-button v-if="warnings.length" text type="warning" @click="resourceOpen = true">{{ warnings.length }} 项提示</el-button><el-button text :icon="Refresh" :loading="resourceLoading" :disabled="replacing || submitting" @click="refreshResources">刷新资源</el-button></div>
+      <div class="resource-strip"><span>知识库 <b>{{ version ? version.slice(0, 8) : '未加载' }}</b></span><span :class="{ 'resource-warning': validResources < 3 }">{{ resourceLoading ? '正在加载…' : `${validResources} / 3 项资源可用` }}</span><el-button v-if="warnings.length" text type="warning" @click="resourceOpen = true; refreshResources()">{{ warnings.length }} 项提示</el-button><el-button text :icon="Refresh" :loading="resourceLoading" :disabled="replacing || submitting" @click="refreshResources">刷新资源</el-button></div>
       <el-alert v-if="resourceError" :title="resourceError" type="error" :closable="false"><el-button text @click="refreshResources">重试加载资源</el-button></el-alert>
       <TaskGenerationScope :tree="tree" v-model:selected="selectedApps" v-model:count="generateN" :disabled="resourceLoading || replacing || submitting" :submitting="submitting" :ready="ready" @submit="submit" />
     </section>
     <section v-show="mode === 'records'" class="generation-panel" aria-label="生成记录">
       <div class="records-toolbar"><h2>生成记录</h2><el-button text :icon="Refresh" :loading="refreshing" :disabled="busy" @click="review.refreshJobs">刷新记录</el-button></div>
+      <el-alert v-if="historyIndexState && historyIndexState !== 'ready'" type="info" title="正在整理历史摘要，已有记录可继续查看" :closable="false" />
       <el-alert v-if="listError" :title="listError" type="error" :closable="false"><el-button text @click="review.refreshJobs">重试加载记录</el-button></el-alert>
       <div class="collection-job-selector">
         <div><b>生成批次任务</b><span>选择要审核并提交轨迹采集的生成作业</span></div>
@@ -149,7 +171,7 @@ onBeforeUnmount(() => { disposed = true; review.dispose(); window.removeEventLis
       </div>
       <CollectionBatchSubmission v-if="selectedJob" :key="selectedJob.job_id" :job="selectedJob" :result-count="collectionTaskCount" :busy="busy || detailLoading || refreshing || submitting" :protect="review.protect" :run-protected="review.runExternalAction" />
       <div class="records-layout">
-        <aside class="job-directory"><el-input v-model="jobQuery" clearable :prefix-icon="Search" placeholder="搜索时间、状态或作业 ID" aria-label="搜索生成记录" /><el-select v-model="jobStatus" clearable placeholder="全部状态" aria-label="筛选作业状态"><el-option v-for="(label, value) in jobLabels" :key="value" :label="label" :value="value" /></el-select><div class="job-list"><button v-for="job in filteredJobs" :key="job.job_id" :data-job-id="job.job_id" :class="{ active: selectedJob?.job_id === job.job_id }" :disabled="busy" @click="review.selectJob(job)"><div><strong>{{ job.created_at.slice(0, 16).replace('T', ' ') }}</strong><span :class="`status-${job.status}`">{{ jobLabels[job.status] }}</span></div><p>{{ job.completed_items }} / {{ job.total_items }} 个执行单元 · {{ job.result_count }} 条结果</p><small :title="job.job_id">{{ displayId('job', job.job_id) }}</small></button><el-empty v-if="!filteredJobs.length" :description="jobs.length ? '没有匹配的记录' : '暂无生成记录'" :image-size="50" /></div></aside>
+        <aside class="job-directory"><GenerationHistoryPager :page="historyPage" :size="Number(historyQuery.limit)" :total="historyTotal" :search="String(historyQuery.search || '')" :status="String(historyQuery.status || '')" :disabled="busy" @change="changeHistory" /><div class="job-list"><button v-for="job in filteredJobs" :key="job.job_id" :data-job-id="job.job_id" :class="{ active: selectedJob?.job_id === job.job_id }" :disabled="busy" @click="review.selectJob(job)"><div><strong>{{ job.created_at.slice(0, 16).replace('T', ' ') }}</strong><span :class="`status-${job.status}`">{{ jobLabels[job.status] }}</span></div><p>{{ job.completed_items }} / {{ job.total_items }} 个执行单元 · {{ job.result_count }} 条结果</p><small :title="job.job_id">{{ displayId('job', job.job_id) }}</small></button><el-empty v-if="!filteredJobs.length" :description="jobs.length ? '没有匹配的记录' : '暂无生成记录'" :image-size="50" /></div></aside>
         <div class="job-detail" :aria-busy="detailLoading">
           <el-empty v-if="!selectedJob" description="提交生成后，在这里查看进度与审核结果" :image-size="70" />
           <template v-else><header class="job-heading"><div><h2>{{ jobLabels[selectedJob.status] }}</h2><p>{{ selectedJob.created_at.slice(0, 19).replace('T', ' ') }} · 作业 <DisplayId kind="job" :id="selectedJob.job_id" /></p></div><el-tag type="info">快照 {{ selectedJob.knowledge_base_version?.slice(0, 8) || '历史版本' }}</el-tag></header><p class="job-summary">{{ selectedJob.total_items }} 个执行单元<span v-if="selectedJob.expected_main_tasks != null"> · 预计 {{ selectedJob.expected_main_tasks }} 条主任务</span> · {{ selectedJob.result_count }} 条生成结果（含前置任务）</p>
@@ -157,7 +179,7 @@ onBeforeUnmount(() => { disposed = true; review.dispose(); window.removeEventLis
             <details v-if="errors.length || selectedJob.error || selectedJob.warnings?.length" class="job-issues"><summary>{{ errors.length }} 项错误 · {{ selectedJob.warnings?.length || 0 }} 项提示</summary><article v-for="(error, index) in errors" :key="index"><strong>{{ unitLabel(selectedJob, error.item_id) }}<span v-if="error.stage"> · {{ stageLabel(error.stage) }}</span></strong><p>{{ error.error }}</p><small v-if="error.item_id">执行单元 {{ error.item_id }}</small></article><p v-if="selectedJob.error">{{ selectedJob.error }}</p><p v-for="warning in selectedJob.warnings" :key="warning">{{ warning }}</p></details>
             <el-alert v-if="detailError" :title="detailError" type="error" :closable="false"><el-button text @click="review.selectJob(selectedJob!, true)">重试加载结果</el-button></el-alert>
             <el-skeleton v-else-if="detailLoading" :rows="5" animated />
-            <TaskGenerationResults v-else-if="results.length" :key="selectedJob.job_id" :results="results" :editing-id="editingId" v-model:text="editingText" :busy="busy" :protect="review.protect" @edit="review.startEdit" @delete="review.toggleDeleted" @save="review.saveEdit" @cancel="review.cancelEdit" @export="exportResults" />
+            <TaskGenerationResults v-else-if="resultMeta" :key="selectedJob.job_id" :results="results" :page-meta="resultMeta" :query="resultPages.query.value" @query="changeResults" :editing-id="editingId" v-model:text="editingText" :busy="busy" :protect="review.protect" @edit="review.startEdit" @delete="review.toggleDeleted" @save="review.saveEdit" @cancel="review.cancelEdit" @export="exportResults" />
             <el-empty v-else-if="!activeJob" description="此作业没有可审核结果，请查看错误与提示" :image-size="65" />
           </template>
         </div>
@@ -172,6 +194,7 @@ onBeforeUnmount(() => { disposed = true; review.dispose(); window.removeEventLis
   </div>
 </template>
 
+<style scoped src="../styles/businessPaging.css"></style>
 <style scoped>
 /* The legacy shell has a 620px body minimum; only this responsive page opts out. */
 :global(body:has(.task-generation-page)){min-width:0}

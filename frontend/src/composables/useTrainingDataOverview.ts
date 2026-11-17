@@ -44,13 +44,6 @@ export function useTrainingDataOverview(client: Pick<typeof trainingDataOverview
     if (!level2Options.value.includes(filters.level2)) filters.level2 = ''
   }
   type FacetRequest = { signal: AbortSignal; current: () => boolean }
-  async function loadDateRange(request: FacetRequest) {
-    const response = await client.read({ ...filters, level2: '' }, request.signal)
-    if (!request.current()) return
-    const range = response.filters.date_range
-    filters.start_date = range.min_date && range.max_date ? range.min_date : ''
-    filters.end_date = range.min_date && range.max_date ? range.max_date : ''
-  }
   async function loadScenes(request: FacetRequest) {
     const response = await client.read({ ...filters, level2: '' }, request.signal)
     if (!request.current()) return
@@ -73,15 +66,6 @@ export function useTrainingDataOverview(client: Pick<typeof trainingDataOverview
     const request = { signal: facetController.signal, current: () => !disposed && generation === currentGeneration && epoch === facetEpoch }
     try { await run(request) }
     catch { if (request.current()) showMessage('加载失败，请重试') }
-  }
-  async function loadDependentOptions(request: FacetRequest) {
-    if (perspective.value === 'scene') {
-      await loadScenes(request)
-      if (request.current()) await loadApps(request)
-    } else {
-      await loadApps(request)
-      if (request.current()) await loadScenes(request)
-    }
   }
   async function search() {
     if (disposed || loading.value) return
@@ -106,33 +90,52 @@ export function useTrainingDataOverview(client: Pick<typeof trainingDataOverview
     ++generation
     ++searchEpoch
     searchController?.abort()
+    facetController?.abort()
+    ++facetEpoch
     clearMessage()
     perspective.value = view
-    Object.assign(filters, emptyOverviewFilters())
-    appliedFilters.value = emptyOverviewFilters()
-    data.value = null
-    sources.value = []
-    sceneTree.value = []
-    apps.value = []
     loading.value = false
+    // Perspective changes presentation, not the committed query or draft.
+    if (data.value) return
+    loading.value = true
+    const currentGeneration = generation
+    const initialFilters = { ...filters }
     await runFacets(async request => {
-      const response = await client.read({ ...filters }, request.signal)
+      const response = await client.read(initialFilters, request.signal)
       if (!request.current()) return
-      sources.value = response.filters.sources
-      filters.source = 'all'
-      await loadDateRange(request)
-      if (!request.current()) return
-      await loadDependentOptions(request)
-      if (request.current()) await search()
+      const unchanged = JSON.stringify(filters) === JSON.stringify(initialFilters)
+      if (unchanged) applyFacets(response)
+      data.value = response
+      appliedFilters.value = unchanged ? { ...filters } : initialFilters
+      showMessage('数据加载完成')
     })
+    if (!disposed && generation === currentGeneration) loading.value = false
+  }
+  function applyFacets(response: TrainingDataOverview) {
+    sources.value = response.filters.sources
+    sceneTree.value = response.filters.scenes
+    apps.value = response.filters.apps
+    const range = response.filters.date_range
+    filters.start_date = range.min_date && range.max_date ? range.min_date : ''
+    filters.end_date = range.min_date && range.max_date ? range.max_date : ''
   }
   async function changeSource() {
     filters.level1 = ''
     filters.level2 = ''
     filters.app = 'all'
     await runFacets(async request => {
-      await loadDateRange(request)
-      if (request.current()) await loadDependentOptions(request)
+      const response = await client.read({ ...filters }, request.signal)
+      if (!request.current()) return
+      const hadDates = Boolean(filters.start_date || filters.end_date)
+      applyFacets(response)
+      // Preserve the DEV cascade: an empty date context clears the dates, then
+      // repopulates options in that unbounded context (without auto-searching).
+      if (hadDates && !filters.start_date && !filters.end_date) {
+        const unbounded = await client.read({ ...filters }, request.signal)
+        if (!request.current()) return
+        sceneTree.value = unbounded.filters.scenes
+        apps.value = unbounded.filters.apps
+      }
     })
   }
   async function changeLevel1() {

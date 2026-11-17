@@ -358,7 +358,8 @@ class TaskGenerationJobManager:
                 available, seeds = False, []
             preview = {"job_id": job_id, "available": available, "seeds": seeds, "stats": self._seed_stats(seeds)}
         if available and include_tree:
-            preview["tree"] = tree_payload(self._source_file(job_id, "KnowledgeBase"))
+            from .resource_views import snapshot_tree
+            preview["tree"] = snapshot_tree(self._source_file(job_id, "KnowledgeBase"))
         return preview
 
     def start_augmentation(self, job_id: str) -> dict[str, Any]:

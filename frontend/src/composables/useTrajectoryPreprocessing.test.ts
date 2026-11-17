@@ -115,7 +115,7 @@ describe('batch preprocessing workspace', () => {
     expect(flow.processing.value).toBe(true)
     expect(flow.annotationVersion.value).toBe('')
     client.preprocessingJob.mockResolvedValue(job('waiting'))
-    await vi.advanceTimersByTimeAsync(1500)
+    await vi.advanceTimersByTimeAsync(5000)
     expect(client.preprocessingJob).toHaveBeenCalledWith('pre-waiting')
   })
   it('shows frozen source tasks before annotation exists and rejects their late replies after switching', async () => {

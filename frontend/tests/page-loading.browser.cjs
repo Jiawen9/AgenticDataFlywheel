@@ -40,7 +40,7 @@ async function main() {
     assert.equal(await tab.locator('.history-panel .el-table__body .el-table__row').count(), 10)
     await tab.locator('.history-panel .btn-next').click(); await tab.getByText('流水线 10', {exact: true}).waitFor()
     assert.ok(new URL(tab.url()).searchParams.get('pipeline_id') === 'p-0', 'history paging must not steal selected detail')
-    assert.ok(await tab.evaluate(() => Object.keys(sessionStorage).some(key => key.startsWith('adf.summary.v1:'))), 'summary snapshot persisted'); delayPipeline = 5000; await tab.reload({waitUntil: 'domcontentloaded'}); await tab.getByText('显示缓存摘要，正在后台更新；操作以最新详情为准。').waitFor(); delayPipeline = 0
+    assert.ok(await tab.evaluate(() => Object.keys(sessionStorage).some(key => key.startsWith('adf.summary.v2:'))), 'summary snapshot persisted'); delayPipeline = 5000; await tab.reload({waitUntil: 'domcontentloaded'}); await tab.getByText('显示缓存摘要，正在后台更新；操作以最新详情为准。').waitFor(); delayPipeline = 0
     await tab.goto(base + '/collection/phone-factory'); await tab.getByTestId('run-overview').getByText('100', {exact: true}).waitFor()
     await tab.getByRole('button', {name: '查看全部', exact: true}).click(); await tab.getByTestId('factory-runs').locator('.el-table__row').first().waitFor()
     assert.equal(await tab.getByTestId('factory-runs').locator('.el-table__body .el-table__row').count(), 10)

@@ -1,18 +1,24 @@
 <script setup lang="ts">
 import DisplayId from '@/components/DisplayId.vue'
 import { useDisplayIdentifiers } from '@/composables/useDisplayIdentifiers'
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Cpu, EditPen, Refresh, Search, Setting, VideoPlay, View } from '@element-plus/icons-vue'
-import { api } from '@/api'
+import { readPageApi } from '@/readPageApi'
+import { useSummaryPage } from '@/composables/useSummaryPage'
 import type { DatasetRelease, ModelArtifact, TrainingMixtureJob } from '@/types'
 import { readModelPublishingState } from '@/utils/modelPublishingStore'
 import { createTrainingMixtureJob, readTrainingMixtureState, updateTrainingMixtureJob } from '@/utils/trainingMixtureStore'
 
-const { displayId, matches, searchText: identifierSearchText } = useDisplayIdentifiers()
+const { displayId, searchText: identifierSearchText } = useDisplayIdentifiers()
 const datasets = ref<DatasetRelease[]>([])
+const chosenDataset = ref<DatasetRelease | null>(null)
 const datasetSearch = ref('')
-const visibleDatasets = computed(() => datasets.value.filter(item => matches(datasetSearch.value, 'release', item.release_id, '', item.name)))
+const datasetPage = ref(1), datasetLimit = ref(10)
+const datasetRead = useSummaryPage('/api/dataset-releases', computed(() => ({ offset: (datasetPage.value - 1) * datasetLimit.value, limit: datasetLimit.value, search: datasetSearch.value })), readPageApi.releases, { persist: true })
+const visibleDatasets = computed(() => chosenDataset.value && !datasets.value.some(item => item.release_id === chosenDataset.value?.release_id) ? [chosenDataset.value, ...datasets.value] : datasets.value)
+watch(datasetRead.items, items => { datasets.value = items }, { immediate: true })
+watch([datasetSearch, datasetLimit], () => { datasetPage.value = 1 })
 const models = ref<ModelArtifact[]>([])
 const jobs = ref<TrainingMixtureJob[]>([])
 const loading = ref(true)
@@ -34,6 +40,7 @@ const form = reactive({
   passK: '4',
   outputDirectory: '/training-platform/data-mixture-results/',
 })
+watch(() => form.datasetReleaseId, id => { chosenDataset.value = datasets.value.find(item => item.release_id === id) || chosenDataset.value })
 const teacherDraft = reactive({ name: '', path: '' })
 const publishedModels = computed(() => models.value.filter(item => item.release_status === 'published'))
 const maxWorkersError = computed(() => integerFieldError(form.maxWorkers, 1, 64, 'max_workers'))
@@ -95,7 +102,7 @@ async function loadPage() {
   loading.value = true
   pageError.value = ''
   try {
-    datasets.value = await api.datasetReleases()
+    await datasetRead.refresh()
     reloadLocalState()
     if (activeJob.value) scheduleProgress()
   } catch (error) {
@@ -141,7 +148,7 @@ function scheduleProgress() {
 }
 
 function startMixture() {
-  const dataset = datasets.value.find(item => item.release_id === form.datasetReleaseId)
+  const dataset = visibleDatasets.value.find(item => item.release_id === form.datasetReleaseId)
   const student = publishedModels.value.find(item => item.artifact_id === form.studentArtifactId)
   if (!dataset || !student) { ElMessage.warning('请选择有效的发布数据集和已发布模型'); return }
   if (maxWorkersError.value || passKError.value) {
@@ -180,9 +187,11 @@ onBeforeUnmount(stopTimer)
 
     <el-alert title="当前为前端流程演示：进度和结果文件信息会保存在浏览器中，但不会真正执行模型推理、访问模型路径或创建 Excel。" type="info" :closable="false" show-icon />
     <el-alert v-if="pageError" :title="`数据集接口加载失败：${pageError}`" type="warning" :closable="false" show-icon />
+    <el-alert v-if="datasetRead.error.value" :title="datasetRead.error.value" type="warning" :closable="false" />
+    <el-alert v-if="datasetRead.data.value && !datasetRead.data.value.counts_complete" title="历史发布摘要正在准备，已有摘要仍可查看。" type="info" :closable="false" />
 
     <section class="metrics">
-      <div class="metric"><b>{{ datasets.length }}</b><span>发布数据集</span></div><div class="metric"><b>{{ publishedModels.length }}</b><span>已发布模型</span></div><div class="metric"><b>{{ jobs.length }}</b><span>历史配比任务</span></div><div class="metric"><b>{{ succeededCount }}</b><span>已完成</span></div>
+      <div class="metric"><b>{{ datasetRead.total.value }}</b><span>发布数据集</span></div><div class="metric"><b>{{ publishedModels.length }}</b><span>已发布模型</span></div><div class="metric"><b>{{ jobs.length }}</b><span>历史配比任务</span></div><div class="metric"><b>{{ succeededCount }}</b><span>已完成</span></div>
     </section>
 
     <section class="panel configuration-panel" v-loading="loading">
@@ -191,6 +200,7 @@ onBeforeUnmount(stopTimer)
         <div class="resource-column">
           <el-form-item label="选择数据集" required>
             <el-select v-model="form.datasetReleaseId" filterable :filter-method="(value: string) => datasetSearch = value" placeholder="选择发布的数据集"><el-option v-for="dataset in visibleDatasets" :key="dataset.release_id" :value="dataset.release_id" :label="`${dataset.name} · ${displayId('release', dataset.release_id)}`"><div class="select-option"><b>{{ dataset.name }}</b><span>{{ displayId('release', dataset.release_id) }} · {{ dataset.trajectory_count }} 轨迹</span></div></el-option></el-select>
+            <el-pagination v-model:current-page="datasetPage" v-model:page-size="datasetLimit" :page-sizes="[10,20,50]" :total="datasetRead.total.value" layout="total, sizes, prev, next" />
             <DisplayId v-if="form.datasetReleaseId" kind="release" :id="form.datasetReleaseId" />
           </el-form-item>
           <el-form-item label="Student 模型（已发布）" required>
@@ -251,7 +261,12 @@ onBeforeUnmount(stopTimer)
   </div>
 </template>
 
+<style scoped src="../styles/businessPaging.css"></style>
 <style scoped>
+:global(body:has(.mixture-page)){min-width:0}
+.mixture-page{grid-template-columns:minmax(0,1fr)}
+.panel,.configuration-grid,.resource-column,.parameter-column{min-width:0}
+.el-pagination { flex-wrap: wrap; row-gap: 8px; margin: 12px 0; }
 .mixture-page { display: grid; gap: 18px; }
 .mixture-hero { align-items: flex-start; }.mixture-hero .el-button { margin-top: 4px; }
 .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
@@ -267,4 +282,5 @@ onBeforeUnmount(stopTimer)
 .history-heading { align-items: center; }.filters { display: grid; grid-template-columns: 250px 130px; gap: 10px; }.primary-cell { display: grid; gap: 4px; }.primary-cell code { color: var(--muted); font-size: 11px; }
 @media (max-width: 1050px) { .configuration-grid { grid-template-columns: minmax(260px, 42%) 170px minmax(0,1fr); gap: 4px 20px; } .metrics { grid-template-columns: repeat(2,1fr); } .history-heading { align-items: flex-start; flex-direction: column; }.filters { width: 100%; } }
 @media (max-width: 680px) { .configuration-grid { grid-template-columns: 1fr; }.parameter-column { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }.start-row { align-items: flex-start; flex-direction: column; }.filters { grid-template-columns: 1fr; } }
+@media(max-width:600px){.mixture-page{padding:20px 12px}.panel{padding:12px}.metrics{gap:8px}.metric{padding:12px 8px}.configuration-grid{grid-template-columns:minmax(0,1fr)}.parameter-column{grid-template-columns:minmax(0,1fr)}.parameter-input{max-width:100%}.section-heading{flex-wrap:wrap}}
 </style>

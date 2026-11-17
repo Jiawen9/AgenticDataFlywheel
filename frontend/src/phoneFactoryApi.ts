@@ -66,6 +66,9 @@ export interface ReportFolder extends AgentProvenance, CollectionSnapshotMetadat
 export type FactoryBatchSummary = Omit<CollectionBatchSummary, 'kind' | 'source_job_id'> & CollectionBatchLineage & AgentProvenance & { warnings?: CollectionWarning[]; kind: CollectionBatchSummary['kind'] | 'manual_collection'; source_job_id: string | null }
 export type FactoryBatchDetail = Omit<CollectionBatchDetail, 'kind' | 'source_job_id' | 'snapshot'> & FactoryBatchSummary & { snapshot: { tasks: Array<Record<string, unknown>> } }
 
+export interface FactoryMonitorDevice { agent_type?: AgentType; run_id?: string; id: string; apps: string[]; model: string; battery: number | null; connected: boolean | null; status: string }
+export interface FactoryMonitorSnapshot { devices: FactoryMonitorDevice[]; task_count: number; observed_at: string | null; observation_age_seconds: number | null; refreshing: boolean; stale: boolean; error: string | null }
+
 export function newRunRequestId(): string {
   if (globalThis.crypto.randomUUID) return globalThis.crypto.randomUUID()
   const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16))
@@ -146,6 +149,12 @@ export function createFactoryApi(base: '/api/phone-factory' | '/api/model-iter')
     evaluations: (runId: string, signal?: AbortSignal) => req<EvaluationResults>(`/runs/${encodeURIComponent(runId)}/evaluations`, { signal }),
     cancelEvaluation: (runId: string) => req<FactoryRun>(`/runs/${encodeURIComponent(runId)}/cancel`, jsonInit('POST', {})),
     state: (signal?: AbortSignal) => req<FactoryState>('/state', { signal }),
+    async monitorState(signal?: AbortSignal, refresh = false): Promise<FactoryMonitorSnapshot> {
+      const value = await (await checked(`${base}/state?view=monitor${refresh ? '&refresh=true' : ''}`, { signal })).json()
+      // Probe errors belong to the snapshot and must not hide its last data.
+      if (!value || !Array.isArray(value.devices) || typeof value.refreshing !== 'boolean') throw new Error('设备状态快照无效')
+      return value
+    },
     addPhone: (phoneId: string) => req<FactoryState>('/phones', jsonInit('POST', { phone_id: phoneId })),
     addApp: (app: string) => req<FactoryState>('/apps', jsonInit('POST', { app })),
     addPhoneApp: (phoneId: string, app: string) => req<FactoryState>('/phone-apps', jsonInit('POST', { phone_id: phoneId, app })),

@@ -22,14 +22,11 @@ function setup() {
 afterEach(() => vi.useRealTimers())
 
 describe('DEV training overview interactions', () => {
-  it('initializes the scene perspective with sources, date range, scenes, apps, then data', async () => {
+  it('initializes all statistics and facets with exactly one request', async () => {
     const { view, client } = setup()
     await view.initialize()
-    expect(client.read).toHaveBeenCalledTimes(5)
+    expect(client.read).toHaveBeenCalledTimes(1)
     expect(client.read.mock.calls[0]?.[0]).toEqual(emptyOverviewFilters())
-    expect(client.read.mock.calls[2]?.[0]).toMatchObject({ app: 'all', level2: '', start_date: '2026-09-01' })
-    expect(client.read.mock.calls[3]?.[0]).toMatchObject({ app: '', start_date: '2026-09-01' })
-    expect(client.read.mock.calls[4]?.[0]).toEqual({ ...emptyOverviewFilters(), start_date: '2026-09-01', end_date: '2026-09-19' })
     expect(view.level2Options.value).toEqual([])
     expect(view.sources.value).toEqual(['数据飞轮', 'DEV'])
     expect(view.apps.value).toEqual(['爱奇艺', '高德'])
@@ -37,20 +34,20 @@ describe('DEV training overview interactions', () => {
     view.dispose()
   })
 
-  it('initializes the app perspective with apps before scenes and resets on each switch', async () => {
+  it('switches perspectives without another read or discarding unsaved filters', async () => {
     const { view, client } = setup()
     await view.initialize('scene')
     Object.assign(view.filters, { source: 'DEV', app: '爱奇艺', level1: '视频', level2: '播放' })
     client.read.mockClear()
     await view.initialize('app')
     expect(view.perspective.value).toBe('app')
-    expect(client.read.mock.calls[0]?.[0]).toEqual(emptyOverviewFilters())
-    expect(client.read.mock.calls[2]?.[0].app).toBe('')
-    expect(client.read.mock.calls[3]?.[0].app).toBe('all')
-    expect(view.filters).toMatchObject({ source: 'all', app: 'all', level1: '', level2: '' })
+    expect(client.read).not.toHaveBeenCalled()
+    expect(view.filters).toMatchObject({ source: 'DEV', app: '爱奇艺', level1: '视频', level2: '播放' })
+    expect(view.appliedFilters.value).toMatchObject({ source: 'all', app: 'all' })
     view.filters.app = '高德'
     await view.initialize('scene')
-    expect(view.filters.app).toBe('all')
+    expect(view.filters.app).toBe('高德')
+    expect(view.data.value?.overview.total_trajectories).toBe(10)
     view.dispose()
   })
 
@@ -69,7 +66,7 @@ describe('DEV training overview interactions', () => {
     expect(client.read).toHaveBeenLastCalledWith(expect.objectContaining({ level1: '视频', level2: '播放', app: '' }), expect.any(AbortSignal))
     view.filters.app = '爱奇艺'
     await view.changeApp()
-    expect(client.read).toHaveBeenCalledTimes(7)
+    expect(client.read).toHaveBeenCalledTimes(3)
     expect(view.data.value?.overview.total_trajectories).toBe(10)
     await view.search()
     expect(view.data.value?.overview.total_trajectories).toBe(77)
@@ -89,7 +86,7 @@ describe('DEV training overview interactions', () => {
     view.filters.level2 = '播放'
     await view.changeLevel2()
     expect(view.level2Options.value).toEqual(['搜索', '播放'])
-    expect(client.read).toHaveBeenCalledTimes(6)
+    expect(client.read).toHaveBeenCalledTimes(2)
     expect(view.appliedFilters.value).toMatchObject({ app: 'all', level1: '', level2: '' })
     view.dispose()
   })
@@ -103,9 +100,8 @@ describe('DEV training overview interactions', () => {
     client.read.mockResolvedValue(narrowed)
     await view.changeSource()
     expect(view.filters).toEqual({ source: 'DEV', app: 'all', level1: '', level2: '', start_date: '2026-09-05', end_date: '2026-09-06' })
-    expect(client.read).toHaveBeenCalledTimes(8)
+    expect(client.read).toHaveBeenCalledTimes(2)
     expect(view.data.value?.overview.total_trajectories).toBe(10)
-    expect(client.read.mock.calls[6]?.[0].app).toBe(perspective === 'scene' ? 'all' : '')
     view.dispose()
   })
 
@@ -118,7 +114,7 @@ describe('DEV training overview interactions', () => {
     expect(view.filters).toMatchObject({ start_date: '2026-09-13', end_date: '2026-09-20' })
     view.recent(30)
     expect(view.filters).toMatchObject({ start_date: '2026-08-21', end_date: '2026-09-20' })
-    expect(client.read).toHaveBeenCalledTimes(5)
+    expect(client.read).toHaveBeenCalledTimes(1)
     expect(view.appliedFilters.value.start_date).toBe('2026-09-01')
     expect(recentOverviewDates(7, new Date('2026-12-31T16:30:00Z'))).toEqual({ start_date: '2026-12-24', end_date: '2026-12-31' })
     view.dispose()
@@ -153,7 +149,7 @@ describe('DEV training overview interactions', () => {
     await previous
     expect(view.filters.source).toBe('DEV')
     expect(view.successMessage.value).toBe('数据加载完成')
-    expect(client.read).toHaveBeenCalledTimes(9)
+    expect(client.read).toHaveBeenCalledTimes(3)
     view.dispose()
   })
 
@@ -164,7 +160,7 @@ describe('DEV training overview interactions', () => {
     client.read.mockReturnValueOnce(pending.promise)
     const search = view.search()
     await view.search()
-    expect(client.read).toHaveBeenCalledTimes(6)
+    expect(client.read).toHaveBeenCalledTimes(2)
     pending.reject(new Error('unavailable'))
     await search
     expect(view.data.value?.overview.total_steps).toBe(142)
@@ -187,7 +183,7 @@ describe('DEV training overview interactions', () => {
     expect(view.filters.end_date).toBe('')
     expect(view.level2Options.value).toEqual([])
     await vi.advanceTimersByTimeAsync(20000)
-    expect(client.read).toHaveBeenCalledTimes(5)
+    expect(client.read).toHaveBeenCalledTimes(1)
     view.dispose()
   })
 

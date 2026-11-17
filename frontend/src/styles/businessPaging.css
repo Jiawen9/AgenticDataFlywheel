@@ -1,0 +1,15 @@
+/* Imported as scoped CSS only by the paged business views. */
+:deep(.el-pagination) {
+  max-width: 100%;
+  min-width: 0;
+  flex-wrap: wrap;
+  row-gap: 8px;
+}
+:deep(.el-pager) {
+  max-width: 100%;
+  flex-wrap: wrap;
+}
+@media (max-width: 600px) {
+  :deep(.el-pagination) { justify-content: flex-start; }
+  :deep(.el-pagination__sizes) { margin-right: 0; }
+}

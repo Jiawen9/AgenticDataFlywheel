@@ -6,7 +6,7 @@ export interface SummaryPage<T> {
   index_state: string; counts_complete: boolean; updated_at?: string; stale?: boolean; refresh_error?: string
 }
 export type SummaryQuery = { offset?: number; limit?: number; search?: string; status?: string; [key: string]: string | number | boolean | undefined }
-const prefix = 'adf.summary.v1:'
+const prefix = 'adf.summary.v2:'
 const namespace = encodeURIComponent((import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, ''))
 const snapshots = new Map<string, { value: unknown; at: number }>()
 const pending = new Map<string, Promise<unknown>>()
@@ -19,9 +19,23 @@ export function summaryKey(path: string, query: SummaryQuery = {}) {
 }
 export function summaryParams(query: SummaryQuery = {}) { const params = new URLSearchParams({ view: 'summary' }); for (const [key, value] of Object.entries(query)) if (value !== undefined && value !== '' && !(key === 'status' && value === 'all')) params.set(key, String(value)); return params.toString() }
 const rowKeys = new Set(['pipeline_id', 'run_id', 'collection_run_id', 'batch_id', 'task_source_batch_id', 'source_batch_id', 'filename', 'name', 'status', 'mode', 'created_at', 'updated_at', 'current_step', 'agent_type', 'execution_mode', 'collection_status', 'transfer_status', 'archive_status', 'batch_status', 'release_id', 'collector_data_state', 'repeat_times', 'receipt_policy_version', 'receipt_closed', 'collection_artifacts_version', 'trajectory_count', 'storage_revision', 'collection_summary', 'evaluation_summary'])
+for (const field of `job_id session_id source_id tree_run_id created_at updated_at kind label input_filename generate_n
+  total_items completed_items result_count task_type_count expected_main_tasks started_at completed_at percent stage
+  augmentation_preview_version augmentation_generation_started knowledge_base_version error_count warning_count
+  pending_review_count stale_task_count group_count row_count export_count task_count step_count
+  cot_row_count cot_generated_count eligible_cot_row_count total_task_count reviewed_task_count
+  tree_completed_at quality_completed_at is_default excel_count trajectory_directory_count source_count source_kind
+  upload_status uploaded_at uploaded_files uploaded_bytes availability_checked ready_trajectory_count ready_step_count
+  annotation_version preprocessing_status batch_role collecting summary_preparing`.split(/\s+/)) rowKeys.add(field)
+rowKeys.add('internal_upload')
+const uploadKeys = new Set('job_id status completed_at completed_files total_files percent folder_upload include_trajectories completed_items total_items'.split(' '))
+
 function displayRow(value: unknown): unknown {
   if (!value || typeof value !== 'object') return value
-  return Object.fromEntries(Object.entries(value).filter(([key]) => rowKeys.has(key)).map(([key, val]) => [key, key.endsWith('_summary') && val && typeof val === 'object' ? Object.fromEntries(Object.entries(val).filter(([, n]) => typeof n === 'number')) : val]))
+  return Object.fromEntries(Object.entries(value).filter(([key]) => rowKeys.has(key)).map(([key, val]) => {
+    if (val && typeof val === 'object' && key === 'internal_upload') return [key, Object.fromEntries(Object.entries(val).filter(([k, v]) => uploadKeys.has(k) && (v === null || ['string', 'number', 'boolean'].includes(typeof v))))]
+    return [key, key.endsWith('_summary') && val && typeof val === 'object' ? Object.fromEntries(Object.entries(val).filter(([, n]) => typeof n === 'number')) : val]
+  }))
 }
 function persist(key: string, value: unknown, at: number) {
   // Only list envelopes are persisted. Detail/configuration/error payloads stay out.

@@ -392,6 +392,8 @@ class PhoneFactoryStore:
                 run, _ = self.collection_runs.complete(parts[1], data)
                 return run
         if method == "GET" and action == "state":
+            if data.get("view") == "monitor":
+                return self.runtime.monitor_cache.read(force=str(data.get("refresh", "")).lower() in {"1", "true"})
             return self.state(mode)
         if method == "GET" and action == "config":
             return self.config(mode)

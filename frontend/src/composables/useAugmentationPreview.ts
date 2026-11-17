@@ -49,7 +49,7 @@ export function useAugmentationPreview(api: PreviewApi, feedback: Feedback) {
   }
   function schedule() {
     stopTimer()
-    if (!disposed && active.value) timer = setTimeout(() => void refresh(), 1200)
+    if (!disposed && active.value && (typeof document === 'undefined' || !document.hidden)) timer = setTimeout(() => void refresh(), 5000)
   }
 
   async function refresh() {
@@ -75,7 +75,7 @@ export function useAugmentationPreview(api: PreviewApi, feedback: Feedback) {
         preview.value = { ...payload, tree: payload.available ? payload.tree || preview.value?.tree : undefined }
       } else failures.push(`场景预览读取失败：${errorMessage(previewReply.reason)}`)
       if (resultReply.status === 'fulfilled') {
-        if (resultReply.value) { results.value = resultReply.value.results; errors.value = resultReply.value.errors }
+        if (resultReply.value) { results.value = resultReply.value.results; errors.value = job.errors?.length ? job.errors : resultReply.value.errors }
       } else {
         failures.push(`变体结果读取失败：${errorMessage(resultReply.reason)}`)
       }
@@ -133,9 +133,10 @@ export function useAugmentationPreview(api: PreviewApi, feedback: Feedback) {
       jobs.value = payload.filter(item => item.kind === 'augmentation')
       listError.value = ''
       if (ticket !== epoch || selectedJob.value) return
-      const next = jobs.value.find(item => item.job_id === preferredId)
-        || jobs.value.find(item => running(item) || item.status === 'awaiting_confirmation') || jobs.value[0]
-      if (next) await selectJob(next)
+      if (preferredId) {
+        const next = jobs.value.find(item => item.job_id === preferredId) || await api.taskGenerationJob(preferredId)
+        if (!disposed && ticket === epoch && request === listRequest && next.kind === 'augmentation') await selectJob(next)
+      }
     } catch (error) { if (!disposed && request === listRequest) listError.value = errorMessage(error) }
   }
   async function create(file: File, generateN: number) {
@@ -201,6 +202,14 @@ export function useAugmentationPreview(api: PreviewApi, feedback: Feedback) {
       return valid(jobId, ticket) ? result : null
     } finally { if (!disposed && ticket === epoch) busy.value = false }
   }
-  function dispose() { disposed = true; epoch++; requestId++; listRequest++; stopTimer() }
-  return { jobs, selectedJob, preview, results, errors, listError, detailError, loading, refreshing, busy, active, editingId, editingText, dirty, protect, selectJob, loadJobs, refresh, create, start, startEdit, saveEdit, cancelEdit, toggleDeleted, exportResults, runExternalAction, dispose }
+  async function reloadResults() {
+    const id = selectedJob.value?.job_id, ticket = epoch
+    if (!id || !(await protect())) return
+    try { const payload = await api.taskGenerationResults(id); if (valid(id, ticket)) results.value = payload.results }
+    catch (error) { if (valid(id, ticket)) detailError.value = errorMessage(error) }
+  }
+  function visibilityChanged() { if (document.hidden) stopTimer(); else { void loadJobs(); if (active.value) void refresh() } }
+  if (typeof document !== 'undefined') document.addEventListener('visibilitychange', visibilityChanged)
+  function dispose() { disposed = true; epoch++; requestId++; listRequest++; stopTimer(); if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', visibilityChanged) }
+  return { jobs, selectedJob, preview, results, errors, listError, detailError, loading, refreshing, busy, active, editingId, editingText, dirty, protect, selectJob, loadJobs, refresh, create, start, startEdit, saveEdit, cancelEdit, toggleDeleted, exportResults, runExternalAction, reloadResults, dispose }
 }

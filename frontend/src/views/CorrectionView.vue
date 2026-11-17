@@ -12,19 +12,25 @@ import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute, useRouter } from 'vu
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
 import { api, correctionDownloadUrl } from '@/api'
+import { readPageApi } from '@/readPageApi'
+import { useSummaryPage } from '@/composables/useSummaryPage'
 import type { CorrectionBatch, CorrectionRow } from '@/types'
 import CorrectionWorkbench from '@/components/CorrectionWorkbench.vue'
-import { resolveBatchSelection } from '@/utils/batchSelection'
 import { useCorrectionWorkspace, type ActionDecision } from '@/composables/useCorrectionWorkspace'
 
 const route = useRoute(), router = useRouter()
-const { displayId, matches } = useDisplayIdentifiers()
+const { displayId } = useDisplayIdentifiers()
 const batchSearch = ref('')
-const visibleBatches = computed(() => batches.value.filter(batch => matches(batchSearch.value, 'batch', batch.batch_id)))
+const visibleBatches = computed(() => batches.value)
 const batches = ref<CorrectionBatch[]>([])
 const selectedBatchId = ref('')
 const pipelineContext = usePipelineContext({ batchId: selectedBatchId, stepId: 'correction' })
 const pipelineReadOnly = pipelineContext.readOnly
+const batchPage = ref(1), batchLimit = ref(10), taskPage = ref(1), taskLimit = ref(10), taskTotal = ref(0)
+const taskSearch = ref(''), taskStatus = ref('')
+const batchRead = useSummaryPage('/api/correction/batches', computed(() => ({ offset: (batchPage.value - 1) * batchLimit.value, limit: batchLimit.value, search: batchSearch.value })), readPageApi.correctionBatches, { persist: true })
+watch(batchRead.items, items => { batches.value = activeBatchItems(items) }, { immediate: true })
+watch([batchSearch, batchLimit], () => { batchPage.value = 1 })
 const loading = ref(true)
 const pageError = ref('')
 const actionPrompt = ref(false)
@@ -43,7 +49,6 @@ const visibleExpandedTasks = ref<string[]>([])
 const selectedBatch = computed(() => batches.value.find((batch) => batch.batch_id === selectedBatchId.value))
 const trajectoryCount = computed(() => tasks.value.reduce((sum, task) => sum + task.trajectories.length, 0))
 const editedCount = computed(() => tasks.value.reduce((sum, task) => sum + task.edited_row_count, 0))
-const exportCount = computed(() => tasks.value.reduce((sum, task) => sum + task.export_count, 0))
 const lifecycle = useBatchLifecycle({ currentBatch: () => selectedBatchId.value || String(route.query.batch_id ?? ''), onPublished, refreshChoices: loadChoices })
 const { notice: publishedNotice } = lifecycle
 function onPublished(event: PublishedBatchEvent) {
@@ -56,15 +61,21 @@ function onPublished(event: PublishedBatchEvent) {
   void router.replace({ query: withoutBatchQuery(route.query) })
 }
 async function loadChoices() {
-  if (pipelineContext.historyOnly.value) return
-  const request = ++choicesRequest
-  const [result, existing] = await Promise.all([api.correctionBatches(), api.correctionSessions()])
-  if (disposed || request !== choicesRequest) return
-  const merged = new Map(activeBatchItems(result.batches).map(batch => [batch.batch_id, batch]))
-  for (const item of activeBatchItems(existing)) if (item.batch_id && !merged.has(item.batch_id)) merged.set(item.batch_id, { batch_id: item.batch_id, tree_run_id: item.tree_run_id, tree_completed_at: '', quality_completed_at: '', total_task_count: item.group_count, reviewed_task_count: 0, status: 'ready', is_default: false })
-  batches.value = [...merged.values()]
-  return result.default_batch_id ?? undefined
+  if (!pipelineContext.historyOnly.value) await batchRead.refresh()
 }
+
+async function loadTaskPage(page = taskPage.value, size = taskLimit.value) {
+  if (!session.value || !await ws.prepareTransition()) return
+  const id = session.value.session_id, request = ++batchRequest
+  try {
+    const result = await readPageApi.groups(id, { offset: (page - 1) * size, limit: size, unit: 'task', search: taskSearch.value, status: taskStatus.value })
+    if (disposed || request !== batchRequest || session.value?.session_id !== id) return
+    taskPage.value = page; taskLimit.value = size; taskTotal.value = result.filtered_total ?? result.total ?? 0
+    ws.setSession({ ...session.value, groups: result.items, storage_revision: (result as typeof result & { storage_revision?: number }).storage_revision ?? session.value.storage_revision })
+    visibleExpandedTasks.value = []
+  } catch (cause) { if (!disposed && request === batchRequest) pageError.value = (cause as Error).message }
+}
+watch([taskSearch, taskStatus], () => { if (session.value && !busy.value && !hasUnsaved.value) void loadTaskPage(1) })
 
 function decideAction(decision: ActionDecision) {
   actionPrompt.value = false
@@ -84,18 +95,18 @@ async function loadBatch(batchId: string) {
     if (pipelineContext.isPipelineRoute.value || pipelineContext.managed.value) {
       const id = pipelineContext.sessionId.value
       if (!id) return
-      const saved = await api.correctionSession(id)
+      const saved = await readPageApi.session(id, true)
       if (saved.batch_id !== batchId) throw new Error('Pipeline 修正会话与当前批次不一致')
-      if (!disposed && request === batchRequest) ws.setSession(saved)
+      if (!disposed && request === batchRequest) { ws.setSession(saved); taskPage.value = 1; await loadTaskPage(1) }
       return
     }
     if (pipelineContext.error.value) throw new Error(pipelineContext.error.value)
-    const existing = (await api.correctionSessions()).find(item => item.batch_id === batchId)
+    const existing = (await readPageApi.sessions({ batch_id: batchId, limit: 1 })).items[0]
     if (disposed || request !== batchRequest) return
-    const saved = existing ? await api.correctionSession(existing.session_id) : await api.createCorrectionSession(batchId)
-    if (!disposed && request === batchRequest) ws.setSession(saved)
+    const saved = existing ? await readPageApi.session(existing.session_id, true) : await api.createCorrectionSession(batchId)
+    if (!disposed && request === batchRequest) { ws.setSession(saved); taskPage.value = 1; await loadTaskPage(1) }
   } catch (error) { if (!disposed && request === batchRequest) pageError.value = (error as Error).message }
-  finally { if (!disposed && request === batchRequest) loading.value = false }
+  finally { if (!disposed && selectedBatchId.value === batchId) loading.value = false }
 }
 async function refreshBatch() {
   if (!await ws.prepareTransition()) return
@@ -179,7 +190,7 @@ function beforeUnload(event: BeforeUnloadEvent) {
 }
 onBeforeRouteLeave(() => ws.prepareTransition())
 onBeforeRouteUpdate((to, from) => publishedNotice.value && to.query.batch_id === undefined && to.query.tree_run_id === undefined ? true : to.query.batch_id !== from.query.batch_id || to.query.tree_run_id !== from.query.tree_run_id ? ws.prepareTransition() : true)
-async function loadRouteBatch(defaultBatchId?: string) {
+async function loadRouteBatch() {
   const request = ++routeSelectionRequest
   ++batchRequest
   selectedBatchId.value = ''; ws.setSession(null); visibleExpandedTasks.value = []
@@ -187,11 +198,9 @@ async function loadRouteBatch(defaultBatchId?: string) {
   try {
     if (typeof route.query.batch_id === 'string' && !await lifecycle.checkBatch(route.query.batch_id)) return
     if (pipelineContext.isPipelineRoute.value) { await loadBatch(pipelineContext.pipeline.value?.batch_id || String(route.query.batch_id || '')); return }
-    const id = await resolveBatchSelection(batches.value.map(batch => batch.batch_id), {
-      batchId: typeof route.query.batch_id === 'string' ? route.query.batch_id : undefined,
-      legacyRunId: typeof route.query.tree_run_id === 'string' ? route.query.tree_run_id : undefined,
-      defaultBatchId: defaultBatchId ?? batches.value.find(batch => batch.is_default)?.batch_id,
-    }, api.treeRun)
+    if (!route.query.batch_id && !route.query.tree_run_id) { loading.value = false; return }
+    const id = typeof route.query.batch_id === 'string' ? route.query.batch_id : (await api.treeRun(String(route.query.tree_run_id))).batch_id || ''
+    if (!id) throw new Error('指定批次不存在或当前不可用，请重新选择批次')
     if (disposed || request !== routeSelectionRequest) return
     if (!await lifecycle.checkBatch(id)) return
     await loadBatch(id)
@@ -212,10 +221,10 @@ onMounted(async () => {
     if (pipelineContext.historyOnly.value) { loading.value = false; return }
     const preferred = typeof route.query.batch_id === 'string' ? route.query.batch_id : ''
     const active = await lifecycle.checkBatch(preferred)
-    const defaultBatch = await loadChoices()
+    await loadChoices()
     if (disposed) return
     initialized = true
-    if (active && !publishedNotice.value) await loadRouteBatch(defaultBatch)
+    if (active && !publishedNotice.value) await loadRouteBatch()
   } catch (error) { if (!disposed) { pageError.value = (error as Error).message; loading.value = false } }
 })
 onBeforeUnmount(() => {
@@ -234,7 +243,7 @@ onBeforeUnmount(() => {
     <BatchPublishedNotice :notice="publishedNotice" />
     <header class="page-hero">
       <div><span class="eyebrow">EXPERT ACTION CORRECTION</span><h1>专家动作纠偏</h1><p>展开任务与轨迹，直接在截图上修正 Action。当前每个任务选择质检 Top-1。</p></div>
-      <div class="hero-metrics"><div><b>{{ tasks.length }}</b><span>任务</span></div><div><b>{{ trajectoryCount }}</b><span>入选轨迹</span></div><div><b>{{ editedCount }}</b><span>已修改步骤</span></div></div>
+      <div class="hero-metrics"><div><b>{{ taskTotal }}</b><span>任务</span></div><div><b>{{ trajectoryCount }}</b><span>入选轨迹</span></div><div><b>{{ editedCount }}</b><span>已修改步骤</span></div></div>
     </header>
 
     <section class="toolbar">
@@ -245,16 +254,24 @@ onBeforeUnmount(() => {
       <DisplayId v-if="selectedBatchId" kind="batch" :id="selectedBatchId" />
       <el-button :disabled="busy || loading" @click="refreshBatch">刷新当前结果</el-button>
       <span class="save-status" role="status">{{ savingCount ? '正在保存…' : hasUnsaved ? '有未保存修改' : session ? '草稿已加载' : '' }}</span>
-      <el-button v-if="!pipelineContext.managed.value && !pipelineContext.isPipelineRoute.value" type="success" :loading="savingCount > 0" :disabled="!session || busy || loading" @click="exportData">导出 SFT / RL / 原生数据（{{ exportCount }} 条）</el-button>
+      <el-button v-if="!pipelineContext.managed.value && !pipelineContext.isPipelineRoute.value" type="success" :loading="savingCount > 0" :disabled="!session || busy || loading" @click="exportData">导出 SFT / RL / 原生数据（全量已选）</el-button>
       <el-button v-if="pipelineContext.canCorrect.value" type="success" :loading="pipelineContext.controlling.value" :disabled="!session || busy || loading" @click="confirmCorrection">完成修正并继续</el-button>
     </section>
+    <el-pagination v-model:current-page="batchPage" v-model:page-size="batchLimit" :page-sizes="[10,20,50]" :total="batchRead.total.value" layout="total, sizes, prev, pager, next" />
+    <el-alert v-if="batchRead.error.value" :title="batchRead.error.value" type="warning" :closable="false" />
+    <el-alert v-if="batchRead.data.value && !batchRead.data.value.counts_complete" title="历史批次摘要正在准备，已有摘要仍可查看。" type="info" :closable="false" />
     <el-alert v-if="session?.pending_review_count" :title="`上游数据已更新，保留的 ${session.pending_review_count} 项人工修改需要复核；导出仅包含不受影响的任务。`" type="warning" :closable="false" show-icon />
     <el-alert v-if="pageError" :title="pageError" type="warning" :closable="false" show-icon />
     <el-alert v-else-if="selectedBatch && selectedBatch.reviewed_task_count < selectedBatch.total_task_count" title="该批次仅部分任务完成质检，当前展示可修正的任务。" type="info" :closable="false" show-icon />
 
     <section v-loading="loading" class="task-list" aria-label="修正任务列表">
-      <el-empty v-if="!loading && !tasks.length" :description="pageError ? '暂无可修正任务' : '该草稿没有入选轨迹'" :image-size="90" />
-      <el-collapse v-else :model-value="visibleExpandedTasks" @change="onTaskCollapse">
+      <div v-if="session" class="toolbar">
+        <el-input v-model="taskSearch" clearable :disabled="busy || hasUnsaved" placeholder="搜索任务或轨迹" />
+        <el-select v-model="taskStatus" :disabled="busy || hasUnsaved" aria-label="修正任务状态"><el-option value="" label="全部状态" /><el-option value="ready" label="可编辑" /><el-option value="pending_review" label="待复核" /></el-select>
+      </div>
+      <el-empty v-if="!loading && !tasks.length" :description="!selectedBatchId ? '请选择批次后查看修正任务' : pageError ? '暂无可修正任务' : '该草稿没有入选轨迹'" :image-size="90" />
+      <el-pagination v-if="session" :current-page="taskPage" :page-size="taskLimit" :page-sizes="[10,20,50]" :total="taskTotal" :disabled="busy || hasUnsaved" layout="total, sizes, prev, pager, next" @current-change="(page: number) => loadTaskPage(page)" @size-change="(size: number) => loadTaskPage(1, size)" />
+      <el-collapse v-if="tasks.length" :model-value="visibleExpandedTasks" @change="onTaskCollapse">
         <el-collapse-item v-for="task in tasks" :key="task.task_id" :name="task.task_id">
           <template #title>
             <div class="task-title">
@@ -309,7 +326,12 @@ onBeforeUnmount(() => {
   </div>
 </template>
 
+<style scoped src="../styles/businessPaging.css"></style>
 <style scoped>
+:global(body:has(.correction-page)){min-width:0}
+.correction-page{min-width:0}
+@media(max-width:600px){.correction-page{padding:20px 12px}.hero-metrics{flex-wrap:wrap;gap:6px}.hero-metrics div{min-width:0;padding:10px 8px}.toolbar{min-width:0}.toolbar :deep(.el-button){margin-left:0}.task-title{min-width:0}.task-title__id{overflow-wrap:anywhere}}
+.el-pagination { flex-wrap: wrap; row-gap: 8px; margin: 12px 0; }
 .task-title__id,.trajectory-title>b{min-width:0;max-width:100%}
 .review-panel{padding:16px;display:grid;gap:12px}.review-panel article{padding:12px;border:1px solid var(--line);border-radius:8px}.review-panel table{width:100%;table-layout:fixed;border-collapse:collapse;font-size:12px}.review-panel th,.review-panel td{padding:8px;text-align:left;white-space:pre-wrap;overflow-wrap:anywhere;vertical-align:top;border:1px solid var(--line)}
 .toolbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:20px 0 10px;padding:14px 16px;border:1px solid var(--line);border-radius:12px;background:white}.toolbar label{font-size:12px;font-weight:800;color:#64748b}.toolbar .el-select{width:330px;max-width:100%}.save-status{margin-left:auto;color:#64748b;font-size:12px}.export-history summary{cursor:pointer;font-weight:700;padding:8px 0}.task-list{min-height:180px;margin-top:16px}.task-title{display:grid;grid-template-columns:190px minmax(240px,1fr) auto minmax(220px,auto);align-items:center;gap:14px;width:calc(100% - 36px);padding-right:16px}.task-title__id{font-weight:900;letter-spacing:.02em}.task-title__goal{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#334155}.task-title__stats{color:var(--muted);font-size:12px;text-align:right;white-space:nowrap}.trajectory-list{padding:10px 14px 18px 46px;min-height:80px}.trajectory-title{display:flex;align-items:center;gap:9px;width:calc(100% - 36px);padding-right:16px}.trajectory-title b{overflow:hidden;color:#334155;font-size:12px;text-overflow:ellipsis;white-space:nowrap}.trajectory-title span{color:var(--muted);font-size:12px;font-weight:400;white-space:nowrap}.trajectory-title .rank{color:#0f766e;font-weight:800}.trajectory-title .score{font-variant-numeric:tabular-nums}.trajectory-export{margin-left:auto;flex-shrink:0}.trajectory-detail{min-height:160px}.inline-loading,.inline-error{padding:24px;color:#64748b;font-size:13px}.inline-error{display:grid;gap:12px}.inline-error .el-button{justify-self:start}.export-history{margin-top:16px;padding:8px 16px;border:1px solid var(--line);border-radius:12px;background:white;font-size:12px;color:#64748b}.export-history a{display:flex;justify-content:space-between;gap:12px;padding:12px 0;color:#0f766e;overflow-wrap:anywhere}.export-history small{color:#64748b}

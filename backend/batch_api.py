@@ -79,8 +79,12 @@ def _tree(batch_id: str) -> dict:
 
 
 @router.get("/{batch_id}/tree")
-def batch_tree(batch_id: str, response: Response):
+def batch_tree(batch_id: str, response: Response, view: str | None = None, offset: int = 0, limit: int = 10, q: str = "", status: str = "", all_ids: bool = False, selected_task_id: str | None = None):
     response.headers["Cache-Control"] = "no-store"
+    if view == "summary":
+        from .stage_page_reads import task_page
+        ensure_batch_active(batch_id, store.root)
+        return _read(lambda: task_page(store.root, batch_id, offset=offset, limit=limit, q=q, status=status, all_ids=all_ids, selected_task_id=selected_task_id))
     return _read(lambda: _tree(batch_id))
 
 
@@ -113,8 +117,12 @@ def task_tree(batch_id: str, task_id: str, response: Response, view: str | None 
 
 
 @router.get("/{batch_id}/quality")
-def batch_quality(batch_id: str, response: Response):
+def batch_quality(batch_id: str, response: Response, view: str | None = None, offset: int = 0, limit: int = 10, q: str = "", status: str = ""):
     response.headers["Cache-Control"] = "no-store"
+    if view == "summary":
+        from .stage_page_reads import task_page
+        ensure_batch_active(batch_id, store.root)
+        return _read(lambda: task_page(store.root, batch_id, view="quality", offset=offset, limit=limit, q=q, status=status))
     def read():
         with store.batch_lock(batch_id):
             tree = _tree(batch_id)

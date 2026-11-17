@@ -118,6 +118,8 @@ onBeforeUnmount(dispose)
 </script>
 
 <style scoped>
+:global(body:has(.training-data-overview)){min-width:0}
+.training-data-overview,.pie-card{min-width:0}
 /* Scope DEV's reset to this page so the surrounding application keeps its layout. */
 :where(.training-data-overview) :deep(*) { margin: 0; padding: 0; }
 .filter-item button { font-family: Arial, sans-serif; }
@@ -311,4 +313,5 @@ h1 {
   box-shadow: 0 2px 10px rgba(0,0,0,0.2);
 }
 
+@media(max-width:600px){.training-data-overview{width:100%;max-width:100%;padding:12px}.training-data-overview h1{font-size:23px}.view-switch{gap:8px}.view-link{padding:8px 12px;font-size:14px}.filters{padding:12px;gap:12px}.filter-item{min-width:0;max-width:100%}.filter-item select,.filter-item input[type=date]{min-width:0;max-width:100%}.pie-row{flex-direction:column}.chart-container{padding:12px}.pie-card{padding:12px}}
 </style>

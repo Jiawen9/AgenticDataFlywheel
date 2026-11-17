@@ -13,6 +13,7 @@ import { ElMessage } from 'element-plus'
 import { DataLine } from '@element-plus/icons-vue'
 import { api, imageUrl, treeRunScope } from '@/api'
 import { useBatchQualityWorkspace } from '@/composables/useBatchQualityWorkspace'
+import { jobPage } from '@/businessPageApi'
 import ActionImage from '@/components/ActionImage.vue'
 import { treeCoordinateSource } from '@/composables/useCoordinateInfo'
 import ReferenceTrajectoryTree from '@/components/ReferenceTrajectoryTree.vue'
@@ -29,12 +30,15 @@ const pipelineBatchId = ref(String(route.query.batch_id || ''))
 const pipelineContext = usePipelineContext({ batchId: pipelineBatchId, stepId: 'quality' })
 const pipelineReadOnly = pipelineContext.readOnly
 const flow = useBatchQualityWorkspace(api, {
+  summaryPages: true,
   historyOnly: () => pipelineContext.historyOnly.value,
   waitingForTree: () => (pipelineContext.isPipelineRoute.value || pipelineContext.managed.value) && !pipelineContext.pipeline.value?.steps.some(step => step.id === 'tree' && step.status === 'succeeded'),
   // Read partial quality results even after failure; only recommendations wait.
   waitingForQuality: () => (pipelineContext.isPipelineRoute.value || pipelineContext.managed.value) && !pipelineContext.pipeline.value?.steps.some(step => step.id === 'quality' && step.status === 'succeeded'),
 })
 const { batches, batchId: selectedBatchId, currentTree: selectedRun, summaries, recommendation: correctionRecommendation, selectedTaskId, tree, quality, loadingBatches: loadingRuns, loadingTree, counts, readyTasks, error: batchError } = flow
+const { choices, taskPage, taskSize, taskTotal, readyTaskIds } = flow
+watch(batchSearch, value => { if (choices) choices.search.value = value })
 watch(selectedBatchId, id => { pipelineBatchId.value = id })
 const checkedTasks = ref<string[]>([]), qualityJobs = ref<QualityJob[]>([])
 const selectedNode = ref<TrajectoryTreeNode | null>(null), occurrenceIndex = ref(0), qualityTrajectory = ref('')
@@ -45,6 +49,8 @@ const auditSelected = ref<(AuditStep & { trajectory: string }) | null>(null)
 const polling = ref(false)
 let pollTimer: number | undefined
 let jobEpoch = 0, disposed = false
+let pollFailures = 0, nextPollAt = 0
+const jobRefreshError = ref('')
 watch(pipelineContext.historyOnly, value => { if (value) { stopPolling(); qualityJobs.value = []; void flow.selectBatch('') } })
 const lifecycle = useBatchLifecycle({ currentBatch: () => selectedBatchId.value || String(route.query.batch_id ?? ''), onPublished, refreshChoices: () => flow.refreshChoices() })
 const { notice: publishedNotice } = lifecycle
@@ -59,7 +65,7 @@ function onPublished(event: PublishedBatchEvent) {
   void router.replace({ query: withoutBatchQuery(route.query) })
 }
 
-const selectedTask = computed<TreeRunTask | undefined>(() => selectedRun.value?.tasks.find((task) => task.task_id === selectedTaskId.value))
+const selectedTask = computed<TreeRunTask | undefined>(() => flow.selectedTaskRow?.value || selectedRun.value?.tasks.find((task) => task.task_id === selectedTaskId.value))
 const occurrence = computed(() => selectedNode.value?.occurrences?.[occurrenceIndex.value] ?? null)
 const terminalIds = computed(() => selectedNode.value?.terminal_trajectories ?? [])
 const evaluation = computed<TrajectoryQualityEvaluation | null>(() => quality.value?.evaluations[qualityTrajectory.value] ?? null)
@@ -123,7 +129,13 @@ async function changeBatch(id: string) {
 async function loadQualityJobs() {
   if (pipelineContext.historyOnly.value) return
   const token = jobEpoch, bound = pipelineContext.pipeline.value?.steps.find(step => step.id === 'quality')?.job_ids
-  const jobs = bound ? await Promise.all(bound.map(id => api.qualityJob(id))) : pipelineContext.isPipelineRoute.value ? [] : await api.qualityJobs()
+  const batch = selectedBatchId.value
+  const pages = !bound && !pipelineContext.isPipelineRoute.value && batch ? await Promise.all([
+    jobPage<QualityJob>('quality-jobs', { batch_id: batch, limit: 20, status: 'active' }),
+    jobPage<QualityJob>('quality-jobs', { batch_id: batch, limit: 3 }),
+  ]) : []
+  const jobs = bound ? await Promise.all(bound.map(id => api.qualityJob(id))) : [...new Map(pages.flatMap(page => page.items).map(job => [job.job_id, job])).values()]
+  if (batch !== selectedBatchId.value) return
   if (!disposed && !pipelineContext.historyOnly.value && token === jobEpoch && JSON.stringify(bound) === JSON.stringify(pipelineContext.pipeline.value?.steps.find(step => step.id === 'quality')?.job_ids)) qualityJobs.value = activeBatchItems(jobs)
 }
 async function viewTree(taskId: string) {
@@ -150,17 +162,18 @@ async function submitQuality() {
   catch (error) { ElMessage.error((error as Error).message) } finally { submitting.value = false }
 }
 function stopPolling() { if (pollTimer) clearInterval(pollTimer); pollTimer = undefined }
-function startPolling() { stopPolling(); pollTimer = window.setInterval(() => void pollJobs(), 1200); void pollJobs() }
+function startPolling() { stopPolling(); pollTimer = window.setInterval(() => { if (!document.hidden) void pollJobs() }, 5000); void pollJobs() }
 function jobLabel(job: QualityJob) {
   return qualityJobStageLabel(job)
 }
 async function pollJobs() {
-  if (polling.value) return
+  if (polling.value || Date.now() < nextPollAt) return
   polling.value = true
   const token = jobEpoch
   const previous = new Map(qualityJobs.value.map((job) => [job.job_id, job.status]))
   try {
     await loadQualityJobs()
+    pollFailures = 0; nextPollAt = 0; jobRefreshError.value = ''
     if (disposed || token !== jobEpoch) return
     const completed = batchJobs.value.filter((job) => {
       const oldStatus = previous.get(job.job_id)
@@ -175,7 +188,8 @@ async function pollJobs() {
     }
     if (!qualityJobs.value.some(job => ['queued', 'running'].includes(job.status))) stopPolling()
   } catch (error) {
-    ElMessage.error((error as Error).message)
+    pollFailures++; nextPollAt = Date.now() + Math.min(120000, 5000 * 2 ** Math.min(pollFailures, 5))
+    jobRefreshError.value = `状态刷新失败，保留上次结果：${(error as Error).message}`
   } finally {
     polling.value = false
   }
@@ -187,7 +201,7 @@ function selectNode(node: TrajectoryTreeNode) {
   qualityTrajectory.value = preferred.terminalTrajectoryId
 }
 function selectAuditStep(row: AuditStep & { trajectory: string }) { auditSelected.value = row }
-function toggleAll() { checkedTasks.value = checkedTasks.value.length === readyTasks.value.length ? [] : readyTasks.value.map(task => task.task_id) }
+function toggleAll() { checkedTasks.value = checkedTasks.value.length === readyTaskIds.value.length ? [] : [...readyTaskIds.value] }
 watch(() => [route.query.batch_id, route.query.run], async ([batch, run]) => {
   if ((batch === selectedBatchId.value && run === undefined) || (publishedNotice.value && batch === undefined && run === undefined)) return
   if (typeof batch === 'string' && !await lifecycle.checkBatch(batch)) return
@@ -196,7 +210,8 @@ watch(() => [route.query.batch_id, route.query.run], async ([batch, run]) => {
   await flow.loadBatches(typeof batch === 'string' ? batch : undefined, typeof run === 'string' ? run : undefined)
   if (selectedBatchId.value) await router.replace({ query: { ...route.query, batch_id: selectedBatchId.value, run: undefined } })
 })
-watch(readyTasks, tasks => { const ready = new Set(tasks.map(task => task.task_id)); checkedTasks.value = checkedTasks.value.filter(id => ready.has(id)) })
+watch(readyTaskIds, ids => { const ready = new Set(ids); checkedTasks.value = checkedTasks.value.filter(id => ready.has(id)) })
+watch(selectedBatchId, () => { ++jobEpoch; void loadQualityJobs() })
 watch(flow.error, value => { if (value) ElMessage.error(value) })
 watch(terminalIds, (ids) => { if (!ids.includes(qualityTrajectory.value)) qualityTrajectory.value = ids[0] ?? '' })
 watch(() => pipelineContext.pipeline.value?.steps.map(step => `${step.id}:${step.status}:${step.job_ids.join(',')}`).join('|'), async () => {
@@ -222,15 +237,22 @@ onBeforeUnmount(() => { disposed = true; ++jobEpoch; stopPolling(); flow.dispose
 <template>
   <div class="page quality-page">
     <PipelineStatusBar :context="pipelineContext" />
+    <el-alert v-if="choices?.error.value" :title="choices.error.value" type="warning" :closable="false" />
+    <el-alert v-if="choices?.data.value?.counts_complete === false" title="正在整理历史摘要，已有记录仍可查看" type="info" :closable="false" />
+    <el-alert v-if="jobRefreshError" :title="jobRefreshError" type="warning" :closable="false" />
     <template v-if="!pipelineContext.historyOnly.value">
     <BatchPublishedNotice :notice="publishedNotice" />
     <header class="page-hero"><div><span class="eyebrow">TRAJECTORY QUALITY</span><h1>轨迹质检</h1><p>选择业务批次，对当前有效轨迹树进行质检；分次处理的任务汇总在同一批次。</p></div><div class="run-selector"><label>业务批次</label><el-select :model-value="selectedBatchId" filterable :filter-method="(value: string) => batchSearch = value" :disabled="pipelineContext.isPipelineRoute.value" :loading="loadingRuns" placeholder="选择批次" style="width:300px" @change="changeBatch"><el-option v-for="batch in visibleBatches" :key="batch.batch_id" :label="`${displayId('batch', batch.batch_id)}${batch.label && batch.label !== batch.batch_id ? ' · ' + batch.label : ''} · ${batch.task_count} 个任务`" :value="batch.batch_id" /></el-select></div></header>
+    <el-pagination v-if="choices" :current-page="choices.page.value" :page-size="choices.size.value" :total="choices.total.value" :page-sizes="[10,20,50]" layout="total, sizes, prev, pager, next" @current-change="(value: number) => choices!.page.value = value" @size-change="(value: number) => choices!.size.value = value" />
     <QualityFusionSettings :disabled="submitting" @ready="qualitySettingsReady = $event" />
     <el-alert v-if="batchError" :title="batchError" type="error" :closable="false" show-icon />
     <el-empty v-if="!loadingRuns && !batches.length" description="还没有可处理的业务批次"><router-link to="/collection"><el-button type="primary">前往轨迹采集</el-button></router-link></el-empty>
     <template v-else-if="selectedRun">
-      <section class="task-toolbar"><div><b>{{ selectedRun.task_count }} 个任务</b><span>已完成 {{ counts.completed }} · 待处理 {{ counts.pending }} · 已失效 {{ counts.stale }}</span></div><div><el-button :disabled="pipelineReadOnly" @click="toggleAll">{{ checkedTasks.length === readyTasks.length ? '取消全选' : '全选' }}</el-button><el-button type="primary" :loading="submitting" :disabled="pipelineReadOnly || jobRunning || !checkedTasks.length || !qualitySettingsReady" @click="submitQuality">提交轨迹质检（{{ checkedTasks.length }}）</el-button></div></section>
+      <section class="task-toolbar"><div><b>{{ selectedRun.task_count }} 个任务</b><span>已完成 {{ counts.completed }} · 待处理 {{ counts.pending }} · 已失效 {{ counts.stale }}</span></div><div><el-button :disabled="pipelineReadOnly" @click="toggleAll">{{ checkedTasks.length === readyTaskIds.length ? '取消全选' : '全选' }}</el-button><el-button type="primary" :loading="submitting" :disabled="pipelineReadOnly || jobRunning || !checkedTasks.length || !qualitySettingsReady" @click="submitQuality">提交轨迹质检（{{ checkedTasks.length }}）</el-button></div></section>
       <section v-if="visibleJobs.length" class="job-queue"><div class="job-queue__head"><div><b>质检任务队列</b><span>{{ activeJobs.length }} 个执行中 / 等待，页面切换后会从后端恢复</span></div><el-button text :loading="polling" @click="loadQualityJobs">刷新队列</el-button></div><article v-for="job in visibleJobs" :key="job.job_id" class="job-queue__item" :class="`job-queue__item--${job.status}`"><div class="job-queue__main"><b>{{ jobLabel(job) }}</b><span><DisplayId kind="batch" :id="job.batch_id || selectedBatchId" /> · <DisplayId v-if="job.current_task" kind="task" :id="job.current_task" :scope="job.batch_id || selectedBatchId" /><template v-else>等待任务</template><template v-if="job.current_trajectory"> · <DisplayId kind="trajectory" :id="job.current_trajectory" :scope="job.batch_id || selectedBatchId" /></template></span><small><DisplayId kind="job" :id="job.job_id" /></small></div><el-progress :percentage="job.percent" :status="job.status === 'failed' ? 'exception' : job.status === 'succeeded' ? 'success' : undefined" /><small class="job-queue__count">{{ qualityJobProgressText(job) }}</small><small v-if="qualityModelProgressText(job)" class="job-queue__count">{{ qualityModelProgressText(job) }}</small><small v-if="job.error" class="job-queue__error">{{ job.error }}</small></article></section>
+      <el-input :model-value="flow.taskSearch.value" clearable placeholder="搜索任务编号或任务文本" @change="flow.searchTasks" />
+      <el-pagination :current-page="taskPage" :page-size="taskSize" :total="taskTotal" :page-sizes="[10,20,50]" layout="total, sizes, prev, pager, next" @current-change="(value: number) => flow.changeTaskPage(value)" @size-change="(value: number) => flow.changeTaskPage(1, value)" />
+      <el-button text @click="flow.loadRecommendation()">查看 Top-1 修正建议</el-button>
       <section class="task-list"><article v-for="task in selectedRun.tasks" :key="task.task_id" class="task-row"><el-checkbox v-model="checkedTasks" :value="task.task_id" :disabled="pipelineReadOnly || !treeReady(task)" /><div class="task-main"><b><DisplayId kind="task" :id="task.task_id" :scope="selectedBatchId" /></b><p>{{ task.goal }}</p></div><div class="metric"><span>轨迹 / 步骤</span><b>{{ task.trajectory_count }} / {{ task.original_step_count }}</b></div><div class="status"><el-tag :type="taskQuality(task.task_id)?.rubric_ready ? 'success' : 'info'">Rubric {{ taskQuality(task.task_id)?.rubric_ready ? '就绪' : '待生成' }}</el-tag><el-tag :type="taskQuality(task.task_id)?.status === 'succeeded' ? 'success' : 'info'">{{ qualityStatus(task.task_id) }}</el-tag></div><div class="metric"><span>Rubric 均分 / 达标数</span><b>{{ taskQuality(task.task_id)?.average_score?.toFixed(2) ?? '—' }} / {{ taskQuality(task.task_id)?.passed_count ?? '—' }}</b></div><div v-if="top1Task(task.task_id)" class="metric top1-metric"><span>Top-1 修正</span><b><DisplayId kind="trajectory" :id="top1Task(task.task_id)?.trajectory_id" :scope="selectedBatchId" /></b><small><template v-if="top1Task(task.task_id)?.ranking_basis === 'fusion'">F {{ scoreText(top1Task(task.task_id)?.fusion_score) }} · </template>Rubric G {{ scoreText(top1Task(task.task_id)?.global_score, 2) }} / 5 · {{ top1Task(task.task_id)?.step_count }} 步</small></div><el-button v-if="top1Task(task.task_id)" type="success" plain @click="router.push({ path: '/correction', query: { ...route.query, batch_id: selectedBatchId, ...(pipelineContext.isPipelineRoute.value ? { step_id: 'correction' } : {}) } })">进入轨迹修正</el-button><el-button type="primary" plain :disabled="!treeReady(task)" @click="viewTree(task.task_id)">查看轨迹树</el-button></article></section>
       <template v-if="selectedTask"><section class="run-banner"><div><span>当前任务</span><b>{{ selectedTask.goal }}</b></div><el-button :icon="DataLine" @click="auditVisible = true">中间态审计（{{ ignoredSteps.length }}）</el-button></section><section class="stat-grid"><div><span>原始步骤</span><b>{{ tree?.original_step_count ?? selectedTask.original_step_count }}</b></div><div><span>入树步骤</span><b>{{ tree?.tree_step_count ?? selectedTask.tree_step_count }}</b></div><div><span>忽略步骤</span><b>{{ tree?.ignored_incidental_step_count ?? selectedTask.ignored_step_count }}</b></div><div><span>Action 节点</span><b>{{ selectedTask.action_node_count }}</b></div></section>
         <div class="highlight-toolbar" data-testid="highest-fusion-toolbar">
@@ -263,6 +285,7 @@ onBeforeUnmount(() => { disposed = true; ++jobEpoch; stopPolling(); flow.dispose
   </div>
 </template>
 
+<style scoped src="../styles/businessPaging.css"></style>
 <style scoped>
 .node-score-card{display:grid;gap:4px;padding:10px;margin:10px 0;border:1px solid #334155;border-radius:9px;color:#67e8f9}.node-score-card small,.terminal-note{color:#94a3b8;font-size:11px;line-height:1.6}.quality-card>.display-id{margin-top:8px}
 .task-main,.metric{min-width:0}.task-main> b,.top1-metric> b{display:block;max-width:240px}.node-panel .display-id{max-width:100%}

@@ -226,14 +226,7 @@ class DatasetReleaseRegistry:
 
     def get(self, release_id: str) -> Optional[dict[str, Any]]:
         with self._lock:
-            release = next(
-                (
-                    item
-                    for item in self._read()["releases"]
-                    if isinstance(item, dict) and item.get("release_id") == release_id
-                ),
-                None,
-            )
+            release = self._records.get("dataset_releases", release_id)
             return self._with_availability(release) if release is not None else None
 
     def create(self, name: str, session_ids: list[str]) -> dict[str, Any]:

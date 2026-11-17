@@ -1,11 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createRenderer, h, nextTick, ref, ssrContextKey } from 'vue'
+import { invalidateSummaryCache } from '@/utils/summaryCache'
 
 const requests = vi.hoisted(() => ({
   datasetReleaseCandidates: vi.fn(async () => []), datasetReleases: vi.fn(async () => []),
   datasetUploadCapabilities: vi.fn(async () => ({ internal: { configured: true, directory_upload: true, default_prefix: 'default/', bucket: 'bucket', region: 'region' } })),
   listPipelines: vi.fn(async () => []), uploadDatasetRelease: vi.fn(), datasetUploadJob: vi.fn(),
 }))
+vi.mock('@/readPageApi', () => {
+  const page = (items: unknown[]) => ({ items, latest: [], total: items.length, filtered_total: items.length, scope_counts: { total: items.length, active: 0, abnormal: 0 }, offset: 0, limit: 10, has_more: false, index_state: 'ready', counts_complete: true })
+  return { readPageApi: { releases: async () => page(await requests.datasetReleases()), candidates: async () => page(await requests.datasetReleaseCandidates()) } }
+})
 vi.mock('@/api', () => ({ api: requests, datasetReleaseExcelUrl: () => '' }))
 vi.mock('vue-router', () => ({ useRoute: () => ({ query: {} }) }))
 vi.mock('@/composables/useBatchLifecycle', () => ({ useBatchLifecycle: () => ({ notice: ref(null) }) }))
@@ -28,7 +33,7 @@ function mount() {
   return { app, state: app._instance!.subTree.component!.setupState as Record<string, any> }
 }
 beforeEach(() => {
-  vi.useFakeTimers(); vi.clearAllMocks()
+  vi.useFakeTimers(); vi.clearAllMocks(); invalidateSummaryCache()
   const storage = new Map<string, string>()
   vi.stubGlobal('localStorage', { getItem: (key: string) => storage.get(key) || null, setItem: (key: string, value: string) => storage.set(key, value), removeItem: (key: string) => storage.delete(key) })
   requests.uploadDatasetRelease.mockResolvedValue(job)
@@ -37,6 +42,13 @@ beforeEach(() => {
 afterEach(() => { apps.splice(0).forEach(app => app.unmount()); vi.useRealTimers(); vi.unstubAllGlobals() })
 
 describe('publishing upload interaction', () => {
+  it('renders history while candidate loading is still pending', async () => {
+    requests.datasetReleaseCandidates.mockReturnValueOnce(new Promise<never[]>(() => {}))
+    requests.datasetReleases.mockResolvedValueOnce([release() as never])
+    const { state } = mount(); await flush()
+    expect(state.releases[0]?.release_id).toBe('release-one')
+    expect(state.loading).toBe(false)
+  })
   it('uses an editable destination dialog and keeps polling after it closes', async () => {
     const { state } = mount(); await flush()
     state.startUpload(release()); expect(state.uploadDialogVisible).toBe(true)
@@ -46,7 +58,7 @@ describe('publishing upload interaction', () => {
     expect(requests.uploadDatasetRelease).toHaveBeenCalledWith('release-one', 'internal', { include_trajectories: true, destination_prefix: 'new-target/' })
     expect(state.uploadDialogVisible).toBe(false)
     const calls = requests.datasetUploadJob.mock.calls.length
-    await vi.advanceTimersByTimeAsync(801)
+    await vi.advanceTimersByTimeAsync(5001)
     expect(requests.datasetUploadJob.mock.calls.length).toBeGreaterThan(calls)
   })
   it('allows a successful release to choose another target and defaults retry to the original', async () => {
@@ -86,7 +98,7 @@ describe('publishing upload interaction', () => {
     const { state, app } = mount(); await flush()
     state.startUpload(release()); await state.confirmUpload(); await flush()
     requests.datasetUploadJob.mockRejectedValueOnce(new Error('offline'))
-    await vi.advanceTimersByTimeAsync(801)
+    await vi.advanceTimersByTimeAsync(5001)
     expect(state.activeUpload.job_id).toBe('job-one')
     expect(state.pollError).toContain('offline')
     let resolve!: (value: object) => void

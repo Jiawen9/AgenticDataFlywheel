@@ -286,6 +286,17 @@ class ArtifactStore:
                 # Some indexes need the exact frozen reference. Build them only
                 # after preparation, before any replacement or SQLite commit.
                 extra_records = record_entries(manifests) if callable(record_entries) else record_entries
+                from ..stage_page_reads import projection_entries
+                from ..stage_page_reads import VERSION as display_version
+                display_records = []
+                for manifest, entry in zip(manifests, entries):
+                    old_display = self.records.get("page_stages", f"{batch_id}:{manifest['stage']}") or {}
+                    if (old_display.get("artifact_version") == manifest["version"]
+                            and old_display.get("content_hash") == manifest["content_hash"]
+                            and old_display.get("display_version") == display_version):
+                        continue
+                    display_records.extend(projection_entries(manifest, entry["payload"]))
+                extra_records = [*(extra_records or []), *display_records]
                 if not changes:
                     if extra_records:
                         self.records.put_many(extra_records)

@@ -1,18 +1,21 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import type { GenerationResultPage } from '@/generationReadApi'
+import type { SummaryQuery } from '@/utils/summaryCache'
 import type { TaskGenerationResult } from '@/types'
 import { filterResultGroups, groupGenerationResults, resultCounts, resultPath, resultTypeKey, type ResultFilters } from '@/utils/taskGeneration'
 import TaskGenerationResultRow from './TaskGenerationResultRow.vue'
-const props = defineProps<{ results: TaskGenerationResult[]; editingId: string | null; text: string; busy: boolean; protect: () => Promise<boolean> }>()
-const emit = defineEmits<{ edit: [row: TaskGenerationResult]; delete: [row: TaskGenerationResult]; save: []; cancel: []; 'update:text': [value: string]; export: [] }>()
-const filters = ref<ResultFilters>({ app: '', type: '', dependency: '', showDeleted: false })
+const props = defineProps<{ results: TaskGenerationResult[]; pageMeta?: GenerationResultPage; query?: SummaryQuery; editingId: string | null; text: string; busy: boolean; protect: () => Promise<boolean> }>()
+const emit = defineEmits<{ edit: [row: TaskGenerationResult]; delete: [row: TaskGenerationResult]; save: []; cancel: []; 'update:text': [value: string]; export: []; query: [patch: SummaryQuery] }>()
+const localFilters = ref<ResultFilters>({ app: '', type: '', dependency: '', showDeleted: false })
+const filters = computed<ResultFilters>(() => props.query ? { app: String(props.query.app || ''), type: String(props.query.task_type || ''), dependency: String(props.query.dependency || ''), showDeleted: Boolean(props.query.show_deleted) } : localFilters.value)
 const expanded = ref<string[]>([])
 const groups = computed(() => groupGenerationResults(props.results))
-const visible = computed(() => filterResultGroups(groups.value, filters.value))
-const counts = computed(() => resultCounts(props.results))
-const apps = computed(() => [...new Set(groups.value.map(group => group.main.app))])
-const types = computed(() => [...new Map(groups.value.map(group => [resultTypeKey(group.main), resultPath(group.main)])).entries()])
-async function changeFilter<K extends keyof ResultFilters>(key: K, value: ResultFilters[K]) { if (await props.protect()) filters.value = { ...filters.value, [key]: value } }
+const visible = computed(() => props.pageMeta ? groups.value.filter(group => filters.value.showDeleted || !group.main.deleted) : filterResultGroups(groups.value, filters.value))
+const counts = computed(() => props.pageMeta?.counts || resultCounts(props.results))
+const apps = computed(() => props.pageMeta?.apps || [...new Set(groups.value.map(group => group.main.app))])
+const types = computed(() => props.pageMeta?.types || [...new Map(groups.value.map(group => [resultTypeKey(group.main), resultPath(group.main)])).entries()])
+async function changeFilter<K extends keyof ResultFilters>(key: K, value: ResultFilters[K]) { if (await props.protect()) { if (props.pageMeta) emit('query', { [key === 'type' ? 'task_type' : key === 'showDeleted' ? 'show_deleted' : key]: value, offset: 0 }); else localFilters.value = { ...filters.value, [key]: value } } }
 async function toggleGroup(id: string) {
   if (expanded.value.includes(id)) { if (await props.protect()) expanded.value = expanded.value.filter(value => value !== id) }
   else expanded.value = [...expanded.value, id]
@@ -28,13 +31,14 @@ async function toggleGroup(id: string) {
       <el-select :model-value="filters.dependency" clearable placeholder="全部依赖类型" aria-label="筛选依赖类型" :disabled="busy" @update:model-value="changeFilter('dependency', $event || '')"><el-option label="无依赖" value="zero" /><el-option label="弱依赖" value="weak" /><el-option label="强依赖" value="strong" /><el-option label="前置任务（历史未关联）" value="pre_node" /><el-option label="依赖判定异常" value="error" /></el-select>
       <el-checkbox :model-value="filters.showDeleted" :disabled="busy" @update:model-value="changeFilter('showDeleted', Boolean($event))">显示已删除</el-checkbox>
     </div>
-    <p class="visible-count">当前显示 {{ visible.length }} 个任务组</p>
+    <p class="visible-count">当前页 {{ visible.length }} 个任务组<span v-if="pageMeta"> · 筛选共 {{ pageMeta.total }} 组</span></p>
     <article v-for="group in visible" :key="group.main.result_id" class="result-group">
       <p v-if="group.orphan" class="orphan-note">历史前置任务未关联到主任务，保留独立展示。</p>
       <p v-else-if="group.main.pre_task_uuid && !group.prerequisites.length" class="orphan-note">关联前置任务缺失，导出时将由服务端校验。</p>
       <TaskGenerationResultRow :row="group.main" :editing-id="editingId" :text="text" :busy="busy" @edit="emit('edit', $event)" @delete="emit('delete', $event)" @save="emit('save')" @cancel="emit('cancel')" @update:text="emit('update:text', $event)" />
       <template v-if="group.prerequisites.length"><button class="pre-toggle" :aria-expanded="expanded.includes(group.main.result_id)" :disabled="busy" @click="toggleGroup(group.main.result_id)">{{ expanded.includes(group.main.result_id) ? '收起' : '展开' }} {{ group.prerequisites.length }} 条前置任务 <span>与主任务成组删除 / 恢复</span></button><div v-if="expanded.includes(group.main.result_id)" class="prerequisites"><TaskGenerationResultRow v-for="row in group.prerequisites" :key="row.result_id" :row="row" :editing-id="editingId" :text="text" :busy="busy" @edit="emit('edit', $event)" @delete="emit('delete', $event)" @save="emit('save')" @cancel="emit('cancel')" @update:text="emit('update:text', $event)" /></div></template>
     </article>
+    <el-pagination v-if="pageMeta" :current-page="Math.floor(pageMeta.offset / pageMeta.limit) + 1" :page-size="pageMeta.limit" :page-sizes="[10,20,50]" :total="pageMeta.total" :disabled="busy" layout="total, sizes, prev, pager, next" @update:current-page="emit('query', { offset: ($event - 1) * pageMeta.limit })" @update:page-size="emit('query', { limit: $event, offset: 0 })" />
     <el-empty v-if="!visible.length" description="当前筛选条件下没有任务" :image-size="65" />
   </section>
 </template>

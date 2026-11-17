@@ -27,6 +27,14 @@ function setup() {
 afterEach(() => { cleanups.splice(0).forEach(dispose => dispose()); vi.useRealTimers() })
 
 describe('augmentation snapshot and confirmation lifecycle', () => {
+  it('opens the history without automatically reading a job preview or results', async () => {
+    const { state, api } = setup()
+    await state.loadJobs()
+    expect(state.selectedJob.value).toBeNull()
+    expect(api.taskGenerationJob).not.toHaveBeenCalled()
+    expect(api.augmentationPreview).not.toHaveBeenCalled()
+    expect(api.taskGenerationResults).not.toHaveBeenCalled()
+  })
   it('protects edits before an external collection submission and holds the shared page lock', async () => {
     const { state, api } = setup(), pending = deferred<string>()
     api.taskGenerationJob.mockImplementation(async id => job(id, 'succeeded'))
@@ -78,12 +86,12 @@ describe('augmentation snapshot and confirmation lifecycle', () => {
     api.taskGenerationJob.mockImplementation(async id => job(id, 'running'))
     await state.selectJob(job('A', 'running'))
     expect(api.augmentationPreview).toHaveBeenLastCalledWith('A', true)
-    await vi.advanceTimersByTimeAsync(1200)
+    await vi.advanceTimersByTimeAsync(5000)
     expect(api.augmentationPreview).toHaveBeenLastCalledWith('A', false)
     expect(state.preview.value?.tree?.version).toBe('snapshot-A')
     expect(api.taskGenerationResults).not.toHaveBeenCalled()
     api.taskGenerationJob.mockImplementation(async id => job(id, 'succeeded'))
-    await vi.advanceTimersByTimeAsync(1200)
+    await vi.advanceTimersByTimeAsync(5000)
     expect(state.results.value).toEqual([row('A')])
     const count = api.taskGenerationJob.mock.calls.length
     await vi.advanceTimersByTimeAsync(10000)

@@ -23,6 +23,17 @@ function deferred<T>() { let resolve!: (value: T) => void; const promise = new P
 afterEach(() => { cleanups.splice(0).forEach(dispose => dispose()); vi.useRealTimers() })
 
 describe('generation records and protected review', () => {
+  it('backs off repeated list errors while preserving jobs and returns to active polling after recovery', async () => {
+    vi.useFakeTimers()
+    const { ws, api } = setup()
+    api.taskGenerationJobs.mockResolvedValueOnce([job('A', 'running')]).mockRejectedValueOnce(new Error('offline')).mockResolvedValue([job('A', 'running')])
+    await ws.refreshJobs()
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(ws.jobs.value[0]?.job_id).toBe('A'); expect(ws.listError.value).toBe('offline')
+    await vi.advanceTimersByTimeAsync(9999); expect(api.taskGenerationJobs).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(1); expect(ws.listError.value).toBe('')
+    await vi.advanceTimersByTimeAsync(5000); expect(api.taskGenerationJobs).toHaveBeenCalledTimes(4)
+  })
   it('saves dirty text before acquiring an external batch lock and blocks edits and job switches until it finishes', async () => {
     const { ws, api } = setup(), pending = deferred<string>()
     await ws.selectJob(job('A')); await ws.startEdit(ws.results.value[1]!)
@@ -48,11 +59,14 @@ describe('generation records and protected review', () => {
     expect(await ws.runExternalAction(action)).toBeNull()
     expect(action).not.toHaveBeenCalled()
   })
-  it('loads persisted summaries and job detail without polling completed jobs', async () => {
+  it('first loads only summaries, then reads detail on explicit selection', async () => {
     vi.useFakeTimers()
     const { ws, api } = setup()
     await ws.refreshJobs()
-    expect(ws.selectedJob.value?.job_id).toBe('A')
+    expect(ws.selectedJob.value).toBeNull()
+    expect(api.taskGenerationJob).not.toHaveBeenCalled()
+    expect(api.taskGenerationResults).not.toHaveBeenCalled()
+    await ws.selectJob(ws.jobs.value[0]!)
     expect(ws.results.value).toHaveLength(2)
     await vi.advanceTimersByTimeAsync(5000)
     expect(api.taskGenerationJobs).toHaveBeenCalledTimes(1)
@@ -63,11 +77,12 @@ describe('generation records and protected review', () => {
     api.taskGenerationJob.mockResolvedValue(job('A', 'running'))
     api.taskGenerationJobs.mockResolvedValue([{ ...job('A', 'running'), execution_units: undefined }])
     await ws.refreshJobs()
+    await ws.selectJob(ws.jobs.value[0]!)
     expect(api.taskGenerationResults).not.toHaveBeenCalled()
-    await vi.advanceTimersByTimeAsync(1500)
+    await vi.advanceTimersByTimeAsync(5000)
     expect(ws.selectedJob.value?.execution_units?.[0]?.scene).toBe('旧场景')
     api.taskGenerationJobs.mockResolvedValue([job('A')]); api.taskGenerationJob.mockResolvedValue(job('A'))
-    await vi.advanceTimersByTimeAsync(1500)
+    await vi.advanceTimersByTimeAsync(5000)
     expect(ws.results.value).toHaveLength(2)
     const calls = api.taskGenerationJobs.mock.calls.length
     await vi.advanceTimersByTimeAsync(5000)
