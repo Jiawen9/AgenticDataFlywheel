@@ -51,6 +51,7 @@ class DirectoryUploadJobsMixin:
                     "error", "folder_upload", "destination", "source_summary", "item_results",
                     "current_item", "completed_items", "total_items", "percent", "include_trajectories",
                     "file_results", "completed_files", "total_files", "completed_bytes", "total_bytes")
+            keys += ("training_jsonl", "training")
             self.registry.update(payload["release_id"], {
                 "internal_upload": deepcopy({key: payload.get(key) for key in keys})})
 
@@ -92,13 +93,13 @@ class DirectoryUploadJobsMixin:
         return payload
 
     def _submit_directory(self, release_id, *, destination_prefix=None, retry_job_id=None,
-                          include_trajectories=True):
+                          include_trajectories=True, training_jsonl=False):
         with self._lock:
             release = self.registry.get(release_id)
             if release is None:
                 raise FileNotFoundError("数据集发布记录不存在")
             capability = self.internal_capabilities()["internal"]
-            if not capability.get("configured") or not capability.get("directory_upload"):
+            if not capability.get("configured") or capability.get("directory_upload") is not True:
                 raise InternalUploadConflict(capability.get("reason") or "当前上传适配器不支持完整目录上传")
             destination = {"region": capability["region"], "bucket": capability["bucket"],
                            "prefix": normalize_prefix(destination_prefix if destination_prefix is not None
@@ -107,7 +108,8 @@ class DirectoryUploadJobsMixin:
                 retry_job = self.get(retry_job_id)
                 if (not retry_job or retry_job.get("release_id") != release_id
                         or not retry_job.get("folder_upload")
-                        or retry_job.get("include_trajectories", True) != include_trajectories):
+                        or retry_job.get("include_trajectories", True) != include_trajectories
+                        or retry_job.get("training_jsonl", False) != training_jsonl):
                     raise InternalUploadConflict("重试任务不属于该发布的目录上传")
                 previous_target = retry_job["destination"]
                 if destination_prefix is None:
@@ -119,6 +121,8 @@ class DirectoryUploadJobsMixin:
                            for item in release.get("excel_paths", [])]
             source_key = _digest({"release_id": release_id, "excel_paths": excel_paths,
                                   "source_refs": release.get("source_refs"), "include_trajectories": include_trajectories})
+            if training_jsonl:
+                source_key = _digest({"source": source_key, "training_jsonl": "training_jsonl_v1"})
             request_key = _digest({"source": source_key, "destination": destination})
             index = self._records.get("dataset_upload_requests", request_key)
             previous = self.get(index["job_id"]) if index else None
@@ -138,6 +142,8 @@ class DirectoryUploadJobsMixin:
                 "job_id": allocate_id("j", self.registry.data_root), "release_id": release_id,
                 "dataset_name": release["name"], "mode": "internal", "folder_upload": True,
                 "include_trajectories": include_trajectories,
+                "training_jsonl": bool(training_jsonl),
+                "training": deepcopy((previous or {}).get("training")),
                 "attempt": int((previous or {}).get("attempt", 0)) + 1,
                 "status": "queued", "stage": "queued", "created_at": utc_now(),
                 "started_at": None, "completed_at": None, "updated_at": utc_now(), "error": None,
@@ -233,9 +239,10 @@ class DirectoryUploadJobsMixin:
                                        if item["kind"] == "trajectory"}),
                 })
                 self._save_directory(payload)
-            for item in payload["item_results"]:
+            def upload_item(item):
+                nonlocal current
                 if item["status"] == "succeeded":
-                    continue
+                    return
                 current = item
                 source_dir = Path(item["source_dir"])
                 if not io_path(source_dir).is_dir():
@@ -243,6 +250,10 @@ class DirectoryUploadJobsMixin:
                 if item["kind"] == "excel":
                     self._validate_excel({"path": self.registry.project_path(Path(item["file_path"])),
                                           "filename": item["filename"], "sha256": item["sha256"]})
+                elif item["kind"] == "training":
+                    from .training_jsonl import file_digest
+                    if file_digest(Path(item["file_path"])) != item["sha256"]:
+                        raise ValueError("训练 JSONL 与冻结生成结果摘要不一致")
                 item.update(status="uploading", error=None)
                 payload.update(stage="uploading", current_item=item.get("label") or item["filename"], process=None)
                 self._save_directory(payload)
@@ -259,6 +270,32 @@ class DirectoryUploadJobsMixin:
                 save_progress(latest_progress, force=True)
                 self._save_directory(payload)
                 current = None
+            for item in payload["item_results"]:
+                if item["kind"] != "training":
+                    upload_item(item)
+            if payload.get("training_jsonl"):
+                from .training_jsonl import write_training_bundle
+                if not (payload.get("training") or {}).get("file_path"):
+                    payload.update(stage="generating_training", current_item="生成训练 JSONL")
+                    self._save_directory(payload)
+                    payload["training"] = write_training_bundle(self.registry, payload["release_snapshot"], payload["item_results"], payload["destination"], payload["request_key"])
+                    self._save_directory(payload)
+                training = payload["training"]
+                if not any(item["kind"] == "training" for item in payload["item_results"]):
+                    payload["item_results"].append({"kind": "training", "source_dir": training["source_dir"],
+                        "file_path": str(self.registry.resolve_project_path(training["file_path"])),
+                        "filename": "train.jsonl", "label": "训练 JSONL", "sha256": training["sha256"],
+                        "bucket_path": training["bucket_path"], "source_identity": payload["request_key"],
+                        "idempotency_key": _digest([payload["request_key"], training["sha256"]]),
+                        "status": "pending", "error": None})
+                    self._save_directory(payload)
+                for item in payload["item_results"]:
+                    if item["kind"] == "training":
+                        training["status"] = "uploading"
+                        training["error"] = None
+                        upload_item(item)
+                        training["status"] = "succeeded"
+                        training["s3_uri"] = f"s3://{payload['destination']['bucket']}/{item['bucket_path']}train.jsonl"
             payload.update(status="succeeded", stage="succeeded", current_item=None, completed_at=utc_now())
             save_progress({}, force=True)
             self._save_directory(payload)
@@ -272,9 +309,26 @@ class DirectoryUploadJobsMixin:
                 message = sanitizer(message)
             if current is not None and current["status"] != "succeeded":
                 current.update(status="failed", error=message)
+            if payload.get("training_jsonl") and all(item["status"] == "succeeded" for item in payload.get("item_results", []) if item["kind"] != "training"):
+                payload["training"] = {**(payload.get("training") or {}), "status": "failed", "error": message}
             payload.update(status="failed", stage="failed", error=message, completed_at=utc_now())
             try:
                 save_progress(latest_progress, force=True)
             except Exception:
                 pass  # Preserve the original transport/storage failure.
             self._save_directory(payload)
+
+    def training_file(self, job_id, kind):
+        payload = self.get(job_id)
+        training = (payload or {}).get("training") or {}
+        field, digest_field = ("file_path", "sha256") if kind == "jsonl" else ("report_path", "report_sha256")
+        if kind not in {"jsonl", "report"} or not training.get(field):
+            raise FileNotFoundError("训练导出文件尚未生成")
+        path = self.registry.resolve_project_path(training[field])
+        expected = (self.registry.data_root / "releases" / payload["release_id"] / "training").resolve()
+        if not path.resolve().is_relative_to(expected):
+            raise ValueError("训练导出路径不属于本次发布")
+        from .training_jsonl import file_digest
+        if file_digest(path) != training[digest_field]:
+            raise ValueError("训练导出文件摘要校验失败")
+        return path

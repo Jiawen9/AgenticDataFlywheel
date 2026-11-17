@@ -164,7 +164,10 @@ class CollectionRunStore:
 
     def run_root(self, batch_id: str, run_id: str) -> Path:
         root = self.raw_root(batch_id)
-        path = root / "runs" / _identifier(run_id, "采集运行编号")
+        _identifier(run_id, "采集运行编号")
+        from .short_paths import collection_layout
+        layout = collection_layout(self.root, batch_id, run_id)
+        path = root / "runs" / (layout["directory"] if layout else run_id)
         self._no_links(path)
         return contained_path(root, path.relative_to(root).as_posix())
 
@@ -264,6 +267,18 @@ class CollectionRunStore:
             run_id = (batch["collection_run_id"] if batch.get("batch_role") == "collection_result" else
                       "cr_" + (payload_digest([batch_id, dispatch_key]) if dispatch_key else uuid.uuid4().hex))
             _identifier(run_id, "采集运行编号")
+            existing = self.get(run_id)
+            if existing is not None:
+                if (existing["request_digest"] != payload_digest(request)
+                        and not matches_legacy_logprobs_request(existing, request, nested_metadata=True)):
+                    raise CollectionRunError("相同 request_id 对应的运行参数不同")
+                return existing, False
+            # Transport identity stays unchanged. Only new HTTP-owned receipts
+            # acquire local physical locations; historical replays returned above.
+            layout = None
+            if (metadata or {}).get("result_transport") == "http":
+                from .short_paths import reserve_collection_layout
+                layout = reserve_collection_layout(self.root, batch_id, run_id)
             root = self.run_root(batch_id, run_id)
             payload = {
                 "schema_version": 1, "batch_id": batch_id, "collection_run_id": run_id, "run_id": run_id,
@@ -273,6 +288,8 @@ class CollectionRunStore:
                 "batch_snapshot_sha256": payload_digest(batch["snapshot"]),
                 "trajectories": [], "errors": [], "dispatch_error": None,
             }
+            if layout:
+                payload["storage_layout"] = layout["version"]
             if batch.get("batch_role") == "collection_result":
                 if run_id != batch["collection_run_id"]:
                     raise CollectionRunError("结果批次的预留运行编号不匹配")
@@ -492,6 +509,8 @@ class CollectionRunStore:
     def _validate_source_files(self, run: dict, manifest: dict, *, root_override: Path | None = None) -> None:
         root = root_override if root_override is not None else self.run_root(run["batch_id"], run["collection_run_id"])
         for trajectory in manifest["trajectories"]:
+            from .short_paths import collection_entry
+            trajectory, _ = collection_entry(self.root, run, trajectory)
             relative_dir = trajectory["relative_dir"]
             try:
                 self._no_links(root / relative_dir)
@@ -618,7 +637,8 @@ class CollectionRunStore:
             self._validate_sources(run, normalized)
             runs.append({"collection_run_id": run["collection_run_id"], "completed_at": run["completed_at"],
                          "manifest_sha256": run["manifest_sha256"], "trajectory_count": len(run["trajectories"])})
-            trajectories.extend(run["trajectories"])
+            from .short_paths import collection_input_trajectories
+            trajectories.extend(collection_input_trajectories(self.root, run, run["trajectories"]))
             errors.extend({**error, "collection_run_id": run["collection_run_id"]} for error in run["errors"])
         if not trajectories:
             raise CollectionRunError("该采集批次尚无已登记完成的可用轨迹")

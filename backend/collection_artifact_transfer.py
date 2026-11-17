@@ -148,7 +148,10 @@ class ArtifactTransfer:
     def _base(self, run, kind):
         if kind == "trajectory":
             return self.runs.run_root(run["batch_id"], run["collection_run_id"])
-        base = contained_path(self.runs.raw_root(run["batch_id"]), "diagnostics", run["collection_run_id"])
+        from .short_paths import collection_layout
+        layout = collection_layout(self.owner.root, run["batch_id"], run["collection_run_id"])
+        base = contained_path(self.runs.raw_root(run["batch_id"]), "diagnostics",
+                              layout["directory"] if layout else run["collection_run_id"])
         self.runs._no_links(base)
         return base
 
@@ -225,15 +228,20 @@ class ArtifactTransfer:
             if entry.get("error"):
                 details["error"] = str(entry["error"])[:2000]
             ledger.update(artifact_id, instance=instance, entry=details)
+            from .short_paths import collection_entry
+            entry, mapping = collection_entry(self.owner.root, run, entry, item["kind"], reserve=True)
+            local_descriptors = {mapping[name]: value for name, value in descriptors.items()}
             base = self._base(run, item["kind"])
             destination = contained_path(base, entry["relative_dir"])
-            temp = self.owner._temporary(run_id) / "artifacts" / artifact_id
+            compact = entry.get("storage_layout") == "compact-v1"
+            temp = self.owner._temporary(run_id) / ("a" if compact else "artifacts") / (
+                entry["relative_dir"] if compact else artifact_id)
             if item["kind"] == "outcome":
                 quality = inspect_eligibility(self.runs, run, entry, base, "outcome")
             elif io_path(destination).exists():
                 # A lost durable acknowledgement never requires downloading a
                 # second copy. Verify existing immutable bytes independently.
-                self._verify(base, entry, descriptors)
+                self._verify(base, entry, local_descriptors)
                 quality = inspect_eligibility(self.runs, run, entry, base, item["kind"])
             else:
                 files = temp / "files"
@@ -246,8 +254,8 @@ class ArtifactTransfer:
                     size, checksum = self.owner._descriptor(item["archive"])
                     if not io_path(archive).is_file() or io_path(archive).stat().st_size != size or workbook_digest(archive) != checksum:
                         raise CollectionRunError("单条采集归档大小或 SHA256 不匹配")
-                    self.owner._extract(archive, files, descriptors)
-                self.owner._validate_tree(files, descriptors)
+                    self.owner._extract(archive, files, descriptors, mapping=mapping)
+                self.owner._validate_tree(files, local_descriptors)
                 quality = inspect_eligibility(self.runs, run, entry, files, item["kind"])
                 source = contained_path(files, entry["relative_dir"])
                 io_path(source).mkdir(parents=True, exist_ok=True)

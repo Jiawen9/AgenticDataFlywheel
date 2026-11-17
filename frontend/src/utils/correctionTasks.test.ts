@@ -3,6 +3,11 @@ import type { CorrectionGroupSummary, CorrectionRecommendation } from '@/types'
 import { correctionTasks } from './correctionTasks'
 
 describe('saved correction ranking', () => {
+  it('keeps same-named trajectories in different tasks separate', () => {
+    const source = ['A', 'B'].map(task => ({ task_id: task, group_id: 'g' + task, meta_task: 'same', edited_row_count: 0, export: true })) as CorrectionGroupSummary[]
+    const selected = { status: 'ready', tasks: ['A', 'B'].map(task => ({ task_id: task, trajectory_id: 'same', goal: task, global_score: 3 })) } as CorrectionRecommendation
+    expect(correctionTasks(selected, source).map(task => task.trajectories[0]?.group.group_id)).toEqual(['gA', 'gB'])
+  })
   const groups = ['t1', 't2'].map(id => ({ group_id: id, meta_task: id, edited_row_count: 0, export: false })) as CorrectionGroupSummary[]
   const selection = (): CorrectionRecommendation => ({ status: 'ready', tasks: [
     { task_id: 'case', goal: '', trajectory_id: 't1', global_score: 5, fusion_score: .3, ranking_basis: 'fusion', passed_threshold: true, trajectory_count: 2, step_count: 2 },

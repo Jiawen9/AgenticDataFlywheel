@@ -281,7 +281,7 @@ class InternalUploadTests(unittest.TestCase):
             url = f"/api/dataset-releases/{self.release_id}/upload"
             self.adapter.configured = False
             self.assertEqual(client.get("/api/dataset-upload-capabilities").json()["internal"],
-                             {"configured": False, "reason": "云道S3上传尚未配置"})
+                             {"configured": False, "reason": "云道S3上传尚未配置", "training_jsonl_version": 1})
             self.assertEqual(client.post(url, json={"target": "internal"}).status_code, 409)
             self.assertEqual(client.post("/api/dataset-releases/missing/upload", json={"target": "internal"}).status_code, 404)
             self.assertEqual(client.post(url, json={"target": "unknown"}).status_code, 422)

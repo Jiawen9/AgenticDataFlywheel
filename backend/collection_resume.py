@@ -439,6 +439,8 @@ class ResumeService:
             batch_id=run["batch_id"], request_digest=signature, execution_instances=instances, execution_ordinal=ordinal,
             status="running", created_at=descriptor.get("created_at") or utc_now(), completed_at=None,
             dispatch_attempted=True, trajectories=[], errors=[])
+        from .short_paths import reserve_collection_layout
+        child["storage_layout"] = reserve_collection_layout(self.root, run["batch_id"], execution_id)["version"]
         child["output_dir"] = str(self.executions.runs.run_root(run["batch_id"], execution_id))
         saved=self.records.put("collection_executions", execution_id, child, expected_revision=0)
         self.execution_roots[execution_id]=run["collection_run_id"]
@@ -559,7 +561,8 @@ class ResumeService:
                     {"batch_id":run["batch_id"],"collection_run_id":execution_id,
                      "agent_type":run["request"]["metadata"].get("agent_type","newagent"),
                      "trajectories":[manifest[manifest["kind"]]],"errors":[]}, execution.get("completed_at") or execution["created_at"])
-                trajectories.extend(normalized["trajectories"])
+                from .short_paths import collection_input_trajectories
+                trajectories.extend(collection_input_trajectories(self.root, execution, normalized["trajectories"]))
                 counts["preprocessing_eligible_count"] += 1
             if row["status"] != "received" or not row.get("eligibility",{}).get("preprocessing") or status != "completed":
                 errors.append({"collection_case_id":identity[1],"phone_id":identity[0],"repeat_index":identity[2],

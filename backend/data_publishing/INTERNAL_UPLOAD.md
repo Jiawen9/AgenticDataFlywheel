@@ -73,3 +73,19 @@ npm run build
 ```
 
 这些测试只用临时发布数据及本地模拟脚本，无云道网络传输。内网最终用一个小型发布核对目录层级、选中范围、速度输出及同目标重试。未执行真实上传时不能写成云道验收通过。
+
+## 可选训练 JSONL（2026-11-17）
+
+上传弹窗增加“生成并上传训练 JSONL”，默认关闭。能力 `internal.training_jsonl_version=1`；请求附 `training_jsonl:true`，同时必须为 `target:internal`、`include_trajectories:true`。旧请求不改变。开关参与任务指纹，同目标同范围同开关复用任务；重试继承开关与目标。
+
+先上传冻结发布 Excel 和其中轨迹的完整目录，再在后台生成一份合并 JSONL，最后上传该文件。训练文件失败不撤销表格／轨迹回执，重试跳过成功目录并复用已生成文件。单批次目标为 `<前缀>/<批次>/训练数据/<发布编号>/<任务摘要>/train.jsonl`；多批次发布以发布编号替代批次根目录，图片始终引用各自实际 `s3://bucket/key`。本地仅新增 `releases/<发布编号>/training/<任务摘要>/files/train.jsonl` 与同级 `exclusions.json`，不复制图片、不打 ZIP。
+
+样本保留附件的 `messages/solution/images` 与 `<thought>/<tool_call>/<action>/sftcall/uuid/metaID` 结构，另外增加 `is_key_step`、`is_refined`。原树有效 Q 不同的分叉动作标记关键步；没有对应评分或映射为 null。人工修正仅统计生效的 action／SOP 修改，两个标记互不替代，不暗含修正后的动作已经重评。
+
+坐标保留原表值，不重新缩放。有效且与当前 action/image 绑定的框进入 tool_call；非空间动作、缺框及旧框失效用当前动作 JSON 兜底，不调用模型。OPD/skip 输出空 thought 标签。任务文本读取 task；history 从同轨迹前序保留步骤重建，采用当前 SOP／有效摘要，必要时使用当前动作的确定性描述，不混入当前或未来步骤。缺图、动作不可解析逐样本排除并列原因，不阻断 Excel／目录上传，不因缺框丢弃整条轨迹。
+
+缺图片但动作可读的步骤仍能提供后续历史；动作不可解析导致必要历史缺失时，仅其后受影响样本标记 `history_unavailable` 并列出前序步骤，其他轨迹继续输出。关键步元数据在冻结投影中保存原节点、父节点、Q覆盖数量、树摘要／版本与评分版本；未知评分的标记为 null。
+
+任务与发布详情提供 `training`：status、included_count、excluded_count、bbox_fallback_count、key_step_count、refined_count、文件摘要、实际 s3_uri。下载复用旧 GET 路径，`GET /api/dataset-upload-jobs/{id}?download=jsonl|report`；原无 download 的查询保持不变。也保留 `/training/jsonl|report` 别名。创新前端继续用自身 API_BASE_URL，不拼接本机地址。
+
+定向测试：`backend.tests.test_export_markers`、`backend.tests.test_training_jsonl_upload`，以及已有目录上传测试。真实训练加载器是否支持当前 bbox 文本／action JSON 两种 tool_call、真实云道脚本退出语义仍需内网小型发布验收；本地模拟通过不代表云道已上传。

@@ -76,15 +76,16 @@ def reconcile(session: dict, old_snapshot: dict, new_snapshot: dict, task_finger
                 cot[str(new["excel_row"])] = deepcopy(generated)
         elif edit:
             pending[key] = {"step_key": key, "task_id": task_id,
+                "trajectory_id": old.get("meta_task", ""),
                 "step": old.get("step"), "image": old.get("image", ""),
                 "baseline": deepcopy(old), "changes": deepcopy(edit),
                 "reason": "来源已更新，人工修改待复核"}
     for key, row in new_rows.items():
         baselines[str(row["excel_row"])] = row.get("actions_box", "")
-    old_groups = {_group_task_id(group): group for group in old_snapshot.get("groups", [])}
+    old_groups = {(_group_task_id(group), str(group.get("meta_task", ""))): group for group in old_snapshot.get("groups", [])}
     exports = {}
     for group in snapshot.get("groups", []):
-        old_group = old_groups.get(group["task_id"], {})
+        old_group = old_groups.get((group["task_id"], str(group.get("meta_task", ""))), {})
         exports[group["group_id"]] = bool(session.get("group_exports", {}).get(
             old_group.get("group_id"), old_group.get("export", group.get("export", False))))
     session.update(snapshot_payload=snapshot, row_edits=edits, cot=cot,
@@ -96,9 +97,20 @@ def reconcile(session: dict, old_snapshot: dict, new_snapshot: dict, task_finger
 def reviews_for_group(session: dict, snapshot: dict, group: dict) -> list[dict]:
     current = row_index(snapshot)
     task_id = _group_task_id(group)
+    siblings = [item for item in snapshot.get("groups", []) if _group_task_id(item) == task_id]
+    identities = {str(item.get("meta_task", "")) for item in siblings}
+    def belongs(key, item):
+        if str(item.get("task_id", "")) != task_id:
+            return False
+        trajectory = str(item.get("trajectory_id") or item.get("baseline", {}).get("meta_task", ""))
+        if trajectory == str(group.get("meta_task", "")) or key in {row.get("step_key") for row in group.get("rows", [])}:
+            return True
+        # An upstream-removed trajectory's retained edits remain visible once,
+        # for explicit discard. They cannot be adopted onto its replacement.
+        return trajectory not in identities and bool(siblings) and siblings[0]["group_id"] == group["group_id"]
     return [{**deepcopy(item), "can_adopt": key in current and item.get("task_id") not in session.get("stale_tasks", [])}
             for key, item in session.get("pending_review", {}).items()
-            if str(item.get("task_id", "")) == task_id]
+            if belongs(key, item)]
 
 
 def session_fingerprint(session: dict) -> str:

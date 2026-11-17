@@ -421,6 +421,9 @@ export interface CorrectionRecommendation {
   source_sha256?: string
   tasks: CorrectionTop1Task[]
   selected_trajectories?: Record<string, string>
+  selected_trajectory_ids?: Record<string, string[]>
+  selected_groups?: string[]
+  candidates?: Array<CorrectionTop1Task & { group_id?: string }>
 }
 
 export interface CorrectionBatch {
@@ -591,7 +594,9 @@ export interface CorrectionTaskItem {
 export interface CorrectionExport {
   storage_revision?: number
   export_id: string
-  kind?: 'routed' | 'full_dataset'
+  kind?: 'routed' | 'selected' | 'full_dataset' | 'corrected_selection'
+  export_profile?: 'corrected_selection_v1'
+  cot_policy?: 'generate' | 'skip'
   filename: string
   created_at: string
   download_url: string
@@ -798,18 +803,19 @@ export interface DatasetReleaseExcel {
 export type DatasetUploadStatus = 'not_uploaded' | 'queued' | 'uploading' | 'succeeded' | 'failed' | 'interrupted'
 
 export interface DatasetUploadCapabilities {
-  internal: { configured: boolean; reason: string | null; directory_upload?: boolean; default_prefix?: string; region?: string; bucket?: string }
+  internal: { configured: boolean; reason: string | null; directory_upload?: boolean; default_prefix?: string; region?: string; bucket?: string; training_jsonl_version?: number }
 }
 
 export interface DatasetUploadOptions {
   include_trajectories: boolean
   destination_prefix: string
   retry_job_id?: string
+  training_jsonl?: boolean
 }
 
 export interface DatasetUploadItem {
   idempotency_key: string
-  kind: 'excel' | 'trajectory'
+  kind: 'excel' | 'trajectory' | 'training'
   filename: string
   label?: string
   source_dir: string
@@ -819,8 +825,23 @@ export interface DatasetUploadItem {
 }
 
 export interface DatasetFolderUpload {
+  job_id?: string
   folder_upload?: boolean
   include_trajectories?: boolean
+  training_jsonl?: boolean
+  training?: {
+    status: 'ready' | 'uploading' | 'succeeded' | 'failed'
+    included_count?: number
+    excluded_count?: number
+    bbox_fallback_count?: number
+    key_step_count?: number
+    unknown_key_step_count?: number
+    refined_count?: number
+    file_path?: string
+    report_path?: string
+    s3_uri?: string
+    error?: string
+  }
   destination?: { prefix: string; region: string; bucket: string }
   source_summary?: { case_count: number; trajectory_count: number; excel_count: number }
   item_results?: DatasetUploadItem[]

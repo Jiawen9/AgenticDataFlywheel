@@ -83,6 +83,22 @@ describe('publishing upload interaction', () => {
     await state.confirmUpload()
     expect(requests.uploadDatasetRelease.mock.calls[0]?.[2]).toEqual({ include_trajectories: true, destination_prefix: 'another/' })
   })
+  it('submits the training option and does not reuse an upload with a different frozen mode', async () => {
+    const { state } = mount(); await flush()
+    state.startUpload(release({ job_id: 'old-job', status: 'failed', folder_upload: true,
+      destination: { prefix: 'old/', bucket: 'bucket', region: 'region' } }))
+    state.trainingJsonl = true
+    expect(state.retryUploadId).toBeUndefined()
+    await state.confirmUpload()
+    expect(requests.uploadDatasetRelease.mock.calls[0]?.[2]).toEqual({ include_trajectories: true, destination_prefix: 'old/', training_jsonl: true })
+  })
+  it('restores the training setting for retries', async () => {
+    const { state } = mount(); await flush()
+    state.startUpload(release({ job_id: 'training-job', status: 'failed', folder_upload: true, training_jsonl: true,
+      destination: { prefix: 'old/', bucket: 'bucket', region: 'region' } }))
+    expect(state.trainingJsonl).toBe(true)
+    expect(state.retryUploadId).toBe('training-job')
+  })
   it('allows folder retry when the already confirmed published workbook is no longer available', async () => {
     const { state } = mount(); await flush()
     const previous = { job_id: 'partly-uploaded', status: 'failed', folder_upload: true,

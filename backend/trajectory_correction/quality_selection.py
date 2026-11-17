@@ -417,6 +417,7 @@ def _selection_for_run(
             groups_by_task.setdefault(task_id, []).append(group)
 
     selected: list[dict[str, Any]] = []
+    all_candidates: list[dict[str, Any]] = []
     selected_trajectories: dict[str, str] = {}
     tree_tasks = {
         str(item.get("task_id", "")).strip(): item
@@ -488,6 +489,13 @@ def _selection_for_run(
                 "step_count": len(group.get("rows", [])),
             }
         )
+        for candidate_group, candidate_score, candidate_evaluation in candidates:
+            all_candidates.append({**selected[-1],
+                "trajectory_id": str(candidate_group["meta_task"]),
+                "global_score": candidate_score,
+                "fusion_score": candidate_evaluation.get("fusion", {}).get("score") if fusion_ranking else None,
+                "passed_threshold": _as_bool(candidate_evaluation.get("passed_threshold")),
+                "trajectory_count": 1, "step_count": len(candidate_group.get("rows", []))})
 
     return {
         "status": "ready",
@@ -505,6 +513,7 @@ def _selection_for_run(
         "task_fingerprints": run.get("tree_manifest", {}).get("task_fingerprints", {}),
         "source_json_sha256": _source_sha256(sidecar_path(source_path)) if has_workbook_json(source_path) else None,
         "tasks": selected,
+        "candidates": all_candidates,
         "selected_trajectories": selected_trajectories,
         "storage_batch_id": str(run.get("tree_manifest", {}).get("batch_id") or run["tree_run_id"]),
     }
@@ -607,9 +616,10 @@ def validate_selection_source(selection: dict[str, Any]) -> None:
     raise QualitySourceMismatch("修正选择缺少 JSON 输入版本，请重新创建会话")
 
 
-def filter_snapshot(snapshot: dict[str, Any], selection: dict[str, Any]) -> dict[str, Any]:
-    """Keep exactly one source group for every selected task."""
-    selected = selection.get("tasks", [])
+def filter_snapshot(snapshot: dict[str, Any], selection: dict[str, Any], *, include_candidates: bool = False) -> dict[str, Any]:
+    """Keep selected groups, or all scored candidates with Top1 defaults."""
+    selected = selection.get("candidates", selection.get("tasks", [])) if include_candidates else selection.get("tasks", [])
+    defaults = {(str(item["task_id"]), str(item["trajectory_id"])) for item in selection.get("tasks", [])}
     group_by_key = {
         (_group_task_id(group), str(group.get("meta_task", ""))): group
         for group in snapshot.get("groups", [])
@@ -633,7 +643,7 @@ def filter_snapshot(snapshot: dict[str, Any], selection: dict[str, Any]) -> dict
         filtered["group_id"] = f"group_{len(groups)}"
         filtered["quality"] = "未知"
         filtered["prefix"] = "[⚪ 未知]"
-        filtered["export"] = False
+        filtered["export"] = include_candidates and (task_id, trajectory_id) in defaults
         groups.append(filtered)
 
     result = dict(snapshot)

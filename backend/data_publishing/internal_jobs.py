@@ -27,12 +27,14 @@ class InternalUploadJobsMixin:
         if callable(getattr(self.internal_adapter, "get_configuration", None)):
             try:
                 config = self.internal_adapter.get_configuration()
-                result.update({key: config.get(key) for key in
-                               ("directory_upload", "default_prefix", "region", "bucket")})
-                if not configured:
-                    result["reason"] = config.get("reason") or reason
+                if isinstance(config, dict):
+                    result.update({key: config.get(key) for key in
+                                   ("directory_upload", "default_prefix", "region", "bucket")})
+                    if not configured:
+                        result["reason"] = config.get("reason") or reason
             except Exception:
                 result.update(configured=False, reason="云道S3上传配置检查失败，请联系维护人员")
+        result["training_jsonl_version"] = 1
         return {"internal": result}
 
     def _validate_excel(self, item: dict[str, Any]) -> Path:

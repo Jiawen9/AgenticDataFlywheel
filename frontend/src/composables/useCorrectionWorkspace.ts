@@ -3,7 +3,7 @@ import type { api as appApi } from '@/api'
 import type { CorrectionExport, CorrectionGroup, CorrectionGroupSummary, CorrectionRow, CorrectionSession } from '@/types'
 import { correctionTasks } from '@/utils/correctionTasks'
 
-type WorkspaceApi = Pick<typeof appApi, 'correctionGroup' | 'patchCorrectionRow' | 'patchCorrectionExport' | 'correctionExport'> & Partial<Pick<typeof appApi, 'reviewCorrectionGroup'>>
+type WorkspaceApi = Pick<typeof appApi, 'correctionGroup' | 'patchCorrectionRow' | 'patchCorrectionExport' | 'correctionExport'> & Partial<Pick<typeof appApi, 'reviewCorrectionGroup' | 'correctionDatasetExport'>>
 export type ActionDecision = 'save' | 'discard' | 'cancel'
 interface Feedback {
   error: (message: string) => void
@@ -208,12 +208,15 @@ export function useCorrectionWorkspace(api: WorkspaceApi, feedback: Feedback) {
     await patchRow(row, { deleted: !row.deleted })
   }
 
-  async function exportData(): Promise<CorrectionExport | null> {
+  async function exportData(cotPolicy?: 'generate' | 'skip'): Promise<CorrectionExport | null> {
     if (feedback.managed?.() || feedback.readOnly?.() || !session.value || !await prepareTransition()) return null
     const current = session.value
     let output: Awaited<ReturnType<WorkspaceApi['correctionExport']>> | null = null
     await trackWrite(async () => {
-      output = current.storage_revision === undefined ? await api.correctionExport(current.session_id) : await api.correctionExport(current.session_id, current.storage_revision)
+      if (cotPolicy && !api.correctionDatasetExport) throw new Error('当前接口不支持已选轨迹导出，请同步前端接口适配')
+      output = cotPolicy && api.correctionDatasetExport
+        ? await api.correctionDatasetExport(current.session_id, current.storage_revision, { export_profile: 'corrected_selection_v1', cot_policy: cotPolicy })
+        : current.storage_revision === undefined ? await api.correctionExport(current.session_id) : await api.correctionExport(current.session_id, current.storage_revision)
       if (output.storage_revision !== undefined) current.storage_revision = output.storage_revision
       current.exports.unshift(output)
       return true

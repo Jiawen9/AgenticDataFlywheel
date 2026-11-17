@@ -26,18 +26,19 @@ def project_session(payload: dict) -> dict:
     selection = mapping(payload.get("selection"))
     tasks = records(selection.get("tasks"))
     exports = records(payload.get("exports"))
-    latest = max((item for item in exports if item.get("kind") == "full_dataset"),
+    latest = max((item for item in exports if item.get("kind") in {"full_dataset", "corrected_selection"}),
                  key=lambda item: str(item.get("created_at", "")), default={})
+    tasks = records(mapping(latest.get("selection") or selection).get("tasks"))
     sheets = mapping(latest.get("sheets"))
     value = {key: payload.get(key) for key in ("session_id", "source_id", "tree_run_id", "created_at", "updated_at", "archived", "published")}
     value.update(batch_id=payload.get("storage_batch_id") or payload.get("batch_id") or payload.get("tree_run_id"),
         pending_review_count=len(mapping(payload.get("pending_review"))), stale_task_count=len(payload.get("stale_tasks") or []) if isinstance(payload.get("stale_tasks"), list) else 0,
         group_count=len(groups) if groups else count(selection.get("selected_trajectory_count") or len(tasks)),
         row_count=count(snapshot.get("row_count")), export_count=len(exports),
-        task_count=len(tasks), trajectory_count=sum(count(item.get("trajectory_count") or 1) for item in tasks),
+        task_count=len({str(item.get("task_id") or index) for index, item in enumerate(tasks)}), trajectory_count=sum(count(item.get("trajectory_count") or 1) for item in tasks),
         step_count=sum(count(number) for number in sheets.values()),
         latest_excel={"filename": latest.get("filename", ""), "created_at": latest.get("created_at"), "rows": sum(count(number) for number in sheets.values()), "path": ""},
-        ready=bool(latest), reason="" if latest else "尚未导出完整数据集 Excel",
+        ready=bool(latest), reason="" if latest else "尚未导出所选完整轨迹或完整数据集 Excel",
         readiness="cached", status="published" if payload.get("published") else "ready")
     # Hashing the authoritative draft remains part of create/export, not list reads.
     # A positive cached hint never bypasses the existing publication checks.

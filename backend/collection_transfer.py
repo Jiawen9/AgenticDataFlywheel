@@ -79,8 +79,11 @@ class CollectionTransferManager:
         manifest = ledger.manifest(artifact_id)
         transfer = ArtifactTransfer(self)
         entry, descriptors = transfer._entry(run, manifest, row["item"])
+        from .short_paths import collection_entry
+        local, mapping = collection_entry(self.root, run, entry, row["item"]["kind"])
         return {"receipt": ReceiptStore.public(row), "manifest": manifest,
-                "root": transfer._base(run, row["item"]["kind"]), "files": descriptors}
+                "root": transfer._base(run, row["item"]["kind"]), "files": descriptors,
+                "file_paths": mapping}
 
     def _poll(self):
         while not self._stop.is_set():
@@ -156,7 +159,19 @@ class CollectionTransferManager:
         return saved
 
     def _temporary(self, run_id):
-        return contained_path(self.root, "tmp", "collection_transfers", _identifier(run_id, "采集运行编号"))
+        _identifier(run_id, "采集运行编号")
+        from .short_paths import collection_layout
+        run = self.runs.get(run_id)
+        layout = collection_layout(self.root, run["batch_id"], run_id) if run else None
+        return contained_path(self.root, "tmp", "collection_transfers", layout["directory"] if layout else run_id)
+
+    def _local_files(self, run, normalized, descriptors, *, reserve=False):
+        from .short_paths import collection_entry
+        mapping = {name: name for name in descriptors}
+        for entry in normalized["trajectories"]:
+            _, files = collection_entry(self.root, run, entry, reserve=reserve)
+            mapping.update(files)
+        return mapping, {mapping[name]: value for name, value in descriptors.items()}
 
     def _remove(self, path):
         path = Path(path)
@@ -211,7 +226,13 @@ class CollectionTransferManager:
             raise CollectionRunError("结果压缩包超出平台接收上限", 413)
         return normalized, descriptors, archive_size, archive_hash
 
-    def _extract(self, archive_path, destination, descriptors):
+    def _extract(self, archive_path, destination, descriptors, *, mapping=None):
+        mapping = mapping or {name: name for name in descriptors}
+        if set(mapping) != set(descriptors):
+            raise CollectionRunError("本地解压路径映射未覆盖运输清单")
+        mapped = [_relative(name, "本地解压路径") for name in mapping.values()]
+        if len({name.casefold() for name in mapped}) != len(mapped):
+            raise CollectionRunError("本地解压路径映射冲突")
         io_path(destination).mkdir(parents=True, exist_ok=False)
         try:
             with io_path(archive_path).open("rb") as archive_file, zipfile.ZipFile(archive_file) as archive:
@@ -237,7 +258,7 @@ class CollectionTransferManager:
                 if set(files) != set(descriptors):
                     raise CollectionRunError("ZIP 缺少清单中的文件")
                 for name, item in files.items():
-                    target = contained_path(destination, name)
+                    target = contained_path(destination, mapping[name])
                     io_path(target.parent).mkdir(parents=True, exist_ok=True)
                     expected_size, expected_hash = descriptors[name]
                     checksum, received = hashlib.sha256(), 0
@@ -282,10 +303,11 @@ class CollectionTransferManager:
         if payload_digest(manifest) != journal["manifest_sha256"]:
             raise CollectionRunError("回传恢复日志校验失败")
         normalized, descriptors, _, _ = self._manifest(run, manifest)
+        _, local_descriptors = self._local_files(run, normalized, descriptors)
         staging = self._temporary(run["collection_run_id"]) / "files"
         final = self.runs.run_root(run["batch_id"], run["collection_run_id"])
         if io_path(staging).exists():
-            self._validate_tree(staging, descriptors)
+            self._validate_tree(staging, local_descriptors)
             self.runs._validate_source_files(run, normalized, root_override=staging)
             if io_path(final).exists():
                 if any(iterdir(final)):
@@ -293,7 +315,7 @@ class CollectionTransferManager:
                 io_path(final).rmdir()
             io_path(final.parent).mkdir(parents=True, exist_ok=True)
             io_path(staging).rename(io_path(final))
-        self._validate_tree(final, descriptors)
+        self._validate_tree(final, local_descriptors)
         diagnostics.log_event("collection_files_verified", file_count=len(descriptors), archive_directory=str(final))
         completed, _ = self.runs.complete(run["collection_run_id"], manifest)
         # If the process stops between complete and this update, the manifest is
@@ -410,7 +432,8 @@ class CollectionTransferManager:
                 if not io_path(archive).is_file() or io_path(archive).stat().st_size != size or workbook_digest(archive) != checksum:
                     raise CollectionRunError("远端归档的大小或 SHA256 不匹配", file_failure={
                         "code": "source_hash_mismatch", "paths": ["archive.zip"]})
-                self._extract(archive, temp / "files", descriptors)
+                mapping, _ = self._local_files(run, normalized, descriptors, reserve=True)
+                self._extract(archive, temp / "files", descriptors, mapping=mapping)
                 self.runs._validate_source_files(run, normalized, root_override=temp / "files")
                 diagnostics.log_event("collection_archive_verified", collection_run_id=run_id,
                                       file_count=len(descriptors), size_bytes=size, sha256=checksum)

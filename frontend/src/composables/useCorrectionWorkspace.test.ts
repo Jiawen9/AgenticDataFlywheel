@@ -48,6 +48,7 @@ function fixture(controls: { readOnly?: () => boolean; managed?: () => boolean }
       return summary(group)
     }),
     correctionExport: vi.fn(async (_session: string) => ({ export_id: 'export', filename: 'review.xlsx', created_at: '', download_url: '', sheets: {} })),
+    correctionDatasetExport: vi.fn(async (_session: string, _revision?: number, _options?: unknown) => ({ export_id: 'complete', filename: 'data_e1.xlsx', created_at: '', download_url: '', sheets: {} })),
   }
   const feedback = { ...controls, error: vi.fn(), actionDecision: vi.fn(async (): Promise<ActionDecision> => 'save') }
   const ws = useCorrectionWorkspace(api, feedback)
@@ -56,6 +57,17 @@ function fixture(controls: { readOnly?: () => boolean; managed?: () => boolean }
 }
 
 describe('correction task list and protected workbench', () => {
+  it('sends OPD as an explicit complete export and keeps all group choices', async () => {
+    const { ws, api, groups } = fixture()
+    await ws.toggleExport(groups[0]!)
+    await ws.toggleExport(groups[1]!)
+    expect(ws.session.value?.groups.slice(0, 2).every(group => group.export)).toBe(true)
+    const result = await ws.exportData('skip')
+    expect(result?.filename).toBe('data_e1.xlsx')
+    expect(api.correctionDatasetExport).toHaveBeenCalledWith('old-session', undefined,
+      { export_profile: 'corrected_selection_v1', cot_policy: 'skip' })
+    expect(api.correctionExport).not.toHaveBeenCalled()
+  })
   it('groups three trajectories under one case ID, keeps tie order and old-session metadata', () => {
     const { saved } = fixture()
     saved.groups[1]!.export = true

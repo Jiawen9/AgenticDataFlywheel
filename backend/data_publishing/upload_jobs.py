@@ -166,15 +166,18 @@ class DatasetUploadJobManager(DirectoryUploadJobsMixin, InternalUploadJobsMixin)
 
     def submit(self, release_id: str, *, target: Optional[str] = None,
                include_trajectories: bool = False, destination_prefix: str | None = None,
-               retry_job_id: str | None = None) -> dict[str, Any]:
+               retry_job_id: str | None = None, training_jsonl: bool = False) -> dict[str, Any]:
+        if training_jsonl and (target != "internal" or not include_trajectories):
+            raise ValueError("训练 JSONL 需要上传所选完整轨迹到云道")
         if include_trajectories:
             if target != "internal":
                 raise ValueError("完整轨迹上传只支持云道目标")
-            return self._submit_directory(release_id, destination_prefix=destination_prefix, retry_job_id=retry_job_id)
+            return self._submit_directory(release_id, destination_prefix=destination_prefix, retry_job_id=retry_job_id, training_jsonl=training_jsonl)
         if destination_prefix is not None or retry_job_id is not None:
             raise ValueError("自定义云道目录需启用完整轨迹上传")
         if target == "internal":
-            if callable(getattr(self.internal_adapter, "upload_directory", None)):
+            if (callable(getattr(self.internal_adapter, "upload_directory", None))
+                    and self.internal_capabilities()["internal"].get("directory_upload") is True):
                 return self._submit_directory(release_id, include_trajectories=False)
             return self._submit_internal(release_id)
         if target not in {None, "mock"}:

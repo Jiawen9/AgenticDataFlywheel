@@ -20,6 +20,110 @@ from .file_io import io_path, is_link_or_junction
 from .identifiers import ID_SCHEME, allocate_id, batch_uses_short_ids
 
 STORAGE_LAYOUT = "short-v1"
+COLLECTION_LAYOUT = "compact-v1"
+
+
+def collection_path_budget(path, *, limit=240):
+    """Report a Windows UTF-16 path budget without blocking evidence receipt."""
+    length = len(os.path.abspath(os.fspath(path)).encode("utf-16-le")) // 2
+    return {"path_length": length, "path_budget": limit, "within_budget": length <= limit,
+            "warning": None if length <= limit else "generated_path_exceeds_budget"}
+
+
+def collection_layout(root, batch_id, run_id):
+    """Read a physical location, never infer it from a presentation alias."""
+    saved = RecordStore(root).get("collection_storage_layouts", run_id)
+    if saved is None:
+        return None
+    value = saved.get("value", {})
+    if (saved.get("sha256") != _digest(value) or value.get("version") != COLLECTION_LAYOUT
+            or value.get("batch_id") != batch_id or value.get("run_id") != run_id
+            or not re.fullmatch(r"r\d{6}-\d{3,}", value.get("directory", ""))):
+        raise ValueError("采集物理目录登记损坏或身份不一致")
+    return value
+
+
+def reserve_collection_layout(root, batch_id, run_id):
+    """Only call before creating a new run/segment, never while reading history."""
+    previous = collection_layout(root, batch_id, run_id)
+    if previous is not None:
+        return previous
+    identifier = allocate_id("r", root, key=[COLLECTION_LAYOUT, "run", batch_id, run_id])
+    value = {"version": COLLECTION_LAYOUT, "batch_id": batch_id, "run_id": run_id,
+             "directory": identifier}
+    value["storage_path_budget"] = collection_path_budget(Path(root) / "raw" / "collection_batches" / batch_id /
+        "runs" / identifier / "tr000000-000" / "step001_vla_input_stability_ui_capture.json")
+    store = RecordStore(root)
+    try:
+        store.put("collection_storage_layouts", run_id, {"value": value, "sha256": _digest(value)}, expected_revision=0)
+    except RevisionConflict:
+        if collection_layout(root, batch_id, run_id) != value:
+            raise
+    return value
+
+
+def collection_entry(root, run, entry, kind="trajectory", *, reserve=False):
+    """Map validated transport paths without changing their immutable manifest.
+
+    Leaves/subdirectories and file bytes are retained. Hashes identify mappings;
+    uniquely reserved IDs, not truncated hashes, name filesystem directories.
+    """
+    result = copy.deepcopy(entry)
+    layout = collection_layout(root, run["batch_id"], run["collection_run_id"])
+    original = entry["relative_dir"]
+    if layout is None or kind == "outcome":
+        return result, {item["path"]: item["path"] for item in entry["files"]}
+    identity = {"run_id": run["collection_run_id"], "kind": kind, "relative_dir": original,
+                **{key: entry.get(key) for key in ("collection_case_id", "phone_id", "source_trajectory_id",
+                   "repeat_index", "repeat_times")}}
+    # One wire directory may never be rebound to a different trajectory.
+    key = _digest([run["collection_run_id"], kind, original.casefold()])
+    store = RecordStore(root)
+    saved = store.get("collection_evidence_locations", key)
+    if saved is None and reserve:
+        local = allocate_id("tr" if kind == "trajectory" else "d", root,
+                            key=[COLLECTION_LAYOUT, "evidence", identity])
+        value = {"identity": identity, "directory": local, "version": COLLECTION_LAYOUT}
+        value["storage_path_budget"] = collection_path_budget(Path(root) / "raw" / "collection_batches" /
+            run["batch_id"] / "runs" / layout["directory"] / local / "step001_vla_input_stability_ui_capture.json")
+        try:
+            store.put("collection_evidence_locations", key, {"value": value, "sha256": _digest(value)}, expected_revision=0)
+        except RevisionConflict:
+            pass
+        saved = store.get("collection_evidence_locations", key)
+    if saved is None:
+        # Direct legacy completion can still use its declared wire directories.
+        # Streaming consumers require a reserved mapping before saving bytes.
+        return result, {item["path"]: item["path"] for item in entry["files"]}
+    value = saved.get("value", {})
+    if (saved.get("sha256") != _digest(value) or value.get("identity") != identity
+            or value.get("version") != COLLECTION_LAYOUT
+            or not re.fullmatch(r"(?:tr|d)\d{6}-\d{3,}", value.get("directory", ""))):
+        raise ValueError("采集原件物理路径映射与来源身份不一致")
+    local = value["directory"]
+    mapping = {}
+    for item in result["files"]:
+        source = item["path"]
+        if not source.startswith(original + "/"):
+            raise ValueError("采集文件越出登记原件目录")
+        target = local + source[len(original):]
+        mapping[source] = target
+        item["source_path"], item["path"] = source, target
+    result.update(relative_dir=local, source_relative_dir=original, storage_layout=COLLECTION_LAYOUT)
+    return result, mapping
+
+
+def collection_input_trajectories(root, run, trajectories):
+    """Freeze actual local paths for new downstream inputs; leave old snapshots alone."""
+    layout = collection_layout(root, run["batch_id"], run["collection_run_id"])
+    if layout is None:
+        return copy.deepcopy(trajectories)
+    result = []
+    for trajectory in trajectories:
+        local, _ = collection_entry(root, run, trajectory)
+        local["storage_run_dir"] = layout["directory"]
+        result.append(local)
+    return result
 
 
 def _digest(value):
@@ -125,7 +229,9 @@ def adapt_conversion_identity(payload, snapshot, root):
             if not run_id:
                 continue
             image = str(row.get("image", "")).replace("\\", "/")
-            prefix = "runs/" + run_id + "/"
+            storage_run = next((item.get("storage_run_dir", run_id) for item in snapshot["trajectories"]
+                                if item["collection_run_id"] == run_id), run_id)
+            prefix = "runs/" + storage_run + "/"
             if not image.startswith(prefix):
                 raise ValueError("轨迹截图不属于登记运行")
             relative = image[len(prefix):].rsplit("/", 1)[0]
