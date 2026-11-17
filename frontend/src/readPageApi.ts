@@ -3,7 +3,7 @@ import type { CorrectionBatch, CorrectionCotJob, CorrectionCotResponse, Correcti
 import { summaryParams, type SummaryPage, type SummaryQuery } from '@/utils/summaryCache'
 
 const page = <T>(path: string, query: SummaryQuery) => request<SummaryPage<T>>(`${path}?${summaryParams(query)}`)
-export type ReleaseSummary = DatasetRelease & { excel_count?: number; availability_checked?: boolean }
+export type ReleaseSummary = DatasetRelease & { excel_count?: number; training_count?: number; training_ready_count?: number; availability_checked?: boolean }
 export type GroupSummary = CorrectionGroupSummary & { cot_row_count?: number; generated_row_count?: number }
 export const readPageApi = {
   correctionBatches: (query: SummaryQuery = {}) => page<CorrectionBatch>('/api/correction/batches', query),

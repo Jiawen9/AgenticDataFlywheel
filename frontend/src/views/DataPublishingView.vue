@@ -12,7 +12,7 @@ import { useRoute } from 'vue-router'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { CopyDocument, Download, Plus, Refresh, Search, Upload, View } from '@element-plus/icons-vue'
-import { api, datasetReleaseExcelUrl } from '@/api'
+import { api, datasetReleaseExcelUrl, datasetReleaseTrainingUrl } from '@/api'
 import { readPageApi, type ReleaseSummary } from '@/readPageApi'
 import { useSummaryPage } from '@/composables/useSummaryPage'
 import { invalidateSummaryCache } from '@/utils/summaryCache'
@@ -35,8 +35,16 @@ const uploadDialogVisible = ref(false)
 const uploadRelease = ref<DatasetRelease | null>(null)
 const destinationPrefix = ref('')
 const trainingJsonl = ref(false)
+const trainingOnly = ref(false)
+const trainingDestinationPrefix = ref('')
+const pairedTraining = computed(() => uploadRelease.value?.training_files?.filter(item => item.status === 'ready') || [])
+const imagePrefixes = computed(() => [...new Set(pairedTraining.value.map(item => item.image_prefix).filter(Boolean))])
+const normalizePrefix = (value: string | undefined) => (value || '').trim().replace(/\\/g, '/').split('/').filter(Boolean).join('/')
 const retryUploadId = computed(() => Boolean(uploadRelease.value?.internal_upload?.training_jsonl) === trainingJsonl.value
+  && Boolean(uploadRelease.value?.internal_upload?.training_only) === trainingOnly.value
+  && normalizePrefix(uploadRelease.value?.internal_upload?.training_destination_prefix) === normalizePrefix(trainingDestinationPrefix.value)
   ? uploadRetryJobId(uploadRelease.value?.internal_upload, destinationPrefix.value) : undefined)
+watch(trainingOnly, value => { if (value) trainingJsonl.value = true })
 const uploadDestination = computed(() => retryUploadId.value && uploadRelease.value?.internal_upload?.destination
   ? uploadRelease.value.internal_upload.destination : capabilities.value.internal)
 const pollError = ref('')
@@ -96,6 +104,7 @@ watch(candidateRead.items, items => { candidates.value = activeBatchItems(items)
 watch([searchText, statusFilter, historyLimit], () => { historyPage.value = 1 })
 watch([candidateSearch, candidateLimit], () => { candidatePage.value = 1 })
 const excelCount = (item: DatasetRelease) => (item as ReleaseSummary).excel_count ?? item.excel_paths?.length ?? 0
+const trainingCount = (item: DatasetRelease) => (item as ReleaseSummary).training_count ?? item.training_files?.length ?? 0
 
 function formatDate(value: string | null | undefined) {
   if (!value) return '—'
@@ -222,7 +231,7 @@ async function pollUpload(jobId: string, epoch = pollEpoch) {
     invalidateSummaryCache()
     await loadData(true)
     if (disposed || epoch !== pollEpoch) return
-    if (job.status === 'succeeded') ElMessage.success(job.folder_upload && job.include_trajectories !== false ? '发布表格及所选完整轨迹已上传到云道S3' : '全部表格已上传到云道S3')
+    if (job.status === 'succeeded') ElMessage.success(job.training_only ? '训练 JSONL 已上传到云道S3' : job.folder_upload && job.include_trajectories !== false ? '发布表格及所选完整轨迹已上传到云道S3' : '全部表格已上传到云道S3')
     else ElMessage.error(datasetUploadMessage(job.error) || '上传作业未成功完成')
   } catch (error) {
     if (disposed || epoch !== pollEpoch) return
@@ -232,7 +241,7 @@ async function pollUpload(jobId: string, epoch = pollEpoch) {
   }
 }
 
-async function startUpload(release: DatasetRelease) {
+async function startUpload(release: DatasetRelease, onlyTraining?: boolean) {
   if (uploadDisabled(release)) return
   const epoch = ++detailEpoch
   try { if ((release as ReleaseSummary).availability_checked === false) release = await api.datasetRelease(release.release_id) }
@@ -240,7 +249,9 @@ async function startUpload(release: DatasetRelease) {
   if (disposed || epoch !== detailEpoch) return
   uploadRelease.value = release
   destinationPrefix.value = uploadDestinationPrefix(release.internal_upload, capabilities.value)
-  trainingJsonl.value = Boolean(release.internal_upload?.training_jsonl)
+  trainingOnly.value = onlyTraining ?? Boolean(release.internal_upload?.training_only)
+  trainingJsonl.value = trainingOnly.value || (release.internal_upload ? Boolean(release.internal_upload.training_jsonl) : Boolean(release.training_files?.some(item => item.status === 'ready')))
+  trainingDestinationPrefix.value = release.internal_upload?.training_destination_prefix || ''
   uploadDialogVisible.value = true
 }
 
@@ -251,8 +262,10 @@ async function confirmUpload() {
   submitting.value = true
   try {
     const job = await api.uploadDatasetRelease(release.release_id, 'internal', folders ? {
-      include_trajectories: true, destination_prefix: destinationPrefix.value.trim(),
+      include_trajectories: !trainingOnly.value, destination_prefix: destinationPrefix.value.trim(),
       ...(trainingJsonl.value ? { training_jsonl: true } : {}),
+      ...(trainingOnly.value ? { training_only: true } : {}),
+      ...(trainingJsonl.value && trainingDestinationPrefix.value.trim() ? { training_destination_prefix: trainingDestinationPrefix.value.trim() } : {}),
       ...(retryUploadId.value ? { retry_job_id: retryUploadId.value } : {}),
     } : undefined)
     localStorage.setItem(ACTIVE_UPLOAD_KEY, job.job_id)
@@ -395,6 +408,7 @@ onBeforeUnmount(() => { if (typeof document !== 'undefined') document.removeEven
         <el-table-column label="来源" min-width="120"><template #default="{ row }"><el-tag :type="isExternalRelease(row) ? 'info' : 'success'">{{ releaseSource(row) }}</el-tag><small v-if="isExternalRelease(row)" class="release-progress">{{ row.external_import?.data_source || '人工采集' }}</small></template></el-table-column>
         <el-table-column label="发布时间" min-width="170"><template #default="{ row }">{{ formatDate(row.created_at) }}</template></el-table-column>
         <el-table-column label="规模" min-width="180"><template #default="{ row }">{{ excelCount(row) }} Excel · {{ row.trajectory_count }} 轨迹 · {{ row.step_count }} 步</template></el-table-column>
+        <el-table-column label="训练 JSONL" min-width="135"><template #default="{ row }"><el-button v-if="trainingCount(row)" text type="primary" @click="showDetails(row)">查看 {{ trainingCount(row) }} 份配套文件</el-button><span v-else class="release-progress">暂无配套文件</span></template></el-table-column>
         <el-table-column label="云道S3" min-width="130"><template #default="{ row }"><el-tag :type="statusType(internalStatus(row))" effect="light">{{ statusText(internalStatus(row)) }}</el-tag><small v-if="row.internal_upload" class="release-progress">{{ row.internal_upload.folder_upload ? `${row.internal_upload.completed_items || 0}/${row.internal_upload.total_items || 0} 个目录` : `${row.internal_upload.completed_files}/${row.internal_upload.total_files} 个 Excel` }}</small></template></el-table-column>
         <el-table-column label="操作" width="380" fixed="right"><template #default="{ row }"><el-button text :icon="View" @click="showDetails(row)">详情</el-button><el-button v-if="excelCount(row)" text :icon="Download" tag="a" :href="datasetReleaseExcelUrl(row.release_id, 0)" target="_blank">下载 Excel</el-button><el-button text type="primary" :icon="Upload" :disabled="uploadDisabled(row)" @click="startUpload(row)">{{ uploadLabel(row) }}</el-button></template></el-table-column>
       </el-table>
@@ -408,15 +422,20 @@ onBeforeUnmount(() => { if (typeof document !== 'undefined') document.removeEven
       <template v-if="uploadRelease">
         <p><b>{{ uploadRelease.name }}</b></p>
         <template v-if="!isExternalRelease(uploadRelease)">
-          <p class="upload-scope">按冻结发布表包含的轨迹上传完整目录，不读取当前页面勾选。例如同一用例 10 条轨迹中发布 2 条，只上传这 2 条的完整文件。旧“完整数据集”表可能包含全部轨迹，实际范围会在后台定位后展示。</p>
+          <p v-if="!trainingOnly" class="upload-scope">按冻结发布表包含的轨迹上传完整目录，不读取当前页面勾选。例如同一用例 10 条轨迹中发布 2 条，只上传这 2 条的完整文件。旧“完整数据集”表可能包含全部轨迹，实际范围会在后台定位后展示。</p>
           <el-form label-position="top" @submit.prevent="confirmUpload">
-            <el-form-item label="云道目标前缀"><el-input v-model="destinationPrefix" data-testid="upload-destination-prefix" :disabled="submitting" placeholder="例如 data/gui_data/flywheel_data/（空白表示 bucket 根目录）" /></el-form-item>
-            <el-form-item label="训练文件"><el-switch v-model="trainingJsonl" data-testid="training-jsonl-switch" :disabled="submitting || capabilities.internal.training_jsonl_version !== 1" active-text="生成并上传训练 JSONL" /><small v-if="capabilities.internal.training_jsonl_version !== 1">需要同步支持训练导出的后端。</small></el-form-item>
+            <el-form-item v-if="pairedTraining.length" label="上传内容"><el-radio-group v-model="trainingOnly" data-testid="training-upload-scope" :disabled="submitting || capabilities.internal.training_pair_version !== 2"><el-radio-button :value="false">表格与完整轨迹</el-radio-button><el-radio-button :value="true">仅训练 JSONL</el-radio-button></el-radio-group><small v-if="capabilities.internal.training_pair_version !== 2">单独上传需要同步支持配套 JSONL 的后端。</small></el-form-item>
+            <el-form-item v-if="!trainingOnly" :label="pairedTraining.length ? '发布表格目标前缀' : '云道目标前缀'"><el-input v-model="destinationPrefix" data-testid="upload-destination-prefix" :disabled="submitting" placeholder="例如 data/gui_data/flywheel_data/（空白表示 bucket 根目录）" /></el-form-item>
+            <el-form-item v-if="!trainingOnly" label="训练文件"><el-switch v-model="trainingJsonl" data-testid="training-jsonl-switch" :disabled="submitting || (capabilities.internal.training_jsonl_version !== 1 && capabilities.internal.training_pair_version !== 2)" :active-text="pairedTraining.length ? '同时上传已生成的配套 JSONL' : '生成并上传训练 JSONL（旧导出）'" /><small v-if="capabilities.internal.training_jsonl_version !== 1 && capabilities.internal.training_pair_version !== 2">需要同步支持训练导出的后端。</small></el-form-item>
+            <el-form-item v-if="trainingJsonl" label="JSONL 上传目录"><el-input v-model="trainingDestinationPrefix" data-testid="training-destination-prefix" :disabled="submitting" placeholder="bucket 内目录；留空使用目标前缀/批次编号/训练数据" /><small>独立设置 JSONL 文件的位置，不改变文件内的图片地址。多份表格分别放入 001、002 等子目录。</small></el-form-item>
           </el-form>
           <p class="upload-scope">Bucket：{{ uploadDestination.bucket || '后端配置' }} · Region：{{ uploadDestination.region || '后端配置' }}</p>
-          <p class="upload-scope">目标：<code>s3://{{ uploadDestination.bucket || 'bucket' }}/{{ destinationPrefix.replace(/^\/+|\/+$/g, '') }}{{ destinationPrefix.replace(/^\/+|\/+$/g, '') ? '/' : '' }}&lt;批次编号&gt;/</code></p>
-          <p class="upload-scope">发布表格放入“发布表格/序号/”，轨迹按“用例/轨迹/”保存。直接传输现有目录，不额外复制本地数据。</p>
-          <p v-if="trainingJsonl" class="upload-scope">轨迹目录上传成功后生成训练 JSONL，图片引用实际 S3 地址。保留原表坐标，缺框使用动作 JSON；无法读取图片或动作无效的样本逐条列入报告。原表与轨迹上传结果独立保留。</p>
+          <p v-if="!trainingOnly" class="upload-scope">表格目标：<code>s3://{{ uploadDestination.bucket || 'bucket' }}/{{ normalizePrefix(destinationPrefix) }}{{ normalizePrefix(destinationPrefix) ? '/' : '' }}&lt;批次编号&gt;/发布表格/</code></p>
+          <p v-if="trainingJsonl" class="upload-scope">JSONL 目标：<code>s3://{{ uploadDestination.bucket || 'bucket' }}/{{ normalizePrefix(trainingDestinationPrefix) || [normalizePrefix(destinationPrefix), uploadRelease.batch_ids?.length === 1 ? uploadRelease.batch_ids[0] : uploadRelease.release_id, '训练数据'].filter(Boolean).join('/') }}/</code></p>
+          <p v-for="prefix in imagePrefixes" :key="prefix" class="upload-scope">导出时确定的图片前缀：<code>{{ prefix }}</code></p>
+          <p v-if="pairedTraining.length" class="upload-scope">上传配套文件，不重新转换内容。完整轨迹沿用上面的图片前缀，修改表格或 JSONL 上传目录不会改变图片地址。</p>
+          <p v-if="trainingOnly" class="upload-scope">本次只上传 JSONL，不重复上传 Excel 或图片；请确认图片已上传，或随后按上述图片前缀上传。</p>
+          <p v-else-if="trainingJsonl && !pairedTraining.length" class="upload-scope">旧导出仍在轨迹目录上传成功后生成 JSONL。缺框使用动作 JSON，无法转换的样本列入报告；原表与轨迹上传结果独立保留。</p>
           <p v-if="uploadRelease.internal_upload?.folder_upload && ['failed', 'interrupted'].includes(internalStatus(uploadRelease))" class="upload-scope">已填入上次目标。保持目标重试可跳过成功目录；更改目标会创建新上传任务。</p>
         </template>
         <p v-else class="upload-scope">外部导入记录沿用表格上传，不查找或上传外部轨迹目录。</p>
@@ -453,6 +472,20 @@ onBeforeUnmount(() => { if (typeof document !== 'undefined') document.removeEven
           <DatasetUploadReceipts v-else :files="detailRelease.internal_upload.file_results" />
         </template>
         <ReleaseOverviewStatus v-if="detailVisible" :key="detailRelease.release_id" :release-id="detailRelease.release_id" />
+        <template v-if="detailRelease.training_files?.length">
+          <h4>配套训练 JSONL</h4>
+          <div v-for="training in detailRelease.training_files" :key="training.index" class="training-detail">
+            <b>表格 {{ training.index + 1 }} · {{ training.filename || '训练文件' }}</b>
+            <span>样本 {{ training.included_count || 0 }} 条 · 排除 {{ training.excluded_count || 0 }} 条</span>
+            <code v-if="training.image_prefix">图片前缀：{{ training.image_prefix }}</code>
+            <p v-if="training.error" class="training-error">{{ training.error }}</p>
+            <div class="training-links">
+              <el-button v-if="training.status === 'ready'" text :icon="Download" tag="a" :href="datasetReleaseTrainingUrl(detailRelease.release_id, training.index)" target="_blank" :disabled="training.available === false">下载 JSONL</el-button>
+              <el-button v-if="training.report_filename && training.report_sha256" text tag="a" :href="datasetReleaseTrainingUrl(detailRelease.release_id, training.index, 'report')" target="_blank">下载转换报告</el-button>
+            </div>
+          </div>
+          <el-button v-if="detailRelease.training_files.some(item => item.status === 'ready')" data-testid="upload-training-only" type="primary" plain :disabled="uploadDisabled(detailRelease) || capabilities.internal.training_pair_version !== 2" @click="startUpload(detailRelease, true)">仅上传训练 JSONL</el-button>
+        </template>
         <h4>{{ isExternalRelease(detailRelease) || isPipelineRelease(detailRelease) ? '发布 Excel' : '纠偏 Excel' }}</h4>
         <div v-for="(excel, index) in detailRelease.excel_paths" :key="excel.path" class="excel-detail"><div><b>{{ excel.filename }}</b><span>{{ excel.rows }} 行 · {{ excel.available ? '本地可用' : '本地缺失' }}</span></div><code v-if="!isExternalRelease(detailRelease)">{{ excel.path }}</code><small>SHA256 {{ excel.sha256 }}</small><el-button text :icon="Download" tag="a" :href="datasetReleaseExcelUrl(detailRelease.release_id, index)" target="_blank" :disabled="excel.available === false">下载</el-button></div>
       </template>
@@ -505,6 +538,7 @@ onBeforeUnmount(() => { if (typeof document !== 'undefined') document.removeEven
 .release-progress { display: block; color: var(--muted); margin-top: 5px; }
 .retry-hint { color: var(--muted); font-size: 13px; }
 .upload-scope { color: var(--muted); line-height: 1.7; overflow-wrap: anywhere; }
+.training-detail{display:grid;gap:7px;border:1px solid var(--line);border-radius:9px;padding:12px;margin-bottom:10px;font-size:13px}.training-detail code{overflow-wrap:anywhere}.training-links{display:flex;gap:12px;flex-wrap:wrap}.training-error{color:#b91c1c}
 .history-heading { align-items: center; margin-bottom: 16px; }
 .filters { display: grid; grid-template-columns: 240px 130px; gap: 10px; }
 .release-name { display: grid; gap: 4px; }

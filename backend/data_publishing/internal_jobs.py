@@ -35,6 +35,7 @@ class InternalUploadJobsMixin:
             except Exception:
                 result.update(configured=False, reason="云道S3上传配置检查失败，请联系维护人员")
         result["training_jsonl_version"] = 1
+        result["training_pair_version"] = 2
         return {"internal": result}
 
     def _validate_excel(self, item: dict[str, Any]) -> Path:

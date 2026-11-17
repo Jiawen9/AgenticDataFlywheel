@@ -34,6 +34,8 @@ class UploadReleaseRequest(BaseModel):
     destination_prefix: str | None = Field(default=None, max_length=1024)
     retry_job_id: str | None = Field(default=None, min_length=1, max_length=128)
     training_jsonl: bool = False
+    training_only: bool = False
+    training_destination_prefix: str | None = Field(default=None, max_length=1024)
 
 
 router = APIRouter(prefix="/api", tags=["data-publishing"])
@@ -155,6 +157,18 @@ def dataset_upload_capabilities() -> dict[str, object]:
     return upload_manager.internal_capabilities()
 
 
+@router.get("/dataset-releases/{release_id}/training/{index}")
+def dataset_release_training(release_id: str, index: int, kind: Literal["jsonl", "report"] = "jsonl") -> FileResponse:
+    try:
+        path, filename = registry.training_file(release_id, index, kind)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    from ..file_io import io_path
+    return FileResponse(io_path(path), filename=filename, media_type="application/x-ndjson" if kind == "jsonl" else "application/json")
+
+
 @router.post("/dataset-releases/{release_id}/upload", status_code=202)
 def upload_dataset_release(release_id: str, request: Optional[UploadReleaseRequest] = None) -> dict[str, object]:
     try:
@@ -163,7 +177,9 @@ def upload_dataset_release(release_id: str, request: Optional[UploadReleaseReque
             include_trajectories=request.include_trajectories if request else False,
             destination_prefix=request.destination_prefix if request else None,
             retry_job_id=request.retry_job_id if request else None,
-            training_jsonl=request.training_jsonl if request else False)}
+            training_jsonl=request.training_jsonl if request else False,
+            training_only=request.training_only if request else False,
+            training_destination_prefix=request.training_destination_prefix if request else None)}
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except InternalUploadConflict as exc:

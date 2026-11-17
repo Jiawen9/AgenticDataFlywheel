@@ -293,7 +293,7 @@ export const api = {
   correctionExport(sessionId: string, expectedRevision?: number): Promise<CorrectionExport> {
     return request(`/api/correction/sessions/${encodeURIComponent(sessionId)}/export`, { method: 'POST', body: JSON.stringify({ expected_revision: expectedRevision }) })
   },
-  correctionDatasetExport(sessionId: string, expectedRevision?: number, options?: { export_profile: 'corrected_selection_v1'; cot_policy: 'generate' | 'skip' }): Promise<CorrectionExport> {
+  correctionDatasetExport(sessionId: string, expectedRevision?: number, options?: { export_profile: 'corrected_selection_v1'; cot_policy: 'generate' | 'skip'; training_image_prefix?: string }): Promise<CorrectionExport> {
     return request(`/api/correction/sessions/${encodeURIComponent(sessionId)}/dataset-export`, { method: 'POST', body: JSON.stringify({ expected_revision: expectedRevision, ...options }) })
   },
   async datasetReleaseCandidates(): Promise<DatasetReleaseCandidate[]> {
@@ -334,6 +334,10 @@ export function treeRunScope(run: Pick<TreeRun, 'batch_id' | 'annotation_version
 
 export function datasetTrainingDownloadUrl(jobId: string, kind: 'jsonl' | 'report'): string {
   return `${API_BASE}/api/dataset-upload-jobs/${encodeURIComponent(jobId)}?download=${kind}`
+}
+
+export function datasetReleaseTrainingUrl(releaseId: string, index: number, kind: 'jsonl' | 'report' = 'jsonl'): string {
+  return `${API_BASE}/api/dataset-releases/${encodeURIComponent(releaseId)}/training/${index}?kind=${kind}`
 }
 
 export function imageUrl(relativePath: string, scope?: TrajectoryScope): string {

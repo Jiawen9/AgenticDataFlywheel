@@ -7,8 +7,8 @@
 1. 纠偏页面从质检合格候选建立会话。默认选 Top-1；同任务可增选其他轨迹。修改、复核和选择按任务＋轨迹身份独立保存，切换轨迹或刷新保留。
 2. 需要 COT 时沿现有 COT 操作生成，再使用“导出已选轨迹”；也可直接选择 OPD 导出。OPD 不提交 COT 或标框模型作业，仅在导出副本清空 thought。
 3. 新完整选轨导出包含每条所选轨迹的全部未删除步骤。旧 SFT/RL 截至修正点的分流导出仍为原规则，两者不能混称。
-4. 在发布页选该冻结导出创建发布；上传时勾选“同时生成并上传训练 JSONL”。表格、完整轨迹目录和 JSONL 读取同一个发布快照，不读取后来页面勾选。
-5. 查看转换样本数、排除数、目录进度；下载训练文件和排除报告。没有有效样本时不把空 JSONL 当成功，表格／原件上传结果独立保留。
+4. 在纠偏完整选轨／OPD 导出时，根据最终表格及图片前缀生成配套 JSONL，可立即下载。发布保存同一组表格和训练文件，上传读取该版本，不读取后来页面勾选。
+5. 发布页支持独立填写 JSONL 目标目录并单独上传，显示转换样本数、排除数、目录进度及报告。没有有效样本时不把空 JSONL 当成功，表格／原件上传结果独立保留。详细字段对应见 [Excel 配套 JSONL](paired-training-jsonl-20261117.md)。
 
 自动流程人工模式冻结 `export_profile`、`cot_policy` 和选轨集合；OPD 的 COT 阶段显示跳过。全自动继续原 Top-1／既有 thought 策略，旧流程缺省不变。
 
@@ -26,9 +26,9 @@
 继续使用现有接口和项目统一 API 地址：
 
 - `PATCH /api/correction/sessions/{session}/tasks/{group}/export`：按 group 保存选择，携带 `export` 和 `expected_revision`。不要在前端把同任务的选择压成单个 trajectory。
-- `POST /api/correction/sessions/{session}/dataset-export`：新流程发送 `export_profile: "corrected_selection_v1"`、`cot_policy: "generate" | "skip"`、`expected_revision`。不传新 profile 仍走旧完整导出。
+- `POST /api/correction/sessions/{session}/dataset-export`：新流程发送 `export_profile: "corrected_selection_v1"`、`cot_policy: "generate" | "skip"`、`expected_revision`，可填写完整 URI `training_image_prefix`。响应含配套文件 `training`。不传新 profile 仍走旧完整导出。
 - 自动流程创建请求增加同名 `export_profile`／`cot_policy`；只在明确 OPD 时发送 `skip`。
-- `POST /api/dataset-releases/{release}/upload`：增加可选 `training_jsonl: true`，旧请求缺省 false。训练文件需要对应图片，请同时发送 `target: "internal"`、`include_trajectories: true`（本仓库页面自动带入）；继续使用已有 `destination_prefix` 和重试字段。
+- `POST /api/dataset-releases/{release}/upload`：保留可选 `training_jsonl: true`，增加 `training_only` 和独立的 `training_destination_prefix`。配套文件可仅上传 JSONL，不必重传 Excel／图片；旧发布的上传阶段转换仍需 `include_trajectories:true`。继续使用 `target:"internal"`、已有 `destination_prefix` 和重试字段。
 - 上传作业 GET 返回训练转换状态、数量、摘要及错误；沿既有 GET 使用 `?download=jsonl` 或 `?download=report` 下载，避免额外依赖网关新增路径。兼容的 `/training/{kind}` 别名也可用。
 - 列表统计分别显示任务数、轨迹数、实际导出步骤数。标记按具名字段读取，不能以 Excel 最后一列位置推断。
 
@@ -36,7 +36,7 @@
 
 ## Excel 与 JSONL 契约
 
-新增 Excel 列 `is_key_step`、`is_refined`；JSONL 同名两个顶层字段，既有 `messages`、`solution`、`images` 保留。system/user 模板与附件保持一致，solution 顺序为 thought → tool_call → action → sftcall → uuid → metaID。
+新增 Excel 列 `is_key_step`、`is_refined`；完整选轨导出还补齐任务正文、任务／轨迹编号、步骤与当前历史及训练图片映射，供纯表格转换。JSONL 同名两个顶层标记字段，既有 `messages`、`solution`、`images` 保留。system/user 模板与附件保持一致，solution 顺序为 thought → tool_call → action → sftcall → uuid → metaID。
 
 `is_key_step` 使用冻结原树的 occurrence 和稳定步骤身份。同父节点至少两个有效 Q 分支且未舍入差值大于 `1e-8` 时标记对应子分支动作；等分 false，无法判定 null。原 Q、覆盖和版本留在导出元数据，不把人工修改后轨迹当作已重新评分。
 
@@ -50,7 +50,7 @@ tool_call 优先使用与当前动作和图片匹配的有效框；动作修改�
 
 ## 上传与数据保护
 
-每个发布／上传目标生成一份合并 JSONL，云道训练目录按发布及上传请求隔离。目标变化创建新上传任务。只生成小型 JSONL 与排除报告，不复制轨迹、不生成中间 Excel、不打 ZIP、不改原件。图片目录完成后上传训练文件；重试复用已确认成功的目录。
+新导出每份 Excel 配套一份 JSONL，发布保留各自配对关系，多表上传用序号子目录隔离。训练文件的目标目录可单独修改，变化创建新上传任务，不改变已生成的图片引用或样本编号。只生成小型 JSONL 与排除报告，不复制轨迹、不生成中间 Excel、不打 ZIP、不改原件。综合上传仍先传图片再传训练文件，也可仅上传配套 JSONL；重试复用已确认成功的目录。旧发布没有配套文件时继续使用旧版上传阶段合并转换。
 
 原上传脚本的 Python、token、region、bucket 配置不变。私有脚本须支持现有目录参数并在真实上传完成后退出；本地模拟上传不能证明内网云道已成功。
 

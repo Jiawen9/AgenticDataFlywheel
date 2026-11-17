@@ -269,7 +269,7 @@ def correction_dataset_export(session_id: str, request: DatasetExportRequest) ->
     try:
         if request.export_profile is not None:
             from .service import export_selected_session
-            return export_selected_session(session_id, request.expected_revision, export_profile=request.export_profile, cot_policy=request.cot_policy)
+            return export_selected_session(session_id, request.expected_revision, export_profile=request.export_profile, cot_policy=request.cot_policy, training_image_prefix=request.training_image_prefix)
         return export_dataset_session(session_id, request.expected_revision)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -290,7 +290,7 @@ def correction_export_download(session_id: str, filename: str) -> FileResponse:
     return FileResponse(
         io_path(path),
         filename=path.name,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        media_type={".jsonl": "application/x-ndjson", ".json": "application/json"}.get(path.suffix.lower(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
     )
 
 

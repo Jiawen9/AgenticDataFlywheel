@@ -57,6 +57,18 @@ function fixture(controls: { readOnly?: () => boolean; managed?: () => boolean }
 }
 
 describe('correction task list and protected workbench', () => {
+  it('passes the image prefix for paired export and reuses the export entry without changing selection', async () => {
+    const { ws, api } = fixture()
+    const before = clone(ws.session.value!.groups)
+    await ws.exportData('skip', ' s3://bucket/训练图片/ ')
+    await ws.exportData('skip', 's3://bucket/训练图片/')
+    expect(api.correctionDatasetExport).toHaveBeenLastCalledWith('old-session', undefined,
+      { export_profile: 'corrected_selection_v1', cot_policy: 'skip', training_image_prefix: 's3://bucket/训练图片/' })
+    expect(ws.session.value!.exports).toHaveLength(1)
+    expect(ws.session.value!.groups).toEqual(before)
+    await ws.exportData(undefined, 'ignored for legacy')
+    expect(api.correctionExport).toHaveBeenCalledWith('old-session')
+  })
   it('sends OPD as an explicit complete export and keeps all group choices', async () => {
     const { ws, api, groups } = fixture()
     await ws.toggleExport(groups[0]!)

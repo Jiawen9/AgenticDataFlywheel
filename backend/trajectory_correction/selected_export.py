@@ -4,8 +4,74 @@ No model requests, evidence copies or mutation of the correction draft occur her
 Legacy SFT/RL and source-shaped workbook exports deliberately remain separate.
 """
 from copy import deepcopy
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
 
 EXPORT_PROFILE = "corrected_selection_v1"
+
+
+def _relative_path(value, raw_root):
+    image = str(value or "").replace("\\", "/")
+    path = Path(image)
+    if not image or ".." in PurePosixPath(image).parts:
+        return None
+    if path.is_absolute():
+        if not raw_root:
+            return None
+        try:
+            return PurePosixPath(path.resolve().relative_to(Path(raw_root).resolve()).as_posix())
+        except ValueError:
+            return None
+    return PurePosixPath(image)
+
+
+def _trajectory_directory(group, raw_root):
+    """Use registered row paths and a bounded metadata-file lookup, not a scan."""
+    from ..file_io import io_path
+    paths = []
+    identities = set()
+    for row in group["rows"]:
+        merged = {**(row.get("values") or {}), **row}
+        for name in ("source_trajectory_id", "文件夹名"):
+            if merged.get(name):
+                identities.add(str(merged[name]))
+        for name in ("image", "xml", "logprobs_path", "model_response_path"):
+            relative = _relative_path(merged.get(name), raw_root)
+            if relative is not None:
+                paths.append(relative)
+    if not paths:
+        return None
+    common = PurePosixPath(os.path.commonpath([p.parent.as_posix() for p in paths]).replace("\\", "/"))
+    if common == PurePosixPath("."):
+        return None
+    for parent in (common, *common.parents):
+        if parent == PurePosixPath("."):
+            break
+        # The original trajectory metadata is an explicit owner. This also
+        # handles short storage aliases and all screenshots under screens/.
+        if raw_root and io_path(Path(raw_root) / parent / "_trajectory_for_evaluate.json").is_file():
+            return parent
+        if parent.name in identities:
+            return parent
+    return common
+
+
+def _training_image(row, group, batch_id, raw_root, directory):
+    """Plan cloud names from registered source paths, never displayed IDs."""
+    from ..data_publishing.upload_sources import _component
+    relative = _relative_path(row.get("image"), raw_root)
+    if relative is None or directory is None:
+        return "", ""
+    try:
+        suffix = relative.relative_to(directory).as_posix()
+    except ValueError:
+        return "", ""
+    identity = hashlib.sha256(json.dumps([str(batch_id), str(raw_root or ""), directory.as_posix()], ensure_ascii=False).encode()).hexdigest()[:20]
+    case = row.get("collection_case_id") or row.get("case_id") or group.get("task_id") or "unknown"
+    target = f"{_component(str(batch_id))}/{_component(str(case))}/{_component(directory.name)}__{identity}"
+    return f"{target}/{suffix}", target
 
 
 def selection_records(groups, candidates=()):
@@ -23,7 +89,7 @@ def selected_identity(items):
     return result
 
 
-def project_selected(*, session, snapshot, table, selection, cot_policy, tree_payload, quality_payload):
+def project_selected(*, session, snapshot, table, selection, cot_policy, tree_payload, quality_payload, raw_root=None, training_prefix=""):
     from .service import _overlay_row
     from ..export_markers import annotate_rows
     if cot_policy not in {"generate", "skip"}:
@@ -32,15 +98,21 @@ def project_selected(*, session, snapshot, table, selection, cot_policy, tree_pa
     active = next(iter(table["sheets"]))
     source_rows = table["sheets"][active]
     columns = list(table.get("columns", {}).get(active) or dict.fromkeys(key for row in source_rows for key in row))
-    for name in ("actions_box", "summary", "thought", "sop", "is_refined", "is_key_step"):
+    for name in ("actions_box", "summary", "thought", "sop", "is_refined", "is_key_step",
+                 "task", "task_id", "trajectory_id", "step", "history", "training_image_relative", "training_trajectory_relative", "training_image_prefix"):
         if name not in columns:
             columns.append(name)
     groups, edits, cot, values_by_row = [], {}, {}, {}
     number = 2
+    raw_root = raw_root or (session.get("source_snapshot") or {}).get("raw_root") or tree_payload.get("raw_root")
+    from ..data_publishing.paired_training import current_box
+    from ..data_publishing.training_jsonl import parse_action, _description
     for group in snapshot["groups"]:
         if group["group_id"] not in chosen:
             continue
         frozen = {**deepcopy(group), "export": True, "trajectory_id": group["meta_task"], "rows": []}
+        history = []
+        directory = _trajectory_directory(group, raw_root)
         for base in group["rows"]:
             source_number = int(base["excel_row"])
             edit = session.get("row_edits", {}).get(str(source_number), {})
@@ -73,6 +145,24 @@ def project_selected(*, session, snapshot, table, selection, cot_policy, tree_pa
             value["actions" if "actions" in columns else "action"] = row["actions"]
             for key in ("actions_box", "summary", "thought", "sop"):
                 value[key] = row.get(key, "")
+            try:
+                action = parse_action(row["actions"])
+                value["actions_box"] = current_box(row, action)
+                # A source SOP cannot describe a different manually edited action.
+                if row.get("action_edited") and not row.get("sop_edited"):
+                    value["sop"] = ""
+                value["summary"] = _description(row, action)
+            except (ValueError, TypeError):
+                action = None
+                value["actions_box"] = ""
+            description = _description(row, action)
+            cloud_image, cloud_directory = _training_image(row, group, selection["batch_id"], raw_root, directory)
+            value.update(task=group.get("task", ""), task_id=group["task_id"],
+                         trajectory_id=group["meta_task"], step=row.get("step", len(history) + 1),
+                         history="\n".join(history),
+                         training_image_relative=cloud_image, training_trajectory_relative=cloud_directory,
+                         training_image_prefix=training_prefix)
+            history.append(f"Step {len(history) + 1}: {description}")
             # Coordinates and existing source identity columns are never rescaled.
             if "coordinate_info" in edit:
                 value["coordinate_info"] = deepcopy(edit["coordinate_info"])

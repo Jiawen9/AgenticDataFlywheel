@@ -25,11 +25,12 @@ function size(value: number | undefined) {
 
 <template>
   <div class="folder-progress">
-    <p v-if="upload.destination" class="destination">云道目标：<code>s3://{{ upload.destination.bucket }}/{{ upload.destination.prefix }}</code></p>
-    <p v-if="stage === 'resolving'">正在定位发布表包含的轨迹目录…</p>
+    <p v-if="upload.destination" class="destination">{{ upload.training_only ? 'JSONL 上传目标' : '云道目标' }}：<code>s3://{{ upload.destination.bucket }}/{{ upload.training_only && upload.training_destination_prefix ? upload.training_destination_prefix : upload.destination.prefix }}</code></p>
+    <p v-if="stage === 'resolving'">{{ upload.training_only ? '正在准备已生成的配套 JSONL…' : '正在定位发布表包含的轨迹目录…' }}</p>
     <p v-else-if="stage === 'recovering'">正在核对上次上传进程，避免重复启动。</p>
     <p v-else-if="stage === 'generating_training'">表格与轨迹已上传，正在生成训练 JSONL…</p>
-    <p v-if="upload.source_summary?.trajectory_count !== undefined">实际上传范围：{{ upload.source_summary.case_count }} 个用例 · {{ upload.source_summary.trajectory_count }} 条完整轨迹 · {{ upload.source_summary.excel_count }} 份发布表格</p>
+    <p v-if="upload.training_only">本次仅上传训练 JSONL，未上传 Excel 或轨迹目录。</p>
+    <p v-else-if="upload.source_summary?.trajectory_count !== undefined">实际上传范围：{{ upload.source_summary.case_count }} 个用例 · {{ upload.source_summary.trajectory_count }} 条完整轨迹 · {{ upload.source_summary.excel_count }} 份发布表格</p>
     <template v-if="upload.total_items && upload.total_items > 0">
       <div class="directory-count">已完成目录：{{ upload.completed_items || 0 }}/{{ upload.total_items }} <span>目录进度 {{ percent }}%</span></div>
       <progress :value="percent" max="100" aria-label="目录上传进度" />
@@ -52,7 +53,8 @@ function size(value: number | undefined) {
         <a v-if="upload.training?.file_path" :href="datasetTrainingDownloadUrl(upload.job_id, 'jsonl')" target="_blank" rel="noopener">下载训练 JSONL</a>
         <a v-if="upload.training?.report_path" :href="datasetTrainingDownloadUrl(upload.job_id, 'report')" target="_blank" rel="noopener">下载排除与转换报告</a>
       </div>
-      <p v-if="!upload.training">等待表格与轨迹目录上传完成后生成；原始上传结果单独保留。</p>
+      <p v-if="upload.training?.files && upload.training.files.length > 1">本次包含 {{ upload.training.files.length }} 份 JSONL；上方下载为第一份，全部文件可在发布详情分别下载。</p>
+      <p v-if="!upload.training">{{ upload.training_only ? '正在读取配套训练文件。' : '正在准备训练文件；已有配套 JSONL 会直接上传，旧导出按原流程转换。' }}</p>
     </section>
     <button v-if="items.length" class="details-toggle" :aria-expanded="detailsOpen" @click="detailsOpen = !detailsOpen">{{ detailsOpen ? '收起' : '查看' }}目录上传结果（{{ items.length }}）</button>
     <section v-if="detailsOpen" aria-label="目录上传结果">

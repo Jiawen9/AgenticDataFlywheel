@@ -591,12 +591,33 @@ export interface CorrectionTaskItem {
   export_count: number
 }
 
+export interface PairedTrainingFile {
+  version: number
+  status: 'ready' | 'empty' | 'failed' | 'needs_configuration'
+  filename?: string
+  report_filename?: string
+  sha256?: string
+  report_sha256?: string
+  included_count?: number
+  excluded_count?: number
+  image_prefix?: string
+  download_url?: string
+  report_download_url?: string
+  error?: string
+}
+
+export interface DatasetReleaseTrainingFile extends PairedTrainingFile {
+  index: number
+  available?: boolean
+}
+
 export interface CorrectionExport {
   storage_revision?: number
   export_id: string
   kind?: 'routed' | 'selected' | 'full_dataset' | 'corrected_selection'
   export_profile?: 'corrected_selection_v1'
   cot_policy?: 'generate' | 'skip'
+  training?: PairedTrainingFile
   filename: string
   created_at: string
   download_url: string
@@ -803,7 +824,7 @@ export interface DatasetReleaseExcel {
 export type DatasetUploadStatus = 'not_uploaded' | 'queued' | 'uploading' | 'succeeded' | 'failed' | 'interrupted'
 
 export interface DatasetUploadCapabilities {
-  internal: { configured: boolean; reason: string | null; directory_upload?: boolean; default_prefix?: string; region?: string; bucket?: string; training_jsonl_version?: number }
+  internal: { configured: boolean; reason: string | null; directory_upload?: boolean; default_prefix?: string; region?: string; bucket?: string; training_jsonl_version?: number; training_pair_version?: number }
 }
 
 export interface DatasetUploadOptions {
@@ -811,6 +832,8 @@ export interface DatasetUploadOptions {
   destination_prefix: string
   retry_job_id?: string
   training_jsonl?: boolean
+  training_only?: boolean
+  training_destination_prefix?: string
 }
 
 export interface DatasetUploadItem {
@@ -829,8 +852,13 @@ export interface DatasetFolderUpload {
   folder_upload?: boolean
   include_trajectories?: boolean
   training_jsonl?: boolean
+  training_only?: boolean
+  training_destination_prefix?: string
   training?: {
+    version?: number
     status: 'ready' | 'uploading' | 'succeeded' | 'failed'
+    files?: DatasetReleaseTrainingFile[]
+    image_prefixes?: string[]
     included_count?: number
     excluded_count?: number
     bbox_fallback_count?: number
@@ -898,6 +926,7 @@ export interface DatasetRelease {
   name: string
   created_at: string
   excel_paths: DatasetReleaseExcel[]
+  training_files?: DatasetReleaseTrainingFile[]
   trajectory_paths: string[]
   source_count: number
   task_count: number

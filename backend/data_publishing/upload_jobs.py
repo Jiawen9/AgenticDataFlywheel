@@ -166,13 +166,23 @@ class DatasetUploadJobManager(DirectoryUploadJobsMixin, InternalUploadJobsMixin)
 
     def submit(self, release_id: str, *, target: Optional[str] = None,
                include_trajectories: bool = False, destination_prefix: str | None = None,
-               retry_job_id: str | None = None, training_jsonl: bool = False) -> dict[str, Any]:
+               retry_job_id: str | None = None, training_jsonl: bool = False,
+               training_only: bool = False, training_destination_prefix: str | None = None) -> dict[str, Any]:
+        if training_only:
+            if target != "internal":
+                raise ValueError("训练 JSONL 上传只支持云道目标")
+            return self._submit_directory(release_id, destination_prefix=destination_prefix,
+                retry_job_id=retry_job_id, include_trajectories=False, training_jsonl=True,
+                training_only=True, training_destination_prefix=training_destination_prefix)
+        if training_destination_prefix is not None and not training_jsonl:
+            raise ValueError("仅启用训练 JSONL 时可指定其上传目录")
         if training_jsonl and (target != "internal" or not include_trajectories):
             raise ValueError("训练 JSONL 需要上传所选完整轨迹到云道")
         if include_trajectories:
             if target != "internal":
                 raise ValueError("完整轨迹上传只支持云道目标")
-            return self._submit_directory(release_id, destination_prefix=destination_prefix, retry_job_id=retry_job_id, training_jsonl=training_jsonl)
+            return self._submit_directory(release_id, destination_prefix=destination_prefix, retry_job_id=retry_job_id, training_jsonl=training_jsonl,
+                                          training_destination_prefix=training_destination_prefix)
         if destination_prefix is not None or retry_job_id is not None:
             raise ValueError("自定义云道目录需启用完整轨迹上传")
         if target == "internal":

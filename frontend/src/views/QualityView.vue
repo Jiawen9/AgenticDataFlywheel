@@ -242,8 +242,21 @@ onBeforeUnmount(() => { disposed = true; ++jobEpoch; stopPolling(); flow.dispose
     <el-alert v-if="jobRefreshError" :title="jobRefreshError" type="warning" :closable="false" />
     <template v-if="!pipelineContext.historyOnly.value">
     <BatchPublishedNotice :notice="publishedNotice" />
-    <header class="page-hero"><div><span class="eyebrow">TRAJECTORY QUALITY</span><h1>轨迹质检</h1><p>选择业务批次，对当前有效轨迹树进行质检；分次处理的任务汇总在同一批次。</p></div><div class="run-selector"><label>业务批次</label><el-select :model-value="selectedBatchId" filterable :filter-method="(value: string) => batchSearch = value" :disabled="pipelineContext.isPipelineRoute.value" :loading="loadingRuns" placeholder="选择批次" style="width:300px" @change="changeBatch"><el-option v-for="batch in visibleBatches" :key="batch.batch_id" :label="`${displayId('batch', batch.batch_id)}${batch.label && batch.label !== batch.batch_id ? ' · ' + batch.label : ''} · ${batch.task_count} 个任务`" :value="batch.batch_id" /></el-select></div></header>
-    <el-pagination v-if="choices" :current-page="choices.page.value" :page-size="choices.size.value" :total="choices.total.value" :page-sizes="[10,20,50]" layout="total, sizes, prev, pager, next" @current-change="(value: number) => choices!.page.value = value" @size-change="(value: number) => choices!.size.value = value" />
+    <header class="page-hero">
+      <div><span class="eyebrow">TRAJECTORY QUALITY</span><h1>轨迹质检</h1><p>选择业务批次，对当前有效轨迹树进行质检；分次处理的任务汇总在同一批次。</p></div>
+      <div class="run-selector">
+        <label>业务批次</label>
+        <el-select :model-value="selectedBatchId" filterable :filter-method="(value: string) => batchSearch = value" :disabled="pipelineContext.isPipelineRoute.value" :loading="loadingRuns" placeholder="选择批次" style="width:300px" @change="changeBatch">
+          <el-option v-for="batch in visibleBatches" :key="batch.batch_id" :label="`${displayId('batch', batch.batch_id)}${batch.label && batch.label !== batch.batch_id ? ' · ' + batch.label : ''} · ${batch.task_count} 个任务`" :value="batch.batch_id" />
+          <template v-if="choices && !pipelineContext.isPipelineRoute.value && choices.total.value > choices.size.value" #footer>
+            <div class="batch-choice-footer" @click.stop>
+              <span>共 {{ choices.total.value }} 个批次</span>
+              <el-pagination size="small" :current-page="choices.page.value" :page-size="choices.size.value" :total="choices.total.value" :page-sizes="[10,20,50]" :pager-count="5" layout="sizes, prev, pager, next" @current-change="(value: number) => choices!.page.value = value" @size-change="(value: number) => choices!.size.value = value" />
+            </div>
+          </template>
+        </el-select>
+      </div>
+    </header>
     <QualityFusionSettings :disabled="submitting" @ready="qualitySettingsReady = $event" />
     <el-alert v-if="batchError" :title="batchError" type="error" :closable="false" show-icon />
     <el-empty v-if="!loadingRuns && !batches.length" description="还没有可处理的业务批次"><router-link to="/collection"><el-button type="primary">前往轨迹采集</el-button></router-link></el-empty>
@@ -287,6 +300,7 @@ onBeforeUnmount(() => { disposed = true; ++jobEpoch; stopPolling(); flow.dispose
 
 <style scoped src="../styles/businessPaging.css"></style>
 <style scoped>
+.batch-choice-footer{display:grid;gap:8px;max-width:100%}.batch-choice-footer>span{color:#64748b;font-size:12px}.batch-choice-footer :deep(.el-pagination){flex-wrap:wrap;justify-content:flex-start;gap:6px}.batch-choice-footer :deep(.el-pagination__sizes){margin-right:0}
 .node-score-card{display:grid;gap:4px;padding:10px;margin:10px 0;border:1px solid #334155;border-radius:9px;color:#67e8f9}.node-score-card small,.terminal-note{color:#94a3b8;font-size:11px;line-height:1.6}.quality-card>.display-id{margin-top:8px}
 .task-main,.metric{min-width:0}.task-main> b,.top1-metric> b{display:block;max-width:240px}.node-panel .display-id{max-width:100%}
 .node-data p{margin:0;color:#cbd5e1;font-size:12px;line-height:1.55}.node-data .observation{padding:9px;border-left:3px solid #22d3ee;border-radius:4px;background:#172338;color:#e0f2fe}

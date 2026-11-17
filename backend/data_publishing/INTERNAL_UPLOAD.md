@@ -74,7 +74,13 @@ npm run build
 
 这些测试只用临时发布数据及本地模拟脚本，无云道网络传输。内网最终用一个小型发布核对目录层级、选中范围、速度输出及同目标重试。未执行真实上传时不能写成云道验收通过。
 
-## 可选训练 JSONL（2026-11-17）
+## 配套训练 JSONL（2026-11-17）
+
+新完整选轨／OPD 导出在纠偏导出 Excel 时就生成配套 JSONL，不再等到上传阶段。发布详情 `training_files` 保存这组文件，使用 `GET /api/dataset-releases/{id}/training/{index}?kind=jsonl|report` 下载。每份 Excel 对应一份训练文件，里面每行是一条动作步骤样本，转换字段详见 [Excel 配套 JSONL](../../docs/paired-training-jsonl-20261117.md)。
+
+上传增加 `training_only:true`（仅传配套训练文件）和 `training_destination_prefix`（bucket 内目标目录），能力 `internal.training_pair_version=2`。单传不会读取或上传原轨迹目录。综合上传的新图片目标使用导出时已冻结的图片前缀，单独改变 JSONL 目标不改变文件内容。训练文件父目录仅放 JSONL，报告单独保存供下载。旧请求／旧发布沿用下面的兼容方式。
+
+### 旧发布兼容转换
 
 上传弹窗增加“生成并上传训练 JSONL”，默认关闭。能力 `internal.training_jsonl_version=1`；请求附 `training_jsonl:true`，同时必须为 `target:internal`、`include_trajectories:true`。旧请求不改变。开关参与任务指纹，同目标同范围同开关复用任务；重试继承开关与目标。
 

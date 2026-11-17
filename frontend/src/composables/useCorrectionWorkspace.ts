@@ -208,17 +208,18 @@ export function useCorrectionWorkspace(api: WorkspaceApi, feedback: Feedback) {
     await patchRow(row, { deleted: !row.deleted })
   }
 
-  async function exportData(cotPolicy?: 'generate' | 'skip'): Promise<CorrectionExport | null> {
+  async function exportData(cotPolicy?: 'generate' | 'skip', trainingImagePrefix?: string): Promise<CorrectionExport | null> {
     if (feedback.managed?.() || feedback.readOnly?.() || !session.value || !await prepareTransition()) return null
     const current = session.value
     let output: Awaited<ReturnType<WorkspaceApi['correctionExport']>> | null = null
     await trackWrite(async () => {
       if (cotPolicy && !api.correctionDatasetExport) throw new Error('当前接口不支持已选轨迹导出，请同步前端接口适配')
       output = cotPolicy && api.correctionDatasetExport
-        ? await api.correctionDatasetExport(current.session_id, current.storage_revision, { export_profile: 'corrected_selection_v1', cot_policy: cotPolicy })
+        ? await api.correctionDatasetExport(current.session_id, current.storage_revision, { export_profile: 'corrected_selection_v1', cot_policy: cotPolicy,
+          ...(trainingImagePrefix?.trim() ? { training_image_prefix: trainingImagePrefix.trim() } : {}) })
         : current.storage_revision === undefined ? await api.correctionExport(current.session_id) : await api.correctionExport(current.session_id, current.storage_revision)
       if (output.storage_revision !== undefined) current.storage_revision = output.storage_revision
-      current.exports.unshift(output)
+      current.exports = [output, ...current.exports.filter(item => item.export_id !== output!.export_id)]
       return true
     })
     return output

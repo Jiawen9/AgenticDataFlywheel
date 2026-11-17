@@ -291,7 +291,8 @@ class CorrectionTrainingChainTests(unittest.TestCase):
                 Image.new("RGB", (120, 264)).save(directory / f"step{step:03}.jpg")
         pipeline = {"pipeline_id": "pipe-training-chain", "name": "训练链路", "batch_id": fixture.batch, "mode": "manual",
                     "selection": pipeline_release.build_selection(fixture.batch, ["A"], "manual", 4, root=fixture.root)}
-        pipeline.update(export_profile="corrected_selection_v1", cot_policy="skip")
+        pipeline.update(export_profile="corrected_selection_v1", cot_policy="skip",
+                        training_image_prefix="s3://fixture-bucket/frozen-images/")
         manual = pipeline_release.prepare_manual(fixture.batch, pipeline["selection"], root=fixture.root)
         session = fixture.records.get("correction_sessions", manual["session_id"])
         for group in session["snapshot_payload"]["groups"]:
