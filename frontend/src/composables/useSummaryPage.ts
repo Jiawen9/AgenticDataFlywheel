@@ -13,7 +13,7 @@ export function useSummaryPage<T>(path: string, query: MaybeRefOrGetter<SummaryQ
   let inFlight: Promise<void> | undefined, flightKey = ''
   function schedule() {
     clearTimeout(timer)
-    if (!disposed && mounted && enabled()) timer = setTimeout(() => void refresh(), Math.min(120000, (data.value?.scope_counts?.active ? 5000 : 30000) * 2 ** Math.min(failures, 3)))
+    if (!disposed && mounted && enabled()) timer = setTimeout(() => void refresh(), Math.min(120000, (data.value?.scope_counts?.active || data.value?.counts_complete === false ? 5000 : 30000) * 2 ** Math.min(failures, 3)))
   }
   async function refresh(): Promise<void> {
     if (disposed || !enabled()) return
@@ -50,7 +50,7 @@ export function useSummaryPage<T>(path: string, query: MaybeRefOrGetter<SummaryQ
   watch(key, current => {
     epoch++; inFlight = undefined; clearTimeout(prefetchTimer); error.value = ''
     const hit = cachedSummary<SummaryPage<T>>(current)
-    const queryNow = toValue(query), scope = JSON.stringify([queryNow.batch_id, queryNow.task_source_batch_id, queryNow.run_id])
+    const queryNow = toValue(query), scope = JSON.stringify([queryNow.batch_id, queryNow.task_source_batch_id, queryNow.run_id, queryNow.session_id, queryNow.kind])
     data.value = hit?.value || (scope === previousScope ? data.value : null); cached.value = !!data.value
     if (hit) shownKey = current
     else if (!data.value) shownKey = ''

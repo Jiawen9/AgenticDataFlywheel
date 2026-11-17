@@ -143,6 +143,9 @@ async def lifespan(app: FastAPI):
     summary_records = RecordStore(DATA_ROOT)
     summary_records.start_summary_backfill()
     app.state.summary_records = summary_records
+    from .stage_page_reads import StageBackfill
+    stage_backfill = StageBackfill(DATA_ROOT)
+    stage_backfill.thread.start()
 
     async def clean_expired_imports():
         while True:
@@ -166,10 +169,18 @@ async def lifespan(app: FastAPI):
             manager.close()
         finally:
             summary_records.close_summary_backfill()
+            stage_backfill.close()
 
 
 app = FastAPI(title="Agentic Data Flywheel", version="1.0.0", lifespan=lifespan)
 install_lifecycle_handlers(app)
+
+from .data_store.registry import SummaryUnavailable
+
+
+@app.exception_handler(SummaryUnavailable)
+async def summary_unavailable_handler(_request, exc):
+    return JSONResponse(status_code=503, content={"detail": str(exc)}, headers={"Retry-After": "5"})
 
 
 @app.exception_handler(PipelineManagedError)
@@ -239,7 +250,12 @@ def health() -> dict[str, str]:
 
 
 @app.get("/api/tasks")
-def get_tasks(batch_id: str | None = None, annotation_version: str | None = None) -> dict[str, Any]:
+def get_tasks(batch_id: str | None = None, annotation_version: str | None = None,
+              view: str | None = None, offset: int = 0, limit: int = 10, q: str = "", status: str = "", all_ids: bool = False) -> dict[str, Any]:
+    if view == "summary" and batch_id:
+        from .stage_page_reads import task_page
+        ensure_batch_active(batch_id, DATA_ROOT)
+        return _batch_read(lambda: task_page(DATA_ROOT, batch_id, view="tasks", offset=offset, limit=limit, q=q, status=status, annotation_version=annotation_version, all_ids=all_ids))
     options = _batch_options(batch_id, annotation_version)
     return {"tasks": _batch_read(lambda: task_status_summaries(batch_id, annotation_version)
                               if batch_id else task_summaries(**options))}
@@ -323,7 +339,9 @@ def create_tree_build(request: TreeBuildRequest) -> dict[str, Any]:
 
 
 @app.get("/api/tree-builds")
-def get_tree_builds(batch_id: str | None = None) -> dict[str, Any]:
+def get_tree_builds(batch_id: str | None = None, view: str | None = None, offset: int = 0, limit: int = 10, status: str = "") -> dict[str, Any]:
+    if view == "summary":
+        return RecordStore(DATA_ROOT).summary_page("tree_jobs", batch_id=batch_id, offset=offset, limit=limit, status=status)
     return {"jobs": job_manager.list_jobs(batch_id=batch_id)}
 
 
@@ -362,7 +380,9 @@ def create_quality_job(request: QualityJobRequest) -> dict[str, Any]:
 
 
 @app.get("/api/quality-jobs")
-def get_quality_jobs() -> dict[str, Any]:
+def get_quality_jobs(batch_id: str | None = None, view: str | None = None, offset: int = 0, limit: int = 10, status: str = "") -> dict[str, Any]:
+    if view == "summary":
+        return RecordStore(DATA_ROOT).summary_page("quality_jobs", batch_id=batch_id, offset=offset, limit=limit, status=status)
     return {"jobs": quality_job_manager.list_jobs()}
 
 

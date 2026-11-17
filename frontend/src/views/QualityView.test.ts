@@ -18,7 +18,7 @@ describe('quality model configuration entry', () => {
     context.managed = managed
     const app = createSSRApp(QualityView)
     const pass = defineComponent({ setup: (_props, { slots }) => () => h('div', slots.default?.()) })
-    for (const tag of ['select', 'option', 'alert', 'empty', 'button', 'progress', 'checkbox', 'tag', 'table', 'table-column']) app.component('el-' + tag, pass)
+    for (const tag of ['pagination', 'input', 'select', 'option', 'alert', 'empty', 'button', 'progress', 'checkbox', 'tag', 'table', 'table-column']) app.component('el-' + tag, pass)
     app.component('el-drawer', { render: () => null })
     app.component('router-link', pass)
     app.directive('loading', {})

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { onBeforeRouteLeave } from 'vue-router'
+import { onBeforeRouteLeave, useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Download, Upload } from '@element-plus/icons-vue'
 import { api, taskGenerationDownloadUrl } from '@/api'
@@ -10,11 +10,18 @@ import CollectionBatchSubmission from '@/components/CollectionBatchSubmission.vu
 import DisplayId from '@/components/DisplayId.vue'
 import { useDisplayIdentifiers } from '@/composables/useDisplayIdentifiers'
 const { displayId } = useDisplayIdentifiers()
+import { useGenerationHistory, useGenerationResultPage } from '@/composables/useGenerationPages'
+import GenerationHistoryPager from '@/components/GenerationHistoryPager.vue'
+import type { SummaryQuery } from '@/utils/summaryCache'
 import { useAugmentationPreview } from '@/composables/useAugmentationPreview'
 import { findNode, nodePath } from '@/utils/scenarioTree'
 import { augmentationResultGroupId, groupAugmentationResults, type AugmentationResultGroup } from '@/utils/augmentationReview'
 
-const review = useAugmentationPreview(api, {
+const route = useRoute()
+const history = useGenerationHistory('augmentation')
+const resultPages = useGenerationResultPage(true)
+const historyQuery = history.query, historyPage = history.page, historyTotal = history.total
+const review = useAugmentationPreview({ ...api, taskGenerationJobs: history.read, taskGenerationResults: resultPages.read }, {
   error: message => ElMessage.error(message),
   async decide() {
     try {
@@ -28,6 +35,9 @@ const review = useAugmentationPreview(api, {
   },
 })
 const { jobs, selectedJob, preview, results, errors, listError, detailError, loading, refreshing, busy, active, editingId, editingText } = review
+const historyIndexState = computed(() => history.snapshot.value?.index_state)
+const resultMeta = computed(() => resultPages.metadata(results.value))
+jobs.value = history.snapshot.value?.items || []
 const selectedFile = ref<File | null>(null)
 const generateN = ref(10)
 const fileInput = ref<HTMLInputElement>()
@@ -39,6 +49,7 @@ const seedPage = ref(1)
 const seedPanelExpanded = ref(false)
 const seedPanel = ref<HTMLElement>()
 const resultPage = ref(1)
+const resultLimit = ref(10)
 const expandedGroupIds = ref(new Set<string>())
 const variantPages = ref<Record<string, number>>({})
 const seedStatusFilter = ref('')
@@ -55,12 +66,14 @@ const focusedSeed = computed(() => seedsById.value.get(focusedSeedId.value))
 const filteredResults = computed(() => results.value.filter(row =>
   !selectedNodeId.value || Boolean(row.seed_id && seedsById.value.get(row.seed_id)?.node_path_ids.includes(selectedNodeId.value))))
 const resultGroups = computed(() => groupAugmentationResults(filteredResults.value, seeds.value))
-const pagedGroups = computed(() => resultGroups.value.slice((resultPage.value - 1) * pageSize, resultPage.value * pageSize))
+const pagedGroups = computed(() => resultGroups.value)
+const activeResultCount = computed(() => resultMeta.value?.counts.active ?? 0)
+async function changeHistory(patch: SummaryQuery) { history.update(patch); await review.loadJobs() }
+async function reloadResultPage(patch: SummaryQuery = {}) { resultPages.update({ offset: (resultPage.value - 1) * resultLimit.value, limit: resultLimit.value, node_id: selectedNodeId.value, seed_id: '', ...patch }); await review.reloadResults() }
 const focusedGroupId = computed(() => {
   const row = results.value.find(row => row.result_id === focusedResultId.value)
   return row ? augmentationResultGroupId(row) : focusedSeedId.value ? `seed:${focusedSeedId.value}` : ''
 })
-const activeResults = computed(() => results.value.filter(row => !row.deleted))
 const branchLabel = computed(() => selectedNodeId.value && preview.value?.tree ? nodePath(preview.value.tree.scenes, selectedNodeId.value).join(' / ') : '')
 const snapshotVersion = computed(() => preview.value?.tree?.version || selectedJob.value?.knowledge_base_version)
 const canStart = computed(() => selectedJob.value?.status === 'awaiting_confirmation' && Boolean(preview.value?.available && preview.value?.stats.eligible) && !detailError.value)
@@ -100,11 +113,14 @@ async function refreshSelected() { if (await review.protect()) await review.refr
 async function selectNode(id: string) {
   if (!(await review.protect()) || !preview.value?.tree || !findNode(preview.value.tree.scenes, id)) return
   selectedNodeId.value = id; focusedSeedId.value = ''; focusedResultId.value = ''; seedPage.value = 1; resultPage.value = 1
+  await reloadResultPage()
 }
 async function locateSeed(seed: AugmentationSeed) {
   if (!(await review.protect())) return
   focusedResultId.value = ''
   focusSeed(seed.seed_id)
+  resultPage.value = 1
+  await reloadResultPage({ seed_id: seed.seed_id })
   const row = filteredResults.value.find(row => row.seed_id === seed.seed_id)
   if (row) revealResult(row)
 }
@@ -144,12 +160,12 @@ function focusSeed(seedId?: string) {
 async function clearFocus() {
   if (!(await review.protect())) return
   focusedSeedId.value = ''; focusedResultId.value = ''
+  resultPage.value = 1; await reloadResultPage()
 }
 function revealResult(row: TaskGenerationResult) {
   const id = augmentationResultGroupId(row)
   const index = resultGroups.value.findIndex(group => group.id === id)
   if (index < 0) return
-  resultPage.value = Math.floor(index / pageSize) + 1
   expandedGroupIds.value = new Set([...expandedGroupIds.value, id])
   const group = resultGroups.value[index]!
   variantPages.value[id] = Math.max(1, Math.floor(group.results.findIndex(result => result.result_id === row.result_id) / pageSize) + 1)
@@ -176,13 +192,16 @@ async function beforeHideTreeSelection() {
   if (!(await review.protect())) return false
   selectedNodeId.value = ''; focusedSeedId.value = ''; focusedResultId.value = ''
   seedPage.value = 1; resultPage.value = 1
+  await reloadResultPage()
   return true
 }
 async function clearFilters() {
   if (!(await review.protect())) return
   selectedNodeId.value = ''; seedStatusFilter.value = ''; seedPage.value = 1; resultPage.value = 1
+  await reloadResultPage()
 }
-async function changeResultPage(page: number) { if (await review.protect()) resultPage.value = page }
+async function changeResultPage(page: number) { if (await review.protect()) { resultPage.value = page; await reloadResultPage() } }
+async function changeResultLimit(limit: number) { if (await review.protect()) { resultLimit.value = limit; resultPage.value = 1; await reloadResultPage() } }
 async function changeSeedStatus(value: string) {
   if (!(await review.protect())) return
   seedStatusFilter.value = value || ''; seedPage.value = 1
@@ -201,11 +220,13 @@ watch(() => selectedJob.value?.job_id, id => {
   if (id) { try { localStorage.setItem(persistedJobKey, id) } catch { /* Storage can be unavailable. */ } }
 }, { flush: 'sync' })
 watch(() => filteredSeeds.value.length, length => { seedPage.value = Math.max(1, Math.min(seedPage.value, Math.ceil(length / pageSize))) })
-watch(() => resultGroups.value.length, length => { resultPage.value = Math.max(1, Math.min(resultPage.value, Math.ceil(length / pageSize))) })
+
 onMounted(() => {
-  let preferredId: string | undefined
-  try { preferredId = localStorage.getItem(persistedJobKey) || undefined } catch { /* Restore is optional. */ }
-  void review.loadJobs(preferredId); window.addEventListener('beforeunload', beforeUnload)
+  let preferredId = typeof route.query.job_id === 'string' ? route.query.job_id : undefined
+  try { preferredId ||= localStorage.getItem(persistedJobKey) || undefined } catch { /* Restore is optional. */ }
+  void review.loadJobs(preferredId)
+  history.startPolling(() => review.loadJobs(), () => jobs.value.some(job => ['queued', 'running'].includes(job.status)))
+  window.addEventListener('beforeunload', beforeUnload)
 })
 onBeforeRouteLeave(() => review.protect())
 onBeforeUnmount(() => { review.dispose(); window.removeEventListener('beforeunload', beforeUnload) })
@@ -213,19 +234,21 @@ onBeforeUnmount(() => { review.dispose(); window.removeEventListener('beforeunlo
 
 <template>
   <div class="page augmentation-page">
-    <header class="page-hero"><div><span class="eyebrow">TASK AUGMENTATION</span><h1>任务扩增</h1><p>先查看失败用例在场景树中的归属，再确认生成变体任务。</p></div><div class="hero-metrics"><div><b>{{ activeResults.length }}</b><span>未删除变体</span></div><div><b>{{ jobs.length }}</b><span>扩增作业</span></div><div><b>{{ selectedJob?.generate_n ?? generateN }}</b><span>每用例变体</span></div></div></header>
+    <header class="page-hero"><div><span class="eyebrow">TASK AUGMENTATION</span><h1>任务扩增</h1><p>先查看失败用例在场景树中的归属，再确认生成变体任务。</p></div><div class="hero-metrics"><div><b>{{ activeResultCount }}</b><span>未删除变体</span></div><div><b>{{ historyTotal }}</b><span>扩增作业</span></div><div><b>{{ selectedJob?.generate_n ?? generateN }}</b><span>每用例变体</span></div></div></header>
     <section class="upload-card">
       <div class="upload-copy"><span class="eyebrow">FAILED SEED WORKBOOK</span><h2>上传失败用例</h2><p>支持“任务、涉及APP”表；有“任务结果”列时排除 TRUE。也支持已包含 app/task/scene/capability/sub_capability 的分类表。</p></div>
       <div class="upload-actions"><label class="file-picker"><el-icon><Upload /></el-icon><span>{{ selectedFile?.name || '选择 Excel 文件' }}</span><input ref="fileInput" type="file" accept=".xlsx,.xlsm" :disabled="busy" @change="chooseFile" /></label><div class="count-control"><span>每个用例生成</span><el-input-number v-model="generateN" :min="1" :max="20" :precision="0" :disabled="busy" /></div><el-button type="primary" size="large" :loading="busy" :disabled="!selectedFile" @click="submit">上传并匹配场景</el-button></div>
     </section>
     <section class="jobs-card">
       <div class="section-title"><div><span class="eyebrow">AUGMENTATION QUEUE</span><h2>场景匹配与扩增</h2></div><el-button :disabled="busy || refreshing" @click="selectedJob ? refreshSelected() : review.loadJobs()">刷新</el-button></div>
+      <GenerationHistoryPager :page="historyPage" :size="Number(historyQuery.limit)" :total="historyTotal" :search="String(historyQuery.search || '')" :status="String(historyQuery.status || '')" :disabled="busy" @change="changeHistory" />
+      <el-alert v-if="historyIndexState && historyIndexState !== 'ready'" type="info" title="正在整理历史摘要，已有记录可继续查看" :closable="false" />
       <el-alert v-if="listError" type="error" :title="listError" :closable="false" show-icon />
       <div v-if="jobs.length" class="job-tabs"><button v-for="job in jobs" :key="job.job_id" :class="{ active: selectedJob?.job_id === job.job_id }" :disabled="busy" @click="selectJob(job)"><b>{{ job.created_at.slice(0, 16).replace('T', ' ') }}</b><span>{{ statusText(job.status) }} · {{ job.result_count }} 条</span><small :title="job.job_id">{{ job.input_filename || displayId('job', job.job_id) }}</small></button></div>
       <el-alert v-if="detailError" type="error" :title="detailError" description="请点击刷新重试。" :closable="false" show-icon />
       <template v-if="selectedJob">
         <div class="job-meta"><span>{{ statusText(selectedJob.status) }} · {{ selectedJob.input_filename }} <DisplayId kind="job" :id="selectedJob.job_id" /></span><span v-if="snapshotVersion" :title="snapshotVersion">场景树快照版本：{{ snapshotVersion }}</span></div>
-        <CollectionBatchSubmission :key="selectedJob.job_id" :job="selectedJob" :result-count="activeResults.length" :busy="busy || loading || refreshing" :protect="review.protect" :run-protected="review.runExternalAction" />
+        <CollectionBatchSubmission :key="selectedJob.job_id" :job="selectedJob" :result-count="activeResultCount" :busy="busy || loading || refreshing" :protect="review.protect" :run-protected="review.runExternalAction" />
         <div v-if="active" class="progress-card"><div><b>{{ stageText(selectedJob.stage) }}</b><span>{{ selectedJob.current_item || '等待执行' }} · {{ selectedJob.completed_items }} / {{ selectedJob.total_items || '待读取' }}</span></div><el-progress :percentage="selectedJob.percent" /></div>
         <div v-if="selectedJob.status === 'awaiting_confirmation'" class="confirmation-card"><div><b>场景匹配完成，等待确认扩增</b><p>{{ preview?.stats.total || 0 }} 条失败用例 · {{ preview?.stats.matched || 0 }} 条已关联 · {{ preview?.stats.unmatched || 0 }} 条未关联 · {{ preview?.stats.classification_failed || 0 }} 条分类失败</p><p v-if="preview?.stats.eligible">将为 {{ preview.stats.eligible }} 条可扩增用例分别生成 {{ selectedJob.generate_n }} 条变体。未关联用例仍按现有扩增规则处理；分类失败用例跳过。</p><p v-else>没有可扩增的用例，请检查下方分类结果。</p></div><el-button type="primary" :loading="busy" :disabled="!canStart || loading || refreshing" @click="review.start()">开始扩增</el-button></div>
         <details v-if="errors.length || selectedJob.error || selectedJob.warnings?.length" class="job-errors"><summary>{{ errors.length }} 项错误 · {{ selectedJob.warnings?.length || 0 }} 项提示</summary><p v-if="selectedJob.error">{{ selectedJob.error }}</p><p v-for="(error, index) in errors" :key="index">{{ error.item_id || '用例' }}{{ error.stage ? ` · ${stageText(error.stage)}` : '' }}：{{ error.error }}</p><p v-for="warning in selectedJob.warnings" :key="warning">{{ warning }}</p></details>
@@ -238,7 +261,7 @@ onBeforeUnmount(() => { review.dispose(); window.removeEventListener('beforeunlo
             <div class="tree-panel"><AugmentationSceneTree v-if="preview.tree" :key="selectedJob.job_id" :tree="preview.tree" :seeds="seeds" :selected-node-id="selectedNodeId" :focused-seed-id="focusedSeedId" :focus-revision="focusRevision" :before-hide-selection="beforeHideTreeSelection" @select="selectNode" /><el-empty v-else description="正在读取该作业的场景树快照" :image-size="60" /></div>
           </div>
         </template>
-        <div class="results-heading"><div><h3>变体审核</h3><p>当前 {{ resultGroups.length }} 个源用例 · {{ filteredResults.length }} 条变体；共 {{ activeResults.length }} 条未删除变体。展开源用例查看变体，导出包含全部未删除结果。</p></div><div class="review-actions"><el-button v-if="focusedSeedId || focusedResultId" link type="primary" :disabled="busy" @click="clearFocus">清除定位</el-button><el-button type="primary" plain :icon="Download" :disabled="busy || active || !activeResults.length" @click="exportResults">导出全部未删除结果</el-button></div></div>
+        <div class="results-heading"><div><h3>变体审核</h3><p>当前页 {{ resultGroups.length }} 个源用例 · {{ filteredResults.length }} 条变体（筛选共 {{ resultMeta?.total || 0 }} 组）；共 {{ activeResultCount }} 条未删除变体。展开源用例查看变体，导出包含全部未删除结果。</p></div><div class="review-actions"><el-button v-if="focusedSeedId || focusedResultId" link type="primary" :disabled="busy" @click="clearFocus">清除定位</el-button><el-button type="primary" plain :icon="Download" :disabled="busy || active || !activeResultCount" @click="exportResults">导出全部未删除结果</el-button></div></div>
         <div v-if="results.length" class="variant-groups">
           <section v-for="group in pagedGroups" :key="group.id" class="variant-group" :class="{ focused: group.id === focusedGroupId }" :data-group-id="group.id">
             <div class="variant-group-header">
@@ -266,7 +289,7 @@ onBeforeUnmount(() => { review.dispose(); window.removeEventListener('beforeunlo
           <el-empty v-if="!pagedGroups.length" description="当前筛选下没有变体任务" :image-size="65" />
         </div>
         <el-empty v-else :description="active ? '扩增完成后在这里审核变体' : selectedJob.status === 'awaiting_confirmation' ? '确认开始扩增后生成变体' : '作业没有生成可审核结果'" :image-size="65" />
-        <el-pagination v-if="resultGroups.length > pageSize" class="group-pagination" :current-page="resultPage" :page-size="pageSize" :total="resultGroups.length" :disabled="busy" layout="prev, pager, next, total" @update:current-page="changeResultPage" />
+        <el-pagination v-if="resultMeta" class="group-pagination" :current-page="resultPage" :page-size="resultLimit" :page-sizes="[10,20,50]" :total="resultMeta.total" :disabled="busy" layout="sizes, prev, pager, next, total" @update:current-page="changeResultPage" @update:page-size="changeResultLimit" />
         <section v-if="preview?.available" ref="seedPanel" class="seed-panel" aria-label="失败用例">
           <button type="button" class="seed-panel-toggle" :aria-expanded="seedPanelExpanded" :aria-controls="`seeds-${selectedJob.job_id}`" @click="seedPanelExpanded = !seedPanelExpanded">
             <span class="seed-panel-title"><span aria-hidden="true">{{ seedPanelExpanded ? '▾' : '▸' }}</span><b>失败用例</b><span>共 {{ preview.stats.total }} 条</span></span>
@@ -308,7 +331,10 @@ onBeforeUnmount(() => { review.dispose(); window.removeEventListener('beforeunlo
   </div>
 </template>
 
+<style scoped src="../styles/businessPaging.css"></style>
 <style scoped>
+:global(body:has(.augmentation-page)){min-width:0}
+@media(max-width:600px){.augmentation-page{padding:20px 12px;min-width:0}.section-title,.seed-toolbar{flex-wrap:wrap}.hero-metrics{flex-wrap:wrap;gap:6px}.hero-metrics div{min-width:0;padding:10px 8px}.progress-card>div{min-width:0}}
 .seed-panel { margin-top: 24px; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
 .seed-panel-toggle { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 18px; width: 100%; min-height: 46px; padding: 10px 12px; border: 0; background: #f8fafc; color: var(--muted); font: inherit; font-size: 12px; text-align: left; cursor: pointer; }
 .seed-panel-toggle:hover { background: #f0fdfa; }

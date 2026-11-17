@@ -12,7 +12,7 @@ import re
 import sqlite3
 import threading
 
-VERSION = 1
+VERSION = 2
 LOG = logging.getLogger(__name__)
 NAMESPACES = frozenset({
     "pipelines", "collection_runs", "model_iter_runs", "remote_sync",
@@ -20,6 +20,8 @@ NAMESPACES = frozenset({
     "collection_resume_heads", "collection_resume_operations", "collector_storage_runs",
     "preprocessing_jobs", "tree_jobs", "quality_jobs", "correction_cot_jobs",
     "display_identifiers", "collection_diagnostics",
+    "task_generation.jobs", "correction_sessions", "dataset_releases",
+    "page_stages", "page_stage_tasks", "quality_partial_results", "batch_task_states",
 })
 ACTIVE = {"preparing", "waiting", "dispatching", "queued", "starting", "running", "stopping", "pending", "accepted"}
 ABNORMAL = {"failed", "partial", "interrupted", "needs_attention", "published_summary_failed"}
@@ -35,7 +37,14 @@ SCALAR_FIELDS = set("""pipeline_id collection_run_id run_id job_id name batch_id
     collection_snapshot_id collection_snapshot_digest source_count evaluation_control_terminal
     mode start_mode threshold session_id release_id published_at paused resume_available
     collector_data_state cleanup_operation_id cleaned_at cleanup_error percent preparation_control_error
-    preparation_control_pending offline_evaluation_jobs_version""".split())
+    preparation_control_pending offline_evaluation_jobs_version stage task_id kind message
+    total_tasks completed_tasks failed_tasks total_steps completed_steps current_task current_trajectory
+    preparation_phase scoring_phase rubric_completed checklist_completed fusion_completed
+    tree_status quality_status annotation_status started_at task_index classified_steps
+    summarized_trajectories total_trajectories completed_trajectories current_step annotation_version
+    completed_rubric_trajectories total_rubric_trajectories completed_checklist_trajectories
+    failed_checklist_trajectories total_checklist_trajectories fusion_eligible_count results_available
+    result_complete partial_results_available current_model current_model_role stale_collection_input""".split())
 COUNTS = set("""original_task_count source_task_count assigned_task_count planned_trajectory_count
     collection_completed_count collection_failed_count collection_cancelled_count collection_not_run_count
     sealed_trajectory_count diagnostic_count outcome_count evaluation_eligible_count preprocessing_eligible_count
@@ -90,7 +99,24 @@ def project(namespace, key, payload, revision):
         return None
     value = _fields(payload, SCALAR_FIELDS)
     value["storage_revision"] = revision
-    if namespace in {"collection_runs", "model_iter_runs"}:
+    if namespace == "quality_jobs":
+        value["checklist_event"] = _fields(payload.get("checklist_event"), {"kind", "role", "model", "call_id", "attempt", "timeout_seconds", "elapsed_seconds"})
+    if namespace in {"task_generation.jobs", "correction_sessions", "dataset_releases"}:
+        if namespace == "task_generation.jobs":
+            from ..task_generation.read_models import project_job as projector
+        elif namespace == "correction_sessions":
+            from ..trajectory_correction.read_models import project_session as projector
+        else:
+            from ..data_publishing.read_models import project_release as projector
+        value = {**projector(payload), "storage_revision": revision}
+    elif namespace in {"page_stages", "page_stage_tasks"}:
+        # Already a pure, allowlisted projection produced at stage publication.
+        value = dict(payload, storage_revision=revision)
+    elif namespace == "quality_partial_results":
+        from ..stage_page_reads import quality_summary
+        value.update(quality_summary(payload.get("result") or {}))
+        value.update(_fields(payload, {"execution_token", "source_tree_hash", "input_fingerprint"}))
+    elif namespace in {"collection_runs", "model_iter_runs"}:
         request = _mapping(payload.get("request"))
         metadata = _mapping(request.get("metadata"))
         source = metadata if namespace == "collection_runs" else request
@@ -111,6 +137,12 @@ def project(namespace, key, payload, revision):
             value["source_run_id"] = _text(source_id)
             value["source_collection_snapshot_id"] = _text(source_request.get("snapshot_id"))
         value["trajectory_count"] = len(_list(payload.get("trajectories")))
+        from pathlib import PurePosixPath
+        value["source_step_count"] = sum(
+            1 for trajectory in _list(payload.get("trajectories")) if isinstance(trajectory, dict)
+            for file in _list(trajectory.get("files")) if isinstance(file, dict)
+            if PurePosixPath(str(file.get("path", ""))).parent.as_posix() == trajectory.get("relative_dir")
+            and str(file.get("path", "")).lower().endswith("_vla_model_response.json"))
         value["errors_count"] = max(_integer(payload.get("errors_count")), len(_list(payload.get("errors"))))
         value["remote_errors_count"] = max(_integer(payload.get("remote_errors_count")), len(_list(payload.get("remote_errors"))))
         for name in ("collection_summary", "evaluation_summary", "allocation_summary"):
@@ -170,6 +202,8 @@ def ensure_schema(connection):
     connection.execute("CREATE INDEX IF NOT EXISTS record_summaries_scope ON record_summaries(namespace,batch_id,created_at DESC,record_key)")
     connection.execute("CREATE INDEX IF NOT EXISTS record_summaries_source ON record_summaries(namespace,task_source_batch_id,created_at DESC,record_key)")
     connection.execute("CREATE INDEX IF NOT EXISTS record_summaries_status ON record_summaries(namespace,status,created_at DESC,record_key)")
+    connection.execute("CREATE INDEX IF NOT EXISTS record_summaries_business ON record_summaries(namespace,batch_id,json_extract(payload,'$.stage'),json_extract(payload,'$.task_id'))")
+    connection.execute("CREATE INDEX IF NOT EXISTS record_summaries_session ON record_summaries(namespace,json_extract(payload,'$.session_id'),created_at DESC)")
     connection.execute("CREATE INDEX IF NOT EXISTS record_summaries_resume_run ON record_summaries(namespace,json_extract(payload,'$.run_id'),status) WHERE namespace='collection_resume_operations'")
     connection.execute("CREATE INDEX IF NOT EXISTS record_summaries_alias ON record_summaries(namespace,json_extract(payload,'$.id'),json_extract(payload,'$.kind'),json_extract(payload,'$.scope')) WHERE namespace='display_identifiers'")
     # The root-migration utility also deletes records in a single SQL
@@ -390,7 +424,7 @@ def materialize(row, namespace):
 
 def page(connection, namespace, *, offset=0, limit=10, q="", status="", batch_id=None,
          task_source_batch_id=None, active_only=False, include_published=True, run_mode=None, filename=None,
-         key=None, all_rows=False):
+         key=None, all_rows=False, session_id=None, kind=None, stage=None, task_id=None):
     if namespace not in NAMESPACES:
         raise ValueError("Unsupported summary namespace")
     if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 200:
@@ -409,10 +443,17 @@ def page(connection, namespace, *, offset=0, limit=10, q="", status="", batch_id
         if value is not None:
             scope.append(f"{column}=?")
             args.append(value)
+    for field, value in (("session_id", session_id), ("kind", kind), ("stage", stage), ("task_id", task_id)):
+        if value is not None:
+            scope.append(f"json_extract(payload,'$.{field}')=?")
+            args.append(value)
     if namespace == "collection_runs" and batch_id is None and key is None:
         scope.append("COALESCE(json_extract(payload,'$.source_kind'),'')<>'rollout_import'")
     if not include_published:
         scope.append("COALESCE(json_extract(lifecycle_payload,'$.status'),'active')<>'published'")
+        if namespace == "correction_sessions":
+            scope.extend(["COALESCE(json_extract(payload,'$.archived'),0)=0", "COALESCE(json_extract(payload,'$.published'),0)=0",
+                          "COALESCE(json_extract(payload,'$.tree_run_id'),'')<>''"])
     if active_only:
         scope.append("is_active=1")
     where = " AND ".join(scope)

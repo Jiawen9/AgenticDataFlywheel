@@ -54,6 +54,8 @@ class FactoryRuntime:
         self.read_models = FactoryReadModels(self)
         from .collector_storage import StorageService
         self.storage_service = StorageService(self)
+        from .phone_monitor_cache import PhoneMonitorCache
+        self.monitor_cache = PhoneMonitorCache(store)
 
     @property
     def resume_service(self):
@@ -152,6 +154,7 @@ class FactoryRuntime:
 
     def close(self):
         self._stop.set()
+        self.monitor_cache.close()
         self.storage_service.close()
         if self._resume_service is not None:
             self._resume_service.close()

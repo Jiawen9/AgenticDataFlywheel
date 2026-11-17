@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, Response, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, Response, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
@@ -16,6 +16,8 @@ from .constants import ALLOWED_WORKBOOK_SUFFIXES, KNOWLEDGE_BASE_FILES
 from .jobs import AugmentationStateError, TaskGenerationJobManager
 from .knowledge_base import list_knowledge_bases, replace_knowledge_base, tree_payload
 from .tree_store import VersionConflict, current_root, read_tree, save_tree, write_scene_workbook
+from .read_models import result_page
+from .resource_views import resource_view, invalidate_resource_view
 
 
 class TaskSelection(BaseModel):
@@ -80,7 +82,11 @@ def upload_knowledge_base(kind: str, file: UploadFile = File(...), base_version:
 
 
 @router.get("/tree")
-def scene_tree() -> dict[str, Any]:
+def scene_tree(view: str | None = None, refresh: bool = False) -> dict[str, Any]:
+    if view == "summary":
+        if refresh:
+            invalidate_resource_view(_manager().knowledge_base_dir)
+        return resource_view(_manager().knowledge_base_dir)
     try:
         return tree_payload(_manager().knowledge_base_dir)
     except (FileNotFoundError, ValueError) as exc:
@@ -156,7 +162,10 @@ def create_augmentation_job(
 
 
 @router.get("/jobs")
-def task_generation_jobs() -> dict[str, Any]:
+def task_generation_jobs(view: str | None = None, offset: int = Query(0, ge=0), limit: int = Query(10, ge=1, le=50),
+                         search: str = "", status: str = "", kind: str = "") -> dict[str, Any]:
+    if view == "summary":
+        return _manager().store.summary_page("task_generation.jobs", offset=offset, limit=limit, q=search, status=status, kind=kind)
     return {"jobs": _manager().list_jobs()}
 
 
@@ -169,7 +178,15 @@ def task_generation_job(job_id: str) -> dict[str, Any]:
 
 
 @router.get("/jobs/{job_id}/results")
-def task_generation_results(job_id: str) -> dict[str, Any]:
+def task_generation_results(job_id: str, view: str | None = None, offset: int = Query(0, ge=0),
+                            limit: int = Query(10, ge=1, le=50), app: str = "", task_type: str = "", dependency: str = "",
+                            show_deleted: bool = False, node_id: str = "", seed_id: str = "", search: str = "") -> dict[str, Any]:
+    if view == "groups":
+        value = result_page(_manager().store, job_id, offset=offset, limit=limit, app=app, task_type=task_type,
+                            dependency=dependency, show_deleted=show_deleted, node_id=node_id, seed_id=seed_id, search=search)
+        if value is None:
+            raise HTTPException(status_code=404, detail="任务生成作业不存在")
+        return value
     job = _manager().get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="任务生成作业不存在")

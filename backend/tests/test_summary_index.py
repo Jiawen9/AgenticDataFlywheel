@@ -79,6 +79,31 @@ class SummaryIndexTests(unittest.TestCase):
         self.assertEqual(value["trajectory_count"], 100)
         self.assertEqual(value["repeat_times"], 10)
 
+    def test_job_summaries_preserve_actual_stage_progress_without_model_config(self):
+        self.store.put("quality_jobs", "q-progress", {
+            "job_id": "q-progress", "status": "running", "stage": "checklist",
+            "completed_rubric_trajectories": 10, "total_rubric_trajectories": 10,
+            "completed_checklist_trajectories": 2, "failed_checklist_trajectories": 1,
+            "total_checklist_trajectories": 10, "fusion_eligible_count": 2,
+            "partial_results_available": True,
+            "checklist_event": {"role": "vision", "model": "actual-model", "attempt": 2,
+                                "elapsed_seconds": 4.5, "api_key": "must-not-cache"},
+            "config": {"token": "must-not-cache"},
+        })
+        value = self.store.get_summary("quality_jobs", "q-progress")
+        self.assertEqual(value["completed_checklist_trajectories"], 2)
+        self.assertEqual(value["failed_checklist_trajectories"], 1)
+        self.assertEqual(value["completed_rubric_trajectories"], 10)
+        self.assertTrue(value["partial_results_available"])
+        self.assertEqual(value["checklist_event"]["role"], "vision")
+        self.assertNotIn("must-not-cache", json.dumps(value))
+        self.store.put("preprocessing_jobs", "p-progress", {"job_id": "p-progress",
+            "stage": "classifying", "classified_steps": 41, "summarized_trajectories": 3,
+            "completed_trajectories": 4, "total_trajectories": 10, "current_step": "step042"})
+        preprocessing = self.store.get_summary("preprocessing_jobs", "p-progress")
+        self.assertEqual(preprocessing["classified_steps"], 41)
+        self.assertEqual(preprocessing["current_step"], "step042")
+
     def test_legacy_optional_bad_shapes_never_block_authoritative_save(self):
         for index, request in enumerate(("unknown", {"metadata": 2}, {"source": "directory", "source_request": ["old"]})):
             key = f"bad-{index}"

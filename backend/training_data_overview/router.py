@@ -1,6 +1,7 @@
 """Read-only overview queries and explicit conversion retries."""
 from fastapi import APIRouter, HTTPException, Response
 from fastapi.responses import FileResponse
+import sqlite3
 
 router = APIRouter(prefix="/api/training-data-overview", tags=["training-data-overview"])
 
@@ -20,6 +21,10 @@ def overview(response: Response, source: str = "", level1: str = "", level2: str
                                    start_date=start_date, end_date=end_date)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
+    except sqlite3.OperationalError as exc:
+        if 'locked' in str(exc).lower() or 'busy' in str(exc).lower():
+            raise HTTPException(503, '训练数据索引暂时忙，请重试', headers={'Retry-After': '1'}) from exc
+        raise
 
 
 @router.get("/workbook")

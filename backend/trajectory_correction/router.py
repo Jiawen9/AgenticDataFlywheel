@@ -32,6 +32,8 @@ from .service import (
     session_asset,
     sessions,
     get_cot,
+    get_group_page,
+    get_session_header,
     get_row_coordinate_info,
     review_group,
 )
@@ -59,7 +61,11 @@ def correction_recommendation(
 
 
 @router.get("/batches")
-def correction_quality_batches() -> dict[str, object]:
+def correction_quality_batches(view: str = "", offset: int = Query(0, ge=0), limit: int = Query(10, ge=1, le=50), search: str = "", status: str = "") -> dict[str, object]:
+    if view == "summary":
+        from .draft_store import storage_root
+        from ..stage_page_reads import quality_candidate_page
+        return quality_candidate_page(storage_root(), offset=offset, limit=limit, q=search, status=status)
     payload = correction_batches()
     published = published_tree_run_ids()
     batches = [item for item in payload.get("batches", []) if item.get("tree_run_id") not in published]
@@ -70,12 +76,18 @@ def correction_quality_batches() -> dict[str, object]:
 
 
 @router.get("/sessions")
-def correction_sessions() -> dict[str, object]:
+def correction_sessions(view: str = "", offset: int = Query(0, ge=0), limit: int = Query(10, ge=1, le=50), search: str = "", status: str = "", batch_id: str = "", session_id: str = "") -> dict[str, object]:
+    if view == "summary":
+        from .draft_store import _store
+        return _store().summary_page("correction_sessions", offset=offset, limit=limit, q=search, status=status, batch_id=batch_id or None, session_id=session_id or None, include_published=False)
     return {"sessions": sessions()}
 
 
 @router.get("/cot-jobs")
-def correction_cot_jobs() -> dict[str, object]:
+def correction_cot_jobs(view: str = "", session_id: str = "", offset: int = Query(0, ge=0), limit: int = Query(10, ge=1, le=50), status: str = "") -> dict[str, object]:
+    if view == "summary":
+        from .draft_store import _store
+        return _store().summary_page("correction_cot_jobs", offset=offset, limit=limit, session_id=session_id or None, status=status, include_published=False)
     if _cot_job_manager is None:
         return {"jobs": []}
     return {"jobs": _cot_job_manager.list_jobs(active_only=True)}
@@ -129,9 +141,9 @@ def create_correction_session(request: CreateSessionRequest) -> dict[str, object
 
 
 @router.get("/sessions/{session_id}")
-def correction_session(session_id: str) -> dict[str, object]:
+def correction_session(session_id: str, view: str = "", reconcile: bool = False) -> dict[str, object]:
     try:
-        return {"session": get_session(session_id)}
+        return {"session": (get_session(session_id, summary=True) if reconcile else get_session_header(session_id)) if view == "summary" else get_session(session_id)}
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except RevisionConflict as exc:
@@ -141,9 +153,9 @@ def correction_session(session_id: str) -> dict[str, object]:
 
 
 @router.get("/sessions/{session_id}/cot")
-def correction_session_cot(session_id: str) -> dict[str, object]:
+def correction_session_cot(session_id: str, group_id: str | None = None) -> dict[str, object]:
     try:
-        return get_cot(session_id)
+        return get_cot(session_id, group_id=group_id)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except RevisionConflict as exc:
@@ -153,8 +165,10 @@ def correction_session_cot(session_id: str) -> dict[str, object]:
 
 
 @router.get("/sessions/{session_id}/tasks")
-def correction_tasks(session_id: str) -> dict[str, object]:
+def correction_tasks(session_id: str, view: str = "", offset: int = Query(0, ge=0), limit: int = Query(10, ge=1, le=50), search: str = "", status: str = "", unit: str = "group") -> dict[str, object]:
     try:
+        if view == "summary":
+            return get_group_page(session_id, offset=offset, limit=limit, search=search, status=status, unit=unit)
         return {"groups": get_groups(session_id)}
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

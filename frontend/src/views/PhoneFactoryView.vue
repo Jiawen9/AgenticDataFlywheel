@@ -3,14 +3,14 @@
     <header class="page-hero"><div><span class="eyebrow">PHONE FACTORY</span><h1>手机工厂监控</h1><p>查看设备连接、运行状态、实时画面与采集日志。</p></div><router-link to="/collection/phone-factory">进入手机工厂采集</router-link></header>
     <el-alert v-if="error" :title="error" type="warning" :closable="false" show-icon />
     <section class="factory-overview">
-      <div class="overview-card"><span>已连接手机</span><strong data-testid="factory-connected-count">{{ connectedCount }}</strong></div>
-      <div class="overview-card"><span>全部手机</span><strong data-testid="factory-phone-count">{{ devices.length }}</strong></div>
-      <div class="overview-card"><span>采集任务</span><strong data-testid="factory-task-count">{{ taskCount }}</strong></div>
+      <div class="overview-card"><span>已连接手机</span><strong data-testid="factory-connected-count">{{ connectedCount ?? '—' }}</strong></div>
+      <div class="overview-card"><span>全部手机</span><strong data-testid="factory-phone-count">{{ updatedAt || devices.length ? devices.length : '—' }}</strong></div>
+      <div class="overview-card"><span>采集任务</span><strong data-testid="factory-task-count">{{ updatedAt || devices.length ? taskCount : '—' }}</strong></div>
     </section>
-    <div class="toolbar"><span>{{ updatedAt ? `最近更新：${updatedAt} · 设备状态每 10 秒刷新` : '正在读取设备状态' }}</span><el-button :loading="loading" data-testid="factory-devices-refresh" @click="refreshDevices">刷新</el-button></div>
+    <div class="toolbar"><span>{{ updatedAt ? `最近观察：${updatedAt}${stale ? '（状态过期）' : ''} · 设备状态每 10 秒刷新` : '正在后台读取设备状态，连接状态尚未确认' }}</span><el-button :loading="loading" data-testid="factory-devices-refresh" @click="refreshDevices">刷新</el-button></div>
     <section class="device-grid" data-testid="factory-device-grid">
       <button v-for="(device, index) in devices" :key="device.id" class="device-card" :data-device-id="device.id" @click="selectDevice(device.id)">
-        <div class="device-heading"><strong>#{{ String(index + 1).padStart(3, '0') }} · {{ device.model || '未知型号' }}</strong><el-tag :type="device.connected ? 'success' : 'info'">{{ device.connected ? '已连接' : '离线' }}</el-tag></div>
+        <div class="device-heading"><strong>#{{ String(index + 1).padStart(3, '0') }} · {{ device.model || '未知型号' }}</strong><el-tag :type="device.connected ? 'success' : 'info'">{{ device.connected == null ? '状态未知' : device.connected ? '已连接' : '离线' }}</el-tag></div>
         <dl class="device-info">
           <dt>序列号</dt><dd>{{ device.id }}</dd><dt>资产编号</dt><dd>{{ device.id }}</dd>
           <dt>手机型号</dt><dd>{{ device.model || '—' }}</dd><dt>运行 App</dt><dd>{{ device.apps.join('、') || '—' }}</dd>
@@ -20,12 +20,12 @@
         <small>查看画面与日志</small>
       </button>
     </section>
-    <el-empty v-if="!loading && !devices.length" description="暂无手机设备，请先在手机工厂采集中新增" />
+    <el-empty v-if="!loading && !refreshing && updatedAt && !devices.length" description="暂无手机设备，请先在手机工厂采集中新增" />
     <el-dialog :model-value="Boolean(selectedId)" :title="`手机监控 · ${selectedId}`" width="min(1100px, 95vw)" destroy-on-close @close="closeMonitor">
       <template v-if="selectedDevice">
         <div class="monitor-heading">
           <el-tag v-if="monitor?.agent_type">{{ agentLabel(monitor.agent_type) }}</el-tag>
-          <el-tag :type="selectedDevice.connected ? 'success' : 'info'">{{ selectedDevice.connected ? '已连接' : '离线' }}</el-tag>
+          <el-tag :type="selectedDevice.connected ? 'success' : 'info'">{{ selectedDevice.connected == null ? '状态未知' : selectedDevice.connected ? '已连接' : '离线' }}</el-tag>
           <el-tag :type="monitor?.running ? 'warning' : 'info'">{{ monitor ? (monitor.running ? '运行中' : '空闲') : '状态待查询' }}</el-tag>
           <span>运行 App：{{ selectedDevice.apps.join('、') || '—' }}</span>
           <el-button :loading="monitorLoading" data-testid="factory-monitor-refresh" @click="refreshMonitor">刷新</el-button>
@@ -42,39 +42,36 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, onMounted, onBeforeUnmount } from 'vue'
 import { agentLabel } from '@/utils/collectionAgents'
-import { phoneFactoryApi, type AgentType, type PhoneMonitor } from '@/phoneFactoryApi'
+import { phoneFactoryApi, type FactoryMonitorDevice, type PhoneMonitor } from '@/phoneFactoryApi'
 import { createSerialPoller, useFactoryPolling } from '@/composables/useFactoryPolling'
 
-interface Device { agent_type?: AgentType; run_id?: string; id: string; apps: string[]; model: string; battery: number | null; connected: boolean; status: string }
-const devices = ref<Device[]>([]), taskCount = ref(0), error = ref(''), loading = ref(true), updatedAt = ref('')
+const devices = ref<FactoryMonitorDevice[]>([]), taskCount = ref(0), error = ref(''), loading = ref(true), updatedAt = ref('')
+const stale = ref(true), refreshing = ref(false)
+let forceRefresh = false
 const selectedId = ref(''), monitor = ref<PhoneMonitor | null>(null), monitorError = ref(''), monitorLoading = ref(false)
 const logElement = ref<HTMLPreElement | null>(null)
 const selectedDevice = computed(() => devices.value.find(device => device.id === selectedId.value))
-const connectedCount = computed(() => devices.value.filter(item => item.connected).length)
+const connectedCount = computed(() => devices.value.some(item => item.connected == null) || !updatedAt.value ? null : devices.value.filter(item => item.connected).length)
 const logText = computed(() => monitor.value?.log || (monitor.value ? (monitor.value.running ? '采集中，暂无日志输出' : '暂无采集日志') : monitorError.value || '正在加载采集日志…'))
 
 const devicePoller = useFactoryPolling(async (signal, current) => {
   loading.value = true
   try {
-    const state = await phoneFactoryApi.state(signal)
+    const force = forceRefresh
+    forceRefresh = false
+    const snapshot = await phoneFactoryApi.monitorState(signal, force)
     if (!current()) return
-    const adb = await phoneFactoryApi.adbDevices(signal)
-    if (!current()) return
-    const ids = [...new Set([...state.phones, ...state.phoneApps.map(item => item.phone_id), ...adb.devices.map(item => item.serial)])]
-    const statuses = await phoneFactoryApi.remoteStatus(ids, signal)
-    if (!current()) return
-    devices.value = ids.map(id => {
-      const connected = adb.devices.find(item => item.serial === id)
-      const apps = [...new Set(state.phoneApps.filter(item => item.phone_id === id).map(item => item.app))]
-      return { id, apps, agent_type: statuses.statuses.find(item => item.phone_id === id)?.agent_type, run_id: statuses.statuses.find(item => item.phone_id === id)?.run_id, model: connected?.model || '', battery: connected?.battery ?? null, connected: Boolean(connected), status: statuses.statuses.find(item => item.phone_id === id)?.status || '未知' }
-    })
-    taskCount.value = state.tasks.length
-    error.value = ''; updatedAt.value = new Date().toLocaleTimeString()
-    if (selectedId.value && !ids.includes(selectedId.value)) closeMonitor()
+    devices.value = snapshot.devices
+    taskCount.value = snapshot.task_count
+    stale.value = snapshot.stale
+    refreshing.value = snapshot.refreshing
+    error.value = snapshot.error ? `设备状态读取失败：${snapshot.error}；保留上次观察` : ''
+    updatedAt.value = snapshot.observed_at ? new Date(snapshot.observed_at).toLocaleTimeString() : ''
+    if (selectedId.value && !snapshot.stale && !snapshot.devices.some(device => device.id === selectedId.value)) closeMonitor()
   } catch (cause) {
-    if (current()) { error.value = `设备状态读取失败：${(cause as Error).message}`; devices.value = devices.value.map(item => ({ ...item, status: '未知' })) }
+    if (current()) { error.value = `设备状态读取失败：${(cause as Error).message}；保留上次观察`; stale.value = true }
   } finally { if (current()) loading.value = false }
-}, 10000)
+}, () => refreshing.value ? 1000 : 10000)
 
 const monitorPoller = createSerialPoller(async (signal, current) => {
   const id = selectedId.value
@@ -94,7 +91,7 @@ const monitorPoller = createSerialPoller(async (signal, current) => {
   } finally { if (current() && selectedId.value === id) monitorLoading.value = false }
 }, 1000)
 
-function refreshDevices() { if (!document.hidden) devicePoller.start() }
+function refreshDevices() { if (!document.hidden) { forceRefresh = true; devicePoller.start() } }
 function refreshMonitor() { if (selectedId.value && !document.hidden) monitorPoller.start() }
 function selectDevice(id: string) {
   if (!devices.value.some(device => device.id === id)) return

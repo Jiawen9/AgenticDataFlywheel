@@ -1,5 +1,7 @@
 import { activeBatchItems, publishedBatch } from '@/utils/batchLifecycle'
-import { computed, reactive, ref } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
+import { useBusinessBatchChoices } from './useBusinessBatchChoices'
+import { preprocessingTaskPage, jobPage, type TreeCounts } from '@/businessPageApi'
 import type { api } from '@/api'
 import type { BuildJob, CollectionSourceRun, CollectionSourceTask, PreprocessingBatch, PreprocessingJob, TaskSummary, TrajectoryRecord, TrajectoryScope, TrajectoryStep, TrajectorySummary } from '@/types'
 
@@ -11,12 +13,24 @@ export function useTrajectoryPreprocessing(client: Client, protect: () => Promis
   readOnly?: () => boolean
   historyOnly?: () => boolean
   boundJobs?: () => { preprocessing: string[]; tree: string[] } | null
+  summaryPages?: boolean
 } = {}) {
   const retiredIds = new Set<string>()
   const batches = ref<PreprocessingBatch[]>([])
   const batchId = ref(''), annotationVersion = ref(''), error = ref('')
+  const choices = options.summaryPages ? useBusinessBatchChoices('preprocessing', () => !options.historyOnly?.()) : null
+  const taskPage = ref(1), taskSize = ref(10), taskSearch = ref(''), taskTotal = ref(0), allTaskIds = ref<string[]>([])
+  let taskRequest = 0
   const loadingBatches = ref(false), loading = ref(false), submitting = ref(false), protecting = ref(false), saving = ref(false)
   const tasks = ref<TaskSummary[]>([]), selectedTasks = ref<string[]>([]), expandedTasks = ref<string[]>([])
+  const unknownTreeCounts = (): TreeCounts => ({ completed: null, stale: null, pending: null })
+  const batchTreeCounts = ref<TreeCounts>(unknownTreeCounts())
+  const treeCounts = computed<TreeCounts>(() => {
+    if (options.summaryPages) return batchTreeCounts.value
+    const completed = tasks.value.filter(task => task.tree_status === 'succeeded').length
+    const stale = tasks.value.filter(task => ['stale', 'invalidated'].includes(task.tree_status || '')).length
+    return { completed, stale, pending: tasks.value.length - completed - stale }
+  })
   const expandedTrajectories = reactive<Record<string, string>>({})
   const taskData = reactive<Record<string, TrajectorySummary[]>>({})
   const trajectoryData = reactive<Record<string, TrajectoryRecord>>({})
@@ -32,15 +46,19 @@ export function useTrajectoryPreprocessing(client: Client, protect: () => Promis
   const newerVersion = computed(() => Boolean(selectedBatch.value?.annotation_version && selectedBatch.value.annotation_version !== annotationVersion.value))
   let epoch = 0, listRequest = 0, selectionRequest = 0, sourceRequest = 0, disposed = false
   let timer: ReturnType<typeof setTimeout> | undefined
+  let pollFailures = 0
+  let adoption: { id: string; promise: Promise<boolean> } | null = null
+  let automaticVersionAttempt = ''
   const current = (token: number) => !disposed && token === epoch
   const key = (taskId: string, trajectoryId: string) => `${taskId}/${trajectoryId}`
   function stopPoll() { if (timer) clearTimeout(timer); timer = undefined }
   function schedulePoll() {
     stopPoll()
-    if (!disposed && (processing.value || building.value)) timer = setTimeout(() => void poll(), 1500)
+    if (!disposed && (processing.value || building.value)) timer = setTimeout(() => { if (typeof document === 'undefined' || !document.hidden) void poll(); else schedulePoll() }, Math.min(120000, 5000 * 2 ** Math.min(pollFailures, 5)))
   }
   function resetData() {
     tasks.value = []; selectedTasks.value = []; expandedTasks.value = []
+    batchTreeCounts.value = unknownTreeCounts()
     clear(expandedTrajectories); clear(taskData); clear(trajectoryData); clear(loadingTasks); clear(loadingTrajectories)
     loading.value = false
   }
@@ -52,11 +70,21 @@ export function useTrajectoryPreprocessing(client: Client, protect: () => Promis
   }
   async function loadTasks() {
     const selected = scope.value, token = epoch
+    const request = ++taskRequest
     if (!selected) return
     loading.value = true
-    try { const result = await client.tasks({ ...selected }); if (current(token)) tasks.value = result }
-    catch (cause) { if (current(token)) error.value = (cause as Error).message }
-    finally { if (current(token)) loading.value = false }
+    try {
+      if (options.summaryPages) {
+        const result = await preprocessingTaskPage({ ...selected, offset: (taskPage.value - 1) * taskSize.value, limit: taskSize.value, q: taskSearch.value })
+        if (current(token) && request === taskRequest) {
+          batchTreeCounts.value = result.counts_complete && result.tree_counts_scope === 'batch' && result.tree_counts
+            ? result.tree_counts : unknownTreeCounts()
+          if (result.counts_complete || result.items.length || !tasks.value.length) { tasks.value = result.items; taskTotal.value = result.filtered_total ?? 0; allTaskIds.value = result.task_ids || [] }
+        }
+      } else { const result = await client.tasks({ ...selected }); if (current(token)) tasks.value = result }
+    }
+    catch (cause) { if (current(token) && request === taskRequest) error.value = (cause as Error).message }
+    finally { if (current(token) && request === taskRequest) loading.value = false }
   }
   async function loadBuild() {
     const token = epoch, id = batchId.value
@@ -71,7 +99,7 @@ export function useTrajectoryPreprocessing(client: Client, protect: () => Promis
         schedulePoll()
         return
       }
-      const jobs = await client.builds()
+      const jobs = options.summaryPages ? (await jobPage<BuildJob>('tree-builds', { batch_id: id, limit: 10 })).items : await client.builds()
       if (current(token)) buildJob.value = jobs.filter(item => item.batch_id === id)
         .sort((a, b) => b.created_at.localeCompare(a.created_at))[0] || null
     } catch (cause) { if (current(token)) error.value = (cause as Error).message }
@@ -111,14 +139,17 @@ export function useTrajectoryPreprocessing(client: Client, protect: () => Promis
     if (publishedBatch(id) || retiredIds.has(id)) { retireBatches([id]); return false }
     if (id === batchId.value) return true
     if (!(await guard()) || attempt !== selectionRequest) return false
+    if (choices && id) { await choices.exact(id); if (attempt !== selectionRequest) return false; batches.value = choices.rows.value }
     const batch = batches.value.find(item => item.batch_id === id)
     if (id && !batch) { error.value = '未找到对应批次，请刷新批次列表'; return false }
     stopPoll(); epoch++; resetData(); error.value = ''
     const token = epoch
     sourceRequest++; sourceTasks.value = []; sourceRuns.value = []; sourceError.value = ''; loadingSources.value = false
     batchId.value = id; annotationVersion.value = batch?.annotation_version || ''
+    taskPage.value = 1; taskSearch.value = ''; taskTotal.value = 0; allTaskIds.value = []
+    if (choices) choices.selected.value = id
     preprocessingJob.value = options.boundJobs?.() ? null : batch?.latest_job || null; buildJob.value = null
-    if (id) await Promise.all([loadTasks(), options.boundJobs?.() ? bindJobs() : loadBuild(), loadSources()])
+    if (id) await Promise.all([loadTasks(), options.boundJobs?.() ? bindJobs() : loadBuild(), options.summaryPages ? Promise.resolve() : loadSources()])
     if (!current(token)) return false
     schedulePoll()
     return true
@@ -128,14 +159,17 @@ export function useTrajectoryPreprocessing(client: Client, protect: () => Promis
     const request = ++listRequest, token = epoch
     loadingBatches.value = true
     try {
-      const result = await client.preprocessingBatches()
+      if (choices) await choices.refresh()
+      if (choices && batchId.value) await choices.exact(batchId.value, true)
+      const result = choices ? choices.rows.value : await client.preprocessingBatches()
       if (!current(token) || request !== listRequest) return
       batches.value = activeBatchItems(result).filter(batch => !retiredIds.has(batch.batch_id))
       if (preferredId !== undefined) await selectBatch(preferredId)
+      else if (!batchId.value && choices?.selected.value) await selectBatch(choices.selected.value)
       else if (batchId.value && selectedBatch.value) {
         if (options.boundJobs?.()) await bindJobs()
         else preprocessingJob.value = selectedBatch.value.latest_job
-        void loadSources()
+        if (!options.summaryPages) void loadSources()
         if (!annotationVersion.value && selectedBatch.value.annotation_version) {
           annotationVersion.value = selectedBatch.value.annotation_version
           await loadTasks()
@@ -161,7 +195,8 @@ export function useTrajectoryPreprocessing(client: Client, protect: () => Promis
           if (current(token) && value.batch_id === batchId.value && buildJob.value?.job_id === build.job_id && (!options.boundJobs?.() || options.boundJobs()!.tree.includes(value.job_id))) { buildJob.value = value; if (!active(value)) void loadTasks() }
         }) : Promise.resolve(),
       ])
-    } catch (cause) { if (current(token)) error.value = `状态刷新失败：${(cause as Error).message}；将继续重试` }
+      if (current(token)) pollFailures = 0
+    } catch (cause) { if (current(token)) { pollFailures++; error.value = `状态刷新失败：${(cause as Error).message}；将继续重试` } }
     finally { if (current(token)) schedulePoll() }
   }
   async function start(retry = false) {
@@ -182,13 +217,28 @@ export function useTrajectoryPreprocessing(client: Client, protect: () => Promis
     } catch (cause) { if (current(token)) error.value = (cause as Error).message; return false }
     finally { if (!disposed) submitting.value = false }
   }
-  async function adoptLatestVersion() {
+  function adoptLatestVersion(): Promise<boolean> {
     const id = batchId.value
-    if (!selectedBatch.value?.annotation_version || !(await guard()) || id !== batchId.value) return false
-    const version = selectedBatch.value?.annotation_version
-    if (!version) return false
-    epoch++; resetData(); annotationVersion.value = version
-    await loadTasks(); return true
+    if (adoption?.id === id) return adoption.promise
+    const promise = (async () => {
+      // A late/cached selector response is only a hint. Re-read the selected
+      // batch before adopting a version or asking to leave a manual editor.
+      if (choices && id) {
+        const authoritative = await choices.exact(id, true)
+        if (disposed || id !== batchId.value || !authoritative) return false
+        batches.value = activeBatchItems(choices.rows.value).filter(batch => !retiredIds.has(batch.batch_id))
+      }
+      if (!selectedBatch.value?.annotation_version) return false
+      if (selectedBatch.value.annotation_version === annotationVersion.value) return true
+      if (!(await guard()) || id !== batchId.value) return false
+      const version = selectedBatch.value?.annotation_version
+      if (!version) return false
+      epoch++; resetData(); annotationVersion.value = version
+      await loadTasks(); return true
+    })()
+    adoption = { id, promise }
+    void promise.finally(() => { if (adoption?.promise === promise) adoption = null }).catch(() => {})
+    return promise
   }
   async function loadTask(taskId: string) {
     const selected = scope.value, token = epoch
@@ -263,7 +313,24 @@ export function useTrajectoryPreprocessing(client: Client, protect: () => Promis
     sourceTasks.value = []; sourceRuns.value = []; loadingSources.value = false; sourceError.value = ''
   }
   function dispose() { disposed = true; epoch++; listRequest++; stopPoll() }
+  if (choices) watch(choices.rows, rows => { batches.value = activeBatchItems(rows).filter(batch => !retiredIds.has(batch.batch_id)) })
+  if (choices) watch([() => selectedBatch.value?.annotation_version, busy], ([version, isBusy]) => {
+    if (disposed || isBusy || !batchId.value || !annotationVersion.value || !version || version === annotationVersion.value) return
+    const identity = `${batchId.value}:${version}`
+    if (automaticVersionAttempt === identity) return
+    automaticVersionAttempt = identity
+    const id = batchId.value
+    void adoptLatestVersion().then(adopted => {
+      if (!adopted && !disposed && id === batchId.value && newerVersion.value) error.value = '标框版本已更新；保留当前编辑，完成或取消编辑后刷新以读取新版本。'
+    }).catch(cause => { if (!disposed && id === batchId.value) error.value = (cause as Error).message })
+  }, { flush: 'post' })
+  async function changeTaskPage(page: number, size = taskSize.value) {
+    if (!await guard()) return
+    taskPage.value = page; taskSize.value = size; await loadTasks()
+  }
+  async function searchTasks(value: string) { if (!await guard()) return; taskSearch.value = value; taskPage.value = 1; await loadTasks() }
   return { batches, batchId, selectedBatch, annotationVersion, scope, error, busy, processing, building, newerVersion,
+    choices, taskPage, taskSize, taskSearch, taskTotal, allTaskIds, treeCounts, changeTaskPage, searchTasks, loadSources,
     sourceTasks, sourceRuns, loadingSources, sourceError,
     loadingBatches, loading, submitting, tasks, selectedTasks, expandedTasks, expandedTrajectories,
     taskData, trajectoryData, loadingTasks, loadingTrajectories, preprocessingJob, buildJob,

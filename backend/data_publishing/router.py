@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Literal, Optional
 import logging
 
-from fastapi import APIRouter, HTTPException, File, Form, UploadFile
+from fastapi import APIRouter, HTTPException, File, Form, UploadFile, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -53,12 +53,16 @@ def configure_data_publishing(
 
 
 @router.get("/dataset-releases/candidates")
-def dataset_release_candidates() -> dict[str, object]:
+def dataset_release_candidates(view: str = "", offset: int = Query(0, ge=0), limit: int = Query(10, ge=1, le=50), search: str = "", status: str = "") -> dict[str, object]:
+    if view == "summary":
+        return registry._records.summary_page("correction_sessions", offset=offset, limit=limit, q=search, status=status, include_published=False)
     return {"candidates": registry.candidates()}
 
 
 @router.get("/dataset-releases")
-def dataset_releases() -> dict[str, object]:
+def dataset_releases(view: str = "", offset: int = Query(0, ge=0), limit: int = Query(10, ge=1, le=50), search: str = "", status: str = "") -> dict[str, object]:
+    if view == "summary":
+        return registry._records.summary_page("dataset_releases", offset=offset, limit=limit, q=search, status=status, include_published=True)
     return {"releases": registry.list_releases()}
 
 

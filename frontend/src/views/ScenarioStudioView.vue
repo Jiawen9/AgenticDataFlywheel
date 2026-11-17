@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ArrowLeft, DocumentChecked, Edit, RefreshLeft, RefreshRight, Search } from '@element-plus/icons-vue'
-import { api } from '@/api'
+import { generationResources } from '@/generationReadApi'
 import type { TaskGenerationTree, TaskGenerationTreeNode } from '@/types'
 import ScenarioEditor from '@/components/ScenarioEditor.vue'
 import ScenarioTreeHome from '@/components/ScenarioTreeHome.vue'
@@ -20,6 +20,8 @@ interface EditorHandle {
 }
 
 const route = useRoute()
+const resourceController = new AbortController()
+let resourceEpoch = 0
 const tree = ref<TaskGenerationTreeNode[]>([])
 const version = ref('')
 const loading = ref(false)
@@ -44,14 +46,18 @@ function resolveSceneId(nodeId: string): string {
 }
 
 async function refresh() {
+  if (editorState.value.dirty || editorState.value.saving) return
+  const ticket = ++resourceEpoch
   loading.value = true
+  const retry = Boolean(failure.value)
   failure.value = ''
   try {
-    const payload = await api.taskGenerationTree()
+    const { tree: payload } = await generationResources(resourceController.signal, retry)
+    if (resourceController.signal.aborted || ticket !== resourceEpoch || editorState.value.dirty) return
     tree.value = normalizeTree(payload.scenes)
     version.value = payload.version
   } catch (error) {
-    failure.value = (error as Error).message
+    if (!resourceController.signal.aborted && ticket === resourceEpoch) failure.value = (error as Error).message
   } finally {
     loading.value = false
   }
@@ -97,6 +103,7 @@ function redo() { editor.value?.redo() }
 function save() { void editor.value?.save() }
 function updateEditorState(state: ScenarioEditorState) { editorState.value = state }
 function handleTreeSaved(payload: TaskGenerationTree) {
+  resourceEpoch++
   tree.value = normalizeTree(payload.scenes)
   version.value = payload.version
 }
@@ -118,6 +125,7 @@ onMounted(() => {
   window.addEventListener('beforeunload', beforeUnload)
 })
 onBeforeUnmount(() => {
+  resourceController.abort(); resourceEpoch++
   document.body.classList.remove('scenario-studio-responsive')
   window.removeEventListener('beforeunload', beforeUnload)
 })

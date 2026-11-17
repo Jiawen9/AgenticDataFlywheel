@@ -26,6 +26,8 @@ export function useTaskGenerationReview(api: ReviewApi, feedback: Feedback) {
   const dirty = computed(() => editingId.value !== null && editingText.value !== originalText.value)
   let disposed = false
   let epoch = 0
+  let listRequest = 0
+  let failures = 0
   let timer: ReturnType<typeof setTimeout> | undefined
   let deciding = false
 
@@ -76,7 +78,7 @@ export function useTaskGenerationReview(api: ReviewApi, feedback: Feedback) {
       if (!isGenerationActive(detail)) {
         const payload = await api.taskGenerationResults(job.job_id)
         if (disposed || ticket !== epoch) return
-        results.value = payload.results; errors.value = payload.errors
+        results.value = payload.results; errors.value = detail.errors?.length ? detail.errors : payload.errors
       }
     } catch (error) { if (!disposed && ticket === epoch) detailError.value = (error as Error).message }
     finally { if (!disposed && ticket === epoch) loading.value = false }
@@ -85,37 +87,39 @@ export function useTaskGenerationReview(api: ReviewApi, feedback: Feedback) {
     if (!retry && job.job_id === selectedJob.value?.job_id) return true
     if (!(await protect())) return false
     await loadSelected(job)
+    schedule()
     return true
   }
   function schedule() {
     if (timer) clearTimeout(timer)
-    if (!disposed && jobs.value.some(isGenerationActive)) timer = setTimeout(() => void refreshJobs(), 1500)
+    const active = selectedJob.value && isGenerationActive(selectedJob.value) || jobs.value.some(isGenerationActive)
+    const interval = Math.min(120000, (active ? 5000 : 30000) * 2 ** failures)
+    if (!disposed && (typeof document === 'undefined' || !document.hidden)) timer = setTimeout(() => void refreshJobs(), interval)
   }
   async function refreshJobs() {
-    if (refreshing.value || disposed) return
+    if (disposed) return
     refreshing.value = true
-    const ticket = epoch
+    const ticket = epoch, request = ++listRequest
     try {
       const list = await api.taskGenerationJobs()
-      if (disposed) return
+      if (disposed || request !== listRequest) return
       jobs.value = list.filter(job => job.kind === 'task_generation')
       listError.value = ''
       if (ticket !== epoch) return
       const current = selectedJob.value
-      if (!current) {
-        const first = jobs.value.find(isGenerationActive) || jobs.value[0]
-        if (first) await loadSelected(first)
-      } else {
-        const updated = jobs.value.find(job => job.job_id === current.job_id)
+      if (current) {
+        const updated = jobs.value.find(job => job.job_id === current.job_id) || (isGenerationActive(current) ? await api.taskGenerationJob(current.job_id) : null)
+        if (disposed || ticket !== epoch || request !== listRequest) return
         if (updated) {
           // List responses deliberately omit execution_units; retain the saved detail snapshot.
-          selectedJob.value = { ...current, ...updated, execution_units: current.execution_units }
+          selectedJob.value = { ...current, ...updated, errors: current.errors, warnings: current.warnings, error: current.error, execution_units: current.execution_units }
           if (isGenerationActive(updated)) errors.value = updated.errors || []
           if (isGenerationActive(current) && !isGenerationActive(updated)) await loadSelected(selectedJob.value)
         }
       }
-    } catch (error) { if (!disposed) listError.value = (error as Error).message }
-    finally { refreshing.value = false; schedule() }
+      if (!disposed && request === listRequest) failures = 0
+    } catch (error) { if (!disposed && request === listRequest) { failures = Math.min(failures + 1, 5); listError.value = (error as Error).message } }
+    finally { if (request === listRequest) { refreshing.value = false; schedule() } }
   }
   async function acceptJob(job: TaskGenerationJob) {
     jobs.value = [job, ...jobs.value.filter(value => value.job_id !== job.job_id)]
@@ -155,6 +159,22 @@ export function useTaskGenerationReview(api: ReviewApi, feedback: Feedback) {
       return !disposed && ticket === epoch && selectedJob.value?.job_id === jobId ? result : null
     } finally { if (!disposed && ticket === epoch) busy.value = false }
   }
-  function dispose() { disposed = true; epoch++; if (timer) clearTimeout(timer) }
-  return { jobs, selectedJob, results, errors, listError, detailError, loading, refreshing, busy, editingId, editingText, dirty, protect, cancelEdit, startEdit, saveEdit, selectJob, refreshJobs, acceptJob, toggleDeleted, exportResults, runExternalAction, dispose }
+  async function restoreJob(id: string) {
+    if (!id || selectedJob.value) return
+    const ticket = epoch
+    try { const job = await api.taskGenerationJob(id); if (!disposed && ticket === epoch && job.kind === 'task_generation') await selectJob(job) }
+    catch (error) { if (!disposed && ticket === epoch) detailError.value = (error as Error).message }
+  }
+  async function reloadResults() {
+    const id = selectedJob.value?.job_id, ticket = epoch
+    if (!id || !(await protect())) return
+    loading.value = true
+    try { const payload = await api.taskGenerationResults(id); if (!disposed && ticket === epoch) results.value = payload.results }
+    catch (error) { if (!disposed && ticket === epoch) detailError.value = (error as Error).message }
+    finally { if (!disposed && ticket === epoch) loading.value = false }
+  }
+  function visibilityChanged() { if (document.hidden) { if (timer) clearTimeout(timer) } else void refreshJobs() }
+  if (typeof document !== 'undefined') document.addEventListener('visibilitychange', visibilityChanged)
+  function dispose() { disposed = true; epoch++; listRequest++; if (timer) clearTimeout(timer); if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', visibilityChanged) }
+  return { jobs, selectedJob, results, errors, listError, detailError, loading, refreshing, busy, editingId, editingText, dirty, protect, cancelEdit, startEdit, saveEdit, selectJob, refreshJobs, acceptJob, toggleDeleted, exportResults, runExternalAction, restoreJob, reloadResults, dispose }
 }

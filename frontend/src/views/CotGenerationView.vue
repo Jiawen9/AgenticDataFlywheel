@@ -7,24 +7,32 @@ import BatchPublishedNotice from '@/components/BatchPublishedNotice.vue'
 import { useBatchLifecycle } from '@/composables/useBatchLifecycle'
 import { activeBatchItems, eventMatchesRoute, publishedBatch, withoutBatchQuery, type PublishedBatchEvent } from '@/utils/batchLifecycle'
 
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { onBeforeRouteUpdate, useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { CircleCheck, Document, Refresh } from '@element-plus/icons-vue'
 import { api, correctionDownloadUrl } from '@/api'
+import { readPageApi, type GroupSummary } from '@/readPageApi'
+import { useSummaryPage } from '@/composables/useSummaryPage'
 import ActionImage from '@/components/ActionImage.vue'
-import { resolveSessionSelection } from '@/utils/batchSelection'
 import { parseBBox, type BBox } from '@/utils/actionOverlay'
 import type { CorrectionCotJob, CorrectionCotResponse, CorrectionCotRow, CorrectionSession } from '@/types'
 
 type EditableTextField = 'thought' | 'summary'
 
 const route = useRoute(), router = useRouter()
-const { displayId, matches } = useDisplayIdentifiers()
+const { displayId } = useDisplayIdentifiers()
 const batchSearch = ref('')
-const visibleSessions = computed(() => sessions.value.filter(item => matches(batchSearch.value, 'batch', item.batch_id)))
+const visibleSessions = computed(() => sessions.value)
 const sessions = ref<CorrectionSession[]>([])
 const selectedSessionId = ref('')
+const selectedHeader = ref<(CorrectionSession & { cot_row_count?: number; cot_generated_count?: number; eligible_cot_row_count?: number }) | null>(null)
+const sessionPage = ref(1), sessionLimit = ref(10), groupPage = ref(1), groupLimit = ref(10)
+const groupChoices = ref<GroupSummary[]>([]), groupTotal = ref(0), groupSearch = ref('')
+const groupStatus = ref('')
+const sessionRead = useSummaryPage('/api/correction/sessions', computed(() => ({ offset: (sessionPage.value - 1) * sessionLimit.value, limit: sessionLimit.value, search: batchSearch.value })), readPageApi.sessions, { persist: true })
+watch(sessionRead.items, values => { sessions.value = activeBatchItems(values) }, { immediate: true })
+watch([batchSearch, sessionLimit], () => { sessionPage.value = 1 })
 const sessionCot = ref<CorrectionCotResponse | null>(null)
 const selectedGroupId = ref('')
 const selectedRowKey = ref('')
@@ -39,15 +47,15 @@ const editingField = ref<EditableTextField | null>(null)
 const textDraft = ref('')
 let timer: number | null = null
 let jobPollRequest = 0
+let changingSession = false
 let detailRequest = 0, listRequest = 0, disposed = false, initialized = false, choicesRequest = 0
 
 const groups = computed(() => sessionCot.value?.groups ?? [])
-const eligibleGroups = computed(() => groups.value.filter(group => !group.pending_review))
 const activeGroup = computed(() => groups.value.find((group) => group.group_id === selectedGroupId.value) ?? groups.value[0] ?? null)
 const activeRow = computed<CorrectionCotRow | null>(() => activeGroup.value?.rows.find((row) => `${row.excel_row}` === selectedRowKey.value) ?? activeGroup.value?.rows[0] ?? null)
-const editedRows = computed(() => groups.value.reduce((total, group) => total + group.rows.length, 0))
-const generatedRows = computed(() => groups.value.reduce((total, group) => total + group.rows.filter((row) => row.status === 'generated').length, 0))
-const selectedSession = computed(() => sessions.value.find((item) => item.session_id === selectedSessionId.value) ?? null)
+const editedRows = computed(() => selectedHeader.value?.cot_row_count ?? 0)
+const generatedRows = computed(() => selectedHeader.value?.cot_generated_count ?? 0)
+const selectedSession = computed(() => selectedHeader.value?.session_id === selectedSessionId.value ? selectedHeader.value : sessions.value.find((item) => item.session_id === selectedSessionId.value) ?? null)
 const selectedBatchId = computed({
   get: () => selectedSession.value?.batch_id || '',
   set: (id: string) => { void chooseBatch(id) },
@@ -63,11 +71,9 @@ async function chooseBatch(id: string) {
   selectedSessionId.value = sessions.value.find(item => item.batch_id === id)?.session_id || ''
 }
 async function loadChoices() {
-  if (pipelineContext.historyOnly.value) return
-  const request = ++choicesRequest
-  const values = await api.correctionSessions()
-  if (!disposed && request === choicesRequest) sessions.value = activeBatchItems(values)
+  if (!pipelineContext.historyOnly.value) await sessionRead.refresh()
 }
+
 function onPublished(event: PublishedBatchEvent) {
   const current = eventMatchesRoute(event, selectedBatchId.value, route.query)
   sessions.value = sessions.value.filter(item => !event.batch_ids.includes(item.batch_id || ''))
@@ -125,29 +131,45 @@ function selectRow(groupId: string, row: CorrectionCotRow) {
 }
 
 async function refreshCot() {
-  if (!selectedSessionId.value) { sessionCot.value = null; return }
+  if (hasUnsaved.value || !selectedSessionId.value) return
   const request = ++detailRequest, sessionId = selectedSessionId.value
   loadingCot.value = true; error.value = ''
-  const previousGroupId = selectedGroupId.value
-  const previousRowKey = selectedRowKey.value
   try {
-    const current = await api.correctionSessionCot(sessionId)
+    const [header, page] = await Promise.all([
+      readPageApi.session(sessionId),
+      readPageApi.groups(sessionId, { offset: (groupPage.value - 1) * groupLimit.value, limit: groupLimit.value, search: groupSearch.value, status: groupStatus.value }),
+    ])
     if (disposed || request !== detailRequest || sessionId !== selectedSessionId.value) return
-    sessionCot.value = current
-    const group = groups.value.find((item) => item.group_id === previousGroupId) ?? groups.value[0]
-    const row = group?.rows.find((item) => String(item.excel_row) === previousRowKey) ?? group?.rows[0] ?? null
-    selectedGroupId.value = group?.group_id ?? ''
-    selectedRowKey.value = row ? String(row.excel_row) : ''
-    resetLocalEditing()
+    selectedHeader.value = header
+    groupChoices.value = page.items; groupTotal.value = page.filtered_total ?? page.total ?? 0
+    if (selectedGroupId.value) await loadCotGroup(selectedGroupId.value)
+    else sessionCot.value = { session_id: sessionId, storage_revision: header.storage_revision, pending_review_count: header.pending_review_count, groups: [] }
   } catch (cause) {
-    if (!disposed && request === detailRequest && sessionId === selectedSessionId.value) error.value = cause instanceof Error ? cause.message : String(cause)
-  } finally {
-    if (!disposed && request === detailRequest) loadingCot.value = false
-  }
+    if (!disposed && request === detailRequest) error.value = (cause as Error).message
+  } finally { if (!disposed && sessionId === selectedSessionId.value) loadingCot.value = false }
 }
 
+async function loadCotGroup(groupId: string) {
+  if (hasUnsaved.value) { ElMessage.warning('请先保存或取消当前修改'); return }
+  const request = ++detailRequest, sessionId = selectedSessionId.value
+  const previousRow = groupId === selectedGroupId.value ? selectedRowKey.value : ''
+  if (groupId !== selectedGroupId.value) sessionCot.value = null
+  selectedGroupId.value = groupId; loadingCot.value = true
+  try {
+    const current = await readPageApi.cot(sessionId, groupId)
+    if (disposed || request !== detailRequest || sessionId !== selectedSessionId.value) return
+    sessionCot.value = current
+    const rows = current.groups[0]?.rows || []
+    selectedRowKey.value = String(rows.find(row => String(row.excel_row) === previousRow)?.excel_row ?? rows[0]?.excel_row ?? '')
+    resetLocalEditing()
+  } catch (cause) { if (!disposed && request === detailRequest) error.value = (cause as Error).message }
+  finally { if (!disposed && request === detailRequest) loadingCot.value = false }
+}
+watch([groupPage, groupLimit], () => { if (!hasUnsaved.value && !changingSession) void refreshCot() })
+watch([groupSearch, groupStatus], () => { if (!hasUnsaved.value && !changingSession) { if (groupPage.value !== 1) groupPage.value = 1; else void refreshCot() } })
+
 async function pollJob() {
-  if (!activeJob.value) return
+  if (!activeJob.value || document.hidden) return
   const request = jobPollRequest
   try {
     const jobId = activeJob.value.job_id, sessionId = selectedSessionId.value
@@ -160,10 +182,10 @@ async function pollJob() {
       ElMessage.success(next.generate_bbox ? 'bbox 与 COT 批量生成完成' : 'COT 重新生成完成')
     } else if (next.status === 'failed' || next.status === 'interrupted') {
       stopPolling()
-    } else { timer = window.setTimeout(() => void pollJob(), 1200) }
+    } else { timer = window.setTimeout(() => void pollJob(), 5000) }
   } catch (cause) {
     if (disposed || request !== jobPollRequest) return
-    timer = window.setTimeout(() => void pollJob(), 1200)
+    timer = window.setTimeout(() => void pollJob(), 5000)
     error.value = cause instanceof Error ? cause.message : String(cause)
   }
 }
@@ -173,8 +195,8 @@ function startPolling(job: CorrectionCotJob) {
   activeJob.value = job
   stopPolling()
   if (job.status === 'queued' || job.status === 'running') {
-    timer = window.setTimeout(() => void pollJob(), 1200)
-  } else if (job.status === 'succeeded') { void refreshCot() }
+    timer = window.setTimeout(() => void pollJob(), 5000)
+  }
 }
 
 async function loadSessions() {
@@ -183,52 +205,24 @@ async function loadSessions() {
   try {
     await pipelineContext.refresh()
     if (disposed || request !== listRequest) return
-    if (pipelineContext.historyOnly.value) { selectedSessionId.value = ''; sessionCot.value = null; activeJob.value = null; stopPolling(); return }
-    if (pipelineContext.isPipelineRoute.value || pipelineContext.managed.value) {
-      const sessionId = pipelineContext.sessionId.value
-      initialized = true
-      if (!sessionId) { sessions.value = []; selectedSessionId.value = ''; sessionCot.value = null; return }
-      const saved = await api.correctionSession(sessionId)
-      if (disposed || request !== listRequest) return
-      if (saved.batch_id !== pipelineContext.pipeline.value?.batch_id) throw new Error('Pipeline COT 会话与当前批次不一致')
-      sessions.value = [saved]; selectedSessionId.value = sessionId
-      const ids = pipelineContext.pipeline.value?.steps.find(step => step.id === 'cot')?.job_ids || []
-      const jobs = await Promise.all(ids.map(id => api.correctionCotJob(id)))
-      if (disposed || request !== listRequest) return
-      const job = jobs.find(item => ['queued', 'running'].includes(item.status)) || jobs.at(-1)
-      if (job) startPolling(job)
-      await refreshCot()
-      return
-    }
+    if (pipelineContext.historyOnly.value) { selectedSessionId.value = ''; sessionCot.value = null; stopPolling(); return }
     if (pipelineContext.error.value) throw new Error(pipelineContext.error.value)
-    if (typeof route.query.batch_id === 'string' && !await lifecycle.checkBatch(route.query.batch_id)) { await loadChoices(); return }
-    const values = await api.correctionSessions()
+    await loadChoices()
+    const explicitId = pipelineContext.sessionId.value || String(route.query.session_id || route.query.session || '')
+    const batch = String(route.query.batch_id || '')
+    let id = explicitId
+    if (!id && batch) id = (await readPageApi.sessions({ batch_id: batch, limit: 1 })).items[0]?.session_id || ''
     if (disposed || request !== listRequest) return
-    sessions.value = activeBatchItems(values)
-    const legacySession = typeof route.query.session_id === 'string' ? route.query.session_id : typeof route.query.session === 'string' ? route.query.session : undefined
-    if (route.query.batch_id === undefined && legacySession && !values.some(item => item.session_id === legacySession)) await api.correctionSession(legacySession)
-    if (disposed || request !== listRequest) return
-    const nextSessionId = resolveSessionSelection(values, {
-      batchId: typeof route.query.batch_id === 'string' ? route.query.batch_id : undefined,
-      sessionId: typeof route.query.session_id === 'string' ? route.query.session_id : typeof route.query.session === 'string' ? route.query.session : undefined,
-    })
-    if (!await lifecycle.checkBatch(values.find(item => item.session_id === nextSessionId)?.batch_id || '')) return
-    if (disposed || request !== listRequest) return
-    selectedSessionId.value = nextSessionId
     initialized = true
-    const jobs = selectedSessionId.value ? await api.correctionCotJobs() : []
+    if (!id) return // Opening the page only loads its lightweight list.
+    const header = await readPageApi.session(id)
     if (disposed || request !== listRequest) return
-    const existing = jobs.find((job) => job.session_id === selectedSessionId.value && (job.status === 'queued' || job.status === 'running'))
-    if (existing) startPolling(existing)
-    await refreshCot()
-  } catch (cause) {
-    if (disposed || request !== listRequest) return
-    ++detailRequest; selectedSessionId.value = ''; sessionCot.value = null; activeJob.value = null; loadingCot.value = false
-    stopPolling(); resetLocalEditing(); initialized = true
-    error.value = cause instanceof Error ? cause.message : String(cause)
-  } finally {
-    if (!disposed && request === listRequest) loading.value = false
-  }
+    if (!await lifecycle.checkBatch(header.batch_id || '')) return
+    selectedHeader.value = header
+    if (selectedSessionId.value === id) await refreshCot()
+    else selectedSessionId.value = id // The selection watcher is the only initial detail fetch.
+  } catch (cause) { if (!disposed && request === listRequest) error.value = (cause as Error).message }
+  finally { if (!disposed && request === listRequest) loading.value = false }
 }
 
 function serializeBBox(row: CorrectionCotRow, box: BBox): string {
@@ -318,11 +312,11 @@ async function regenerateCot() {
 async function generateAll() {
   if (pipelineReadOnly.value) return
   if (!selectedSessionId.value || saving.value || hasUnsaved.value) return
-  const rows = eligibleGroups.value.flatMap((group) => group.rows)
-  if (!rows.length) return
+  const count = selectedHeader.value?.eligible_cot_row_count || 0
+  if (!count) return
   try {
     await ElMessageBox.confirm(
-      `将重新生成 ${rows.length} 个步骤的 bbox、thought 和 summary；已有人工修改会被覆盖。`,
+      `将重新生成 ${count} 个步骤的 bbox、thought 和 summary；已有人工修改会被覆盖。`,
       '确认批量生成',
       { type: 'warning', confirmButtonText: '确认覆盖生成', cancelButtonText: '取消' },
     )
@@ -330,7 +324,7 @@ async function generateAll() {
   if (!selectedSessionId.value || publishedNotice.value) return
   saving.value = true; error.value = ''
   try {
-    startPolling(await api.createCorrectionCotJob(selectedSessionId.value, eligibleGroups.value.map(group => group.group_id), undefined, { generateBBox: true, forceOverwrite: true, expectedRevision: sessionCot.value?.storage_revision }))
+    startPolling(await api.createCorrectionCotJob(selectedSessionId.value, undefined, undefined, { generateBBox: true, forceOverwrite: true, expectedRevision: sessionCot.value?.storage_revision }))
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : String(cause)
   } finally {
@@ -356,14 +350,26 @@ async function exportDataset() {
   }
 }
 
-watch(selectedSessionId, () => {
+watch(selectedSessionId, async () => {
+  changingSession = true
   ++detailRequest
   sessionCot.value = null
+  groupChoices.value = []; selectedGroupId.value = ''; selectedRowKey.value = ''; groupPage.value = 1
   if (selectedBatchId.value) void router.replace({ query: { ...route.query, batch_id: selectedBatchId.value, session_id: undefined, session: undefined } })
   activeJob.value = null
   stopPolling()
   resetLocalEditing()
-  void refreshCot()
+  await nextTick()
+  changingSession = false
+  await refreshCot()
+  const id = selectedSessionId.value
+  if (!id) return
+  try {
+    const page = await readPageApi.cotJobs(id)
+    if (disposed || id !== selectedSessionId.value) return
+    const job = page.items.find(value => ['queued', 'running'].includes(value.status))
+    if (job) startPolling(job)
+  } catch (cause) { if (!disposed && id === selectedSessionId.value) error.value = (cause as Error).message }
 })
 onBeforeRouteUpdate((to, from) => {
   if (publishedNotice.value && to.query.batch_id === undefined && to.query.session_id === undefined && to.query.session === undefined) return true
@@ -380,8 +386,9 @@ watch(pipelineContext.historyOnly, value => { if (value) void loadSessions() })
 watch(() => `${pipelineContext.sessionId.value}:${pipelineContext.pipeline.value?.steps.find(step => step.id === 'cot')?.job_ids.join(',') || ''}`, () => {
   if (initialized && !disposed && !publishedNotice.value) void loadSessions()
 })
-onMounted(() => { void loadSessions() })
-onBeforeUnmount(() => { disposed = true; ++detailRequest; ++listRequest; stopPolling() })
+function resumePolling() { if (!document.hidden && jobRunning.value) void pollJob(); else if (document.hidden) stopPolling() }
+onMounted(() => { document.addEventListener('visibilitychange', resumePolling); void loadSessions() })
+onBeforeUnmount(() => { document.removeEventListener('visibilitychange', resumePolling); disposed = true; ++detailRequest; ++listRequest; stopPolling() })
 </script>
 
 <template>
@@ -397,10 +404,13 @@ onBeforeUnmount(() => { disposed = true; ++detailRequest; ++listRequest; stopPol
       <div class="toolbar-field"><span>业务批次</span><el-select v-model="selectedBatchId" filterable :filter-method="(value: string) => batchSearch = value" :loading="loading" :disabled="pipelineContext.isPipelineRoute.value || loading || !sessions.length || hasUnsaved || jobRunning || saving || exporting" placeholder="选择批次"><el-option v-for="item in visibleSessions" :key="item.batch_id" :label="displayId('batch', item.batch_id)" :value="item.batch_id" /></el-select></div>
       <div class="toolbar-stats"><span>任务 {{ selectedSession?.group_count ?? 0 }}</span><span>修改步骤 {{ editedRows }}</span></div>
       <DisplayId v-if="selectedBatchId" kind="batch" :id="selectedBatchId" />
-      <el-button type="primary" :loading="saving && jobRunning" :disabled="pipelineReadOnly || !selectedSessionId || !editedRows || jobRunning || hasUnsaved || !eligibleGroups.length" @click="generateAll">批量生成 bbox + COT</el-button>
+      <el-button type="primary" :loading="saving && jobRunning" :disabled="pipelineReadOnly || !selectedSessionId || !editedRows || jobRunning || hasUnsaved || !selectedHeader?.eligible_cot_row_count" @click="generateAll">批量生成 bbox + COT</el-button>
       <el-button type="success" :loading="exporting" :disabled="pipelineReadOnly || !selectedSessionId || !editedRows || jobRunning || hasUnsaved || saving" @click="exportDataset">导出数据集</el-button>
       <el-button :icon="Refresh" text :disabled="loadingCot || jobRunning || hasUnsaved" @click="refreshCot">刷新</el-button>
     </section>
+    <el-pagination v-model:current-page="sessionPage" v-model:page-size="sessionLimit" :page-sizes="[10,20,50]" :total="sessionRead.total.value" layout="total, sizes, prev, pager, next" />
+    <el-alert v-if="sessionRead.error.value" :title="sessionRead.error.value" type="warning" :closable="false" />
+    <el-alert v-if="sessionRead.data.value && !sessionRead.data.value.counts_complete" title="历史会话摘要正在准备，已有摘要仍可查看。" type="info" :closable="false" />
     <el-alert v-if="pendingReview" :title="`${pendingReview} 项人工修改待复核；生成和导出会排除这些任务。`" type="warning" :closable="false" show-icon><router-link :to="{ path: '/correction', query: { ...route.query, batch_id: selectedBatchId, ...(pipelineContext.isPipelineRoute.value ? { step_id: 'correction' } : {}) } }">进入当前批次复核</router-link></el-alert>
     <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />
     <section v-if="activeJob" class="job-status">
@@ -411,10 +421,15 @@ onBeforeUnmount(() => { disposed = true; ++detailRequest; ++listRequest; stopPol
     <section v-else v-loading="loading || loadingCot" class="workspace">
       <aside class="step-panel">
         <div class="panel-title"><b>修改步骤</b><span>{{ editedRows }} 步</span></div>
-        <div v-for="group in groups" :key="group.group_id" class="trajectory-group">
-          <div class="trajectory-heading"><el-icon><Document /></el-icon><b><DisplayId kind="trajectory" :id="group.trajectory_id" :scope="selectedBatchId" /></b></div>
-          <button v-for="row in group.rows" :key="row.excel_row" class="step-item" :class="{ active: activeRow?.excel_row === row.excel_row }" :title="`${row.trajectory_id}-step${row.step}`" @click="selectRow(group.group_id, row)"><span>{{ displayId('trajectory', row.trajectory_id, selectedBatchId) }}-step{{ row.step }}</span><span class="step-check">✓</span></button>
+        <el-input v-model="groupSearch" clearable placeholder="搜索任务或轨迹" :disabled="hasUnsaved" />
+        <el-select v-model="groupStatus" :disabled="hasUnsaved" aria-label="COT 任务状态"><el-option value="" label="全部状态" /><el-option value="ready" label="可生成" /><el-option value="pending_review" label="待复核" /></el-select>
+        <div v-for="group in groupChoices" :key="group.group_id" class="trajectory-group">
+          <button class="trajectory-heading" @click="loadCotGroup(group.group_id)"><el-icon><Document /></el-icon><b><DisplayId kind="trajectory" :id="group.meta_task" :scope="selectedBatchId" /></b><span>{{ group.cot_row_count || 0 }} 步</span></button>
+          <template v-if="selectedGroupId === group.group_id">
+            <button v-for="row in activeGroup?.rows || []" :key="row.excel_row" class="step-item" :class="{ active: activeRow?.excel_row === row.excel_row }" @click="selectRow(group.group_id, row)"><span>Step {{ row.step }}</span><span class="step-check">✓</span></button>
+          </template>
         </div>
+        <el-pagination v-model:current-page="groupPage" v-model:page-size="groupLimit" :page-sizes="[10,20,50]" :total="groupTotal" :disabled="hasUnsaved" layout="total, sizes, prev, next" />
       </aside>
       <section class="image-panel">
         <div class="panel-title"><div><b>步骤截图</b><span v-if="activeRow"><DisplayId kind="trajectory" :id="activeRow.trajectory_id" :scope="selectedBatchId" /> · Step {{ activeRow.step }}</span></div><el-tag v-if="bboxEditing" type="warning" size="small">bbox 编辑中</el-tag></div>
@@ -458,7 +473,12 @@ onBeforeUnmount(() => { disposed = true; ++detailRequest; ++listRequest; stopPol
   </div>
 </template>
 
+<style scoped src="../styles/businessPaging.css"></style>
 <style scoped>
+:global(body:has(.cot-page)){min-width:0}
+.cot-page{min-width:0}
+@media(max-width:600px){.cot-page{padding:20px 12px}.hero-metrics{flex-wrap:wrap;gap:6px}.hero-metrics div{min-width:0;padding:10px 8px}.toolbar-field{min-width:0}.toolbar-stats{flex-wrap:wrap}.toolbar :deep(.el-button){margin-left:0}.workspace{grid-template-columns:minmax(0,1fr)}.panel-title{flex-wrap:wrap;padding:10px 12px}}
+.el-pagination { flex-wrap: wrap; row-gap: 8px; margin: 12px 0; }
 .cot-hero{margin-bottom:10px}.toolbar{display:flex;align-items:end;gap:18px;flex-wrap:wrap;margin:12px 0 14px;padding:14px 16px;border:1px solid var(--line);border-radius:14px;background:#fff}.toolbar-field{display:grid;gap:6px}.toolbar-field>span,.toolbar label,.field-card label,.bbox-card label,.compare-card label,.history-card label{font-size:11px;font-weight:800;letter-spacing:.05em;color:#64748b}.toolbar-field .el-select{width:360px;max-width:100%}.toolbar-stats{display:flex;gap:14px;padding-bottom:9px;color:#64748b;font-size:12px}.toolbar>.el-button--primary{margin-left:auto}.job-status{display:grid;gap:10px;margin:0 0 14px;padding:12px 16px;border:1px solid var(--line);border-radius:12px;background:#fff}.job-status>div{display:flex;gap:12px;flex-wrap:wrap;align-items:center;color:#64748b;font-size:12px}.job-status b{color:#0f172a}.job-status em{color:#dc2626;font-style:normal}.workspace{display:grid;grid-template-columns:236px minmax(330px,1fr) minmax(360px,.95fr);gap:14px;min-height:650px}.step-panel,.image-panel,.detail-panel{min-width:0;border:1px solid var(--line);border-radius:14px;background:#fff;overflow:hidden}.step-panel{overflow:auto}.panel-title{display:flex;justify-content:space-between;align-items:center;gap:8px;min-height:48px;padding:0 14px;border-bottom:1px solid #e5e7eb;color:#0f172a;font-size:13px}.panel-title span{margin-left:8px;color:#94a3b8;font-size:11px;font-weight:400}.trajectory-group{padding:10px 8px;border-bottom:1px solid #eef2f7}.trajectory-heading{display:grid;grid-template-columns:auto 1fr;gap:6px 8px;align-items:center;padding:5px 7px;color:#334155;font-size:12px}.trajectory-heading small{grid-column:2;overflow:hidden;color:#94a3b8;font-size:10px;text-overflow:ellipsis;white-space:nowrap}.step-item{display:grid;grid-template-columns:1fr auto;gap:3px 8px;width:100%;margin:2px 0;padding:9px 8px;border:1px solid transparent;border-radius:9px;background:transparent;color:#475569;text-align:left;cursor:pointer}.step-item:hover{background:#f0fdfa}.step-item.active{border-color:#5eead4;background:#ecfdf5;box-shadow:0 0 0 2px rgba(20,184,166,.08)}.step-item span{font-size:11px;font-weight:800}.step-item strong{color:#0f766e;font-size:10px}.step-item small{grid-column:1/-1;overflow:hidden;color:#94a3b8;font-size:10px;text-overflow:ellipsis;white-space:nowrap}.image-panel{display:grid;grid-template-rows:auto 1fr}.image-stage{position:relative;display:grid;place-items:center;min-height:600px;padding:16px;background:#0b1220;overflow:hidden;touch-action:none}.image-stage img{display:block;max-width:100%;max-height:100%;object-fit:contain}.overlay{position:absolute;width:calc(100% - 32px);height:calc(100% - 32px);pointer-events:none}.bbox{fill:rgba(20,184,166,.18);stroke:#14b8a6;stroke-width:8}.bbox-handle{fill:#fff;stroke:#0f766e;stroke-width:5;pointer-events:auto}.action-point{fill:#f59e0b;stroke:#fff;stroke-width:8}.swipe-line{stroke:#f59e0b;stroke-width:12;stroke-linecap:round}.image-caption{position:absolute;right:12px;bottom:12px;left:12px;padding:8px;border-radius:8px;background:rgba(2,6,23,.78);color:#e2e8f0;font-size:11px;text-align:center;pointer-events:none}.empty-image{color:#94a3b8;font-size:13px}.detail-panel{overflow:auto}.identity,.field-card,.bbox-card,.compare-card,.history-card{margin:12px;padding:11px;border:1px solid #e5e7eb;border-radius:10px;background:#f8fafc}.identity{display:grid;gap:5px}.identity span,.identity label{color:#64748b;font-size:10px;font-weight:800}.identity b{color:#0f766e;font-size:12px}.identity p{margin:0;color:#334155;font-size:12px;line-height:1.5}.field-card,.bbox-card,.history-card{display:grid;gap:8px}.field-card :deep(textarea){font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px}.bbox-card .card-head{display:flex;justify-content:space-between;gap:8px;align-items:center}.bbox-card code{color:#0f766e;font-size:11px}.bbox-fields{display:grid;grid-template-columns:1fr 1fr;gap:7px}.bbox-fields :deep(.el-input-number){width:100%}.muted{color:#94a3b8!important}.compare-card{display:grid;gap:10px}.compare-card>div{padding-bottom:8px;border-bottom:1px dashed #dbe3ed}.compare-card>div:last-child{padding-bottom:0;border-bottom:0}.compare-card p{margin:4px 0 0;color:#334155;font-size:12px;line-height:1.6;white-space:pre-wrap}.history-card pre{max-height:120px;margin:0;overflow:auto;color:#475569;font:11px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap}.detail-actions{position:sticky;bottom:0;padding:12px;background:linear-gradient(transparent,#fff 18%)}.detail-actions .el-button{width:100%}.done{color:#16a34a}@media(max-width:1150px){.workspace{grid-template-columns:210px minmax(300px,1fr)}.detail-panel{grid-column:1/-1}.image-stage{min-height:520px}}@media(max-width:700px){.toolbar-field,.toolbar-field .el-select{width:100%}.toolbar>.el-button--primary{margin-left:0}.workspace{grid-template-columns:1fr}.step-panel{max-height:300px}.image-stage{min-height:430px}.detail-panel{grid-column:auto}}
 .identity-meta{color:#94a3b8;font-size:11px}.original-value{display:grid;gap:3px;padding:7px 8px;border-radius:7px;background:#fff;color:#64748b;font-size:10px}.original-value code{overflow:auto;color:#64748b;font:10px/1.4 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap}.image-frame{position:relative;display:inline-block;max-width:100%;max-height:100%;line-height:0}.image-frame img{display:block;max-width:100%;max-height:568px;width:auto;height:auto;object-fit:contain}.image-frame .overlay{position:absolute;inset:0;width:100%;height:100%}
 .action-readonly{display:block;max-width:100%;padding:8px 10px;border:1px solid #dbe3ed;border-radius:8px;background:#fff;color:#334155;font:11px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.original-value code{display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.bbox-help{padding:8px 9px;border-radius:8px;background:#ecfdf5;color:#0f766e;font-size:11px;line-height:1.5}

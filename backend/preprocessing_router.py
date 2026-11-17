@@ -42,7 +42,10 @@ def checked(operation):
 
 
 @router.get("/batches")
-def list_batches():
+def list_batches(view: str | None = None, offset: int = 0, limit: int = 10, q: str = "", status: str = "", batch_id: str | None = None):
+    if view == "summary":
+        from .stage_page_reads import batch_page
+        return checked(lambda: batch_page(manager().root, offset=offset, limit=limit, q=q, status=status, batch_id=batch_id))
     return checked(lambda: {"batches": manager().batches()})
 
 
@@ -52,7 +55,10 @@ def create_job(request: PreprocessingRequest):
 
 
 @router.get("/jobs")
-def list_jobs(batch_id: str | None = None):
+def list_jobs(batch_id: str | None = None, view: str | None = None, offset: int = 0, limit: int = 10):
+    if view == "summary":
+        from .data_store import RecordStore
+        return RecordStore(manager().root).summary_page("preprocessing_jobs", batch_id=batch_id, offset=offset, limit=limit)
     return checked(lambda: {"jobs": manager().list_jobs(batch_id)})
 
 
