@@ -391,11 +391,20 @@ def _publish_pipeline_with_diagnostics(pipeline, *, root=None, registry=None):
             snapshot = session["snapshot_payload"]
         elif sessions:
             session = _existing_edit_view(sessions[0], snapshot)
+        intent_key = "pipeline:" + pipeline_id
+        intent = records.get("release_intents", intent_key)
         if pipeline.get("export_profile") == "corrected_selection_v1":
             from .trajectory_correction.selected_export import project_selected
-            tree, quality, _, _, _ = _validate_source(selection, root)
+            from .data_publishing.paired_training import image_prefix
+            tree, quality, _, _, assets = _validate_source(selection, root)
+            training_prefix = (intent["training_image_prefix"] if intent and "training_image_prefix" in intent
+                               else image_prefix(pipeline.get("training_image_prefix")))
+            if (intent and "training_image_prefix" in intent and pipeline.get("training_image_prefix") is not None
+                    and image_prefix(pipeline["training_image_prefix"]) != training_prefix):
+                raise RevisionConflict("同一 Pipeline 发布重试不能改变已冻结的图片前缀")
             payload = project_selected(session=session, snapshot=snapshot, table=table, selection=selection,
-                cot_policy=pipeline.get("cot_policy", "generate"), tree_payload={**tree, "artifact": store.get(batch_id, "04_tree")}, quality_payload=quality)
+                cot_policy=pipeline.get("cot_policy", "generate"), tree_payload={**tree, "artifact": store.get(batch_id, "04_tree")}, quality_payload=quality,
+                raw_root=assets, training_prefix=training_prefix)
             payload.update(pipeline_id=pipeline_id, source_kind="pipeline_selection")
         else:
             payload = _export_payload(selection, snapshot, table, session, pipeline_id)
@@ -403,8 +412,6 @@ def _publish_pipeline_with_diagnostics(pipeline, *, root=None, registry=None):
         release_root.mkdir(parents=True, exist_ok=True)
         final, staging = release_root / release_id, release_root / ("." + release_id + ".tmp")
         # A durable, stable intent lets retries recover an unregistered rename.
-        intent_key = "pipeline:" + pipeline_id
-        intent = records.get("release_intents", intent_key)
         request_hash = fingerprint({"pipeline": pipeline_id, "batch": batch_id, "selection": selection,
                                     "confirmation": pipeline.get("confirmation"), "name": pipeline["name"],
                                     **({"export_profile": pipeline["export_profile"], "cot_policy": pipeline.get("cot_policy")} if pipeline.get("export_profile") else {})})
@@ -412,7 +419,14 @@ def _publish_pipeline_with_diagnostics(pipeline, *, root=None, registry=None):
             raise RevisionConflict("同一 Pipeline 的发布内容不能在重试时改变")
         if not intent:
             intent = records.put("release_intents", intent_key, {"release_id": release_id, "pipeline_id": pipeline_id,
-                "batch_id": batch_id, "request_hash": request_hash, "created_at": utc_now(), "status": "preparing"}, expected_revision=0)
+                "batch_id": batch_id, "request_hash": request_hash, "created_at": utc_now(), "status": "preparing",
+                **({"training_image_prefix": training_prefix, "training_version": 2}
+                   if pipeline.get("export_profile") == "corrected_selection_v1" else {})}, expected_revision=0)
+        elif pipeline.get("export_profile") == "corrected_selection_v1" and "training_image_prefix" not in intent:
+            # Upgrade an uncommitted old publication intent once, without
+            # changing its original request identity or already published data.
+            intent = records.put("release_intents", intent_key, {**intent, "training_image_prefix": training_prefix,
+                "training_version": 2}, expected_revision=intent["storage_revision"])
         for orphan in (staging, final):
             if orphan.exists():
                 _remove_release_directory(orphan, release_root)
@@ -421,6 +435,19 @@ def _publish_pipeline_with_diagnostics(pipeline, *, root=None, registry=None):
             filename = "full_dataset.xlsx"
             excel = staging / "001" / filename
             write_payload_workbook(excel, payload)
+            training = None
+            if pipeline.get("export_profile") == "corrected_selection_v1":
+                from .data_publishing.paired_training import write_paired_workbook, image_prefix
+                try:
+                    prefix = training_prefix
+                    training = write_paired_workbook(excel, staging / "training/001/files/train.jsonl",
+                        staging / "training/001/report.json", prefix,
+                        source_id=f"pipeline:{pipeline_id}:{request_hash}")
+                except (OSError, ValueError, TypeError) as exc:
+                    training = {"version": 2, "status": "failed", "image_prefix": "",
+                                "included_count": 0, "excluded_count": 0,
+                                "error": f"Excel 已生成，配套 JSONL 生成失败：{exc}"}
+                payload["training"] = training
             refs = [store.get(batch_id, stage) for stage in ("04_tree", "05_quality")]
             artifact = store.publish(batch_id, "07_cot", payload,
                 workbooks={filename: excel}, source_refs=[ref for ref in refs if ref],
@@ -438,6 +465,11 @@ def _publish_pipeline_with_diagnostics(pipeline, *, root=None, registry=None):
                 "export_profile": pipeline.get("export_profile"), "cot_policy": pipeline.get("cot_policy"),
                 "upload_status": "not_uploaded", "upload_job_id": None, "upload_error": None, "s3_uri": None,
                 "uploaded_at": None, "uploaded_files": 0, "uploaded_bytes": 0}
+            if training is not None:
+                release["training_files"] = [{**training, "index": 0, "batch_id": batch_id,
+                    **({"path": registry.project_path(final / "training/001/files/train.jsonl"),
+                        "report_path": registry.project_path(final / "training/001/report.json")}
+                       if training.get("sha256") else {})}]
             release = freeze_release_provenance(root, release, staging)
             (staging / "manifest.json").write_text(json.dumps(release, ensure_ascii=False, indent=2), encoding="utf-8")
             staging.rename(final)

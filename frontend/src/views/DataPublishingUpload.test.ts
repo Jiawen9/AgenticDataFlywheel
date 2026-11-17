@@ -11,7 +11,7 @@ vi.mock('@/readPageApi', () => {
   const page = (items: unknown[]) => ({ items, latest: [], total: items.length, filtered_total: items.length, scope_counts: { total: items.length, active: 0, abnormal: 0 }, offset: 0, limit: 10, has_more: false, index_state: 'ready', counts_complete: true })
   return { readPageApi: { releases: async () => page(await requests.datasetReleases()), candidates: async () => page(await requests.datasetReleaseCandidates()) } }
 })
-vi.mock('@/api', () => ({ api: requests, datasetReleaseExcelUrl: () => '' }))
+vi.mock('@/api', () => ({ api: requests, datasetReleaseExcelUrl: () => '', datasetReleaseTrainingUrl: () => '' }))
 vi.mock('vue-router', () => ({ useRoute: () => ({ query: {} }) }))
 vi.mock('@/composables/useBatchLifecycle', () => ({ useBatchLifecycle: () => ({ notice: ref(null) }) }))
 vi.mock('@/composables/useDisplayIdentifiers', () => ({ useDisplayIdentifiers: () => ({ displayId: (_: string, id: string) => id, matches: () => true }) }))
@@ -42,6 +42,31 @@ beforeEach(() => {
 afterEach(() => { apps.splice(0).forEach(app => app.unmount()); vi.useRealTimers(); vi.unstubAllGlobals() })
 
 describe('publishing upload interaction', () => {
+  it('uploads paired JSONL alone to an independent prefix without changing its image prefix', async () => {
+    const { state } = mount(); await flush()
+    const paired = { ...release(), training_files: [{ index: 0, version: 2, status: 'ready', image_prefix: 's3://bucket/frozen-images/', filename: 'train.jsonl' }] }
+    await state.startUpload(paired, true)
+    state.trainingDestinationPrefix = ' training/only/ '
+    expect(state.trainingJsonl).toBe(true)
+    expect(state.imagePrefixes).toEqual(['s3://bucket/frozen-images/'])
+    await state.confirmUpload()
+    expect(requests.uploadDatasetRelease).toHaveBeenCalledWith('release-one', 'internal', {
+      include_trajectories: false, destination_prefix: 'default/', training_jsonl: true, training_only: true, training_destination_prefix: 'training/only/',
+    })
+    expect(paired.training_files[0]?.image_prefix).toBe('s3://bucket/frozen-images/')
+  })
+  it('restores JSONL-only retry scope and target, and starts a new job if target changes', async () => {
+    const { state } = mount(); await flush()
+    await state.startUpload(release({ job_id: 'jsonl-failed', status: 'failed', folder_upload: true, training_jsonl: true, training_only: true,
+      training_destination_prefix: 'train/old/', destination: { prefix: 'tables/', bucket: 'bucket', region: 'region' } }))
+    expect(state.trainingOnly).toBe(true)
+    expect(state.trainingDestinationPrefix).toBe('train/old/')
+    expect(state.retryUploadId).toBe('jsonl-failed')
+    state.trainingDestinationPrefix = 'train/new/'
+    expect(state.retryUploadId).toBeUndefined()
+    await state.confirmUpload()
+    expect(requests.uploadDatasetRelease.mock.calls[0]?.[2]).toEqual({ include_trajectories: false, destination_prefix: 'tables/', training_jsonl: true, training_only: true, training_destination_prefix: 'train/new/' })
+  })
   it('renders history while candidate loading is still pending', async () => {
     requests.datasetReleaseCandidates.mockReturnValueOnce(new Promise<never[]>(() => {}))
     requests.datasetReleases.mockResolvedValueOnce([release() as never])

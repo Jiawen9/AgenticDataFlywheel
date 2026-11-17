@@ -16,6 +16,7 @@ from ..trajectory_correction.draft_store import list_sessions, load_session, sav
 from .constants import PROJECT_ROOT, RELEASES_FILE, ensure_release_dirs
 from ..data_store import RecordStore, ArtifactStore, DATA_ROOT, rebase_data_path
 from ..identifiers import allocate_id
+from ..file_io import io_path
 from ..data_store.release_provenance import freeze_release_provenance
 from ..trajectory_correction.session_state import session_fingerprint
 from ..batch_lifecycle import (is_batch_active, session_batch_id, ensure_publishable, published_entry,
@@ -285,7 +286,8 @@ class DatasetReleaseRegistry:
                                 "revision": session.get("storage_revision"), "tree_run_id": session.get("tree_run_id"),
                                 "export_id": latest.get("export_id"), "artifact": latest.get("artifact"),
                                 "export_profile": latest.get("export_profile"), "cot_policy": latest.get("cot_policy"),
-                                "selection": deepcopy(latest.get("selection"))})
+                                "selection": deepcopy(latest.get("selection")),
+                                "training": deepcopy(latest.get("training"))})
 
             batch_ids = [session_batch_id(item, self.data_root) for item in sessions]
             if len(set(batch_ids)) != len(batch_ids):
@@ -329,6 +331,34 @@ class DatasetReleaseRegistry:
                     item["source_path"] = item["path"]
                     item["path"] = self.project_path(final / relative)
                     item["data_path"] = (Path("releases") / release_id / relative).as_posix()
+                release["training_files"] = []
+                for index, source in enumerate(sources):
+                    training = source.get("training")
+                    if not training or training.get("version") != 2:
+                        continue
+                    entry = {**deepcopy(training), "index": index, "batch_id": batch_ids[index]}
+                    for field in ("download_url", "report_download_url"):
+                        entry.pop(field, None)
+                    for kind, filename_key, digest_key, result_key, relative in (
+                        ("jsonl", "filename", "sha256", "path", Path("training") / f"{index + 1:03d}" / "files" / "train.jsonl"),
+                        ("report", "report_filename", "report_sha256", "report_path", Path("training") / f"{index + 1:03d}" / "report.json"),
+                    ):
+                        filename = training.get(filename_key)
+                        if not filename or not training.get(digest_key):
+                            continue
+                        if Path(filename).name != filename:
+                            raise ValueError("配套训练文件名无效")
+                        original = self.correction_exports_dir / source["id"] / filename
+                        if _sha256(io_path(original)) != training[digest_key]:
+                            raise ValueError("配套训练文件与导出摘要不一致，请重新导出")
+                        target = staging / relative
+                        io_path(target.parent).mkdir(parents=True, exist_ok=True)
+                        shutil.copyfile(io_path(original), io_path(target))
+                        if _sha256(io_path(target)) != training[digest_key]:
+                            raise ValueError("发布期间训练文件发生变化")
+                        entry[result_key] = self.project_path(final / relative)
+                        entry[filename_key] = relative.name
+                    release["training_files"].append(entry)
                 release = freeze_release_provenance(self.data_root, release, staging)
                 (staging / "manifest.json").write_text(json.dumps(release, ensure_ascii=False, indent=2), encoding="utf-8")
                 staging.rename(final)
@@ -397,6 +427,23 @@ class DatasetReleaseRegistry:
         if not item.get("sha256") or _sha256(path) != item["sha256"]:
             raise ValueError("数据集 Excel 与发布版本的 SHA256 不一致")
         return path, str(item.get("filename") or path.name)
+
+    def training_file(self, release_id: str, index: int, kind: str = "jsonl") -> tuple[Path, str]:
+        release = self.get(release_id)
+        if release is None:
+            raise FileNotFoundError("数据集发布记录不存在")
+        item = next((row for row in release.get("training_files", []) if row.get("index") == index), None)
+        if kind not in {"jsonl", "report"} or item is None:
+            raise FileNotFoundError("配套训练文件不存在")
+        field, sha, filename = ("path", "sha256", "filename") if kind == "jsonl" else ("report_path", "report_sha256", "report_filename")
+        if not item.get(field) or not item.get(sha):
+            raise FileNotFoundError("配套训练文件尚未生成")
+        path = self.resolve_project_path(item[field])
+        if not path.resolve().is_relative_to((self.data_root / "releases" / release_id / "training").resolve()):
+            raise ValueError("训练文件不属于本次发布")
+        if _sha256(io_path(path)) != item[sha]:
+            raise ValueError("配套训练文件与发布摘要不一致")
+        return path, str(item.get(filename) or path.name)
 
 
 def default_registry() -> DatasetReleaseRegistry:

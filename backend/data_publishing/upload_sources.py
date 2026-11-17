@@ -10,6 +10,7 @@ import json
 import re
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import urlsplit
 
 from openpyxl import load_workbook
 
@@ -172,7 +173,7 @@ def resolve_upload_sources(registry, release: dict, *, include_trajectories: boo
     sources = release.get("source_refs") or []
     root = resolve_path(registry.data_root)
     frozen = None
-    items, seen, destinations = [], set(), {}
+    items, seen, destinations = [], {}, {}
     for index, file in enumerate(release.get("excel_paths") or []):
         source = sources[index] if index < len(sources) else {}
         if include_trajectories and source.get("kind") == "external_import":
@@ -218,14 +219,28 @@ def resolve_upload_sources(registry, release: dict, *, include_trajectories: boo
                         continue
                     row_count += 1
                     directory, metadata = scope.directory(row, f"{path.name}/{sheet.title} 第 {number} 行")
+                    if _text(row.get("training_trajectory_relative")):
+                        trajectory_relative = PurePosixPath(_image(row["training_trajectory_relative"]))
+                        paired_image = PurePosixPath(_image(row.get("training_image_relative")))
+                        if trajectory_relative.is_absolute() or ".." in trajectory_relative.parts:
+                            raise UploadSourceError("配套轨迹目录越界")
+                        try:
+                            suffix = paired_image.relative_to(trajectory_relative)
+                        except ValueError as exc:
+                            raise UploadSourceError("配套图片不属于登记轨迹目录") from exc
+                        if not suffix.parts or ".." in suffix.parts:
+                            raise UploadSourceError("配套图片路径无效")
+                        local_image = Path(_image(row.get("image")))
+                        local_image = resolve_path(local_image if local_image.is_absolute() else scope.raw_root / local_image)
+                        directory = local_image.parents[len(suffix.parts) - 1]
+                        if (directory == scope.raw_root or not directory.is_relative_to(scope.raw_root)
+                                or local_image.relative_to(directory).as_posix() != suffix.as_posix()):
+                            raise UploadSourceError("配套图片路径与原始轨迹不对应")
                     relative = directory.relative_to(scope.raw_root).as_posix()
                     # Root-relative paths remain stable through supported data
                     # root relocation, and include run/phone/repeat identity.
                     root_identity = scope.raw_root.relative_to(root).as_posix()
                     identity = _digest(["trajectory", batch_id, root_identity, relative])
-                    if identity in seen:
-                        continue
-                    seen.add(identity)
                     case_id = next((_text(metadata.get(name)) for name in
                                     ("collection_case_id", "case_id", "task_id") if _text(metadata.get(name))), "")
                     if not case_id:
@@ -234,13 +249,33 @@ def resolve_upload_sources(registry, release: dict, *, include_trajectories: boo
                     trajectory_id = _text(metadata.get("trajectory_id") or metadata.get("meta_task") or directory.name)
                     folder_name = _component(directory.name) + "__" + identity[:20]
                     destination = f"{_component(batch_id)}/{_component(case_id)}/{folder_name}"
-                    previous = destinations.setdefault(destination.casefold(), identity)
+                    frozen_target = {}
+                    if "training_image_relative" in headers and _text(row.get("training_image_prefix")):
+                        relative_image = _image(row.get("training_image_relative"))
+                        parsed = urlsplit(_text(row.get("training_image_prefix")))
+                        parts = PurePosixPath(relative_image).parts
+                        if (not relative_image or relative_image.startswith("/") or ".." in parts
+                                or len(parts) < 2 or parsed.scheme != "s3" or not parsed.netloc
+                                or parsed.query or parsed.fragment):
+                            raise UploadSourceError(f"{path.name} 第 {number} 行缺少有效的配套图片目标，请重新导出")
+                        from .directory_jobs import normalize_prefix
+                        destination = (_image(row.get("training_trajectory_relative"))
+                                       or str(PurePosixPath(relative_image).parent))
+                        frozen_target = {"frozen_bucket": parsed.netloc, "frozen_prefix": normalize_prefix(parsed.path)}
+                    mapping = (destination, frozen_target.get("frozen_bucket"), frozen_target.get("frozen_prefix"))
+                    if identity in seen:
+                        if seen[identity] != mapping:
+                            raise UploadSourceError("同一轨迹在发布表中具有不同的图片目标，请分别发布")
+                        continue
+                    seen[identity] = mapping
+                    destination_key = "/".join(str(value or "") for value in mapping).casefold()
+                    previous = destinations.setdefault(destination_key, identity)
                     if previous != identity:
                         raise UploadSourceError(f"轨迹目标目录身份冲突：{destination}")
                     items.append({"kind": "trajectory", "source_dir": str(directory), "batch_id": batch_id,
                                   "case_id": case_id, "trajectory_id": trajectory_id, "source_identity": identity,
                                   "destination_relative": destination, "filename": directory.name,
-                                  "label": f"{case_id}/{directory.name}", "index": index})
+                                  "label": f"{case_id}/{directory.name}", "index": index, **frozen_target})
         finally:
             book.close()
         if not row_count:

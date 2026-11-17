@@ -122,7 +122,7 @@ class DatasetPublishingTests(unittest.TestCase):
         registry = self.registry()
         candidate = registry.candidates()[0]
         self.assertFalse(candidate["ready"])
-        with self.assertRaisesRegex(ValueError, "尚未导出完整数据集"):
+        with self.assertRaisesRegex(ValueError, "尚未导出.*完整数据集"):
             registry.create("不可发布", [session["session_id"]])
         self.assertFalse(session.get("published", False))
         self.assertFalse((self.release_root / "releases.json").exists())

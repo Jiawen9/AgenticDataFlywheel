@@ -1,8 +1,18 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { api } from './api'
+import { api, datasetReleaseTrainingUrl } from './api'
 
 afterEach(() => vi.unstubAllGlobals())
 describe('dataset internal upload API', () => {
+  it('sends paired export and independent training upload fields without transferring file contents', async () => {
+    const fetcher = vi.fn().mockResolvedValue(new Response('{}'))
+    vi.stubGlobal('fetch', fetcher)
+    await api.correctionDatasetExport('session', 8, { export_profile: 'corrected_selection_v1', cot_policy: 'skip', training_image_prefix: 's3://bucket/images/' })
+    expect(JSON.parse(fetcher.mock.calls[0]?.[1].body)).toEqual({ expected_revision: 8, export_profile: 'corrected_selection_v1', cot_policy: 'skip', training_image_prefix: 's3://bucket/images/' })
+    fetcher.mockResolvedValue(new Response('{"job":{"job_id":"jsonl"}}'))
+    await api.uploadDatasetRelease('release', 'internal', { include_trajectories: false, destination_prefix: 'tables/', training_jsonl: true, training_only: true, training_destination_prefix: 'training/批次/' })
+    expect(JSON.parse(fetcher.mock.calls[1]?.[1].body)).toEqual({ target: 'internal', include_trajectories: false, destination_prefix: 'tables/', training_jsonl: true, training_only: true, training_destination_prefix: 'training/批次/' })
+    expect(datasetReleaseTrainingUrl('发布/1', 1, 'report')).toBe('/api/dataset-releases/%E5%8F%91%E5%B8%83%2F1/training/1?kind=report')
+  })
   it('submits only release ID and target without fetching any workbook', async () => {
     const fetcher = vi.fn().mockResolvedValue(new Response('{"job":{"job_id":"internal","mode":"internal"}}', { status: 202 }))
     vi.stubGlobal('fetch', fetcher)

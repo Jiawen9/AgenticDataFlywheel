@@ -19,6 +19,7 @@ class RevisionRequest(BaseModel):
 class DatasetExportRequest(RevisionRequest):
     export_profile: str | None = None
     cot_policy: str = "generate"
+    training_image_prefix: str | None = Field(default=None, max_length=2048)
 
 
 class ReviewRequest(RevisionRequest):

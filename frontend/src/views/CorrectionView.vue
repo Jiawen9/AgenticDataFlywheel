@@ -35,6 +35,8 @@ const loading = ref(true)
 const pageError = ref('')
 const actionPrompt = ref(false)
 const exportPolicy = ref<'generate' | 'skip'>('generate')
+const trainingImagePrefix = ref('')
+const exportHistoryOpen = ref(false)
 let resolveDecision: ((decision: ActionDecision) => void) | null = null
 let batchRequest = 0, routeSelectionRequest = 0
 let initialized = false, choicesRequest = 0
@@ -46,6 +48,9 @@ const ws = useCorrectionWorkspace(api, {
   actionDecision: () => new Promise((resolve) => { resolveDecision = resolve; actionPrompt.value = true }),
 })
 const { session, tasks, expandedTasks, openGroupId, activeGroup, activeRow, actionDraft, actionRevision, loadingGroup, groupError, savingCount, busy, hasUnsaved } = ws
+watch(() => session.value?.session_id, () => {
+  trainingImagePrefix.value = session.value?.exports?.find(item => item.training?.image_prefix)?.training?.image_prefix || ''
+})
 const visibleExpandedTasks = ref<string[]>([])
 const selectedBatch = computed(() => batches.value.find((batch) => batch.batch_id === selectedBatchId.value))
 const trajectoryCount = computed(() => tasks.value.reduce((sum, task) => sum + task.trajectories.length, 0))
@@ -155,10 +160,13 @@ async function toggleDeleted(row: CorrectionRow) {
 
 async function exportData(complete = false) {
   const sessionId = session.value?.session_id
-  const result = await ws.exportData(complete ? exportPolicy.value : undefined)
+  const result = await ws.exportData(complete ? exportPolicy.value : undefined, complete ? trainingImagePrefix.value : undefined)
   if (result && sessionId && session.value?.session_id === sessionId) {
     window.open(correctionDownloadUrl(sessionId, result.filename), '_blank', 'noopener')
-    ElMessage.success('导出完成，文件也可从导出历史下载')
+    exportHistoryOpen.value = true
+    if (result.training?.image_prefix) trainingImagePrefix.value = result.training.image_prefix
+    if (result.training && result.training.status !== 'ready') ElMessage.warning('Excel 已导出，JSONL 状态请查看导出结果')
+    else ElMessage.success(result.training ? 'Excel 与配套 JSONL 已生成，可从导出结果下载' : '导出完成，文件也可从导出历史下载')
   }
 }
 
@@ -236,7 +244,7 @@ onBeforeUnmount(() => {
     <template v-if="!pipelineContext.historyOnly.value">
     <BatchPublishedNotice :notice="publishedNotice" />
     <header class="page-hero">
-      <div><span class="eyebrow">EXPERT ACTION CORRECTION</span><h1>专家动作纠偏</h1><p>展开任务与轨迹，直接在截图上修正 Action。当前每个任务选择质检 Top-1。</p></div>
+      <div><span class="eyebrow">EXPERT ACTION CORRECTION</span><h1>专家动作纠偏</h1><p>展开任务与轨迹，直接在截图上修正 Action。默认选择质检 Top-1，可增选其他轨迹。</p></div>
       <div class="hero-metrics"><div><b>{{ taskTotal }}</b><span>任务</span></div><div><b>{{ trajectoryCount }}</b><span>入选轨迹</span></div><div><b>{{ editedCount }}</b><span>已修改步骤</span></div></div>
     </header>
 
@@ -255,6 +263,11 @@ onBeforeUnmount(() => {
       </template>
       <el-button v-if="pipelineContext.canCorrect.value" type="success" :loading="pipelineContext.controlling.value" :disabled="!session || busy || loading" @click="confirmCorrection">完成修正并继续</el-button>
     </section>
+    <div v-if="!pipelineContext.managed.value && !pipelineContext.isPipelineRoute.value" class="training-prefix">
+      <label for="training-image-prefix">JSONL 图片路径前缀</label>
+      <el-input id="training-image-prefix" v-model="trainingImagePrefix" data-testid="training-image-prefix" :disabled="busy || loading" clearable placeholder="s3://bucket/图片目录/；留空沿用后端云道默认配置" />
+      <small>完整导出会同时生成 Excel 与一份 JSONL，每个动作步骤一行。图片前缀后会接上批次、用例、轨迹及图片相对路径，后续图片上传沿用该地址；JSONL 文件本身的上传目录可在数据发布时单独配置。</small>
+    </div>
     <p class="form-hint">同一任务可选择多条轨迹；完整导出保留全部未删除步骤。普通导出仅使用已保存的有效 COT，不会自动调用模型。</p>
     <el-pagination v-model:current-page="batchPage" v-model:page-size="batchLimit" :page-sizes="[10,20,50]" :total="batchRead.total.value" layout="total, sizes, prev, pager, next" />
     <el-alert v-if="batchRead.error.value" :title="batchRead.error.value" type="warning" :closable="false" />
@@ -316,7 +329,23 @@ onBeforeUnmount(() => {
       </el-collapse>
     </section>
 
-    <details v-if="session?.exports.length" class="export-history"><summary>导出历史（{{ session.exports.length }}）</summary><a v-for="item in session.exports" :key="item.export_id" :href="correctionDownloadUrl(session.session_id, item.filename)" target="_blank" rel="noreferrer"><span>{{ item.filename }}</span><small>{{ item.created_at }} · {{ Object.entries(item.sheets).map(([name, count]) => `${name} ${count}`).join(' / ') }}</small></a></details>
+    <details v-if="session?.exports.length" :open="exportHistoryOpen" class="export-history" @toggle="exportHistoryOpen = ($event.target as HTMLDetailsElement).open">
+      <summary>导出结果与历史（{{ session.exports.length }}）</summary>
+      <article v-for="item in session.exports" :key="item.export_id" class="export-pair">
+        <a :href="correctionDownloadUrl(session.session_id, item.filename)" target="_blank" rel="noreferrer"><span>下载 Excel · {{ item.filename }}</span><small>{{ item.created_at }} · {{ Object.entries(item.sheets).map(([name, count]) => `${name} ${count}`).join(' / ') }}</small></a>
+        <template v-if="item.training">
+          <div class="paired-downloads">
+            <a v-if="item.training.status === 'ready' && item.training.filename" :href="correctionDownloadUrl(session.session_id, item.training.filename)" target="_blank" rel="noreferrer">下载配套 JSONL</a>
+            <a v-if="item.training.report_filename && item.training.report_sha256" :href="correctionDownloadUrl(session.session_id, item.training.report_filename)" target="_blank" rel="noreferrer">下载转换与排除报告</a>
+          </div>
+          <p v-if="item.training.included_count !== undefined">JSONL 样本 {{ item.training.included_count }} 条 · 排除 {{ item.training.excluded_count || 0 }} 条</p>
+          <p v-if="item.training.image_prefix" class="image-prefix">图片前缀：{{ item.training.image_prefix }}</p>
+          <p v-if="item.training.status === 'needs_configuration'" role="status">Excel 已生成；请填写上方图片路径前缀后再次导出，生成配套 JSONL。</p>
+          <p v-else-if="item.training.status === 'empty'" role="status">无可用训练样本，请查看转换报告；Excel 仍可下载。</p>
+          <p v-if="item.training.error" class="training-error" role="status">{{ item.training.error }}</p>
+        </template>
+      </article>
+    </details>
     <el-dialog :model-value="actionPrompt" title="动作尚未保存" width="min(440px, 92vw)" :close-on-click-modal="false" :before-close="() => decideAction('cancel')">
       <p>当前步骤的 Action 有修改，请选择如何处理。</p>
       <template #footer><el-button @click="decideAction('cancel')">取消</el-button><el-button @click="decideAction('discard')">放弃修改</el-button><el-button type="primary" @click="decideAction('save')">保存后继续</el-button></template>
@@ -329,6 +358,7 @@ onBeforeUnmount(() => {
 <style scoped>
 :global(body:has(.correction-page)){min-width:0}
 .correction-page{min-width:0}
+.training-prefix{display:grid;grid-template-columns:auto minmax(240px,1fr);gap:8px 14px;align-items:center;font-size:12px}.training-prefix small{grid-column:1 / -1;color:var(--muted);line-height:1.6}.export-pair+.export-pair{border-top:1px solid var(--line)}.paired-downloads{display:flex;gap:18px;flex-wrap:wrap}.export-pair p{margin:5px 0 10px;overflow-wrap:anywhere}.training-error{color:#b91c1c}.image-prefix{color:#475569}@media(max-width:650px){.training-prefix{grid-template-columns:1fr}}
 @media(max-width:600px){.correction-page{padding:20px 12px}.hero-metrics{flex-wrap:wrap;gap:6px}.hero-metrics div{min-width:0;padding:10px 8px}.toolbar{min-width:0}.toolbar :deep(.el-button){margin-left:0}.task-title{min-width:0}.task-title__id{overflow-wrap:anywhere}}
 .el-pagination { flex-wrap: wrap; row-gap: 8px; margin: 12px 0; }
 .task-title__id,.trajectory-title>b{min-width:0;max-width:100%}

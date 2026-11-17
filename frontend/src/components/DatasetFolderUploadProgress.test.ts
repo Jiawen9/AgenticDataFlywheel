@@ -11,6 +11,12 @@ const base: DatasetFolderUpload = { folder_upload: true, total_items: 3, complet
 const render = (upload: DatasetFolderUpload) => renderToString(createSSRApp(DatasetFolderUploadProgress, { upload }))
 
 describe('folder upload progress', () => {
+  it('labels JSONL-only uploads without claiming images or Excel were sent', async () => {
+    const html = await render({ ...base, training_only: true, training_jsonl: true, training_destination_prefix: 'training/batch/' })
+    expect(html).toContain('本次仅上传训练 JSONL，未上传 Excel 或轨迹目录')
+    expect(html).toContain('s3://test-bucket/training/batch/')
+    expect(html).not.toContain('2 条完整轨迹')
+  })
   it('labels directory progress and does not invent byte progress from speed alone', async () => {
     const html = await render({ ...base, progress: { speed_text: '2.4 MiB/s', message: '上传中', percent: 99 } })
     expect(html).toContain('目录进度 33%')

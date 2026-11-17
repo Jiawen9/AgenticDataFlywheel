@@ -913,10 +913,27 @@ def _export_view(session: dict, snapshot: dict) -> tuple[dict, dict]:
     return value, frozen
 
 
-def _existing_export(session: dict, kind: str, cot_policy: str | None = None) -> dict | None:
+def _existing_export(session: dict, kind: str, cot_policy: str | None = None, *, training_prefix: str | None = None) -> dict | None:
     current_key = session_fingerprint(session)
     store = ArtifactStore(storage_root())
     for record in session.get("exports", []):
+        if training_prefix is not None:
+            training = record.get("training") or {}
+            if training.get("version") != 2 or training.get("image_prefix") != training_prefix:
+                continue
+            if training.get("status") not in {"ready", "empty", "needs_configuration"}:
+                continue
+            if training.get("status") in {"ready", "empty"}:
+                from ..data_publishing.paired_training import digest_file
+                valid = True
+                for field, digest in (("filename", "sha256"), ("report_filename", "report_sha256")):
+                    name = str(training.get(field) or "")
+                    target = CORRECTION_EXPORTS_DIR / session["session_id"] / name
+                    if Path(name).name != name or not io_path(target).is_file() or digest_file(target) != training.get(digest):
+                        valid = False
+                        break
+                if not valid:
+                    continue
         if cot_policy is not None and record.get("cot_policy") != cot_policy:
             continue
         if str(record.get("kind") or "selected") != kind or record.get("content_fingerprint") != current_key:
@@ -953,6 +970,9 @@ def _remember_export(session_id: str, history: dict) -> dict:
     replaced = []
     kind = history.get("kind", "selected")
     def same_kind(item):
+        if kind == "corrected_selection":
+            # Paired versions are immutable, including their cloud image prefix.
+            return item.get("export_id") == history.get("export_id")
         return str(item.get("kind") or "selected") == kind and (kind != "corrected_selection" or item.get("cot_policy") == history.get("cot_policy"))
     def apply(current):
         replaced.extend(item for item in current.get("exports", []) if same_kind(item))
@@ -1021,14 +1041,16 @@ def export_session(session_id: str, expected_revision: int | None = None) -> dic
 
 
 @_locked_session
-def export_selected_session(session_id: str, expected_revision: int | None = None, *, export_profile="corrected_selection_v1", cot_policy="generate") -> dict[str, Any]:
+def export_selected_session(session_id: str, expected_revision: int | None = None, *, export_profile="corrected_selection_v1", cot_policy="generate", training_image_prefix: str | None = None) -> dict[str, Any]:
     from .selected_export import EXPORT_PROFILE, project_selected, selection_records
     from ..batch_results import current_tree_payload, current_quality_payload
+    from ..data_publishing.paired_training import image_prefix, write_paired_workbook
     if export_profile != EXPORT_PROFILE or cot_policy not in {"generate", "skip"}:
         raise ValueError("不支持的已选轨迹导出策略")
     session = _session_or_raise(session_id)
     _check_revision(session, expected_revision)
-    existing = _existing_export(session, "corrected_selection", cot_policy)
+    prefix = image_prefix(training_image_prefix)
+    existing = _existing_export(session, "corrected_selection", cot_policy, training_prefix=prefix)
     if existing is not None:
         return existing
     session, snapshot = _export_view(session, _snapshot(session))
@@ -1039,7 +1061,8 @@ def export_selected_session(session_id: str, expected_revision: int | None = Non
                  "tasks": selection_records(chosen, session.get("selection", {}).get("candidates", []))}
     payload = project_selected(session=session, snapshot=snapshot, table=session["workbook_payload"],
         selection=selection, cot_policy=cot_policy, tree_payload={**current_tree_payload(batch, storage_root()), "artifact": ArtifactStore(storage_root()).get(batch, "04_tree")},
-        quality_payload=current_quality_payload(batch, storage_root()))
+        quality_payload=current_quality_payload(batch, storage_root()),
+        raw_root=_source_for_session(session)[1], training_prefix=prefix)
     payload["content_fingerprint"] = session["export_fingerprint"]
     export_id = allocate_id("e", storage_root())
     output_dir = CORRECTION_EXPORTS_DIR / session_id
@@ -1047,6 +1070,19 @@ def export_selected_session(session_id: str, expected_revision: int | None = Non
     filename = f"data_{export_id}.xlsx"
     destination = output_dir / filename
     write_payload_workbook(destination, payload)
+    training_filename, report_filename = f"train_{export_id}.jsonl", f"report_{export_id}.json"
+    try:
+        training = write_paired_workbook(destination, output_dir / training_filename,
+            output_dir / report_filename, prefix,
+            source_id=f"{session_id}:{session['export_fingerprint']}:{cot_policy}")
+    except (OSError, ValueError, TypeError) as exc:
+        training = {"version": 2, "status": "failed", "image_prefix": prefix,
+                    "included_count": 0, "excluded_count": 0,
+                    "error": f"Excel 已生成，配套 JSONL 生成失败：{exc}"}
+    if training.get("sha256"):
+        training["download_url"] = f"/api/correction/sessions/{session_id}/exports/{training_filename}"
+        training["report_download_url"] = f"/api/correction/sessions/{session_id}/exports/{report_filename}"
+    payload["training"] = training
     store = ArtifactStore(storage_root())
     artifact = store.publish(batch, "07_cot", payload, workbooks={"full_dataset.xlsx": destination},
         source_refs=[ref for stage in ("04_tree", "05_quality") if (ref := store.get(batch, stage))],
@@ -1055,7 +1091,7 @@ def export_selected_session(session_id: str, expected_revision: int | None = Non
     history = {"export_id": export_id, "kind": "corrected_selection", "export_profile": export_profile,
         "cot_policy": cot_policy, "content_fingerprint": session["export_fingerprint"],
         "selection": payload["selection"], "filename": filename, "sha256": hashlib.sha256(io_path(destination).read_bytes()).hexdigest(),
-        "artifact": artifact, "created_at": utc_now(), "sheets": sheets,
+        "artifact": artifact, "created_at": utc_now(), "sheets": sheets, "training": training,
         "summary": {"rows": sum(sheets.values()), "groups": len(payload["groups"]),
                     "tasks": len({group["task_id"] for group in payload["groups"]})},
         "download_url": f"/api/correction/sessions/{session_id}/exports/{filename}"}
@@ -1107,7 +1143,7 @@ def export_dataset_session(session_id: str, expected_revision: int | None = None
 def download_export(session_id: str, filename: str) -> Path:
     session = _session_or_raise(session_id)
     safe_name = Path(filename).name
-    if safe_name != filename or Path(safe_name).suffix.lower() not in {".xlsx", ".xlsm"}:
+    if safe_name != filename or Path(safe_name).suffix.lower() not in {".xlsx", ".xlsm", ".jsonl", ".json"}:
         raise ValueError("无效的导出文件名")
     path = resolve_path(CORRECTION_EXPORTS_DIR / session_id / safe_name)
     try:
@@ -1117,6 +1153,15 @@ def download_export(session_id: str, filename: str) -> Path:
     if not io_path(path).is_file():
         raise FileNotFoundError("导出文件不存在")
     record = next((item for item in session.get("exports", []) if item.get("filename") == filename), None)
+    if record is None:
+        for item in session.get("exports", []):
+            training = item.get("training") or {}
+            if training.get("filename") == filename:
+                record = {"sha256": training.get("sha256")}
+                break
+            if training.get("report_filename") == filename:
+                record = {"sha256": training.get("report_sha256")}
+                break
     if record is None or not record.get("sha256") or hashlib.sha256(io_path(path).read_bytes()).hexdigest() != record["sha256"]:
         raise ValueError("导出文件与已保存版本的 SHA256 不一致，请重新导出")
     return path
