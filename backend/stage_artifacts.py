@@ -63,8 +63,13 @@ def payload_workbook(payload: dict[str, Any]) -> Workbook:
         sheet = workbook.create_sheet(name)
         columns = payload.get("columns", {}).get(name) or list(dict.fromkeys(key for row in rows for key in row))
         sheet.append(columns)
+        coordinate_column = columns.index("coordinate_info") if "coordinate_info" in columns else None
         for row in rows:
-            sheet.append([row.get(key) for key in columns])
+            values = [row.get(key) for key in columns]
+            # Keep the authoritative payload structured; Excel stores the metadata as JSON text.
+            if coordinate_column is not None and isinstance(values[coordinate_column], dict):
+                values[coordinate_column] = json.dumps(values[coordinate_column], ensure_ascii=False)
+            sheet.append(values)
             for cell in sheet[sheet.max_row]:
                 if isinstance(cell.value, str):
                     cell.data_type = "s"

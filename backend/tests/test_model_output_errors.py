@@ -172,7 +172,12 @@ class ModelOutputPipelineRetryTests(unittest.TestCase):
         self.manager.tick(self.pipeline["pipeline_id"])
         return self.manager.get(self.pipeline["pipeline_id"])
 
-    def test_model_output_uses_existing_three_attempts_and_30_120_delays(self):
+    def test_legacy_model_output_uses_three_attempts_and_30_120_delays(self):
+        stored = self.manager.get(self.pipeline["pipeline_id"], public=False)
+        stored["retry_policy"].pop("stage_max_attempts")
+        for step in stored["steps"]:
+            step["retry_info"]["max_attempts"] = 3
+        self.manager._save(stored)
         failure = failure_from_exception(ModelOutputError("inconsistent_fields"))
         for attempt, delay in ((1, 30), (2, 120), (3, None)):
             self.runtime.complete("preprocessing", fail=True, failure=failure)
@@ -206,7 +211,7 @@ class ModelOutputPipelineRetryTests(unittest.TestCase):
         self.assertEqual(len(self.runtime.calls), 1)
 
     def test_already_failed_pipeline_stays_failed_after_classifier_update(self):
-        self.runtime.complete("preprocessing", fail=True, failure={"category": "unknown"})
+        self.runtime.complete("preprocessing", fail=True, failure={"category": "input"})
         self.assertEqual(self.tick()["status"], "failed")
         self.runtime.complete("preprocessing", fail=True,
                               failure=failure_from_exception(ModelOutputError("invalid_json")))

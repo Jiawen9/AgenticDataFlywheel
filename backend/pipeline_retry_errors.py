@@ -298,6 +298,8 @@ def failure_from_exception(exc: BaseException) -> dict[str, Any]:
 
     if any(isinstance(cause, ModelConfigurationError) for cause in chain):
         return classified("config")
+    if any(isinstance(cause, (FileNotFoundError, PermissionError)) for cause in chain):
+        return classified("input")
     from .quality_execution import QualityExecutionBlocked, QualityExecutionRevoked
     for cause in chain:
         if isinstance(cause, QualityExecutionBlocked):
@@ -352,6 +354,6 @@ def failure_from_exception(exc: BaseException) -> dict[str, Any]:
     cleanup_type = getattr(request_control, "QualityClientCleanupTimeout", None)
     if isinstance(cleanup_type, type) and any(isinstance(cause, cleanup_type) for cause in chain):
         return classified("unknown", code="quality_client_cleanup_timeout")
-    if isinstance(exc, (ValueError, TypeError, FileNotFoundError)):
+    if isinstance(exc, (ValueError, TypeError)):
         return classified("input")
     return classified("unknown")

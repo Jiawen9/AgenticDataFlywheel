@@ -34,7 +34,7 @@ def _step(p):
 
 
 def create(manager, data):
-    from .pipelines import RETRY_POLICY, STEPS
+    from .pipelines import STEPS, new_retry_policy, retry_info
     from .pipeline_evaluation import WAIT_EVALUATION
     request_id = str(data.get("request_id") or "")
     _identifier(request_id, "请求编号")
@@ -85,19 +85,19 @@ def create(manager, data):
         stages = [("generation", "任务生成与审核"), *STEPS]
         if from_evaluation:
             stages.insert(0, ("evaluation", "迭代评估"))
+        retry_policy = new_retry_policy()
         p = {"pipeline_id": identifier, "id_scheme": ID_SCHEME, "name": name, "batch_id": None,
              "mode": mode, "start_mode": data["start_mode"], "generation_kind": kind, "generation_job_id": None,
              "generation_attempt": 0, "feedback_id": feedback_id, "parent_pipeline_id": parent_id,
              "threshold": threshold if mode == "automatic" else None, "task_ids": [], "batch_snapshot": None,
-             "collection_config": None, "config_fingerprints": {}, "retry_policy": dict(RETRY_POLICY),
+             "collection_config": None, "config_fingerprints": {}, "retry_policy": retry_policy,
              "status": WAIT_EVALUATION if from_evaluation else WAIT_CONFIG, "current_step": first, "created_at": now, "updated_at": now,
              "error": None, "session_id": None, "release_id": None, "selection": None, "confirmation": None,
              "collection_run_ids": [], "logs": [],
              "steps": [{"id": k, "label": label, "status": "waiting" if k == first else "pending",
                         "job_ids": [], "percent": 0, "message": ("请开始评测或选择已有评测" if from_evaluation else "请配置任务生成") if k == first else "等待前置步骤",
                         "error": None, "started_at": None, "completed_at": None,
-                        "retry_info": {"attempts": 0, "max_attempts": RETRY_POLICY["max_attempts"],
-                                       "last_error": None, "next_retry_at": None}}
+                        "retry_info": retry_info(retry_policy, k)}
                        for k, label in stages]}
         if profile:
             p.update(export_profile=profile, cot_policy=cot_policy or "generate")

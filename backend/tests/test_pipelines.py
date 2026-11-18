@@ -1,6 +1,6 @@
 """Offline state-machine, ownership, exact-job and restart tests."""
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -15,7 +15,7 @@ from backend.data_store import ArtifactStore, RecordStore, RevisionConflict
 from backend.batch_lifecycle import active_jobs, lifecycle
 from backend.pipeline_access import (PipelineManagedError, active_pipeline, ensure_pipeline_write,
                                      internal_pipeline, submit_with_context)
-from backend.pipelines import PipelineManager, PipelineError
+from backend.pipelines import PipelineManager, PipelineError, RETRY_POLICY
 from backend.pipeline_router import router
 
 
@@ -164,7 +164,7 @@ class PipelineTests(unittest.TestCase):
     def test_failed_job_retry_does_not_keep_failed_attempt_as_active_binding(self):
         p = self.tick(self.create(), 2)
         old = p["steps"][1]["job_ids"][0]
-        self.runtime.complete("preprocessing", fail=True)
+        self.runtime.complete("preprocessing", fail=True, failure={"category": "input"})
         p = self.tick(p)
         self.assertEqual(p["status"], "failed")
         p = self.tick(self.control(p, "retry"))
@@ -173,8 +173,9 @@ class PipelineTests(unittest.TestCase):
         self.runtime.complete("preprocessing")
         self.assertEqual(self.tick(p)["steps"][1]["status"], "succeeded")
 
-    def test_transient_job_retries_twice_and_persists_schedule_across_restart(self):
-        p = self.tick(self.create(), 2)
+    def test_legacy_policy_retries_twice_and_persists_schedule_across_restart(self):
+        with patch("backend.pipelines.new_retry_policy", return_value=deepcopy(RETRY_POLICY)):
+            p = self.tick(self.create(), 2)
         self.assertEqual(p["retry_policy"], {"version": 1, "max_attempts": 3, "delays_seconds": [30, 120]})
         self.assertEqual(p["steps"][1]["retry_info"]["attempts"], 1)
         transient = {"category": "server_error", "http_status": 500, "retryable": True,
@@ -248,10 +249,14 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(self.tick(p)["status"], "terminated")
         self.assertEqual(len(self.runtime.calls), 2)
 
-    def test_quota_stale_and_unknown_failure_never_auto_retry(self):
+    def test_permanent_or_cancelled_job_does_not_auto_retry(self):
         for failure, status in (({"category": "quota", "http_status": 403}, "failed"),
+                                ({"category": "auth", "http_status": 401}, "failed"),
+                                ({"category": "config"}, "failed"),
+                                ({"category": "input"}, "failed"),
                                 ({"category": "server_error", "http_status": 500}, "stale"),
-                                (None, "failed")):
+                                ({"category": "unknown", "http_status": 403}, "failed"),
+                                (None, "cancelled")):
             with self.subTest(failure=failure, status=status), TemporaryDirectory() as directory:
                 root = Path(directory)
                 runtime = OfflineRuntime(root)
@@ -269,6 +274,119 @@ class PipelineTests(unittest.TestCase):
                     self.assertIn("输入已变化", result["error"])
                 self.assertEqual(len(runtime.calls), 1)
                 self.assertIsNone(result["steps"][1]["retry_info"]["next_retry_at"])
+
+    def test_new_policy_uses_same_retry_path_and_hides_intermediate_errors(self):
+        self.runtime.ready_stages.update({"preprocessing", "tree"})
+        p = self.tick(self.create(), 4)
+        self.assertEqual({s["id"]: s["retry_info"]["max_attempts"] for s in p["steps"]},
+                         {s["id"]: 51 if s["id"] in {"preprocessing", "quality"} else 3 for s in p["steps"]})
+        now = datetime(2026, 11, 18, 1, tzinfo=timezone.utc)
+        app = FastAPI()
+        app.include_router(router)
+        steps = []
+        submit = self.runtime.submit
+
+        def record_retry(step, pipeline, retry=False):
+            steps.append((step, retry, pipeline["steps"][3].get("retry_job_id")))
+            return submit(step, pipeline, retry=retry)
+
+        self.runtime.submit = record_retry
+        with patch("backend.pipelines.datetime", wraps=datetime) as clock, TestClient(app) as client:
+            clock.now.side_effect = lambda tz=None: now
+            for attempt in range(1, 4):
+                failed_job = p["steps"][3]["job_ids"][0]
+                self.runtime.complete("quality", fail=True)
+                p = self.tick(p)
+                self.assertEqual(p["status"], "retry_waiting")
+                self.assertEqual(p["steps"][3]["retry_info"]["attempts"], attempt)
+                due = datetime.fromisoformat(p["steps"][3]["retry_info"]["next_retry_at"])
+                self.assertEqual((due - now).total_seconds(), 30 if attempt == 1 else 120)
+                self.manager = PipelineManager(self.runtime, self.root)
+                app.state.pipelines = self.manager
+                url = f"/api/pipelines/{p['pipeline_id']}"
+                response = client.get(url)
+                self.assertEqual(response.status_code, 200)
+                visible = response.json()["pipeline"]
+                quality = visible["steps"][3]
+                self.assertIsNone(visible["error"])
+                self.assertIsNone(quality["error"])
+                self.assertIsNone(quality["retry_info"]["last_error"])
+                self.assertIsNone(quality["jobs"][0]["error"])
+                self.assertNotIn("mock failure", response.text)
+                self.assertEqual(self.tick(p)["storage_revision"], p["storage_revision"])
+                self.assertEqual(len(self.runtime.calls), attempt)
+                now = due
+                p = self.tick(p)
+                self.assertEqual(steps[-1], ("quality", True, failed_job))
+                self.assertEqual(p["steps"][3]["retry_info"]["attempts"], attempt + 1)
+                self.assertEqual(len(self.runtime.calls), attempt + 1)
+            self.runtime.complete("quality")
+            self.assertEqual(self.tick(p)["steps"][3]["status"], "succeeded")
+        self.assertEqual(self.runtime.calls, [("quality", False)] + [("quality", True)] * 3)
+
+    def test_bbox_exhaustion_allows_fifty_retries_and_then_reports_error(self):
+        p = self.tick(self.create(), 2)
+        failure = {"category": "model_output", "code": "bbox_invalid"}
+        with patch("backend.pipelines._retry_due", return_value=True):
+            for attempt in range(1, 52):
+                self.runtime.complete("preprocessing", fail=True, failure=failure)
+                p = self.tick(p)
+                info = p["steps"][1]["retry_info"]
+                self.assertEqual((info["attempts"], info["max_attempts"]), (attempt, 51))
+                if attempt == 51:
+                    break
+                self.assertEqual(p["status"], "retry_waiting")
+                self.assertIsNone(info["last_error"])
+                p = self.tick(p)
+        self.assertEqual(p["status"], "failed")
+        self.assertIn("标框模型返回无效坐标或格式", p["error"])
+        self.assertIsNone(info["next_retry_at"])
+        p = self.tick(p)
+        self.assertEqual(len(self.runtime.calls), 51)
+        p = self.tick(self.control(p, "retry"))
+        self.assertEqual(p["steps"][1]["retry_info"]["attempts"], 1)
+        self.assertEqual(p["steps"][1]["retry_info"]["max_attempts"], 51)
+
+    def test_retry_submission_failure_retains_original_checkpoint(self):
+        p = self.tick(self.create(), 2)
+        previous = p["steps"][1]["job_ids"][0]
+        self.runtime.complete("preprocessing", fail=True, failure={"category": "timeout"})
+        p = self.tick(p)
+        submit = self.runtime.submit
+
+        def unavailable(step, pipeline, retry=False):
+            self.assertEqual(pipeline["steps"][1]["retry_job_id"], previous)
+            raise TimeoutError("submission did not reach the worker")
+
+        with patch("backend.pipelines._retry_due", return_value=True):
+            self.runtime.submit = unavailable
+            p = self.tick(p)
+            self.assertEqual(p["status"], "retry_waiting")
+            self.assertEqual(p["steps"][1]["retry_info"]["attempts"], 2)
+            self.runtime.submit = submit
+            p = self.tick(p)
+        self.assertEqual(p["steps"][1]["retry_job_id"], previous)
+        self.assertEqual(p["steps"][1]["retry_info"]["attempts"], 3)
+        self.assertNotIn(previous, p["steps"][1]["job_ids"])
+
+    def test_quality_retry_stops_if_old_process_exit_is_unconfirmed(self):
+        self.runtime.ready_stages.update({"preprocessing", "tree"})
+        p = self.tick(self.create(), 4)
+        job_id = p["steps"][3]["job_ids"][0]
+        self.runtime.records.put("quality_executions", job_id,
+                                 {"state": "revoked", "process": {"pid": 123, "cleanup_failed": True}})
+        self.runtime.complete("quality", fail=True, failure={"category": "connection"})
+        p = self.tick(p)
+        self.assertEqual(p["status"], "failed")
+        self.assertIn("退出未确认", p["error"])
+        self.assertEqual(len(self.runtime.calls), 1)
+
+    def test_new_generation_and_evaluation_flows_freeze_same_stage_limits(self):
+        for start in ("generate", "evaluation"):
+            with self.subTest(start=start):
+                p = self.create(start_mode=start, request_id=start, batch_id=None, generation_kind="augmentation")
+                self.assertEqual([s["retry_info"]["max_attempts"] for s in p["steps"]
+                                  if s["id"] in {"preprocessing", "quality"}], [51, 51])
 
     def test_old_pipeline_without_policy_keeps_manual_retry_behavior(self):
         p = self.tick(self.create(), 2)
