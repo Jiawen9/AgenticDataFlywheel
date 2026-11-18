@@ -127,14 +127,35 @@ class PairedUploadTests(unittest.TestCase):
         self.pair(0); self.pair(1)
         manager, adapter = self.manager()
         adapter.fail_at = 2
-        first = manager.submit(self.release_id, target="internal", training_only=True, training_destination_prefix="训练")
+        configuration = adapter.get_configuration()
+        with patch.object(adapter, "get_configuration", return_value={**configuration, "default_prefix": "dataset/figures/"}):
+            first = manager.submit(self.release_id, target="internal", training_only=True)
         self.assertEqual(manager.get(first["job_id"])["status"], "failed")
-        second = manager.submit(self.release_id, target="internal", training_only=True,
-                                retry_job_id=first["job_id"], training_destination_prefix="训练")
+        with patch.object(adapter, "get_configuration", return_value={**configuration, "training_prefix": "new-default"}):
+            second = manager.submit(self.release_id, target="internal", training_only=True,
+                                    retry_job_id=first["job_id"])
         self.assertEqual(manager.get(second["job_id"])["status"], "succeeded")
-        self.assertEqual([call.bucket_path for call in adapter.calls], ["训练/001/", "训练/002/", "训练/002/"])
+        root = f"dataset/training_jsonl/{self.release_id}"
+        self.assertEqual([call.bucket_path for call in adapter.calls], [f"{root}/001/", f"{root}/002/", f"{root}/002/"])
         for call in adapter.calls:
             self.assertEqual([file.name for file in call.source_dir.iterdir()], ["train.jsonl"])
+
+    def test_retry_preserves_legacy_implicit_training_directory(self):
+        self.pair()
+        self.release["batch_ids"] = ["batch_001"]
+        manager, adapter = self.manager()
+        legacy_id = "ab" * 16
+        manager._write({
+            "job_id": legacy_id, "release_id": self.release_id, "status": "failed",
+            "mode": "internal", "folder_upload": True, "include_trajectories": False,
+            "training_only": True, "training_jsonl": True, "training_destination_prefix": None,
+            "destination": {"prefix": "old/figures", "bucket": "fixture-bucket", "region": "test-region"},
+        })
+        resumed = manager.submit(self.release_id, target="internal", training_only=True, retry_job_id=legacy_id)
+        job = manager.get(resumed["job_id"])
+        self.assertEqual(job["status"], "succeeded", job.get("error"))
+        self.assertIsNone(job["training_destination_prefix"])
+        self.assertEqual(adapter.calls[0].bucket_path, "old/figures/batch_001/训练数据/")
 
     def test_unavailable_pair_does_not_block_ready_pair(self):
         self.pair(0)

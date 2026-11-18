@@ -824,7 +824,18 @@ export interface DatasetReleaseExcel {
 export type DatasetUploadStatus = 'not_uploaded' | 'queued' | 'uploading' | 'succeeded' | 'failed' | 'interrupted'
 
 export interface DatasetUploadCapabilities {
-  internal: { configured: boolean; reason: string | null; directory_upload?: boolean; default_prefix?: string; region?: string; bucket?: string; training_jsonl_version?: number; training_pair_version?: number }
+  internal: {
+    configured: boolean
+    reason: string | null
+    directory_upload?: boolean
+    default_prefix?: string
+    training_default_prefix?: string
+    training_default_prefix_error?: string
+    region?: string
+    bucket?: string
+    training_jsonl_version?: number
+    training_pair_version?: number
+  }
 }
 
 export interface DatasetUploadOptions {
@@ -853,7 +864,7 @@ export interface DatasetFolderUpload {
   include_trajectories?: boolean
   training_jsonl?: boolean
   training_only?: boolean
-  training_destination_prefix?: string
+  training_destination_prefix?: string | null
   training?: {
     version?: number
     status: 'ready' | 'uploading' | 'succeeded' | 'failed'

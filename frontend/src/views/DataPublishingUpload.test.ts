@@ -4,7 +4,7 @@ import { invalidateSummaryCache } from '@/utils/summaryCache'
 
 const requests = vi.hoisted(() => ({
   datasetReleaseCandidates: vi.fn(async () => []), datasetReleases: vi.fn(async () => []),
-  datasetUploadCapabilities: vi.fn(async () => ({ internal: { configured: true, directory_upload: true, default_prefix: 'default/', bucket: 'bucket', region: 'region' } })),
+  datasetUploadCapabilities: vi.fn(async () => ({ internal: { configured: true, directory_upload: true, default_prefix: 'default/', training_default_prefix: 'shared/training_jsonl', bucket: 'bucket', region: 'region' } })),
   listPipelines: vi.fn(async () => []), uploadDatasetRelease: vi.fn(), datasetUploadJob: vi.fn(),
 }))
 vi.mock('@/readPageApi', () => {
@@ -46,6 +46,7 @@ describe('publishing upload interaction', () => {
     const { state } = mount(); await flush()
     const paired = { ...release(), training_files: [{ index: 0, version: 2, status: 'ready', image_prefix: 's3://bucket/frozen-images/', filename: 'train.jsonl' }] }
     await state.startUpload(paired, true)
+    expect(state.trainingDestinationPrefix).toBe('shared/training_jsonl/release-one/')
     state.trainingDestinationPrefix = ' training/only/ '
     expect(state.trainingJsonl).toBe(true)
     expect(state.imagePrefixes).toEqual(['s3://bucket/frozen-images/'])
@@ -115,14 +116,21 @@ describe('publishing upload interaction', () => {
     state.trainingJsonl = true
     expect(state.retryUploadId).toBeUndefined()
     await state.confirmUpload()
-    expect(requests.uploadDatasetRelease.mock.calls[0]?.[2]).toEqual({ include_trajectories: true, destination_prefix: 'old/', training_jsonl: true })
+    expect(requests.uploadDatasetRelease.mock.calls[0]?.[2]).toEqual({ include_trajectories: true, destination_prefix: 'old/', training_jsonl: true, training_destination_prefix: 'shared/training_jsonl/release-one/' })
   })
-  it('restores the training setting for retries', async () => {
+  it('preserves the old implicit training destination for a retry', async () => {
     const { state } = mount(); await flush()
     state.startUpload(release({ job_id: 'training-job', status: 'failed', folder_upload: true, training_jsonl: true,
+      training_destination_prefix: null, item_results: [{ kind: 'training', bucket_path: 'older/training/' }],
       destination: { prefix: 'old/', bucket: 'bucket', region: 'region' } }))
     expect(state.trainingJsonl).toBe(true)
+    expect(state.trainingDestinationPrefix).toBe('')
+    expect(state.trainingTarget).toBe('older/training/')
     expect(state.retryUploadId).toBe('training-job')
+    await state.confirmUpload()
+    expect(requests.uploadDatasetRelease.mock.calls[0]?.[2]).toEqual({
+      include_trajectories: true, destination_prefix: 'old/', training_jsonl: true, retry_job_id: 'training-job',
+    })
   })
   it('allows folder retry when the already confirmed published workbook is no longer available', async () => {
     const { state } = mount(); await flush()

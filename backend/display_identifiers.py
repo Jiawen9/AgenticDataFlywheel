@@ -117,7 +117,8 @@ class DisplayIdentifierStore:
                         items.append({"kind": kind, "id": str(row[field]), "scope": batch_id})
         return self.prepare_entries(items)
 
-    def create_run(self, namespace: str, run_id: str, payload: dict, *, now: datetime | None = None) -> dict:
+    def create_run(self, namespace: str, run_id: str, payload: dict, *, now: datetime | None = None,
+                   pipeline_binding: dict | None = None) -> dict:
         """Atomically create a new run and alias; never alias an existing run."""
         if namespace not in {"collection_runs", "model_iter_runs"}:
             raise ValueError("不支持的运行记录类型")
@@ -131,6 +132,11 @@ class DisplayIdentifierStore:
                 if entry:
                     self.records._save(connection, DISPLAY_IDS, entry["key"], entry["payload"], 1)
                 saved = self.records._save(connection, namespace, run_id, payload, 1)
+                if pipeline_binding is not None:
+                    pipeline_id = pipeline_binding["pipeline_id"]
+                    if self.records._read(connection, "pipeline_evaluations", pipeline_id) is not None:
+                        raise RevisionConflict("Pipeline 已登记评测运行")
+                    self.records._save(connection, "pipeline_evaluations", pipeline_id, pipeline_binding, 1)
                 connection.commit()
                 return saved
             except BaseException:

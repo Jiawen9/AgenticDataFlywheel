@@ -10,9 +10,24 @@
         <p>{{ isEvaluation ? '采集并即时评测，或用已有轨迹创建独立评测；选择规则版本，保留每轮结果。' : '管理采集手机与运行 APP，配置 VLA 接口，上传轨迹生产任务文件。' }}</p>
       </div>
     </header>
-    <ModelIterationPanel v-if="evaluationProgress" :runs="runs" :progress="evaluationProgress" @ready="evaluationReady = $event" @config="evaluatorConfig = $event" @mode="evaluationMode = $event" @profile="evaluationProfile = $event" @started="onEvaluationStarted" @details="openDetails('cases')" />
-    <EvaluationPipelineBar v-if="isEvaluation && evaluationPipelineId" :pipeline-id="evaluationPipelineId" :run-id="evaluationProgress?.selectedRun.value || ''" />
-    <BadCasePanel v-if="evaluationProgress" :run-id="evaluationProgress.selectedRun.value" :parent-pipeline-id="evaluationPipelineId || undefined" />
+    <section v-if="evaluationPipelineId" class="evaluation-pipeline-context">
+      <span>Pipeline {{ evaluationPipeline?.name || evaluationPipelineId }}</span>
+      <router-link :to="{ path: '/pipeline', query: { pipeline_id: evaluationPipelineId } }">返回 Pipeline</router-link>
+      <el-alert v-if="evaluationContext?.error.value" :title="evaluationContext.error.value" type="warning" :closable="false" />
+      <details v-if="evaluationPipeline?.parent_pipeline_id || evaluationPipeline?.next_pipeline_ids?.length">
+        <summary>查看回流记录</summary>
+        <p v-if="evaluationPipeline.parent_pipeline_id">来源轮次 <router-link :to="{ path: '/pipeline', query: { pipeline_id: evaluationPipeline.parent_pipeline_id } }">{{ evaluationPipeline.parent_pipeline_id }}</router-link></p>
+        <p v-for="id in evaluationPipeline.next_pipeline_ids" :key="id">下一轮 <router-link :to="{ path: '/pipeline', query: { pipeline_id: id } }">{{ id }}</router-link></p>
+      </details>
+    </section>
+    <ModelIterationPanel v-if="evaluationProgress && (!evaluationPipelineId || evaluationPipeline)" :key="evaluationScope?.evaluation_attempt || 0"
+      :runs="runs" :progress="evaluationProgress" :pipeline-id="evaluationScope?.pipeline_id" :pipeline-attempt="evaluationScope?.evaluation_attempt"
+      :creation-blocked="Boolean(evaluationPipelineId && !canStartEvaluationInPipeline)" :locked-run-id="evaluationRunLock"
+      @ready="evaluationReady = $event" @config="evaluatorConfig = $event" @mode="evaluationMode = $event" @profile="evaluationProfile = $event" @started="onEvaluationStarted" @details="openDetails('cases')" />
+    <BadCasePanel v-if="evaluationProgress" :run-id="evaluationProgress.selectedRun.value" :pipeline="evaluationScope"
+      :parent-pipeline-id="evaluationRunLock ? evaluationPipeline?.pipeline_id : undefined" :open-requested="route.query.badcases === '1'"
+      :blocked="Boolean(evaluationPipelineId && (!evaluationPipeline || evaluationContext?.error.value))"
+      @confirmed="onBadcaseConfirmed" @refresh-pipeline="evaluationContext?.refresh()" />
     <PhoneRunDiagnostics v-if="!showCollectionControls" :state="diagnostics" :runs="filteredRuns" :allow-resume="false" @details="openPhoneDiagnostics" />
 
     <div class="factory-layout" :class="{ 'offline-layout': !showCollectionControls }">
@@ -245,8 +260,7 @@
 
 <script setup lang="ts">
 import BadCasePanel from '@/components/BadCasePanel.vue'
-import EvaluationPipelineBar from '@/components/EvaluationPipelineBar.vue'
-import { pipelineLoopApi } from '@/pipelineLoopApi'
+import { loopRequestId } from '@/pipelineLoopApi'
 import PipelineStatusBar from '@/components/PipelineStatusBar.vue'
 import CollectionAgentSelect from '@/components/CollectionAgentSelect.vue'
 import PipelineModelFields from '@/components/PipelineModelFields.vue'
@@ -264,7 +278,8 @@ import { collectionRunBelongsToSource, collectionResultLocation, isCollectionRes
 import { useSummaryPage } from '@/composables/useSummaryPage'
 import { invalidateSummaryCache } from '@/utils/summaryCache'
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
+import { pipelineStepLocation, type Pipeline } from '@/types/pipeline'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { phoneFactoryApi, modelIterationApi, factoryBatchesApi, newRunRequestId, type EvaluatorConfig, type EvaluationExecutionMode, type EvaluationProfile, type FactoryConfig, type PhoneAppRow, type TaskRow, type FactoryBatchSummary, type FactoryState, type FactoryRun, type ReportFolder, type ReportFile, type AdbDevice, type CollectionWarning } from '@/phoneFactoryApi'
 import ModelIterationPanel from '@/components/ModelIterationPanel.vue'
@@ -288,10 +303,19 @@ const filterRunTasks = (query: string) => { taskQuery.value = query }
 const taskFileLabel = (task: TaskRow) => task.original_filename || task.filename
 const taskDescription = (task: TaskRow) => task.source_batch_id ? task.description.replaceAll(task.source_batch_id, displayId('batch', task.source_batch_id)) : task.description
 const isEvaluation = props.mode === 'modeliter'
+const route = useRoute(), router = useRouter()
+const evaluationPipelineId = computed(() => isEvaluation && typeof route.query.evaluation_pipeline_id === 'string' ? route.query.evaluation_pipeline_id : '')
+const evaluationContext = isEvaluation ? usePipelineContext({ pipelineId: evaluationPipelineId, lookupByBatch: false }) : undefined
+const evaluationPipeline = computed(() => evaluationContext?.pipeline.value)
+const evaluationScope = computed(() => evaluationPipeline.value?.start_mode === 'evaluation' ? evaluationPipeline.value : undefined)
+const submittedEvaluationRun = ref('')
+const evaluationRunLock = computed(() => evaluationPipeline.value?.evaluation_run_id || evaluationPipeline.value?.source_evaluation_run_id || submittedEvaluationRun.value)
+const canStartEvaluationInPipeline = computed(() => evaluationScope.value?.status === 'waiting_for_evaluation' && !evaluationRunLock.value && !evaluationContext?.error.value)
+watch(() => evaluationScope.value?.evaluation_attempt, () => { submittedEvaluationRun.value = '' })
 const factoryApi = isEvaluation ? modelIterationApi : phoneFactoryApi
 const evaluationReady = ref(false), evaluatorConfig = ref<EvaluatorConfig>()
 const evaluationMode = ref<EvaluationExecutionMode>('collect_and_evaluate'), evaluationProfile = ref<EvaluationProfile>()
-const showCollectionControls = computed(() => !isEvaluation || evaluationMode.value === 'collect_and_evaluate')
+const showCollectionControls = computed(() => !isEvaluation || (evaluationMode.value === 'collect_and_evaluate' && (!evaluationPipelineId.value || canStartEvaluationInPipeline.value)))
 const evaluationBlocked = computed(() => isEvaluation && (!evaluationReady.value || !evaluationProfile.value || !showCollectionControls.value))
 // ---------- 状态 ----------
 const apps = ref<string[]>([])
@@ -374,7 +398,7 @@ const runStorage = useRunStorage({
 })
 const historySourceId = ref('')
 const filteredRuns = computed(() => runs.value.filter(run => isEvaluation || pipelineContext.isPipelineRoute.value || collectionRunBelongsToSource(run, historySourceId.value)))
-const evaluationProgress = isEvaluation ? useEvaluationProgress(runs, refreshEvaluationRuns) : undefined
+const evaluationProgress = isEvaluation ? useEvaluationProgress(runs, refreshEvaluationRuns, !evaluationPipelineId.value) : undefined
 const detailsVisible = ref(false), detailsTab = ref<FactoryDetailsTab>('runs')
 const detailsRunFilter = ref<'all' | 'active' | 'abnormal'>('all'), detailsFocusedRun = ref('')
 const detailsFocusedPhone = ref('')
@@ -385,13 +409,16 @@ function openRunDetails(filter: 'all' | 'active' | 'abnormal', runId = '') {
 }
 function openPhoneDiagnostics(phoneId: string) { detailsFocusedPhone.value = phoneId; openDetails('diagnostics') }
 async function onEvaluationStarted(runId: string) {
-  const origin = evaluationPipelineId.value
+  if (evaluationScope.value) submittedEvaluationRun.value = runId
   evaluationProgress?.selectRun(runId)
   await refreshEvaluationRuns()
-  if (origin) {
-    try { const p = await api.pipeline(origin); await pipelineLoopApi.associate(p.pipeline_id, runId, p.storage_revision) }
-    catch (cause) { ElMessage.warning('评测已创建，关联 Pipeline 待重试：' + (cause as Error).message) }
-  }
+  await evaluationContext?.refresh()
+}
+async function onBadcaseConfirmed(updated: Pipeline) {
+  if (!evaluationContext || evaluationScope.value?.pipeline_id !== updated.pipeline_id) return
+  evaluationContext.pipeline.value = updated
+  if (updated.feedback_id) await router.push(pipelineStepLocation(updated, 'generation'))
+  else await router.push({ path: '/pipeline', query: { pipeline_id: updated.pipeline_id } })
 }
 function isPublishedRun(run: FactoryRun): boolean {
   // A publication event can arrive before the next run-list refresh.
@@ -412,9 +439,9 @@ const warningSummary = (warnings: CollectionWarning[]) => {
   return first ? `${warnings.length} 条分类提示：${first.sheet} 第 ${first.row} 行（${first.field}）：${first.message}` : ''
 }
 const deviceFor = (id: string) => devices.value.find(device => device.serial === id)
-const route = useRoute()
-const evaluationPipelineId = computed(() => typeof route.query.evaluation_pipeline_id === 'string' ? route.query.evaluation_pipeline_id : '')
-watch(() => route.query.run_id, value => { if (isEvaluation && typeof value === 'string') evaluationProgress?.selectRun(value) }, { immediate: true })
+watch([evaluationRunLock, () => route.query.run_id], ([bound, value]) => {
+  if (bound || typeof value === 'string') evaluationProgress?.selectRun(bound || String(value))
+}, { immediate: true })
 const manualTaskBusy = computed(() => savingTask.value || Boolean(deletingTask.value) || Boolean(startingTask.value) || confirmingRun.value)
 const collection = usePhoneCollectionBatches(factoryBatchesApi, factoryApi, {
   setTasks: rows => { tasks.value = activeFactoryTasks(rows) },
@@ -442,7 +469,7 @@ const diagnosticResumeAllowed = computed(() => !!diagnostics.selectedRun.value &
 watch(historySourceId, () => { diagnostics.selectRun(''); detailsFocusedRun.value = ''; detailsFocusedPhone.value = '' })
 if (evaluationProgress) {
   watch(evaluationProgress.selectedRun, id => { if (id && id !== diagnostics.selectedRunId.value) diagnostics.selectRun(id) })
-  watch(diagnostics.selectedRunId, id => { if (id && id !== evaluationProgress.selectedRun.value) evaluationProgress.selectRun(id) })
+  watch(diagnostics.selectedRunId, id => { if (id && id !== evaluationProgress.selectedRun.value && !evaluationRunLock.value) evaluationProgress.selectRun(id) })
 }
 const isManagedTask = (task: TaskRow) => Boolean(isCollectionResult(task) && task.source_batch_id && (managedBatchIds.value.includes(task.source_batch_id) || (pipelineContext.managed.value && pipelineContext.pipeline.value?.batch_id === task.source_batch_id)))
 async function loadManagedBatches() {
@@ -717,10 +744,13 @@ async function confirmRun() {
 }
 
 async function dispatchTask(task: TaskRow, phoneId: string, app: string, vla: string, config: FactoryConfig, agent: AgentType = agentType.value, modelConfig: PipelineModelDraft = activeModels.value, repeats = repeatTimes.value) {
+  if (evaluationPipelineId.value && !canStartEvaluationInPipeline.value) return
+  const origin = evaluationScope.value?.pipeline_id
   const parameters = { ...modelOptions(agent, modelConfig), agent_type: agent, filename: task.filename, phone_id: phoneId, app, vla, config, run_mode: props.mode, repeat_times: isEvaluation ? 1 : repeats,
+    ...(origin ? { pipeline_id: origin } : {}),
     ...(isEvaluation ? { evaluator_config: evaluatorConfig.value, evaluation_profile_id: evaluationProfile.value?.id, evaluation_profile_digest: evaluationProfile.value?.digest, checklist_source: 'auto' as const, evaluation_mode: 'checklist' as const } : {}) }
   const key = JSON.stringify(parameters)
-  const requestId = requestIds.get(key) || newRunRequestId()
+  const requestId = origin ? loopRequestId(`evaluation-start.${origin}.${evaluationScope.value?.evaluation_attempt || 0}`, parameters) : requestIds.get(key) || newRunRequestId()
   requestIds.set(key, requestId)
   const remote = await factoryApi.remoteStartRun({ ...parameters, request_id: requestId })
   requestIds.delete(key)
@@ -849,6 +879,8 @@ onBeforeUnmount(() => { document.body.classList.remove('factory-responsive'); di
 </script>
 
 <style scoped>
+.evaluation-pipeline-context{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 16px;margin:14px 0;border:1px solid #acd3c6;border-radius:9px;background:#eff8f5;color:#375e51;font-size:13px}
+.evaluation-pipeline-context details{width:100%}
 .history-scope{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:20px;font-size:12px}.history-scope .el-select{width:min(360px,100%)}.history-scope small{color:var(--muted)}
 :global(body.factory-responsive) { min-width: 0; }
 .report-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }.report-folder p { overflow-wrap: anywhere; color: var(--muted); font-size: 13px; }.custom-config { display: grid; gap: 14px; margin-top: 20px; }.custom-config label { display: flex; align-items: center; justify-content: space-between; gap: 14px; }.custom-config .el-select { width: 240px; }.report-folder { margin-top: 14px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; }.report-file { display:flex; justify-content:space-between; gap:12px; margin-top:8px; overflow-wrap:anywhere; }

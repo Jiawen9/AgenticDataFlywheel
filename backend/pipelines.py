@@ -178,13 +178,13 @@ class PipelineRuntime:
                 ("input_digest", "collection_snapshot_id", "collection_epoch")}
             return True
         bound = set(pipeline.get("collection_run_ids", []))
-        if pipeline["start_mode"] in {"collect", "generate"} and bound - {run["collection_run_id"] for run in runs}:
+        if pipeline["start_mode"] in {"collect", "generate", "evaluation"} and bound - {run["collection_run_id"] for run in runs}:
             raise PipelineError("本次采集运行记录缺失，不能改用其他历史运行继续")
         if runs:
             for run in runs:
                 if run["status"] in ACTIVE_JOBS:
                     return False
-                if (pipeline["start_mode"] in {"collect", "generate"} and run["collection_run_id"] in bound
+                if (pipeline["start_mode"] in {"collect", "generate", "evaluation"} and run["collection_run_id"] in bound
                         and (run["status"] != "completed" or run.get("errors"))):
                     guidance = ("请从任务来源重新采集，并选择新结果批次继续"
                                 if pipeline.get("batch_role") == "collection_result"
@@ -385,7 +385,9 @@ class PipelineManager:
             for step in pipeline["steps"]:
                 # The public detail needs only the jobs explicitly bound to
                 # this step. Discovery during orchestration remains separate.
-                if step["id"] == "generation":
+                if step["id"] == "evaluation":
+                    jobs = []  # The lightweight evaluation summary is projected below.
+                elif step["id"] == "generation":
                     jobs = self.records.get_many("task_generation.jobs", step["job_ids"])
                 elif not pipeline.get("batch_id"):
                     jobs = []
@@ -424,7 +426,7 @@ class PipelineManager:
                    for run in self.runtime.collection_runs(batch_id))
 
     def create(self, data):
-        if data.get("start_mode") == "generate":
+        if data.get("start_mode") in {"generate", "evaluation"}:
             from .pipeline_generation import create
             return create(self, data)
         if any(data.get(key) is not None for key in ("generation_kind", "feedback_id", "parent_pipeline_id")):
@@ -535,10 +537,16 @@ class PipelineManager:
             p = self.get(pipeline_id, public=False)
             if revision != p["storage_revision"]:
                 raise RevisionConflict("流程已更新，请刷新后重试，当前草稿不会丢失")
-            if p.get("start_mode") == "generate" and not p.get("batch_id"):
-                from .pipeline_generation import control
-                control(self, p, action)
-                self._save(p)
+            if p.get("start_mode") in {"generate", "evaluation"} and not p.get("batch_id"):
+                if p["current_step"] == "evaluation":
+                    from .pipeline_evaluation import control
+                    persisted = control(self, p, action)
+                else:
+                    from .pipeline_generation import control
+                    control(self, p, action)
+                    persisted = False
+                if not persisted:
+                    self._save(p)
                 return self.get(pipeline_id)
             if action == "retry" and p["status"] == "published_summary_failed":
                 self.runtime.conversion(p["release_id"], retry=True)
@@ -771,7 +779,7 @@ class PipelineManager:
             pipeline.update(status="paused", error="等待已启动的旧快照作业结束；结果将保留为旧版本")
             return True
         for step in pipeline["steps"]:
-            if step["id"] == "generation":
+            if step["id"] in {"evaluation", "generation"}:
                 continue
             step.setdefault("previous_job_ids", []).extend(step.get("job_ids", []))
             step.update(status="pending", job_ids=[], started_at=None, completed_at=None, error=None, message="等待新采集快照")
@@ -795,8 +803,11 @@ class PipelineManager:
         with self.artifacts.batch_lock("pipeline_" + pipeline_id), internal_pipeline(pipeline_id):
             p = self.get(pipeline_id, public=False)
             original = digest(p)
-            if p.get("start_mode") == "generate" and not p.get("batch_id"):
-                from .pipeline_generation import tick
+            if p.get("start_mode") in {"generate", "evaluation"} and not p.get("batch_id"):
+                if p["current_step"] == "evaluation":
+                    from .pipeline_evaluation import tick
+                else:
+                    from .pipeline_generation import tick
                 persisted = tick(self, p)
                 if not persisted and digest(p) != original:
                     self._save(p)
@@ -862,14 +873,14 @@ class PipelineManager:
                 key = step["id"]
                 if key == "collection":
                     runs_by_id = {run["collection_run_id"]: run for run in self.runtime.collection_runs(p["batch_id"])}
-                    if p["start_mode"] in {"collect", "generate"} and not p["collection_run_ids"]:
+                    if p["start_mode"] in {"collect", "generate", "evaluation"} and not p["collection_run_ids"]:
                         recovered = [run for run in runs_by_id.values() if run.get("dispatch_key") == pipeline_id]
                         p["collection_run_ids"] = [run["collection_run_id"] for run in recovered]
                     bound = [runs_by_id.get(run_id) for run_id in p["collection_run_ids"]]
                     dispatch_needed = not bound or any(run and run.get("dispatch_error")
                                                        and run.get("status") in {"failed", "dispatching"}
                                                        for run in bound)
-                    if p["start_mode"] in {"collect", "generate"} and dispatch_needed:
+                    if p["start_mode"] in {"collect", "generate", "evaluation"} and dispatch_needed:
                         retrying = bool(step.pop("retry", False))
                         if (step["status"] != "running"
                                 and (not retrying or not step.get("retry_info", {}).get("attempts"))):

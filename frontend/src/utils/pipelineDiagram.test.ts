@@ -45,7 +45,7 @@ describe('original Pipeline diagram with real execution state', () => {
   it.each(['collect', 'existing'] as const)('lights prior modules for %s without inventing jobs', start => {
     const p = pipeline(); p.start_mode = start
     const before = JSON.stringify(p)
-    for (const id of ['evaluation', 'generation']) expect(diagramStageState(p, stage(id))).toEqual({ status: 'completed', active: false, inherited: true, detail: '前置环节 · 本轮不执行' })
+    for (const id of ['evaluation', 'generation']) expect(diagramStageState(p, stage(id))).toEqual({ status: 'completed', active: false, inherited: true, detail: '前置环节' })
     expect(JSON.stringify(p)).toBe(before)
   })
   it('shows actual generation while leaving unused augmentation skipped', () => {
@@ -57,6 +57,20 @@ describe('original Pipeline diagram with real execution state', () => {
     expect(diagramNodeState(p, node('badcase-augmentation')).status).toBe('skipped')
     p.generation_kind = 'augmentation'
     expect(diagramNodeState(p, node('badcase-augmentation')).status).toBe('running')
+  })
+  it('keeps evaluation-start pending until it has an actual evaluation and allows linked augmentation', () => {
+    const p = pipeline()
+    p.start_mode = 'evaluation'; p.batch_id = null; p.current_step = 'evaluation'; p.status = 'waiting_for_evaluation'
+    p.generation_kind = 'augmentation'
+    p.steps.unshift({ id: 'evaluation', label: '迭代评估', status: 'waiting', job_ids: [] },
+      { id: 'generation', label: '任务生成', status: 'pending', job_ids: [] })
+    expect(diagramStageState(p, stage('evaluation'))).toMatchObject({ status: 'waiting', active: true })
+    expect(diagramNodeState(p, node('badcase-extraction')).status).toBe('pending')
+    expect(diagramStageState(p, stage('generation')).status).toBe('pending')
+    p.feedback_id = 'fc-1'
+    p.steps[0]!.status = 'succeeded'; p.steps[1]!.status = 'waiting'
+    expect(diagramNodeState(p, node('badcase-extraction')).status).toBe('completed')
+    expect(diagramNodeState(p, node('badcase-augmentation')).status).toBe('waiting')
   })
   it('uses associated evaluation status and preserves unknown status as pending', () => {
     const p = pipeline(); p.evaluation_run_id = 'eval-1'

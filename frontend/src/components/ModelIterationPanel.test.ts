@@ -3,8 +3,8 @@ import { createRenderer, h, nextTick, ref, ssrContextKey } from 'vue'
 import ModelIterationPanel from './ModelIterationPanel.vue'
 import { useEvaluationProgress } from '@/composables/useEvaluationProgress'
 
-const mocks = vi.hoisted(() => ({ config: vi.fn(), capability: vi.fn(), profiles: vi.fn(), sources: vi.fn(), preview: vi.fn(), previewState: vi.fn(), previewControl: vi.fn(), retryPreparation: vi.fn(), start: vi.fn(), cancel: vi.fn(), confirm: vi.fn(), requestId: vi.fn(), save: vi.fn(), evaluations: vi.fn(), poll: undefined as undefined | ((signal: AbortSignal, current: () => boolean) => Promise<void>) }))
-vi.mock('@/phoneFactoryApi', () => ({ newRunRequestId: mocks.requestId, modelIterationApi: { evaluationConfig: mocks.config, evaluationCapabilities: mocks.capability, evaluationProfiles: mocks.profiles, evaluationSources: mocks.sources, evaluationPreview: mocks.preview, evaluationPreviewState: mocks.previewState, evaluationPreviewControl: mocks.previewControl, retryEvaluationPreparation: mocks.retryPreparation, remoteStartEvaluation: mocks.start, cancelEvaluation: mocks.cancel, saveEvaluationConfig: mocks.save, evaluations: mocks.evaluations } }))
+const mocks = vi.hoisted(() => ({ config: vi.fn(), capability: vi.fn(), profiles: vi.fn(), sources: vi.fn(), preview: vi.fn(), previewState: vi.fn(), previewControl: vi.fn(), retryPreparation: vi.fn(), start: vi.fn(), cancel: vi.fn(), confirm: vi.fn(), requestId: vi.fn(), save: vi.fn(), runDetail: vi.fn(), evaluationSummary: vi.fn(), poll: undefined as undefined | ((signal: AbortSignal, current: () => boolean) => Promise<void>) }))
+vi.mock('@/phoneFactoryApi', () => ({ newRunRequestId: mocks.requestId, modelIterationApi: { evaluationConfig: mocks.config, evaluationCapabilities: mocks.capability, evaluationProfiles: mocks.profiles, evaluationSources: mocks.sources, evaluationPreview: mocks.preview, evaluationPreviewState: mocks.previewState, evaluationPreviewControl: mocks.previewControl, retryEvaluationPreparation: mocks.retryPreparation, remoteStartEvaluation: mocks.start, cancelEvaluation: mocks.cancel, saveEvaluationConfig: mocks.save, runDetail: mocks.runDetail, evaluationSummary: mocks.evaluationSummary } }))
 vi.mock('element-plus', () => ({ ElMessageBox: { confirm: mocks.confirm } }))
 vi.mock('@/composables/useFactoryPolling', () => ({ useFactoryPolling: (work: typeof mocks.poll) => { mocks.poll = work; return { start() {} } } }))
 const config = () => ({ text: { base_url: 'http://text/v1/', model: 'text', api_key_env: 'TEXT_KEY' }, vision: { base_url: 'http://vision/v1/', model: 'vision', api_key_env: 'VISION_KEY' } })
@@ -14,13 +14,14 @@ const flush = async () => { for (let index = 0; index < 5; index++) { await Prom
 
 // Run the real component setup and lifecycle without a browser. The repository's
 // Node test environment compiles Vue templates for SSR, so only rendering is stubbed.
-function mount(runs: Array<{ run_id: string; status: string }> = []) {
+function mount(runs: Array<{ run_id: string; status: string }> = [], context: { pipelineId?: string; pipelineAttempt?: number; creationBlocked?: boolean } = {}) {
+  mocks.runDetail.mockImplementation(async runId => runs.find(run => run.run_id === runId))
   const renderer = createRenderer<object, object>({ createElement: () => ({}), createText: () => ({}), createComment: () => ({}), setText() {}, setElementText() {}, parentNode: () => null, nextSibling: () => null, patchProp() {}, insert() {}, remove() {} })
   const events = { ready: [] as boolean[], config: [] as ReturnType<typeof config>[], profile: [] as any[], mode: [] as string[], started: [] as string[], changed: [] as string[] }
   const component = { ...ModelIterationPanel, render: () => h('div') }
   const app = renderer.createApp({ setup() {
     const progress = useEvaluationProgress(ref(runs), value => { events.changed.push(value) })
-    return () => h(component, { runs, progress, onReady: (value: boolean) => events.ready.push(value), onConfig: (value: ReturnType<typeof config>) => events.config.push(value), onProfile: (value: unknown) => events.profile.push(value), onMode: (value: string) => events.mode.push(value), onStarted: (value: string) => { progress.selectRun(value); events.started.push(value) } })
+    return () => h(component, { runs, progress, ...context, onReady: (value: boolean) => events.ready.push(value), onConfig: (value: ReturnType<typeof config>) => events.config.push(value), onProfile: (value: unknown) => events.profile.push(value), onMode: (value: string) => events.mode.push(value), onStarted: (value: string) => { progress.selectRun(value); events.started.push(value) } })
   } })
   app.provide(ssrContextKey, { modules: new Set() })
   app.mount({})
@@ -62,11 +63,11 @@ describe('model iteration interactions', () => {
   it('ignores a late result after selecting another run', async () => {
     const view = mount([{ run_id: 'eval-a', status: 'running' }, { run_id: 'eval-b', status: 'running' }]); await flush()
     view.state.selectedRun = 'eval-a'; await flush()
-    const old = deferred<any>(); mocks.evaluations.mockReturnValueOnce(old.promise)
-    const first = mocks.poll!(new AbortController().signal, () => true)
+    const old = deferred<any>(); mocks.evaluationSummary.mockReturnValueOnce(old.promise)
+    const first = mocks.poll!(new AbortController().signal, () => true); await flush()
     view.state.selectedRun = 'eval-b'; await flush()
     const result = { run_id: 'eval-b', summary: { total: 1, success_rate: null }, cases: [{ case_key: 'B' }] }
-    mocks.evaluations.mockResolvedValueOnce(result)
+    mocks.evaluationSummary.mockResolvedValueOnce(result)
     await mocks.poll!(new AbortController().signal, () => true); await flush()
     old.resolve({ ...result, run_id: 'eval-a', cases: [{ case_key: 'A' }] }); await first; await flush()
     expect(view.state.results.cases).toEqual([{ case_key: 'B' }])
@@ -135,6 +136,7 @@ describe('model iteration interactions', () => {
   })
   it('cancels the selected independent run only after confirmation and refreshes its results', async () => {
     const view = mount([{ run_id: 'offline-a', status: 'running', execution_mode: 'evaluate_only' } as any]); await flush()
+    await mocks.poll!(new AbortController().signal, () => true)
     mocks.confirm.mockRejectedValueOnce('cancel')
     await view.state.cancelRun(); expect(mocks.cancel).not.toHaveBeenCalled()
     mocks.confirm.mockResolvedValueOnce('confirm'); mocks.cancel.mockResolvedValue({ run_id: 'offline-a', status: 'cancelled' })
@@ -167,6 +169,27 @@ it('polls asynchronous previews and drops a late page after source selection cha
 })
 
 describe('durable offline evaluation jobs', () => {
+  it('scopes a lost offline start to its Pipeline attempt and restores its exact request', async () => {
+    const first = mount([], { pipelineId: 'p-eval', pipelineAttempt: 0 }); await flush()
+    first.state.executionMode = 'evaluate_only'; first.state.sourceRunId = 'source-a'; await flush()
+    mocks.preview.mockResolvedValue({ ...preview('scoped'), status: 'completed', job_version: 1, revision: 1 })
+    await first.state.previewSource()
+    mocks.start.mockRejectedValueOnce(new Error('response lost'))
+    await first.state.startOffline()
+    const request = mocks.start.mock.calls[0]![0]
+    expect(request).toMatchObject({ pipeline_id: 'p-eval', preview_id: 'scoped' })
+    first.app.unmount()
+    const other = mount([], { pipelineId: 'p-eval', pipelineAttempt: 1 }); await flush()
+    expect(other.state.pendingStart).toBeUndefined()
+    other.app.unmount()
+    mocks.previewState.mockResolvedValue({ ...preview('scoped'), status: 'completed', job_version: 1, revision: 1 })
+    const restored = mount([], { pipelineId: 'p-eval', pipelineAttempt: 0 }); await flush()
+    expect(restored.state.pendingStart).toEqual(request)
+    mocks.start.mockResolvedValue({ ok: true, run_id: 'eval-scoped' })
+    await restored.state.recoverStart()
+    expect(mocks.start.mock.calls[1]![0]).toEqual(request)
+    restored.app.unmount()
+  })
   it('replays a lost preview acknowledgement after refresh and only rechecks with a new request on explicit action', async () => {
     const first = mount(); await flush()
     first.state.executionMode = 'evaluate_only'; first.state.sourceKind = 'directory'; first.state.sourcePath = 'D:/轨迹/case-01'; await flush()
@@ -312,6 +335,7 @@ describe('durable offline evaluation jobs', () => {
 
   it('retries a paused input-preparation job without resubmitting a collection', async () => {
     const view = mount([{ run_id: 'offline-a', status: 'failed', execution_mode: 'evaluate_only', preparation: { status: 'paused', revision: 8, retryable: true, error: 'disk full' } } as any]); await flush()
+    await mocks.poll!(new AbortController().signal, () => true)
     expect(view.state.canRetryPreparation).toBe(true)
     expect(view.state.canCancel).toBe(true)
     mocks.retryPreparation.mockRejectedValueOnce(new Error('lost ack')).mockResolvedValueOnce({ run_id: 'offline-a', status: 'preparing' })

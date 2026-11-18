@@ -3,13 +3,16 @@ import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { api } from '@/api'
 import { pipelineLoopApi, loopRequestId, type BadCase, type BadCasePage } from '@/pipelineLoopApi'
-import { pipelineStepLocation } from '@/types/pipeline'
-const props = defineProps<{ runId: string; parentPipelineId?: string }>()
+import { pipelineStepLocation, type Pipeline } from '@/types/pipeline'
+const props = defineProps<{ runId: string; parentPipelineId?: string; pipeline?: Pipeline; openRequested?: boolean; blocked?: boolean }>()
+const emit = defineEmits<{ confirmed: [Pipeline]; refreshPipeline: [] }>()
 const router = useRouter(), visible = ref(false), loading = ref(false), submitting = ref(false), error = ref('')
 const page = ref(1), size = ref(10), status = ref('candidate'), data = ref<BadCasePage | null>(null)
 const selected = ref(new Set<string>()), edit = ref<BadCase | null>(null), editTask = ref(''), editApp = ref('')
 const nextName = ref(''), nextPipelineId = ref('')
 const rows = computed(() => data.value?.items || [])
+const canConfirmInPipeline = computed(() => props.pipeline?.status === 'waiting_for_evaluation' && !props.blocked && data.value?.index_state === 'ready' && data.value.final === true)
+const noBusinessCases = computed(() => data.value?.index_state === 'ready' && data.value.final === true && !data.value.summary.candidate && !data.value.summary.needs_completion)
 let timer: ReturnType<typeof setTimeout> | undefined
 let disposed = false
 let epoch = 0, controller: AbortController | undefined
@@ -19,7 +22,15 @@ async function load() {
   controller?.abort(); controller = new AbortController()
   if (!run || !visible.value) return
   loading.value = true; error.value = ''
-  try { const value = await pipelineLoopApi.badcases(run, (page.value - 1) * size.value, size.value, status.value, controller.signal); if (ticket === epoch) { data.value = value; if (value.index_state === 'pending') timer = setTimeout(() => void load(), 2000); if (value.error) error.value = value.error } }
+  try {
+    const value = await pipelineLoopApi.badcases(run, (page.value - 1) * size.value, size.value, status.value, controller.signal)
+    if (ticket !== epoch) return
+    data.value = value
+    if (value.index_state === 'pending' || (props.pipeline?.status === 'waiting_for_evaluation' && !value.final && value.index_state !== 'failed')) {
+      timer = setTimeout(() => void load(), 5000)
+    }
+    if (value.error) error.value = value.error
+  }
   catch (cause) { if (ticket === epoch && !controller.signal.aborted) error.value = (cause as Error).message }
   finally { if (ticket === epoch) loading.value = false }
 }
@@ -38,7 +49,8 @@ async function save() {
 }
 function evidence(row: BadCase) { return row.failures.map(item => JSON.stringify(item, null, 2)).join('\n\n') || '暂无详细证据；保留原评测结论。' }
 async function feedback() {
-  if (!selected.value.size || submitting.value) return
+  if (!selected.value.size || submitting.value || props.blocked) return
+  if (props.pipeline) { await confirmScoped([...selected.value].sort()); return }
   const runId = props.runId, candidateIds = [...selected.value].sort(), parent = props.parentPipelineId, name = nextName.value.trim() || 'BadCase 回流 · ' + props.runId.slice(-10)
   submitting.value = true; error.value = ''
   try {
@@ -52,6 +64,32 @@ async function feedback() {
   } catch (cause) { if (!disposed && props.runId === runId) error.value = (cause as Error).message }
   finally { submitting.value = false }
 }
+async function confirmScoped(candidateIds: string[]) {
+  const pipeline = props.pipeline
+  if (!pipeline || !canConfirmInPipeline.value || submitting.value || (!candidateIds.length && !noBusinessCases.value)) return
+  const run = props.runId
+  submitting.value = true
+  error.value = ''
+  try {
+    const updated = await pipelineLoopApi.confirmBadcases(pipeline.pipeline_id, {
+      run_id: run, candidate_ids: candidateIds, expected_revision: pipeline.storage_revision,
+      request_id: loopRequestId('confirm-badcases.' + pipeline.pipeline_id, [run, candidateIds]),
+    })
+    if (disposed || props.runId !== run || props.pipeline?.pipeline_id !== pipeline.pipeline_id) return
+    visible.value = false
+    emit('confirmed', updated)
+  } catch (cause) {
+    if (!disposed && props.runId === run) {
+      error.value = (cause as Error).message
+      emit('refreshPipeline')
+    }
+  } finally { submitting.value = false }
+}
+let openedRun = ''
+watch([() => props.openRequested, () => props.runId], ([requested, run]) => {
+  if (!requested) openedRun = ''
+  if (requested && run && run !== openedRun && !visible.value) { openedRun = run; open() }
+}, { immediate: true })
 watch(() => props.runId, () => { epoch++; controller?.abort(); selected.value = new Set(); data.value = null; page.value = 1; error.value = ''; edit.value = null; nextPipelineId.value = ''; if (visible.value) void load() })
 watch([page, size, status, visible], () => { void load() })
 onBeforeUnmount(() => { disposed = true; if (timer) clearTimeout(timer); epoch++; controller?.abort() })
@@ -65,6 +103,8 @@ onBeforeUnmount(() => { disposed = true; if (timer) clearTimeout(timer); epoch++
     <p>默认纳入有效评测的失败、部分成功；同一原任务的重复失败合并为一个扩增种子。</p>
     <p v-if="data" class="summary">候选 {{ data.summary.candidate || 0 }} · 技术问题 {{ data.summary.technical || 0 }} · 待补信息 {{ data.summary.needs_completion || 0 }} · 已选 {{ selected.size }}</p>
     <p v-if="data?.index_state === 'pending'" role="status">正在后台整理评测结果，已有候选可继续查看…</p>
+    <p v-if="noBusinessCases" role="status">无可回流项</p>
+    <p v-else-if="pipeline && data?.index_state === 'ready' && !data.final" role="status">评测仍在同步，结果就绪后可确认回流。</p>
     <el-alert v-if="error" :title="error" type="error" :closable="false" />
     <div class="tools">
     <el-select v-model="status" aria-label="BadCase 类型" @change="page = 1">
@@ -117,8 +157,15 @@ onBeforeUnmount(() => { disposed = true; if (timer) clearTimeout(timer); epoch++
     </div>
     <template #footer>
     <div class="next">
-    <el-input v-model="nextName" placeholder="下一轮名称（可选）" />
-    <el-button type="primary" :loading="submitting" :disabled="!selected.size" @click="feedback">回流并创建下一轮（{{ selected.size }}）</el-button>
+    <template v-if="pipeline">
+      <el-button v-if="noBusinessCases && canConfirmInPipeline" :loading="submitting" @click="confirmScoped([])">结束本轮</el-button>
+      <el-button v-else-if="pipeline.status === 'waiting_for_evaluation'" type="primary" :loading="submitting"
+        :disabled="!selected.size || !canConfirmInPipeline" @click="feedback">确认并继续扩增（{{ selected.size }}）</el-button>
+    </template>
+    <template v-else-if="!blocked">
+      <el-input v-model="nextName" placeholder="下一轮名称（可选）" />
+      <el-button type="primary" :loading="submitting" :disabled="!selected.size" @click="feedback">回流并创建下一轮（{{ selected.size }}）</el-button>
+    </template>
     </div>
     </template>
   </el-drawer>

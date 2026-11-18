@@ -34,10 +34,16 @@ def _step(p):
 
 def create(manager, data):
     from .pipelines import RETRY_POLICY, STEPS
+    from .pipeline_evaluation import WAIT_EVALUATION
     request_id = str(data.get("request_id") or "")
     _identifier(request_id, "请求编号")
     name = str(data.get("name") or "").strip()
     mode, kind, threshold = data.get("mode"), data.get("generation_kind"), data.get("threshold")
+    from_evaluation = data.get("start_mode") == "evaluation"
+    if from_evaluation:
+        if kind not in {None, "augmentation"} or data.get("feedback_id") or data.get("parent_pipeline_id"):
+            raise _error("评测起点在确认 BadCase 后生成扩增来源", 422)
+        kind = "augmentation"
     if not name or len(name) > 200:
         raise _error("流程名称须为 1～200 个字符", 422)
     if mode not in {"manual", "automatic"} or kind not in {"initial", "augmentation"}:
@@ -74,22 +80,28 @@ def create(manager, data):
                 raise _error("回流来源与父流程不一致")
         identifier = allocate_id("p", manager.root, key=["pipeline", request_id], request_fingerprint=fingerprint)
         now = utc_now()
+        first = "evaluation" if from_evaluation else "generation"
+        stages = [("generation", "任务生成与审核"), *STEPS]
+        if from_evaluation:
+            stages.insert(0, ("evaluation", "迭代评估"))
         p = {"pipeline_id": identifier, "id_scheme": ID_SCHEME, "name": name, "batch_id": None,
-             "mode": mode, "start_mode": "generate", "generation_kind": kind, "generation_job_id": None,
+             "mode": mode, "start_mode": data["start_mode"], "generation_kind": kind, "generation_job_id": None,
              "generation_attempt": 0, "feedback_id": feedback_id, "parent_pipeline_id": parent_id,
              "threshold": threshold if mode == "automatic" else None, "task_ids": [], "batch_snapshot": None,
              "collection_config": None, "config_fingerprints": {}, "retry_policy": dict(RETRY_POLICY),
-             "status": WAIT_CONFIG, "current_step": "generation", "created_at": now, "updated_at": now,
+             "status": WAIT_EVALUATION if from_evaluation else WAIT_CONFIG, "current_step": first, "created_at": now, "updated_at": now,
              "error": None, "session_id": None, "release_id": None, "selection": None, "confirmation": None,
              "collection_run_ids": [], "logs": [],
-             "steps": [{"id": k, "label": label, "status": "waiting" if k == "generation" else "pending",
-                        "job_ids": [], "percent": 0, "message": "请配置任务生成" if k == "generation" else "等待前置步骤",
+             "steps": [{"id": k, "label": label, "status": "waiting" if k == first else "pending",
+                        "job_ids": [], "percent": 0, "message": ("请开始评测或选择已有评测" if from_evaluation else "请配置任务生成") if k == first else "等待前置步骤",
                         "error": None, "started_at": None, "completed_at": None,
                         "retry_info": {"attempts": 0, "max_attempts": RETRY_POLICY["max_attempts"],
                                        "last_error": None, "next_retry_at": None}}
-                       for k, label in [("generation", "任务生成与审核"), *STEPS]]}
+                       for k, label in stages]}
         if profile:
             p.update(export_profile=profile, cot_policy=cot_policy or "generate")
+        if feedback_id:
+            p["source_evaluation_run_id"] = feedback["run_id"]
         manager.records.put_many([
             {"namespace": "pipelines", "key": identifier, "payload": p, "expected_revision": 0},
             {"namespace": "pipeline_requests", "key": key, "payload": {
@@ -100,7 +112,7 @@ def create(manager, data):
 def validate_binding(manager, pipeline_id, kind, request_id=None):
     p = manager.get(pipeline_id, public=False)
     actual_kind = "initial" if kind == "task_generation" else kind
-    if p.get("start_mode") != "generate" or p.get("generation_kind") != actual_kind:
+    if p.get("start_mode") not in {"generate", "evaluation"} or p.get("current_step") != "generation" or p.get("generation_kind") != actual_kind:
         raise _error("生成方式与 Pipeline 配置不一致")
     if p.get("batch_id") or p["status"] in TERMINAL | {"paused", "terminating"}:
         raise _error("该 Pipeline 当前不接受新的生成作业")
@@ -275,7 +287,7 @@ def confirm(manager, pipeline_id, data):
             if data.get("expected_revision") != p["storage_revision"]:
                 raise RevisionConflict("流程已更新，请刷新后确认，当前配置不会丢失")
         preparing = (p.get("generation_confirmation") or {}).get("status") == "preparing"
-        if (p.get("start_mode") != "generate" or p.get("batch_id")
+        if (p.get("start_mode") not in {"generate", "evaluation"} or p.get("batch_id")
                 or (p["status"] != WAIT_REVIEW and not (preparing and p["status"] == "running"))):
             raise _error("请先完成生成并审核任务后确认采集")
         generation = getattr(manager.runtime, "generation", None)

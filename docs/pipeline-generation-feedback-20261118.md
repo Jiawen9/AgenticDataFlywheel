@@ -6,7 +6,7 @@
 
 原七个模块及十五个子步骤名称和顺序保留。外层分组为：模型评测包含迭代评估，数据治理包含任务生成、轨迹采集、轨迹质检和数据发布，模型训练包含模型训练和模型发布。训练仍使用原入口，不增加后台训练任务或模拟完成状态。
 
-从已有任务或结果开始时，迭代评估、任务生成点亮并标注“本轮不执行”。这表示本轮从后续起点开始，不证明存在评测报告；后台不会写入虚假作业、分数或完成时间。有真实关联评测、生成作业时使用其状态。数据流程按原规则结算，不等待外部训练或评测。
+主线箭头按原顺序连接模块及板块。模型发布沿上方回到迭代评估，表达下一轮评测的方向。点击板块小三角可收起子步骤，标题和主模块仍可操作。已有任务、已有结果起点直接点亮前置环节。后台的状态、计数与报告来自实际作业。
 
 ## 使用流程
 
@@ -23,7 +23,7 @@
 
 ### 评测回流
 
-在 Pipeline 关联一条已登记的模型迭代评测运行，或带本轮上下文进入评测页面创建、选择运行。关联是显式选择，不自动选最近一次评测，也不推断它使用了某次训练产物。
+新建 Pipeline 选择“从迭代评估开始”后进入现有评测页。可配置新评测，也可选择已登记的结果。由本轮启动的评测在平台保存来源，选择已有运行时随 BadCase 确认采用其结果。原有的关联面板和“关联当前评测”按钮已移除。普通任务生成起点直接进入生成页面。
 
 评测同步后后台整理 BadCase；历史运行可点击提取。候选列表按原任务合并重复失败轨迹，保留失败次数、来源轨迹、失败理由、检查项和报告引用：
 
@@ -31,40 +31,55 @@
 - `needs_review/collection_failed`：技术问题，不自动扩增。
 - 任务文本或 App 缺失：可补充，也可不选择；不影响其他候选回流。
 
-批量选择后回流，建立不可变选择快照和关联的下一轮 Pipeline。扩增使用失败任务与已有检查项依据；没有详细证据时如实显示，不额外调用摘要模型。下一轮审核后再接续采集，不覆盖上一轮结果，也不会自行无限循环。
+在评测起点提交 BadCase 后，进入同一 Pipeline 的扩增阶段。冻结的选择和已有检查项作为扩增输入，审核完成后沿用确认采集步骤。评测结果已结算且没有业务候选时，可结束本轮。从独立评测页回流仍创建下一轮 Pipeline。
 
-候选提取使用平台已同步的评测结果，报告补充在有界后台队列中读取并缓存，不下载原始轨迹。列表和流程详情只读取本地记录，报告暂不可用不会拖住原评测同步。回流区域显示候选数、下一轮实际扩增数及前后轮入口；尚未生成时显示待扩增，不填虚假数量。
+候选提取使用平台已同步的评测结果，报告补充在有界后台队列中完成。对应节点保留历史评测来源和前后轮查看入口。
 
 ## 接口适配
 
 | 接口 | 用途 |
 | --- | --- |
-| `POST /api/pipelines` | 增加 `start_mode=generate`、`generation_kind=initial/augmentation`；生成起点不需要 `batch_id`，回流可带 `feedback_id`、`parent_pipeline_id`。旧两个起点保持原契约。 |
+| `POST /api/pipelines` | 支持 `start_mode=evaluation`、`generate`、`collect`、`existing`。评测和生成起点在确认采集前没有结果批次，直接从独立评测页回流可在生成起点带 `feedback_id`、`parent_pipeline_id`。 |
 | 现有生成／扩增创建接口 | 可选 `pipeline_id`、`request_id`，让作业与流程在后端关联；原独立创建继续可用。 |
 | `POST /api/task-generation/badcase-jobs` | `feedback_id`、`generate_n`、`request_id`、可选 `pipeline_id` 和 `auto_start`；直接使用冻结的结构化种子，复用原扩增分类、预览与生成流程。 |
 | `POST /api/pipelines/{id}/confirm-generation` | `request_id`、`expected_revision`、`collection_config`；确认接续并冻结来源与采集参数。同编号重放复用已提交结果。 |
-| `POST /api/pipelines/{id}/evaluation` | 显式关联 `run_id`，携带 `expected_revision`；不启动评测或手机任务。 |
+| 现有 `/api/model-iter/remote/start-run`、`remote/start-evaluation` | 从评测起点启动时传 `pipeline_id` 和稳定的 `request_id`，平台登记本轮评测身份。 |
+| `POST /api/pipelines/{id}/confirm-badcases` | 传 `run_id`、`candidate_ids`、`request_id`、`expected_revision`，同轮进入扩增。最终结果确认无业务候选时用空集合结束本轮。 |
+| `POST /api/pipelines/{id}/evaluation` | 历史界面兼容接口，新页面使用评测启动与 BadCase 确认。 |
 | `GET /api/badcases` | `run_id`、`offset`、`limit=10/20/50`、`search`、`status`；只读取本地候选。 |
 | `POST /api/badcases/refresh` | `{run_id}`，后台整理，返回 202；不在 GET 中下载报告或扫描轨迹。 |
 | `PATCH /api/badcases/{candidate_id}` | 补充 `task`、`app`，保留来源和修改信息。 |
 | `POST /api/badcases/feedback` | `run_id`、`candidate_ids`、`request_id`；冻结选择，返回 `feedback_id`，供下一轮扩增使用。 |
 | `GET /api/badcases/feedback/{feedback_id}` | 读取冻结回流来源。 |
 
-新生成流程可能返回 `batch_id=null`，不能拼接成 `/batches/null`。新增 `waiting_for_generation_config`、`waiting_for_generation_review` 状态和 `generation` 步骤。历史流程保留原八阶段，不进行批量迁移。结果批次、来源批次、生成作业和父／子 Pipeline 是不同身份。
+评测、生成流程启动后 `batch_id` 可以为 `null`，只有确认接续采集并准备完成后才有结果批次。识别 `waiting_for_evaluation`、`evaluation` 及原生成阶段状态。结果批次、来源批次、评测运行、生成作业和父子 Pipeline 是不同身份。
 
-Pipeline 创建、确认和评测关联接口都返回 `{ "pipeline": ... }`。详情增加 `evaluation_run_id`、`evaluation`、`next_pipeline_ids` 和 `next_rounds`，后者包含每轮的生成作业、状态和实际 `generated_count`（尚未生成时为 `null`）。
+Pipeline 创建、确认和控制接口返回 `{ "pipeline": ... }`。详情使用 `evaluation_run_id`、`evaluation`、`source_evaluation_run_id`、`next_pipeline_ids` 和 `next_rounds` 显示已登记来源和轮次。BadCase 索引返回 `final`，评测结果结算且索引就绪后可确认同轮回流。`next_rounds` 包含每轮的生成作业、状态和实际 `generated_count`（尚未生成时为 `null`）。
 
-创新平台前端按上述接口逐项适配，保留自己的 `API_BASE_URL`、网关前缀和路由。前置节点点亮只属于展示，不据此推进流程。切换运行丢弃旧响应；刷新后以后台已登记关联恢复，重放请求沿用原请求编号。自用前端用 `evaluation_pipeline_id` 传评测关联上下文，`pipeline_return_id` 只提供训练／来源页面的返回入口，二者都不触发采集流程的只读管控。
+创新平台前端按上述接口逐项适配，沿用自己的 `API_BASE_URL`、网关前缀和路由。前置点亮属于展示。切换运行丢弃旧响应，刷新后以后台的登记状态恢复，重放请求沿用原编号。自用前端用 `evaluation_pipeline_id` 表达评测起点的上下文，`pipeline_return_id` 表达纯返回导航。
+
+## 云道训练 JSONL 目录
+
+后端支持 `ADF_YUNDAO_TRAINING_PREFIX=AgenticFlywheel_train_data/training_jsonl`。留空时，以 `ADF_YUNDAO_PREFIX` 为基础，末级是 `figures` 时取同级 `training_jsonl`，其他情形在前缀下加 `training_jsonl`。上传能力的 `internal.training_default_prefix` 提供解析后的目录。
+
+新上传默认目标是 `<默认目录>/<发布编号>/train.jsonl`，多份文件继续用 `001`、`002` 子目录。用户可通过现有 `training_destination_prefix` 自定义本次目录。该目录在上传任务中冻结，历史重试采用原地址，包括旧任务的隐式目标。已有 JSONL 的 `images` 字段和实际图片发布位置取决于原来的导出及上传设置。
 
 ## 部署与验收
 
 先同步兼容后端，再同步前端；不需要采集端增量包、新模型配置或训练平台配置。不删除历史数据或重建旧 Pipeline。
 
-现场定向验收：从场景生成一组短任务，审核并接续一次采集；用已有评测的失败、部分成功及技术错误检查分类；同任务多轨迹归并后回流扩增，确认下一轮关联和原件保留。核对原两个起点仍可用、三块布局及原节点名称未变。
+现场定向验收用一组短任务测试新评测起点，选 BadCase 后核对同轮扩增、审核与采集接续。再用一份小型发布检查云道默认目录、手工地址和图片引用。创新平台网关需实际调用新增的 BadCase 确认路由。
 
 本地自动化验证与真实模型、手机、内网网关验收分开记录。离线测试使用临时数据根和模拟模型响应，不产生真实手机采集或云道上传。
 
-## 本地验证记录（2026-11-18）
+## 本轮本地验证
+
+- 评测与回流后端 105 项通过，覆盖新发评测、已有结果同轮扩增、无候选结束、响应丢失、启动前重启、失效请求隔离和原入口回归。采集和平台核心另外执行了 98 项回归，以下发、批次和摘要为主，部分用例与评测回归重叠。
+- 训练上传相关后端 60 项通过，覆盖默认目标、覆写、多件编号、旧任务重试和图片引用。前端两组共 104 项通过，类型检查和构建通过。
+- Chrome 离线验收覆盖 1440px 桌面及 390px 窄屏。六段主线和一段回线方向正确，板块可各自折叠。桌面流程图由约 460px 缩至 196px，未出现页面横向溢出或无批次请求错误。
+- 内网真实模型、网关和云道脚本验收待执行。
+
+## 上一轮本地验证记录（2026-11-18）
 
 - 后端主回归：15 个测试模块、208 项通过，覆盖原 Pipeline／结果批次／采集配置／融合评分／摘要索引、生成与扩增、模型迭代及新回流链路。
 - 最后补充确认中断后的任务冻结测试：生成起点与任务生成两个模块 30 项通过，其中新增 1 项；合计验证 209 个不同后端用例，无跳过。重复运行的用例不重复累计。
@@ -77,11 +92,8 @@ Pipeline 创建、确认和评测关联接口都返回 `{ "pipeline": ... }`。�
 
 ## 提交说明
 
-建议标题：`feat(pipeline): 接通任务生成与 BadCase 回流并增加三板块展示`
+建议标题 `feat(pipeline): 增加评测起点、闭环连线与 JSONL 默认目录`
 
-提交摘要：
-
-- 保留原模块名称和顺序，增加数据治理、模型训练、模型评测分组及前置环节展示。
-- 接通生成起点、审核确认、冻结采集配置与中断恢复，兼容原有两个起点和历史八阶段流程。
-- 增加评测关联、BadCase 分类归并与下一轮扩增；技术错误单列，原评测和采集数据保持不变。
-- 同步自用前端、接口适配说明和项目总 README；采集服务、训练实现与评分公式不变。
+- 自动 Pipeline 增加跨板块连线、顶部回箭和自适应折叠。
+- 评测起点直接在同一轮完成 BadCase 选择、扩增和采集接续，移除手动关联面板。
+- 云道训练 JSONL 支持统一默认前缀及单次自定义目标，历史任务按冻结目录重试。

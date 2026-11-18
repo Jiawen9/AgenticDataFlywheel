@@ -12,6 +12,7 @@ import time
 import uuid
 import mimetypes
 import zipfile
+from contextlib import nullcontext
 from pathlib import Path
 from urllib.parse import urlsplit
 from fastapi.responses import FileResponse
@@ -31,6 +32,10 @@ from .agent_types import normalize_agent_type, engine_capabilities, PROVENANCE_F
 from .pipeline_model_config import MODEL_OVERRIDE_FIELDS, normalize_overrides
 from .collection_protocol import repeat_times, COLLECTION_ARTIFACTS_VERSION, SUPPORTED_ARTIFACT_VERSIONS
 from .collection_control import merge_control, can_cancel
+from .pipeline_evaluation import (
+    check_start as check_pipeline_evaluation, create_run as create_evaluation_run,
+    dispatch_guard, may_dispatch, start_context,
+)
 
 TERMINAL = {"completed", "succeeded", "partial", "failed", "interrupted", "cancelled"}
 
@@ -231,6 +236,16 @@ class FactoryRuntime:
                         from .offline_evaluation_dispatch import schedule
                         schedule(self, run["run_id"])
                     continue
+            pending_dispatch = run["status"] == "dispatching" or (
+                run["status"] == "failed" and run.get("dispatch_error")
+                and run.get("dispatch_attempted") and not run.get("dispatch_rejected"))
+            if (run.get("pipeline_id") and pending_dispatch and not run.get("stop_requested_at")
+                    and may_dispatch(self.records, run) and time.time() >= run.get("dispatch_checked_epoch", 0) + 10):
+                # The run and its round were atomically registered before a POST.
+                # A restart in that window can replay the exact frozen run ID.
+                run_id = run["run_id"]
+                self._evaluation_pool.submit(run_id, lambda run=run: self._recover_pipeline_evaluation(run))
+                continue
             snapshot = self.records.get("model_iter_results", run["run_id"]) or {}
             if snapshot.get("final"):
                 self._restore_final_evaluation(run, snapshot)
@@ -275,6 +290,11 @@ class FactoryRuntime:
                                    evaluation_summary=snapshot["result"]["summary"], updated_at=utc_now())
             run = self.records.update("model_iter_runs", run_id, restore)
         self.sync_policy.complete("evaluation", run_id)
+        if run.get("pipeline_id"):
+            head = self.records.get("badcase_heads", run_id) or {}
+            if not head.get("final") and head.get("status") != "failed":
+                from .badcases import schedule_refresh
+                schedule_refresh(self.root, run_id, store=self.store)
         return run
 
     def sync_evaluation(self, run_id, *, force=True, fresh=False):
@@ -571,6 +591,13 @@ class FactoryRuntime:
             raise PhoneFactoryError(f"{agent_type} 尚不支持模型迭代评测，请升级采集电脑", 409)
 
     def remote_start(self, data, mode, *, bound_batch_id=None, legacy_batch=False):
+        context = None
+        if "pipeline_id" in data:
+            if mode != "modeliter":
+                raise PhoneFactoryError("评测轮次只能用于模型迭代评测", 422)
+            data, context, replay = start_context(self, data, "collect_and_evaluate")
+            if replay:
+                return self._resume_pipeline_evaluation(replay)
         if bound_batch_id is not None and (mode != "generate" or legacy_batch):
             raise PhoneFactoryError("结果批次只能绑定生产采集")
         bound = None
@@ -652,7 +679,33 @@ class FactoryRuntime:
                 run = self.records.update("collection_runs", run_id, initialize_dispatch)
         else:
             run_id = "eval_" + payload_digest(request_id)
+            lock = batch_lock(self.root, "pipeline_" + context["pipeline_id"]) if context else nullcontext()
+            with lock:
+                if context:
+                    replay = self.records.get("model_iter_runs", run_id)
+                    if replay:
+                        if any(replay.get(key) != value for key, value in context.items()):
+                            raise PhoneFactoryError("相同评测请求编号对应的运行参数不同", 409)
+                        created, run = False, replay
+                    else:
+                        check_pipeline_evaluation(self, context, run_id)
+                        run, created = self._register_collection_evaluation(task, content, digest, options, metadata,
+                                                                           request_id, incremental, existing, context)
+                else:
+                    run, created = self._register_collection_evaluation(task, content, digest, options, metadata,
+                                                                       request_id, incremental, existing, None)
+            if context and not created:
+                return self._resume_pipeline_evaluation(run)
+        return self._dispatch_registered(run, mode, options, protocol, incremental, created, content=content, path=path)
+
+    def _register_collection_evaluation(self, task, content, digest, options, metadata, request_id,
+                                        incremental, existing, context):
+        run_id = "eval_" + payload_digest(request_id)
+        try:
             request = {**metadata, "workbook_sha256": digest}
+            if context:
+                from .evaluation_job_previews import endpoint
+                request["collector_server"] = endpoint()
             payload = {"run_id": run_id, "collection_run_id": run_id, "run_mode": "modeliter", "status": "dispatching", "filename": task["filename"], "vla": options["vla"], "created_at": utc_now(), "request": request, "request_digest": payload_digest(request), "errors": [], "dispatch_error": None, "dispatch_attempted": False}
             # Accepted historical requests keep their original data ownership.
             # For the new protocol, freeze a real collection result batch before
@@ -672,24 +725,61 @@ class FactoryRuntime:
                         workbook_sha256=source["workbook_sha256"])
                 payload.update(batch_id=collection["batch_id"], task_source_batch_id=collection["task_source_batch_id"],
                                collection_artifacts_version=options["collection_artifacts_version"], repeat_times=1)
-            try:
-                from .display_identifiers import DisplayIdentifierStore
-                run = DisplayIdentifierStore(self.root).create_run("model_iter_runs", run_id, payload)
-                created = True
-            except RevisionConflict:
-                run = self.records.get("model_iter_runs", run_id)
-                if (run["request_digest"] != payload["request_digest"]
-                        and not matches_legacy_logprobs_request(run, request)):
-                    raise PhoneFactoryError("相同 request_id 对应的运行参数不同", 409)
-                created = False
+            return create_evaluation_run(self, run_id, payload, context), True
+        except RevisionConflict:
+            run = self.records.get("model_iter_runs", run_id)
+            if not run or (run["request_digest"] != payload["request_digest"]
+                    and not matches_legacy_logprobs_request(run, request)):
+                raise PhoneFactoryError("相同 request_id 对应的运行参数不同", 409)
+            return run, False
+
+    def _recover_pipeline_evaluation(self, run):
+        try:
+            current = self.records.get("model_iter_runs", run["run_id"])
+            if not current or not may_dispatch(self.records, current):
+                return
+            if current.get("dispatch_rejected") or current.get("evaluation_control_terminal"):
+                return
+            self.records.update("model_iter_runs", run["run_id"],
+                                lambda item: item.update(dispatch_checked_epoch=time.time()))
+            self._resume_pipeline_evaluation(run)
+        except Exception:
+            logging.getLogger(__name__).exception("恢复已登记的评测派发失败：%s", run["run_id"])
+
+    def _resume_pipeline_evaluation(self, run):
+        from .collector_storage import require_available
+        require_available(self.records, run["run_id"])
+        if run.get("stop_requested_at") or run.get("evaluation_control_terminal") or not may_dispatch(self.records, run):
+            return {"ok": True, "reused": True, **self._public_run(run)}
+        request = run["request"]
+        if request.get("execution_mode") == "evaluate_only":
+            if request.get("offline_evaluation_jobs_version") == 1:
+                from .offline_evaluation_dispatch import schedule
+                if run.get("dispatch_rejected") and not run.get("stop_requested_at"):
+                    run = self.records.update("model_iter_runs", run["run_id"], lambda row: row.update(
+                        dispatch_rejected=False, status="preparing", dispatch_error=None, dispatch_checked_epoch=0))
+                schedule(self, run["run_id"])
+                return {"ok": True, "reused": True, **self._public_run(run)}
+            return self._dispatch_legacy_evaluation(run, created=False)
+        version = request.get("collection_artifacts_version")
+        return self._dispatch_registered(run, "modeliter", request, "http", version in SUPPORTED_ARTIFACT_VERSIONS, False)
+
+    def _dispatch_registered(self, run, mode, options, protocol, incremental, created, *, content=None, path=None):
+        run_id = run["collection_run_id"]
         if not created and (run["status"] not in {"failed", "dispatching"} or (run["status"] == "failed" and not run.get("dispatch_error"))):
             return {"ok": True, "reused": True, **run}
         with batch_lock(self.root, "dispatch_" + run_id):
             current = self.store.collection_runs.get(run_id) if mode == "generate" else self.records.get("model_iter_runs", run_id)
-            if current["status"] not in {"failed", "dispatching"}:
+            if (current["status"] not in {"failed", "dispatching"} or not may_dispatch(self.records, current)
+                    or current.get("pipeline_id") and current.get("stop_requested_at")):
                 return {"ok": True, "reused": True, **current}
             can_reject = self._can_reject_dispatch(current, mode)
             try:
+                collector = current.get("request", {}).get("collector_server") if current.get("pipeline_id") else None
+                if collector:
+                    from .evaluation_job_previews import endpoint
+                    if collector != endpoint():
+                        raise PhoneFactoryError("评测提交地址与已登记的采集服务地址不同，请恢复原配置后重试", 409)
                 if not created:
                     # An acknowledgement can be lost after remote acceptance. Query that
                     # durable identity before considering another idempotent submission.
@@ -782,12 +872,15 @@ class FactoryRuntime:
                         args.append("--exp")
                     if options["config"]["capture_logprobs"]:
                         args.append("--capture-logprobs")
-                    if mode == "generate" or incremental:
-                        with active_batch_lock(current["batch_id"], self.root):
+                    with dispatch_guard(self, current):
+                        if not may_dispatch(self.records, current):
+                            return {"ok": True, "reused": True, **self._public_run(current)}
+                        if mode == "generate" or incremental:
+                            with active_batch_lock(current["batch_id"], self.root):
+                                self._begin_dispatch(run_id, mode, incremental)
+                        else:
                             self._begin_dispatch(run_id, mode, incremental)
-                    else:
-                        self._begin_dispatch(run_id, mode, incremental)
-                    response = self.store._remote_result(args)
+                    response = self.store._remote_result([*args, "--server", collector] if collector else args)
                     if response.get("agent_type", "newagent") != options["agent_type"]:
                         raise PhoneFactoryError("远端接受运行的采集引擎与请求不匹配", 502)
                     if response.get("ok") is False:
@@ -839,12 +932,15 @@ class FactoryRuntime:
 
     def remote_start_evaluation(self, data):
         """Submit a manifest-bound evaluation without touching phone or production state."""
+        data, context, replay = start_context(self, data, "evaluate_only")
+        if replay:
+            return self._resume_pipeline_evaluation(replay)
         candidate = self.records.get("model_iter_runs", "eval_" + payload_digest(data["request_id"])) if data.get("request_id") else None
         preview_record = self.records.get("model_iter_previews", data["preview_id"]) if isinstance(data.get("preview_id"), str) and data["preview_id"] else None
         if ((candidate or {}).get("request", {}).get("offline_evaluation_jobs_version") == 1
                 or preview_record and preview_record.get("paged")):
             from .offline_evaluation_dispatch import accept
-            return accept(self, data)
+            return accept(self, data, pipeline_context=context)
         allowed = {"request_id", "evaluator_config", "evaluation_profile_id", "evaluation_profile_digest",
                    "profile_id", "profile_digest", "preview_id", "checklist_source", "evaluation_mode"}
         if set(data) - allowed:
@@ -875,6 +971,9 @@ class FactoryRuntime:
         request = {**options, "run_mode": "modeliter", "execution_mode": "evaluate_only", "result_transport": "http",
                    "preview_id": preview_id, "source": preview["source"], "source_digest": preview["source_digest"],
                    "source_cases": preview["cases"], "source_request": preview_record["request"]}
+        if context:
+            from .evaluation_job_previews import endpoint
+            request["collector_server"] = endpoint()
         payload = {"run_id": run_id, "collection_run_id": run_id, "run_mode": "modeliter",
                    "execution_mode": "evaluate_only", "source": preview["source"], "source_digest": preview["source_digest"],
                    "evaluation_profile_id": options["evaluation_profile_id"],
@@ -883,20 +982,32 @@ class FactoryRuntime:
                    "request": request, "request_digest": payload_digest(request), "errors": [], "dispatch_error": None,
                    "dispatch_attempted": False}
         try:
-            from .display_identifiers import DisplayIdentifierStore
-            run = DisplayIdentifierStore(self.root).create_run("model_iter_runs", run_id, payload)
+            run = create_evaluation_run(self, run_id, payload, context)
             created = True
         except RevisionConflict:
             run = self.records.get("model_iter_runs", run_id)
+            if context:
+                if not run or any(run.get(key) != value for key, value in context.items()):
+                    raise PhoneFactoryError("相同评测请求编号对应的运行参数不同", 409)
+                return self._resume_pipeline_evaluation(run)
             if run["request_digest"] != payload["request_digest"]:
                 raise PhoneFactoryError("相同 request_id 对应的运行参数不同", 409)
             created = False
+        return self._dispatch_legacy_evaluation(run, created)
+
+    def _dispatch_legacy_evaluation(self, run, created):
+        run_id = run["run_id"]
+        frozen = run["request"]
+        from .offline_evaluation_dispatch import OPTIONS
+        options = {key: frozen[key] for key in OPTIONS if key in frozen}
+        preview_id = frozen["preview_id"]
         if not created and (run["status"] not in {"failed", "dispatching"}
                             or run["status"] == "failed" and not run.get("dispatch_error")):
             return {"ok": True, "reused": True, **run}
         with batch_lock(self.root, "dispatch_" + run_id):
             current = self.records.get("model_iter_runs", run_id)
-            if current["status"] not in {"failed", "dispatching"}:
+            if (current["status"] not in {"failed", "dispatching"} or not may_dispatch(self.records, current)
+                    or current.get("pipeline_id") and current.get("stop_requested_at")):
                 return {"ok": True, "reused": True, **current}
             try:
                 model_iteration.require_capability(self.store, offline=True)
@@ -907,10 +1018,16 @@ class FactoryRuntime:
                 # a GET with only the same run id cannot establish that identity.
                 # Already accepted runs may outlive their selectable rule version.
                 remote_request = {**options, "collection_run_id": run_id, "preview_id": preview_id}
-                self.records.update("model_iter_runs", run_id,
-                    lambda item: item.update(dispatch_attempted=True, submitted_at=utc_now()))
+                with dispatch_guard(self, current):
+                    if not may_dispatch(self.records, current):
+                        return {"ok": True, "reused": True, **self._public_run(current)}
+                    self.records.update("model_iter_runs", run_id,
+                        lambda item: item.update(dispatch_attempted=True, submitted_at=utc_now()))
                 self.sync_policy.reset("evaluation", run_id)
-                response = self.store._remote_result(["start-evaluation", "--payload", json.dumps(remote_request, ensure_ascii=False)])
+                args = ["start-evaluation", "--payload", json.dumps(remote_request, ensure_ascii=False)]
+                if frozen.get("collector_server"):
+                    args.extend(["--server", frozen["collector_server"]])
+                response = self.store._remote_result(args)
                 if (response.get("ok") is False or response.get("run_id", response.get("collection_run_id")) != run_id
                         or response.get("run_mode") != "modeliter" or response.get("execution_mode") != "evaluate_only"
                         or response.get("status") not in TERMINAL | {"preparing", "queued", "starting", "running", "stopping", "needs_attention"}):

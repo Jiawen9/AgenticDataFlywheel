@@ -226,13 +226,17 @@ print('1MiB/1MiB 2MiB/s', end='\\r', flush=True)
                   for directory in fixture.directories for p in directory.rglob("*") if p.is_file()}
         with patch.dict(os.environ, {"ADF_YUNDAO_PYTHON": sys.executable, "ADF_YUNDAO_SCRIPT": str(script),
                                     "ADF_YUNDAO_APP_TOKEN": "fake-chain-token", "ADF_YUNDAO_REGION": "region-test",
-                                    "ADF_YUNDAO_BUCKET": "bucket-test", "ADF_YUNDAO_PREFIX": "prefix"}):
+                                    "ADF_YUNDAO_BUCKET": "bucket-test", "ADF_YUNDAO_PREFIX": "group/figures",
+                                    "ADF_YUNDAO_TRAINING_PREFIX": "统一配置/training_jsonl/"}):
             manager = DatasetUploadJobManager(fixture.registry, jobs_dir=fixture.root / "jobs",
                                               executor=ImmediateExecutor(), internal_adapter=internal_uploader)
             app = FastAPI()
             app.include_router(router)
             with patch("backend.data_publishing.router.registry", fixture.registry), \
                  patch("backend.data_publishing.router.upload_manager", manager), TestClient(app) as client:
+                capability = client.get("/api/dataset-upload-capabilities").json()["internal"]
+                self.assertEqual(capability["default_prefix"], "group/figures")
+                self.assertEqual(capability["training_default_prefix"], "统一配置/training_jsonl")
                 response = client.post(f"/api/dataset-releases/{fixture.release_id}/upload",
                                        json={"target": "internal", "include_trajectories": True,
                                              "destination_prefix": "团队/已发布"})

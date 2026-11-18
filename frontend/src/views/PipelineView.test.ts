@@ -15,6 +15,26 @@ vi.mock('@/composables/usePipelineContext', () => ({
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
 describe('Pipeline collection configuration', () => {
+  it('opens the evaluation stage after creating a Pipeline without a collection batch', async () => {
+    const create = vi.spyOn(api, 'createPipeline').mockResolvedValue({ pipeline_id: 'p-eval', batch_id: null } as never)
+    const batchList = vi.spyOn(factoryBatchesApi, 'list')
+    vi.spyOn(api, 'pipelinePage').mockResolvedValue({ items: [], latest: [], total: 0, counts: {}, counts_complete: true } as never)
+    const app = createSSRApp(PipelineView)
+    const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/:pathMatch(.*)*', component: { render: () => null } }] })
+    app.use(router)
+    let view: any
+    app.mixin({ created() { if (this.$options.__name === 'PipelineView') view = this.$.setupState } })
+    const empty = defineComponent({ setup: () => () => h('div') })
+    for (const name of ['pagination', 'button', 'icon', 'alert', 'progress', 'table', 'table-column', 'input', 'select', 'option', 'dialog']) app.component('el-' + name, empty)
+    await renderToString(app)
+    view.openCreate(); Object.assign(view.draft, { name: '评测起点', start_mode: 'evaluation' })
+    await view.create()
+    expect(create.mock.calls[0]![0]).toMatchObject({ start_mode: 'evaluation', name: '评测起点' })
+    expect(create.mock.calls[0]![0]).not.toHaveProperty('batch_id')
+    expect(batchList).not.toHaveBeenCalled()
+    expect(router.currentRoute.value.path).toBe('/model-iteration-evaluation')
+    expect(router.currentRoute.value.query).toEqual({ evaluation_pipeline_id: 'p-eval' })
+  })
   it('retries uncertain creation once but starts a fresh request after acknowledged success', async () => {
     const create = vi.spyOn(api, 'createPipeline')
       .mockRejectedValueOnce(new Error('response lost'))

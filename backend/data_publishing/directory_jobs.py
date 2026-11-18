@@ -9,22 +9,12 @@ from ..identifiers import allocate_id
 from ..file_io import io_path
 from ..trajectory_correction.draft_store import utc_now
 from .internal_jobs import InternalUploadConflict
-from .internal_uploader import UploadError, UploadResult
+from .internal_uploader import UploadError, UploadResult, normalize_prefix
 
 
 def _digest(value):
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
                                     separators=(",", ":")).encode("utf-8")).hexdigest()
-
-
-def normalize_prefix(value):
-    value = str(value).strip().replace("\\", "/")
-    if "://" in value or any(ord(char) < 32 for char in value):
-        raise ValueError("云道目标请填写 bucket 内的目录前缀，不填写 URL 或控制字符")
-    parts = [part for part in value.split("/") if part]
-    if any(part in {".", ".."} for part in parts):
-        raise ValueError("云道目录前缀不能包含 . 或 .. 路径段")
-    return "/".join(parts)
 
 
 class DirectoryUploadJobsMixin:
@@ -126,6 +116,13 @@ class DirectoryUploadJobsMixin:
                     training_prefix = retry_job.get("training_destination_prefix")
                 if training_prefix != retry_job.get("training_destination_prefix"):
                     raise InternalUploadConflict("训练文件上传目录已改变，请创建新任务")
+            elif training_jsonl and training_prefix is None:
+                # Only new jobs adopt the configured default. For an explicit
+                # retry, None still denotes the old implicit destination.
+                if not capability.get("training_default_prefix"):
+                    raise InternalUploadConflict(capability.get("training_default_prefix_error")
+                                                 or "云道 JSONL 默认目录不可用，请填写上传目录")
+                training_prefix = f"{capability['training_default_prefix']}/{release_id}"
             # Only immutable release identity participates; current UI selections never do.
             excel_paths = [{key: deepcopy(value) for key, value in item.items() if key != "available"}
                            for item in release.get("excel_paths", [])]
@@ -306,7 +303,8 @@ class DirectoryUploadJobsMixin:
                 training = payload["training"]
                 if not paired and not any(item["kind"] == "training" for item in payload["item_results"]):
                     if payload.get("training_destination_prefix") is not None:
-                        training["bucket_path"] = payload["training_destination_prefix"].strip("/") + "/"
+                        prefix = payload["training_destination_prefix"]
+                        training["bucket_path"] = prefix + "/" if prefix else ""
                     payload["item_results"].append({"kind": "training", "source_dir": training["source_dir"],
                         "file_path": str(self.registry.resolve_project_path(training["file_path"])),
                         "filename": "train.jsonl", "label": "训练 JSONL", "sha256": training["sha256"],

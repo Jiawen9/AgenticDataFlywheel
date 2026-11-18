@@ -19,7 +19,7 @@ OPTIONS = {"evaluator_config", "evaluation_profile_id", "evaluation_profile_dige
 TERMINAL = {"completed", "succeeded", "partial", "failed", "interrupted", "cancelled"}
 
 
-def accept(runtime, data):
+def accept(runtime, data, *, pipeline_context=None):
     if set(data) - OPTIONS - {"request_id", "preview_id"}:
         raise PhoneFactoryError("独立评测不接受手机、App、VLA 或采集参数")
     request_id = _identifier(data.get("request_id") or uuid.uuid4().hex, "request_id")
@@ -29,6 +29,10 @@ def accept(runtime, data):
     # Replay precedes current defaults, preview expiry and selectable profile
     # checks: an accepted request must remain the same request after recovery.
     if old:
+        if pipeline_context:
+            if any(old.get(key) != value for key, value in pipeline_context.items()):
+                raise PhoneFactoryError("相同评测请求编号对应的运行参数不同", 409)
+            return runtime._resume_pipeline_evaluation(old)
         from .collector_storage import require_available
         require_available(runtime.records, run_id)
         frozen = old["request"]
@@ -74,11 +78,11 @@ def accept(runtime, data):
                "dispatch_attempted": False, "dispatch_confirmed": False, "evaluation_control_epoch": 0,
                "preparation": {"status": "preparing", "phase": "queued", "revision": 0,
                                "progress": {"prepared": 0, "total": preview["trajectory_count"]}}}
-    from .display_identifiers import DisplayIdentifierStore
+    from .pipeline_evaluation import create_run
     try:
-        saved = DisplayIdentifierStore(runtime.root).create_run("model_iter_runs", run_id, payload)
+        saved = create_run(runtime, run_id, payload, pipeline_context)
     except RevisionConflict:
-        return accept(runtime, data)
+        return accept(runtime, data, pipeline_context=pipeline_context)
     schedule(runtime, run_id)
     return {"ok": True, **runtime._public_run(saved)}
 
@@ -89,12 +93,13 @@ def schedule(runtime, run_id):
 
 def dispatch(runtime, run_id):
     from .collector_storage import unavailable
+    from .pipeline_evaluation import dispatch_guard, may_dispatch
     if unavailable(runtime.records, run_id):
         return
     run = runtime.records.get("model_iter_runs", run_id)
     if not run or run.get("dispatch_confirmed") or run.get("dispatch_rejected"):
         return
-    if run.get("evaluation_control_terminal"):
+    if run.get("evaluation_control_terminal") or not may_dispatch(runtime.records, run, allow_stop=True):
         return
     epoch = run.get("evaluation_control_epoch", 0)
     try:
@@ -104,7 +109,11 @@ def dispatch(runtime, run_id):
                            preparation={**row["preparation"], "status": "cancelled", "phase": "cancelled"})
                 return
             row.update(dispatch_attempted=True, submitted_at=utc_now())
-        run = runtime.records.update("model_iter_runs", run_id, mark)
+        with dispatch_guard(runtime, run):
+            run = runtime.records.get("model_iter_runs", run_id)
+            if not run or run.get("dispatch_confirmed") or run.get("dispatch_rejected") or not may_dispatch(runtime.records, run, allow_stop=True):
+                return
+            run = runtime.records.update("model_iter_runs", run_id, mark)
         if run.get("evaluation_control_terminal"):
             return
         frozen = run["request"]

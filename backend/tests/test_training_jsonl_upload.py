@@ -68,6 +68,7 @@ class TrainingUploadTests(unittest.TestCase):
         self.assertEqual(job["status"], "succeeded", job.get("error"))
         self.assertEqual([item["kind"] for item in job["item_results"]], ["excel", "trajectory", "trajectory", "training"])
         self.assertEqual(len(self.adapter.calls), 4)
+        self.assertEqual(self.adapter.calls[-1].bucket_path, f"发布/默认/training_jsonl/{self.release_id}/")
         samples = [json.loads(line) for line in self.manager.training_file(job["job_id"], "jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertEqual(len(samples), 6)
         self.assertEqual(set(samples[0]), {"messages", "solution", "images", "is_key_step", "is_refined"})
@@ -201,7 +202,7 @@ class TrainingUploadTests(unittest.TestCase):
         self.assertEqual(job["training"]["included_count"], 7)
         samples = [json.loads(line) for line in self.manager.training_file(job["job_id"], "jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertIn("/batch_002/", samples[-1]["images"][0])
-        self.assertIn(f"/{self.release_id}/训练数据/", job["training"]["s3_uri"])
+        self.assertEqual(job["training"]["s3_uri"], f"s3://fixture-bucket/发布/默认/training_jsonl/{self.release_id}/train.jsonl")
         self.assertEqual(sum(item["kind"] == "training" for item in job["item_results"]), 1)
 
     def test_http_training_option_and_download_contract(self):

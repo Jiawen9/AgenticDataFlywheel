@@ -39,14 +39,42 @@ const trainingOnly = ref(false)
 const trainingDestinationPrefix = ref('')
 const pairedTraining = computed(() => uploadRelease.value?.training_files?.filter(item => item.status === 'ready') || [])
 const imagePrefixes = computed(() => [...new Set(pairedTraining.value.map(item => item.image_prefix).filter(Boolean))])
-const normalizePrefix = (value: string | undefined) => (value || '').trim().replace(/\\/g, '/').split('/').filter(Boolean).join('/')
-const retryUploadId = computed(() => Boolean(uploadRelease.value?.internal_upload?.training_jsonl) === trainingJsonl.value
-  && Boolean(uploadRelease.value?.internal_upload?.training_only) === trainingOnly.value
-  && normalizePrefix(uploadRelease.value?.internal_upload?.training_destination_prefix) === normalizePrefix(trainingDestinationPrefix.value)
-  ? uploadRetryJobId(uploadRelease.value?.internal_upload, destinationPrefix.value) : undefined)
+const normalizePrefix = (value: string | null | undefined) => (value || '').trim().replace(/\\/g, '/').split('/').filter(Boolean).join('/')
+function defaultTrainingDestination(releaseId: string) {
+  const root = normalizePrefix(capabilities.value.internal.training_default_prefix)
+  return root ? `${root}/${releaseId}/` : ''
+}
+const retryUploadId = computed(() => {
+  const previous = uploadRelease.value?.internal_upload
+  if (Boolean(previous?.training_jsonl) !== trainingJsonl.value || Boolean(previous?.training_only) !== trainingOnly.value) return
+  if (trainingJsonl.value) {
+    const original = previous?.training_destination_prefix
+    const matches = original == null
+      ? !trainingDestinationPrefix.value.trim()
+      : normalizePrefix(original) === normalizePrefix(trainingDestinationPrefix.value)
+    if (!matches) return
+  }
+  return uploadRetryJobId(previous, destinationPrefix.value)
+})
 watch(trainingOnly, value => { if (value) trainingJsonl.value = true })
 const uploadDestination = computed(() => retryUploadId.value && uploadRelease.value?.internal_upload?.destination
   ? uploadRelease.value.internal_upload.destination : capabilities.value.internal)
+const trainingTarget = computed(() => {
+  const release = uploadRelease.value
+  if (!release) return ''
+  if (trainingDestinationPrefix.value.trim()) return normalizePrefix(trainingDestinationPrefix.value)
+  if (retryUploadId.value) {
+    const previous = release.internal_upload
+    if (previous?.training_destination_prefix != null) return normalizePrefix(previous.training_destination_prefix)
+    return previous?.item_results?.find(item => item.kind === 'training')?.bucket_path ?? null
+  }
+  const defaultTarget = defaultTrainingDestination(release.release_id)
+  if (defaultTarget) return normalizePrefix(defaultTarget)
+  if (capabilities.value.internal.training_default_prefix_error) return null
+  // Compatibility with older platform backends without the default field.
+  const batch = release.batch_ids?.length === 1 ? release.batch_ids[0] : release.release_id
+  return [normalizePrefix(destinationPrefix.value), batch, '训练数据'].filter(Boolean).join('/')
+})
 const pollError = ref('')
 let pollEpoch = 0
 let loadEpoch = 0
@@ -248,10 +276,14 @@ async function startUpload(release: DatasetRelease, onlyTraining?: boolean) {
   catch (cause) { ElMessage.error((cause as Error).message); return }
   if (disposed || epoch !== detailEpoch) return
   uploadRelease.value = release
-  destinationPrefix.value = uploadDestinationPrefix(release.internal_upload, capabilities.value)
-  trainingOnly.value = onlyTraining ?? Boolean(release.internal_upload?.training_only)
-  trainingJsonl.value = trainingOnly.value || (release.internal_upload ? Boolean(release.internal_upload.training_jsonl) : Boolean(release.training_files?.some(item => item.status === 'ready')))
-  trainingDestinationPrefix.value = release.internal_upload?.training_destination_prefix || ''
+  const previous = release.internal_upload
+  destinationPrefix.value = uploadDestinationPrefix(previous, capabilities.value)
+  trainingOnly.value = onlyTraining ?? Boolean(previous?.training_only)
+  trainingJsonl.value = trainingOnly.value || (previous ? Boolean(previous.training_jsonl) : Boolean(release.training_files?.some(item => item.status === 'ready')))
+  const sameTrainingScope = previous?.folder_upload && previous.training_jsonl && Boolean(previous.training_only) === trainingOnly.value
+  const legacyRetry = sameTrainingScope && Boolean(uploadRetryJobId(previous, destinationPrefix.value))
+  trainingDestinationPrefix.value = (sameTrainingScope ? previous?.training_destination_prefix : undefined)
+    ?? (legacyRetry ? '' : defaultTrainingDestination(release.release_id))
   uploadDialogVisible.value = true
 }
 
@@ -427,11 +459,19 @@ onBeforeUnmount(() => { if (typeof document !== 'undefined') document.removeEven
             <el-form-item v-if="pairedTraining.length" label="上传内容"><el-radio-group v-model="trainingOnly" data-testid="training-upload-scope" :disabled="submitting || capabilities.internal.training_pair_version !== 2"><el-radio-button :value="false">表格与完整轨迹</el-radio-button><el-radio-button :value="true">仅训练 JSONL</el-radio-button></el-radio-group><small v-if="capabilities.internal.training_pair_version !== 2">单独上传需要同步支持配套 JSONL 的后端。</small></el-form-item>
             <el-form-item v-if="!trainingOnly" :label="pairedTraining.length ? '发布表格目标前缀' : '云道目标前缀'"><el-input v-model="destinationPrefix" data-testid="upload-destination-prefix" :disabled="submitting" placeholder="例如 data/gui_data/flywheel_data/（空白表示 bucket 根目录）" /></el-form-item>
             <el-form-item v-if="!trainingOnly" label="训练文件"><el-switch v-model="trainingJsonl" data-testid="training-jsonl-switch" :disabled="submitting || (capabilities.internal.training_jsonl_version !== 1 && capabilities.internal.training_pair_version !== 2)" :active-text="pairedTraining.length ? '同时上传已生成的配套 JSONL' : '生成并上传训练 JSONL（旧导出）'" /><small v-if="capabilities.internal.training_jsonl_version !== 1 && capabilities.internal.training_pair_version !== 2">需要同步支持训练导出的后端。</small></el-form-item>
-            <el-form-item v-if="trainingJsonl" label="JSONL 上传目录"><el-input v-model="trainingDestinationPrefix" data-testid="training-destination-prefix" :disabled="submitting" placeholder="bucket 内目录；留空使用目标前缀/批次编号/训练数据" /><small>独立设置 JSONL 文件的位置，不改变文件内的图片地址。多份表格分别放入 001、002 等子目录。</small></el-form-item>
+            <el-form-item v-if="trainingJsonl" label="JSONL 上传目录">
+              <el-input v-model="trainingDestinationPrefix" data-testid="training-destination-prefix" :disabled="submitting" placeholder="填写 bucket 内的目录" />
+              <small>留空使用默认目录，重试沿用原上传目标。多份 JSONL 分别放入 001、002 等子目录。</small>
+            </el-form-item>
           </el-form>
           <p class="upload-scope">Bucket：{{ uploadDestination.bucket || '后端配置' }} · Region：{{ uploadDestination.region || '后端配置' }}</p>
           <p v-if="!trainingOnly" class="upload-scope">表格目标：<code>s3://{{ uploadDestination.bucket || 'bucket' }}/{{ normalizePrefix(destinationPrefix) }}{{ normalizePrefix(destinationPrefix) ? '/' : '' }}&lt;批次编号&gt;/发布表格/</code></p>
-          <p v-if="trainingJsonl" class="upload-scope">JSONL 目标：<code>s3://{{ uploadDestination.bucket || 'bucket' }}/{{ normalizePrefix(trainingDestinationPrefix) || [normalizePrefix(destinationPrefix), uploadRelease.batch_ids?.length === 1 ? uploadRelease.batch_ids[0] : uploadRelease.release_id, '训练数据'].filter(Boolean).join('/') }}/</code></p>
+          <p v-if="trainingJsonl" class="upload-scope">
+            JSONL 目标：
+            <code v-if="trainingTarget !== null">s3://{{ uploadDestination.bucket || 'bucket' }}/{{ normalizePrefix(trainingTarget) }}{{ normalizePrefix(trainingTarget) ? '/' : '' }}</code>
+            <span v-else-if="retryUploadId">沿用原上传任务地址</span>
+            <span v-else>{{ capabilities.internal.training_default_prefix_error }}</span>
+          </p>
           <p v-for="prefix in imagePrefixes" :key="prefix" class="upload-scope">导出时确定的图片前缀：<code>{{ prefix }}</code></p>
           <p v-if="pairedTraining.length" class="upload-scope">上传配套文件，不重新转换内容。完整轨迹沿用上面的图片前缀，修改表格或 JSONL 上传目录不会改变图片地址。</p>
           <p v-if="trainingOnly" class="upload-scope">本次只上传 JSONL，不重复上传 Excel 或图片；请确认图片已上传，或随后按上述图片前缀上传。</p>
