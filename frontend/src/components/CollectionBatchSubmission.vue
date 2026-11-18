@@ -7,7 +7,7 @@ import type { TaskGenerationJob } from '@/types'
 import { useCollectionBatchSubmission, type RunCollectionBatchAction } from '@/composables/useCollectionBatchSubmission'
 import DisplayId from '@/components/DisplayId.vue'
 
-const props = defineProps<{ job: TaskGenerationJob; resultCount: number; busy: boolean; protect: () => Promise<boolean>; runProtected: RunCollectionBatchAction }>()
+const props = defineProps<{ pipelineId?: string; boundJobId?: string; job: TaskGenerationJob; resultCount: number; busy: boolean; protect: () => Promise<boolean>; runProtected: RunCollectionBatchAction }>()
 const router = useRouter()
 const state = useCollectionBatchSubmission(collectionBatchesApi, { job: () => props.job, resultCount: () => props.resultCount, busy: () => props.busy, runProtected: action => props.runProtected(action) })
 const { batch, loading, submitting, downloading, error, canSubmit } = state
@@ -27,7 +27,8 @@ onBeforeUnmount(state.dispose)
 </script>
 
 <template>
-  <section class="collection-submission" aria-label="提交轨迹采集" :aria-busy="loading || submitting">
+  <section v-if="pipelineId" class="collection-submission"><div class="collection-copy"><h3>审核后接续自动 Pipeline</h3><p>确认本作业全部未删除任务，随后配置手机并继续采集；无需另行提交或下载表格。</p><p v-if="boundJobId !== job.job_id">当前查看的是其他作业，请返回本轮关联的生成作业继续。</p></div><el-button type="primary" :disabled="busy || boundJobId !== job.job_id || !['succeeded', 'partial'].includes(job.status) || !resultCount" @click="async () => { if (await protect()) router.push({ path: '/pipeline', query: { pipeline_id: pipelineId, review_generation: '1' } }) }">审核完成，配置采集</el-button></section>
+  <section v-else class="collection-submission" aria-label="提交轨迹采集" :aria-busy="loading || submitting">
     <div class="collection-copy"><h3>{{ batch ? '已提交轨迹采集' : '提交轨迹采集' }}</h3>
       <template v-if="batch"><p>{{ batch.task_count }} 条任务 · {{ batch.apps.join('、') }} · {{ batch.created_at.slice(0, 19).replace('T', ' ') }}</p><p>批次 <DisplayId kind="batch" :id="batch.batch_id" />。已冻结首次提交的数据，后续修改、删除或恢复不会改变此批次。</p></template>
       <template v-else><p>首次提交会保存全部未删除任务及前置任务的固定副本，不受页面筛选影响。每个作业只创建一个采集批次。</p><p>请先完成审核；提交后继续编辑源任务，不会更新这个批次。提交仅准备采集数据，手机与执行配置在采集页选择。</p></template>

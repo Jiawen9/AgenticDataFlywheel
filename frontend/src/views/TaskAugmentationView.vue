@@ -7,6 +7,9 @@ import { api, taskGenerationDownloadUrl } from '@/api'
 import type { AugmentationSeed, TaskGenerationJob, TaskGenerationResult } from '@/types'
 import AugmentationSceneTree from '@/components/AugmentationSceneTree.vue'
 import CollectionBatchSubmission from '@/components/CollectionBatchSubmission.vue'
+import GenerationPipelineBanner from '@/components/GenerationPipelineBanner.vue'
+import { useGenerationPipeline } from '@/composables/useGenerationPipeline'
+import { pipelineLoopApi } from '@/pipelineLoopApi'
 import DisplayId from '@/components/DisplayId.vue'
 import { useDisplayIdentifiers } from '@/composables/useDisplayIdentifiers'
 const { displayId } = useDisplayIdentifiers()
@@ -18,10 +21,11 @@ import { findNode, nodePath } from '@/utils/scenarioTree'
 import { augmentationResultGroupId, groupAugmentationResults, type AugmentationResultGroup } from '@/utils/augmentationReview'
 
 const route = useRoute()
+const flow = useGenerationPipeline()
 const history = useGenerationHistory('augmentation')
 const resultPages = useGenerationResultPage(true)
 const historyQuery = history.query, historyPage = history.page, historyTotal = history.total
-const review = useAugmentationPreview({ ...api, taskGenerationJobs: history.read, taskGenerationResults: resultPages.read }, {
+const review = useAugmentationPreview({ ...api, createAugmentation: (file, count, autoStart) => api.createAugmentation(file, count, autoStart, flow.submission({ filename: file.name, size: file.size, modified: file.lastModified, generate_n: count })), taskGenerationJobs: history.read, taskGenerationResults: resultPages.read }, {
   error: message => ElMessage.error(message),
   async decide() {
     try {
@@ -101,8 +105,23 @@ function chooseFile(event: Event) {
   selectedFile.value = file
 }
 async function submit() {
+  if (!flow.mayGenerate.value) return
+  if (flow.feedbackId.value) {
+    if (!(await review.protect())) return
+    busy.value = true
+    try {
+      const context = flow.submission({ feedback_id: flow.feedbackId.value, generate_n: generateN.value })
+      const job = await pipelineLoopApi.createBadcaseJob({ feedback_id: flow.feedbackId.value, generate_n: generateN.value, ...context, request_id: context.request_id!, auto_start: false })
+      busy.value = false
+      await review.selectJob(job); await flow.refresh()
+      ElMessage.success('已提交 BadCase 场景匹配')
+    } catch (error) { ElMessage.error((error as Error).message) }
+    finally { busy.value = false }
+    return
+  }
   if (!selectedFile.value) return ElMessage.warning('请先选择失败用例 Excel')
   if (await review.create(selectedFile.value, generateN.value)) {
+    if (flow.id.value) await flow.refresh()
     selectedFile.value = null
     if (fileInput.value) fileInput.value.value = ''
     ElMessage.success('已提交场景匹配，匹配完成后可确认开始扩增')
@@ -223,21 +242,24 @@ watch(() => filteredSeeds.value.length, length => { seedPage.value = Math.max(1,
 
 onMounted(() => {
   let preferredId = typeof route.query.job_id === 'string' ? route.query.job_id : undefined
-  try { preferredId ||= localStorage.getItem(persistedJobKey) || undefined } catch { /* Restore is optional. */ }
+  try { if (!flow.id.value) preferredId ||= localStorage.getItem(persistedJobKey) || undefined } catch { /* Restore is optional. */ }
   void review.loadJobs(preferredId)
   history.startPolling(() => review.loadJobs(), () => jobs.value.some(job => ['queued', 'running'].includes(job.status)))
   window.addEventListener('beforeunload', beforeUnload)
 })
+watch(flow.boundJob, jobId => { if (jobId && selectedJob.value?.job_id !== jobId) void review.loadJobs(jobId) })
 onBeforeRouteLeave(() => review.protect())
 onBeforeUnmount(() => { review.dispose(); window.removeEventListener('beforeunload', beforeUnload) })
 </script>
 
 <template>
   <div class="page augmentation-page">
+    <GenerationPipelineBanner :pipeline-id="flow.id.value" :pipeline="flow.pipeline.value" :error="flow.error.value" @back="flow.back()" />
+    <el-alert v-if="flow.feedbackId.value" title="本轮使用已冻结的 BadCase 种子，无需上传 Excel。选择扩增数量后提交。" type="info" :closable="false" />
     <header class="page-hero"><div><span class="eyebrow">TASK AUGMENTATION</span><h1>任务扩增</h1><p>先查看失败用例在场景树中的归属，再确认生成变体任务。</p></div><div class="hero-metrics"><div><b>{{ activeResultCount }}</b><span>未删除变体</span></div><div><b>{{ historyTotal }}</b><span>扩增作业</span></div><div><b>{{ selectedJob?.generate_n ?? generateN }}</b><span>每用例变体</span></div></div></header>
     <section class="upload-card">
       <div class="upload-copy"><span class="eyebrow">FAILED SEED WORKBOOK</span><h2>上传失败用例</h2><p>支持“任务、涉及APP”表；有“任务结果”列时排除 TRUE。也支持已包含 app/task/scene/capability/sub_capability 的分类表。</p></div>
-      <div class="upload-actions"><label class="file-picker"><el-icon><Upload /></el-icon><span>{{ selectedFile?.name || '选择 Excel 文件' }}</span><input ref="fileInput" type="file" accept=".xlsx,.xlsm" :disabled="busy" @change="chooseFile" /></label><div class="count-control"><span>每个用例生成</span><el-input-number v-model="generateN" :min="1" :max="20" :precision="0" :disabled="busy" /></div><el-button type="primary" size="large" :loading="busy" :disabled="!selectedFile" @click="submit">上传并匹配场景</el-button></div>
+      <div class="upload-actions"><label class="file-picker"><el-icon><Upload /></el-icon><span>{{ selectedFile?.name || '选择 Excel 文件' }}</span><input ref="fileInput" type="file" accept=".xlsx,.xlsm" :disabled="busy" @change="chooseFile" /></label><div class="count-control"><span>每个用例生成</span><el-input-number v-model="generateN" :min="1" :max="20" :precision="0" :disabled="busy" /></div><el-button type="primary" size="large" :loading="busy" :disabled="(!selectedFile && !flow.feedbackId.value) || !flow.mayGenerate.value" @click="submit">{{ flow.feedbackId.value ? '使用回流用例匹配场景' : '上传并匹配场景' }}</el-button></div>
     </section>
     <section class="jobs-card">
       <div class="section-title"><div><span class="eyebrow">AUGMENTATION QUEUE</span><h2>场景匹配与扩增</h2></div><el-button :disabled="busy || refreshing" @click="selectedJob ? refreshSelected() : review.loadJobs()">刷新</el-button></div>

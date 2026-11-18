@@ -38,8 +38,8 @@ def _text(value: Any, default: str = "") -> str:
 
 
 def _model(model: TaskGenerationModel | None, kb_root: Path,
-           diagnostic_id_factory: IdFactory | None = None) -> TaskGenerationModel:
-    return model or TaskGenerationModel(diagnostics_dir=kb_root.parent / "model_calls",
+           diagnostic_id_factory: IdFactory | None = None, model_config=None) -> TaskGenerationModel:
+    return model or TaskGenerationModel(config=model_config, diagnostics_dir=kb_root.parent / "model_calls",
                                         diagnostic_id_factory=diagnostic_id_factory)
 
 
@@ -297,6 +297,7 @@ def _variant_records(seed: dict[str, Any], *, generate_n: int, kb_root: Path, mo
             "seed_id": seed.get("seed_id"),
             "source_row": seed.get("source_row"),
             "source_task": seed["task"],
+            **({"feedback_id": seed["feedback_id"], "source_candidate_id": seed.get("candidate_id")} if seed.get("feedback_id") else {}),
             "用例编号": generate_case_id(seed["app"], seed.get("scene", "Unclassified"), short_uuid, sequence),
             "源失败任务": seed["task"], "app": seed["app"], "scene": seed.get("scene", "Unclassified"),
             "capability": seed.get("capability", "Unclassified"), "sub_capability": seed.get("sub_capability", "Unclassified"),
@@ -414,8 +415,8 @@ def _run_augmentation_generation(seeds: list[dict[str, Any]], generate_n: int, *
 
 def run_augmentation_classification(seeds: list[dict[str, Any]], *, kb_root: Path, progress: Progress,
                                    on_seed: SeedProgress | None = None, model: TaskGenerationModel | None = None,
-                                   diagnostic_id_factory: IdFactory | None = None) -> dict[str, Any]:
-    active = _model(model, kb_root, diagnostic_id_factory)
+                                   diagnostic_id_factory: IdFactory | None = None, model_config=None) -> dict[str, Any]:
+    active = _model(model, kb_root, diagnostic_id_factory, model_config)
     try:
         return _run_augmentation_classification(seeds, kb_root=kb_root, progress=progress, model=active, on_seed=on_seed)
     finally:
@@ -426,8 +427,8 @@ def run_augmentation_classification(seeds: list[dict[str, Any]], *, kb_root: Pat
 def run_augmentation_generation(seeds: list[dict[str, Any]], generate_n: int, *, kb_root: Path, progress: Progress,
                                on_seed: SeedProgress | None = None, model: TaskGenerationModel | None = None,
                                id_factory: IdFactory | None = None,
-                               diagnostic_id_factory: IdFactory | None = None) -> dict[str, Any]:
-    active = _model(model, kb_root, diagnostic_id_factory)
+                               diagnostic_id_factory: IdFactory | None = None, model_config=None) -> dict[str, Any]:
+    active = _model(model, kb_root, diagnostic_id_factory, model_config)
     try:
         return _run_augmentation_generation(seeds, generate_n, kb_root=kb_root, progress=progress, model=active, on_seed=on_seed, id_factory=id_factory)
     finally:
@@ -443,8 +444,8 @@ def _run_augmentation(path: Path, generate_n: int, *, kb_root: Path, progress: P
     return outcome
 
 
-def run_initial_generation(node_ids: list[str], generate_n: int, *, kb_root: Path, progress: Progress, model: TaskGenerationModel | None = None, id_factory: IdFactory | None = None, diagnostic_id_factory: IdFactory | None = None) -> dict[str, Any]:
-    active = _model(model, kb_root, diagnostic_id_factory)
+def run_initial_generation(node_ids: list[str], generate_n: int, *, kb_root: Path, progress: Progress, model: TaskGenerationModel | None = None, id_factory: IdFactory | None = None, diagnostic_id_factory: IdFactory | None = None, model_config=None) -> dict[str, Any]:
+    active = _model(model, kb_root, diagnostic_id_factory, model_config)
     try:
         return _run_initial_generation(node_ids, generate_n, kb_root=kb_root, progress=progress, model=active, id_factory=id_factory)
     finally:
@@ -452,8 +453,8 @@ def run_initial_generation(node_ids: list[str], generate_n: int, *, kb_root: Pat
             active.close()
 
 
-def run_augmentation(path: Path, generate_n: int, *, kb_root: Path, progress: Progress, model: TaskGenerationModel | None = None, id_factory: IdFactory | None = None, diagnostic_id_factory: IdFactory | None = None) -> dict[str, Any]:
-    active = _model(model, kb_root, diagnostic_id_factory)
+def run_augmentation(path: Path, generate_n: int, *, kb_root: Path, progress: Progress, model: TaskGenerationModel | None = None, id_factory: IdFactory | None = None, diagnostic_id_factory: IdFactory | None = None, model_config=None) -> dict[str, Any]:
+    active = _model(model, kb_root, diagnostic_id_factory, model_config)
     try:
         return _run_augmentation(path, generate_n, kb_root=kb_root, progress=progress, model=active, id_factory=id_factory)
     finally:

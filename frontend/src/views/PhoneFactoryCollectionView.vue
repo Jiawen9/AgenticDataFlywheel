@@ -11,6 +11,8 @@
       </div>
     </header>
     <ModelIterationPanel v-if="evaluationProgress" :runs="runs" :progress="evaluationProgress" @ready="evaluationReady = $event" @config="evaluatorConfig = $event" @mode="evaluationMode = $event" @profile="evaluationProfile = $event" @started="onEvaluationStarted" @details="openDetails('cases')" />
+    <EvaluationPipelineBar v-if="isEvaluation && evaluationPipelineId" :pipeline-id="evaluationPipelineId" :run-id="evaluationProgress?.selectedRun.value || ''" />
+    <BadCasePanel v-if="evaluationProgress" :run-id="evaluationProgress.selectedRun.value" :parent-pipeline-id="evaluationPipelineId || undefined" />
     <PhoneRunDiagnostics v-if="!showCollectionControls" :state="diagnostics" :runs="filteredRuns" :allow-resume="false" @details="openPhoneDiagnostics" />
 
     <div class="factory-layout" :class="{ 'offline-layout': !showCollectionControls }">
@@ -234,7 +236,7 @@
         </el-dialog>
       </section>
     </div>
-    <FactoryRunDetailsDrawer v-model="detailsVisible" v-model:tab="detailsTab" v-model:run-filter="detailsRunFilter" :focused-run="detailsFocusedRun" :scope-key="historySourceId" :batch-id="pipelineContext.isPipelineRoute.value ? pipelineContext.pipeline.value?.batch_id : undefined" :evaluation="isEvaluation" :runs="filteredRuns" :storage="runStorage" :storage-runs="runs" :progress="evaluationProgress" :diagnostics="diagnostics" :diagnostics-api="factoryApi" :allow-resume="diagnosticResumeAllowed" :focused-phone="detailsFocusedPhone" :folders="reportFolders" :run-error="runError" :report-error="reportError" :loading-reports="loadingReports" :downloading-report="downloadingReport" @download-report="downloadReport">
+    <FactoryRunDetailsDrawer v-model="detailsVisible" v-model:tab="detailsTab" v-model:run-filter="detailsRunFilter" :focused-run="detailsFocusedRun" :scope-key="historySourceId" :batch-id="pipelineContext.isPipelineRoute.value ? pipelineContext.pipeline.value?.batch_id || undefined : undefined" :evaluation="isEvaluation" :runs="filteredRuns" :storage="runStorage" :storage-runs="runs" :progress="evaluationProgress" :diagnostics="diagnostics" :diagnostics-api="factoryApi" :allow-resume="diagnosticResumeAllowed" :focused-phone="detailsFocusedPhone" :folders="reportFolders" :run-error="runError" :report-error="reportError" :loading-reports="loadingReports" :downloading-report="downloadingReport" @download-report="downloadReport">
       <template #run-actions="{ run: row }"><router-link v-if="isPublishedRun(row)" :to="publishedRunLocation(row)" class="preprocessing-link">查看发布记录</router-link><router-link v-if="canPreprocessCollection(row) && !isPublishedRun(row) && !pipelineContext.isPipelineRoute.value && !managedBatchIds.includes(row.batch_id)" :to="collectionResultLocation(row)" class="preprocessing-link">前往预处理</router-link><el-button v-if="!collectorDataUnavailable(row) && (!isEvaluation || (row.batch_id && row.execution_mode !== 'evaluate_only'))" link :loading="syncingRun === (row.collection_run_id || row.run_id)" :disabled="pipelineContext.isPipelineRoute.value || managedBatchIds.includes(row.batch_id) || isPublishedRun(row)" @click="syncRun(row)">重试回传</el-button><el-button v-if="!isEvaluation && canCancelCollectionRun(row) && !isPublishedRun(row)" link type="danger" :loading="cancellingRun === (row.collection_run_id || row.run_id)" :disabled="pipelineContext.isPipelineRoute.value || managedBatchIds.includes(row.batch_id)" @click="cancelCollectionRun(row)">停止</el-button></template>
     </FactoryRunDetailsDrawer>
     </template>
@@ -242,6 +244,9 @@
 </template>
 
 <script setup lang="ts">
+import BadCasePanel from '@/components/BadCasePanel.vue'
+import EvaluationPipelineBar from '@/components/EvaluationPipelineBar.vue'
+import { pipelineLoopApi } from '@/pipelineLoopApi'
 import PipelineStatusBar from '@/components/PipelineStatusBar.vue'
 import CollectionAgentSelect from '@/components/CollectionAgentSelect.vue'
 import PipelineModelFields from '@/components/PipelineModelFields.vue'
@@ -380,8 +385,13 @@ function openRunDetails(filter: 'all' | 'active' | 'abnormal', runId = '') {
 }
 function openPhoneDiagnostics(phoneId: string) { detailsFocusedPhone.value = phoneId; openDetails('diagnostics') }
 async function onEvaluationStarted(runId: string) {
+  const origin = evaluationPipelineId.value
   evaluationProgress?.selectRun(runId)
   await refreshEvaluationRuns()
+  if (origin) {
+    try { const p = await api.pipeline(origin); await pipelineLoopApi.associate(p.pipeline_id, runId, p.storage_revision) }
+    catch (cause) { ElMessage.warning('评测已创建，关联 Pipeline 待重试：' + (cause as Error).message) }
+  }
 }
 function isPublishedRun(run: FactoryRun): boolean {
   // A publication event can arrive before the next run-list refresh.
@@ -403,6 +413,8 @@ const warningSummary = (warnings: CollectionWarning[]) => {
 }
 const deviceFor = (id: string) => devices.value.find(device => device.serial === id)
 const route = useRoute()
+const evaluationPipelineId = computed(() => typeof route.query.evaluation_pipeline_id === 'string' ? route.query.evaluation_pipeline_id : '')
+watch(() => route.query.run_id, value => { if (isEvaluation && typeof value === 'string') evaluationProgress?.selectRun(value) }, { immediate: true })
 const manualTaskBusy = computed(() => savingTask.value || Boolean(deletingTask.value) || Boolean(startingTask.value) || confirmingRun.value)
 const collection = usePhoneCollectionBatches(factoryBatchesApi, factoryApi, {
   setTasks: rows => { tasks.value = activeFactoryTasks(rows) },
@@ -436,7 +448,7 @@ const isManagedTask = (task: TaskRow) => Boolean(isCollectionResult(task) && tas
 async function loadManagedBatches() {
   if (isEvaluation || typeof api.pipelineBindings !== 'function') return
   const pipelines = await api.pipelineBindings()
-  if (!disposed) managedBatchIds.value = pipelines.map(item => item.batch_id)
+  if (!disposed) managedBatchIds.value = pipelines.map(item => item.batch_id).filter((id): id is string => Boolean(id))
 }
 // A production task keeps its batch identity even before its workbook is registered.
 const runTaskOptions = computed(() => {
@@ -773,7 +785,7 @@ useFactoryPolling(async (signal, current) => {
 })
 // Collection snapshots have their own clock; a slow ADB/status probe cannot
 // hold back run progress, diagnostics, or return receipts.
-const runScope = computed(() => ({ offset: 0, limit: 10, task_source_batch_id: isEvaluation ? undefined : historySourceId.value || undefined, batch_id: pipelineContext.isPipelineRoute.value ? pipelineContext.pipeline.value?.batch_id : undefined }))
+const runScope = computed(() => ({ offset: 0, limit: 10, task_source_batch_id: isEvaluation ? undefined : historySourceId.value || undefined, batch_id: pipelineContext.isPipelineRoute.value ? pipelineContext.pipeline.value?.batch_id || undefined : undefined }))
 const runList = useSummaryPage<FactoryRun>(isEvaluation ? '/api/model-iter/runs' : '/api/phone-factory/collection-runs', runScope, query => factoryApi.runPage(query), {
   prefetch: true, enabled: () => !pipelineContext.historyOnly.value && (!pipelineContext.isPipelineRoute.value || pipelineContext.resolved.value),
 })

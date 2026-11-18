@@ -18,6 +18,7 @@ from .knowledge_base import list_knowledge_bases, replace_knowledge_base, tree_p
 from .tree_store import VersionConflict, current_root, read_tree, save_tree, write_scene_workbook
 from .read_models import result_page
 from .resource_views import resource_view, invalidate_resource_view
+from ..pipelines import PipelineError
 
 
 class TaskSelection(BaseModel):
@@ -29,6 +30,16 @@ class TaskGenerationRequest(BaseModel):
     version: str
     selections: list[TaskSelection] = Field(min_length=1)
     generate_n: int = Field(default=5, ge=1, le=20)
+    request_id: str | None = Field(default=None, min_length=1, max_length=128)
+    pipeline_id: str | None = None
+
+
+class BadCaseGenerationRequest(BaseModel):
+    feedback_id: str
+    generate_n: int = Field(default=10, ge=1, le=20)
+    request_id: str = Field(min_length=1, max_length=128)
+    pipeline_id: str | None = None
+    auto_start: bool = False
 
 
 class TreeUpdateRequest(BaseModel):
@@ -43,6 +54,23 @@ class ResultPatchRequest(BaseModel):
 
 router = APIRouter(prefix="/api/task-generation", tags=["task-generation"])
 manager: TaskGenerationJobManager | None = None
+pipeline_manager = None
+
+
+def configure_pipeline_manager(value):
+    global pipeline_manager
+    pipeline_manager = value
+
+
+def _binding(pipeline_id, kind, request_id, feedback_id=None):
+    if not pipeline_id:
+        return None
+    if pipeline_manager is None:
+        raise PipelineError("Pipeline 服务尚未启动", 503)
+    pipeline = pipeline_manager.validate_generation_binding(pipeline_id, kind, request_id=request_id)
+    if pipeline.get("feedback_id") != feedback_id:
+        raise PipelineError("扩增输入与 Pipeline 冻结的回流选择不一致")
+    return lambda job: pipeline_manager.bind_generation(pipeline_id, job)
 
 
 def configure_job_manager(value: TaskGenerationJobManager) -> None:
@@ -132,7 +160,13 @@ def download_scene_tree() -> FileResponse:
 @router.post("/jobs", status_code=202)
 def create_task_generation_job(request: TaskGenerationRequest) -> dict[str, Any]:
     try:
-        return _manager().submit_initial([item.model_dump() for item in request.selections], request.generate_n, version=request.version)
+        binding = _binding(request.pipeline_id, "initial", request.request_id)
+        return _manager().submit_initial([item.model_dump() for item in request.selections], request.generate_n, version=request.version,
+            request_id=request.request_id, pipeline_id=request.pipeline_id, on_created=binding)
+    except PipelineError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    except AugmentationStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except VersionConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (FileNotFoundError, ValueError) as exc:
@@ -144,21 +178,44 @@ def create_augmentation_job(
     file: UploadFile = File(...),
     generate_n: int = Form(default=10, ge=1, le=20),
     auto_start: bool = Form(default=True),
+    request_id: str | None = Form(default=None),
+    pipeline_id: str | None = Form(default=None),
 ) -> dict[str, Any]:
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED_WORKBOOK_SUFFIXES:
         raise HTTPException(status_code=422, detail="种子文件只支持 .xlsx 或 .xlsm 文件")
     temporary_path: Path | None = None
     try:
+        binding = _binding(pipeline_id, "augmentation", request_id)
         with tempfile.NamedTemporaryFile(prefix="task-augmentation-input-", suffix=suffix, delete=False) as temporary:
             temporary_path = Path(temporary.name)
             shutil.copyfileobj(file.file, temporary)
-        return _manager().submit_augmentation(temporary_path, file.filename or "input.xlsx", generate_n, auto_start=auto_start)
+        return _manager().submit_augmentation(temporary_path, file.filename or "input.xlsx", generate_n, auto_start=auto_start,
+            request_id=request_id, pipeline_id=pipeline_id, on_created=binding)
+    except PipelineError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    except AugmentationStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     finally:
         if temporary_path:
             temporary_path.unlink(missing_ok=True)
+
+
+@router.post("/badcase-jobs", status_code=202)
+def create_badcase_job(request: BadCaseGenerationRequest):
+    from ..badcases import BadCaseError
+    try:
+        binding = _binding(request.pipeline_id, "augmentation", request.request_id, request.feedback_id)
+        return _manager().submit_badcase_seeds(request.feedback_id, request.generate_n, auto_start=request.auto_start,
+            request_id=request.request_id, pipeline_id=request.pipeline_id, on_created=binding)
+    except (BadCaseError, PipelineError) as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    except AugmentationStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.get("/jobs")

@@ -9,7 +9,8 @@ def project_job(payload: dict) -> dict:
     fields = ("job_id", "kind", "status", "stage", "percent", "created_at", "updated_at",
               "started_at", "completed_at", "current_item", "input_filename", "generate_n", "total_items",
               "completed_items", "result_count", "task_type_count", "expected_main_tasks",
-              "knowledge_base_version", "augmentation_preview_version", "augmentation_generation_started")
+              "knowledge_base_version", "augmentation_preview_version", "augmentation_generation_started",
+              "pipeline_id", "request_id", "feedback_id", "source_evaluation_run_id")
     value = {key: payload[key] for key in fields if key in payload}
     value["filename"] = payload.get("input_filename") or ""
     value["error_count"] = len(payload.get("errors") or [])

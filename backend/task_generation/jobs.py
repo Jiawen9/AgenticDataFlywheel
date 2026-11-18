@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import shutil
 import sqlite3
 import tempfile
 import threading
 from concurrent.futures import Executor, ThreadPoolExecutor
+from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -49,6 +51,10 @@ _MANAGER_LOCKS_GUARD = threading.Lock()
 
 class AugmentationStateError(ValueError):
     """A valid request cannot run in the persisted job's current phase."""
+
+
+class GenerationPaused(AugmentationStateError):
+    """The owning flow retains the checkpoint but prohibits another phase."""
 
 
 def _now() -> str:
@@ -192,6 +198,10 @@ class TaskGenerationJobManager:
         if runner is not default:
             return {}
         options = {"diagnostic_id_factory": lambda: diagnostics.diagnostic_id("q", root=self.data_root)}
+        frozen = (self.get(job_id) or {}).get("model_config")
+        if frozen:
+            from .config import TaskGenerationConfig, load_model_config
+            options["model_config"] = TaskGenerationConfig(**frozen, api_key=load_model_config().api_key)
         if tasks and batch_uses_short_ids(job_id, self.data_root):
             options["id_factory"] = lambda: allocate_id("t", root=self.data_root)
         return options
@@ -255,10 +265,15 @@ class TaskGenerationJobManager:
                 self._write_job(payload)
 
     def _new_job(self, kind: str, *, total_items: int, generate_n: int, input_filename: str | None = None,
-                 kb_source: Path | None = None, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
+                 kb_source: Path | None = None, parameters: dict[str, Any] | None = None, submission=None, initial_seeds=None) -> dict[str, Any]:
         job_id = allocate_id("b", root=self.data_root)
         self._run_dir(job_id).mkdir(parents=True, exist_ok=True)
         snapshot = snapshot_knowledge_base(self._run_dir(job_id) / "KnowledgeBase", root=kb_source or self.knowledge_base_dir)
+        parameters = dict(parameters or {})
+        if submission and "model_config" not in parameters:
+            from dataclasses import asdict
+            from .config import load_model_config
+            parameters["model_config"] = {key: value for key, value in asdict(load_model_config()).items() if key != "api_key"}
         payload = {
             "job_id": job_id,
             "kind": kind,
@@ -280,12 +295,69 @@ class TaskGenerationJobManager:
             "knowledge_base": snapshot,
             "knowledge_base_version": snapshot["version"],
             **(parameters or {}),
+            **({key: submission[key] for key in ("request_id", "pipeline_id")} if submission else {}),
         }
         with active_batch_lock(job_id, self.data_root), self._lock:
-            self._write_job(payload)
+            if submission:
+                entries = [
+                    {"namespace": "task_generation.jobs", "key": job_id, "payload": payload, "expected_revision": 0},
+                    {"namespace": "task_generation.requests", "key": submission["key"],
+                     "payload": {"job_id": job_id, "digest": submission["digest"]}, "expected_revision": 0},
+                ]
+                if initial_seeds is not None:
+                    entries.append({"namespace": "task_generation.seeds", "key": job_id,
+                                    "payload": {"job_id": job_id, "rows": initial_seeds}, "expected_revision": 0})
+                self.store.put_many(entries)
+                submission["job_id"] = job_id
+            else:
+                self._write_job(payload)
+        if submission and submission.get("on_created"):
+            try:
+                submission["on_created"](payload)
+            except Exception as exc:
+                payload.update(status="interrupted", stage="interrupted", completed_at=_now(), error=f"Pipeline 关联未完成，未启动生成：{exc}")
+                self._write_job(payload)
+                raise
         return payload
 
-    def submit_initial(self, selections: list[dict[str, Any]], generate_n: int, *, version: str) -> dict[str, Any]:
+    def _submit_once(self, kind, body, request_id, pipeline_id, on_created, operation):
+        from ..badcases import digest
+        if not request_id and not pipeline_id:
+            return operation(None)
+        if not isinstance(request_id, str) or not request_id.strip() or len(request_id) > 128:
+            raise AugmentationStateError("需要有效的生成请求编号")
+        submission = {"request_id": request_id, "pipeline_id": pipeline_id, "on_created": on_created,
+                      "key": digest([pipeline_id, request_id]), "digest": digest([kind, body, pipeline_id])}
+        with ExitStack() as locks:
+            if pipeline_id:
+                locks.enter_context(self.artifacts.batch_lock("pipeline_" + pipeline_id))
+            locks.enter_context(self.artifacts.batch_lock("generation_request_" + submission["key"]))
+            prior = self.store.get("task_generation.requests", submission["key"])
+            if prior:
+                if prior["digest"] != submission["digest"]:
+                    raise AugmentationStateError("同一生成请求编号对应了不同参数")
+                job = self.get(prior["job_id"])
+                if not job:
+                    raise AugmentationStateError("已受理请求的作业记录缺失")
+                if on_created:
+                    on_created(job)
+                return job
+            try:
+                return operation(submission)
+            except Exception as exc:
+                if submission.get("job_id"):
+                    current = self.get(submission["job_id"])
+                    if current and current["status"] == "queued":
+                        current.update(status="failed", stage="failed", completed_at=_now(), error=str(exc))
+                        self._write_job(current)
+                raise
+
+    def submit_initial(self, selections, generate_n, *, version, request_id=None, pipeline_id=None, on_created=None):
+        return self._submit_once("initial", {"selections": selections, "generate_n": generate_n, "version": version},
+            request_id, pipeline_id, on_created,
+            lambda submission: self._submit_initial(selections, generate_n, version=version, submission=submission))
+
+    def _submit_initial(self, selections: list[dict[str, Any]], generate_n: int, *, version: str, submission=None) -> dict[str, Any]:
         if not 1 <= generate_n <= 20:
             raise ValueError("每个任务类型/App 生成数量必须为 1–20")
         source = current_root(self.knowledge_base_dir)
@@ -312,25 +384,31 @@ class TaskGenerationJobManager:
                               **dict(zip(("scene", "capability", "sub_capability"), labels)), **configs[app]})
         if not units:
             raise ValueError("至少选择一个任务类型和适用 App")
-        payload = self._new_job("task_generation", total_items=len(units), generate_n=generate_n, kb_source=source,
+        payload = self._new_job("task_generation", total_items=len(units), generate_n=generate_n, kb_source=source, submission=submission,
                                 parameters={"selections": normalized, "execution_units": units,
                                             "task_type_count": len(normalized), "expected_main_tasks": len(units) * generate_n})
         self._executor.submit(self._run_initial, payload["job_id"], [unit["execution_unit_id"] for unit in units], generate_n)
         return payload
 
-    def submit_augmentation(self, input_path: Path, original_filename: str, generate_n: int, *, auto_start: bool = True) -> dict[str, Any]:
+    def submit_augmentation(self, input_path, original_filename, generate_n, *, auto_start=True, request_id=None, pipeline_id=None, on_created=None):
+        content_digest = hashlib.sha256(io_path(input_path).read_bytes()).hexdigest()
+        return self._submit_once("augmentation", {"sha256": content_digest, "generate_n": generate_n, "auto_start": auto_start},
+            request_id, pipeline_id, on_created,
+            lambda submission: self._submit_augmentation(input_path, original_filename, generate_n, auto_start=auto_start, submission=submission))
+
+    def _submit_augmentation(self, input_path: Path, original_filename: str, generate_n: int, *, auto_start: bool = True, submission=None) -> dict[str, Any]:
         if not 1 <= generate_n <= 20:
             raise ValueError("每个种子生成数量必须为 1–20")
         # Preserve the existing injected, one-shot runner contract. Production
         # defaults and preview calls both use the checkpointed two-phase flow.
         if auto_start and self.augmentation_runner is not run_augmentation:
-            payload = self._new_job("augmentation", total_items=0, generate_n=generate_n, input_filename=original_filename)
+            payload = self._new_job("augmentation", total_items=0, generate_n=generate_n, input_filename=original_filename, submission=submission)
             target = self._run_dir(payload["job_id"]) / "input.xlsx"
             shutil.copy2(input_path, target)
             self._executor.submit(self._run_augmentation, payload["job_id"], target, generate_n)
             return payload
         seeds = prepare_augmentation_seeds(input_path, id_factory=lambda: allocate_id("t", root=self.data_root))
-        payload = self._new_job("augmentation", total_items=len(seeds) * 2, generate_n=generate_n, input_filename=original_filename,
+        payload = self._new_job("augmentation", total_items=len(seeds) * 2, generate_n=generate_n, input_filename=original_filename, submission=submission, initial_seeds=seeds,
                                 parameters={"auto_start": auto_start, "augmentation_preview_version": 1,
                                             "classification_completed": False, "augmentation_generation_started": False,
                                             "seed_stats": self._seed_stats(seeds)})
@@ -343,6 +421,62 @@ class TaskGenerationJobManager:
             self._fail_augmentation(payload["job_id"], exc)
             raise
         return payload
+
+    def submit_badcase_seeds(self, feedback_id, generate_n, *, auto_start=False, request_id=None, pipeline_id=None, on_created=None):
+        from ..badcases import BadCaseService
+        feedback = BadCaseService(self.data_root).get_feedback(feedback_id)
+        def create(submission):
+            if type(generate_n) is not int or not 1 <= generate_n <= 20:
+                raise ValueError("每个种子生成数量必须为 1–20")
+            seeds = [{**row, "seed_id": allocate_id("t", root=self.data_root), "source_row": index,
+                      "feedback_id": feedback_id, "classification_source": "feedback" if all(row.get(k) for k in ("scene", "capability", "sub_capability")) else "model",
+                      "classification_status": "pending", "mapping_status": "pending", "node_path_ids": [],
+                      "generation_status": "waiting", "result_count": 0} for index, row in enumerate(feedback["seeds"], 1)]
+            payload = self._new_job("augmentation", total_items=len(seeds) * 2, generate_n=generate_n, submission=submission, initial_seeds=seeds,
+                parameters={"auto_start": auto_start, "augmentation_preview_version": 1, "classification_completed": False,
+                            "augmentation_generation_started": False, "seed_stats": self._seed_stats(seeds),
+                            "feedback_id": feedback_id, "feedback_digest": feedback["digest"], "source_evaluation_run_id": feedback["run_id"]})
+            try:
+                self._write_json(self._seeds_path(payload["job_id"]), seeds)
+                self._executor.submit(self._run_augmentation_classification, payload["job_id"])
+            except Exception as exc:
+                self._fail_augmentation(payload["job_id"], exc)
+                raise
+            return payload
+        return self._submit_once("badcase", {"feedback_id": feedback_id, "digest": feedback["digest"], "generate_n": generate_n, "auto_start": auto_start},
+                                 request_id, pipeline_id, on_created, create)
+
+    def retry_generation(self, job_id, *, request_id, pipeline_id, on_created=None):
+        old = self.get(job_id)
+        if not old or old.get("pipeline_id") != pipeline_id:
+            raise AugmentationStateError("重试作业不存在或不属于此 Pipeline")
+        if old.get("status") not in {"failed", "interrupted", "partial"}:
+            raise AugmentationStateError("只有失败、中断或部分完成的生成作业可重试")
+        if not old.get("model_config"):
+            raise AugmentationStateError("历史作业没有冻结模型配置，请明确配置后创建新生成作业")
+        def create(submission):
+            parameters = {key: old[key] for key in ("selections", "execution_units", "task_type_count", "expected_main_tasks", "model_config",
+                "feedback_id", "feedback_digest", "source_evaluation_run_id", "augmentation_preview_version", "auto_start") if key in old}
+            parameters["retry_of_job_id"] = job_id
+            if old["kind"] == "augmentation":
+                seeds = self._read_seeds(job_id)
+                classified = bool(old.get("classification_completed")) and any(s.get("classification_status") == "classified" for s in seeds)
+                for seed in seeds:
+                    seed.update(generation_status="waiting", result_count=0)
+                    seed.pop("error", None)
+                    if not classified:
+                        seed.update(classification_status="pending", mapping_status="pending", node_path_ids=[])
+                parameters.update(classification_completed=classified, augmentation_generation_started=classified, seed_stats=self._seed_stats(seeds))
+            payload = self._new_job(old["kind"], total_items=old["total_items"], generate_n=old["generate_n"],
+                input_filename=old.get("input_filename"), kb_source=self._execution_library(job_id), parameters=parameters, submission=submission,
+                initial_seeds=seeds if old["kind"] == "augmentation" else None)
+            if old["kind"] == "task_generation":
+                self._executor.submit(self._run_initial, payload["job_id"], [unit["execution_unit_id"] for unit in old["execution_units"]], old["generate_n"])
+            else:
+                self._write_json(self._seeds_path(payload["job_id"]), seeds)
+                self._executor.submit(self._run_augmentation_generation if classified else self._run_augmentation_classification, payload["job_id"])
+            return payload
+        return self._submit_once("retry", {"source_job_id": job_id}, request_id, pipeline_id, on_created, create)
 
     def augmentation_preview(self, job_id: str, *, include_tree: bool = True) -> dict[str, Any]:
         with self._lock:
@@ -363,6 +497,17 @@ class TaskGenerationJobManager:
         return preview
 
     def start_augmentation(self, job_id: str) -> dict[str, Any]:
+        job = self.get(job_id)
+        with ExitStack() as locks:
+            if job and job.get("pipeline_id"):
+                locks.enter_context(self.artifacts.batch_lock("pipeline_" + job["pipeline_id"]))
+                owner = self.store.get("pipelines", job["pipeline_id"])
+                if (not owner or owner.get("status") != "running"
+                        or owner.get("generation_job_id") != job_id):
+                    raise GenerationPaused("所属 Pipeline 已暂停、结束或改用其他作业，保留现有分类结果")
+            return self._start_augmentation(job_id)
+
+    def _start_augmentation(self, job_id: str) -> dict[str, Any]:
         with active_batch_lock(job_id, self.data_root), self._lock:
             job = self.get(job_id)
             if job is None:
@@ -455,7 +600,10 @@ class TaskGenerationJobManager:
                     self._write_job(ready)
                 self._log(job_id, f"分类完成，可扩增={stats['eligible']}，未匹配={stats['unmatched']}，失败={stats['classification_failed']}")
                 if stats["eligible"] and (self.get(job_id) or {}).get("auto_start"):
-                    self.start_augmentation(job_id)
+                    try:
+                        self.start_augmentation(job_id)
+                    except GenerationPaused:
+                        self._log(job_id, "所属 Pipeline 未允许下一阶段，保留分类预览等待继续")
         except Exception as exc:
             self._fail_augmentation(job_id, exc)
 
@@ -668,6 +816,22 @@ class TaskGenerationJobManager:
             return self._existing_collection_batch_dir(batch_id) / batch["filename"]
 
     def patch_result(self, job_id: str, result_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+        # Review acceptance freezes which tasks will be collected even if the
+        # source workbook has not been written yet. Use the same lock order as
+        # Pipeline confirmation so edits cannot slip into its recovery window.
+        with ExitStack() as locks:
+            job = self.get(job_id)
+            if job and job.get("pipeline_id"):
+                locks.enter_context(self.artifacts.batch_lock("pipeline_" + job["pipeline_id"]))
+                owner = self.store.get("pipelines", job["pipeline_id"])
+                confirmation = (owner or {}).get("generation_confirmation") or {}
+                if ((owner or {}).get("generation_job_id") == job_id
+                        and (owner or {}).get("status") != "terminated"
+                        and confirmation.get("status") == "preparing"):
+                    raise AugmentationStateError("该生成结果已确认采集，正在冻结任务来源；请等待准备完成后编辑，已冻结的采集来源不会变化")
+            return self._patch_result(job_id, result_id, patch)
+
+    def _patch_result(self, job_id: str, result_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         with active_batch_lock(job_id, self.data_root), self._lock:
             job = self.get(job_id)
             if job is None:
@@ -723,6 +887,7 @@ class TaskGenerationJobManager:
         payload = {"schema_version": 1, "job_id": job_id, "kind": job["kind"], "status": job["status"],
                    "knowledge_base_version": job.get("knowledge_base_version"),
                    "results": results, "seeds": seeds, "errors": job.get("errors", [])}
+        payload.update({key: job[key] for key in ("pipeline_id", "feedback_id", "feedback_digest", "source_evaluation_run_id") if job.get(key)})
         return self.artifacts.publish(job_id, chosen_stage, payload, tables=tables,
             source_refs=[{"kind": "knowledge_base", "version": job.get("knowledge_base_version")}],
             metadata={"source_job_id": job_id, "source_status": job["status"]})

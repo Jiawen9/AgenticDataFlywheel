@@ -38,6 +38,9 @@ class ModelIterationTests(unittest.TestCase):
         self.calls, self.runs, self.snapshots = [], {}, {}
         self.supported, self.unreachable = True, False
         self.store = PhoneFactoryStore(Path(temporary.name), run_client_fn=self.client)
+        # Result synchronization now owns a background BadCase indexer. Drain
+        # the runtime before TemporaryDirectory removes its locks and database.
+        self.addCleanup(self.store.runtime.close)
         self.store.initialize_settings({"phones": ["phone-1"], "apps": ["App"], "phoneApps": [{"phone_id": "phone-1", "app": "App"}], "vla": ["http://vla.invalid"]})
         self.store.add_task({"filename": "eval.xlsx", "description": "cases", "content_base64": base64.b64encode(workbook_bytes()).decode()}, mode="modeliter")
         model_iteration.save_config(self.store, evaluator_config())
@@ -138,7 +141,9 @@ class ModelIterationTests(unittest.TestCase):
         self.unreachable = False; self.runs[run_id]["status"] = "succeeded"
         self.store.runtime.sync_evaluation(run_id)
         self.unreachable = True
+        self.store.runtime.close()
         rebuilt = PhoneFactoryStore(self.store.root, run_client_fn=self.client)
+        self.addCleanup(rebuilt.runtime.close)
         final = rebuilt.dispatch(f"runs/{run_id}/evaluations", "GET", {}, mode="modeliter")
         self.assertNotIn("stale", final)
         self.assertEqual(final["cases"][0]["case_id"], "case-a")

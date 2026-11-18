@@ -35,11 +35,38 @@ describe('original Pipeline diagram with real execution state', () => {
     const p = pipeline()
     p.status = 'succeeded'
     p.steps.forEach(step => { step.status = 'succeeded' })
-    for (const id of ['evaluation', 'generation', 'training', 'model-publishing']) {
+    for (const id of ['training', 'model-publishing']) {
       expect(diagramStageState(p, stage(id))).toEqual({ status: 'unavailable', active: false, detail: '尚未接入自动执行' })
       expect(diagramStageTarget(p, stage(id))).toBeUndefined()
       for (const item of stage(id).children) expect(diagramNodeState(p, item).status).toBe('unavailable')
     }
+  })
+
+  it.each(['collect', 'existing'] as const)('lights prior modules for %s without inventing jobs', start => {
+    const p = pipeline(); p.start_mode = start
+    const before = JSON.stringify(p)
+    for (const id of ['evaluation', 'generation']) expect(diagramStageState(p, stage(id))).toEqual({ status: 'completed', active: false, inherited: true, detail: '前置环节 · 本轮不执行' })
+    expect(JSON.stringify(p)).toBe(before)
+  })
+  it('shows actual generation while leaving unused augmentation skipped', () => {
+    const p = pipeline({ id: 'generation', status: 'running', percent: 25, jobs: [{ status: 'running' }] })
+    p.start_mode = 'generate'; p.generation_kind = 'initial'; p.batch_id = null
+    p.steps.unshift({ id: 'generation', label: '任务生成', status: 'running', job_ids: ['g1'], percent: 25 })
+    expect(diagramStageTarget(p, stage('generation'))).toBe('generation')
+    expect(diagramStageState(p, stage('generation'))).toMatchObject({ status: 'running', percent: 25 })
+    expect(diagramNodeState(p, node('badcase-augmentation')).status).toBe('skipped')
+    p.generation_kind = 'augmentation'
+    expect(diagramNodeState(p, node('badcase-augmentation')).status).toBe('running')
+  })
+  it('uses associated evaluation status and preserves unknown status as pending', () => {
+    const p = pipeline(); p.evaluation_run_id = 'eval-1'
+    expect(diagramStageState(p, stage('evaluation')).status).toBe('pending')
+    p.evaluation = { status: 'completed' }
+    expect(diagramStageState(p, stage('evaluation')).status).toBe('completed')
+    expect(diagramStageState(p, stage('evaluation')).inherited).toBeUndefined()
+    expect(diagramNodeState(p, node('badcase-extraction')).status).toBe('waiting')
+    p.evaluation.index_state = 'ready'
+    expect(diagramNodeState(p, node('badcase-extraction')).status).toBe('completed')
   })
 
   it('shows waiting before creation without manufacturing progress', () => {

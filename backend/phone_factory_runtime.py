@@ -37,6 +37,8 @@ TERMINAL = {"completed", "succeeded", "partial", "failed", "interrupted", "cance
 class FactoryRuntime:
     def __init__(self, store):
         self.store, self.root, self.records = store, store.root, store.records
+        from .badcases import open_refresh
+        open_refresh(self.root)
         self.manual = ManualCollectionStore(self.root)
         self._transfer = None
         self._stop = threading.Event()
@@ -146,6 +148,8 @@ class FactoryRuntime:
         return self.store._remote_result(["collection-archive", run_id, "--out", str(destination)])
 
     def start(self):
+        from .badcases import open_refresh
+        open_refresh(self.root)
         self.transfer.start()
         if self._thread is None or not self._thread.is_alive():
             self._stop.clear()
@@ -167,6 +171,8 @@ class FactoryRuntime:
         self._preview_pool.close()
         self._control_pool.close()
         self.read_models.close()
+        from .badcases import close_refresh
+        close_refresh(self.root)
 
     def _poll_evaluations(self):
         while not self._stop.wait(5):

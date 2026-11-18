@@ -74,11 +74,12 @@ def _retry_at(delay):
 
 class PipelineRuntime:
     """Adapter to existing production services; tests inject a fully offline adapter."""
-    def __init__(self, root, *, preprocessing, tree, quality, cot, factory, overview):
+    def __init__(self, root, *, preprocessing, tree, quality, cot, factory, overview, generation=None):
         self.root = Path(root)
         self.artifacts, self.records = ArtifactStore(root), RecordStore(root)
         self.preprocessing, self.tree, self.quality, self.cot = preprocessing, tree, quality, cot
         self.factory, self.overview = factory, overview
+        self.generation = generation
 
     def configurations(self):
         from .tree_build_service import tree_build_config
@@ -177,13 +178,13 @@ class PipelineRuntime:
                 ("input_digest", "collection_snapshot_id", "collection_epoch")}
             return True
         bound = set(pipeline.get("collection_run_ids", []))
-        if pipeline["start_mode"] == "collect" and bound - {run["collection_run_id"] for run in runs}:
+        if pipeline["start_mode"] in {"collect", "generate"} and bound - {run["collection_run_id"] for run in runs}:
             raise PipelineError("本次采集运行记录缺失，不能改用其他历史运行继续")
         if runs:
             for run in runs:
                 if run["status"] in ACTIVE_JOBS:
                     return False
-                if (pipeline["start_mode"] == "collect" and run["collection_run_id"] in bound
+                if (pipeline["start_mode"] in {"collect", "generate"} and run["collection_run_id"] in bound
                         and (run["status"] != "completed" or run.get("errors"))):
                     guidance = ("请从任务来源重新采集，并选择新结果批次继续"
                                 if pipeline.get("batch_role") == "collection_result"
@@ -306,14 +307,15 @@ class PipelineRuntime:
             batch_id=pipeline["batch_id"], session_id=pipeline.get("session_id")))
 
     def bound_jobs(self, step, pipeline, job_ids):
-        namespace = {"collection": "collection_runs", "preprocessing": "preprocessing_jobs",
+        namespace = {"generation": "task_generation.jobs", "collection": "collection_runs", "preprocessing": "preprocessing_jobs",
                      "tree": "tree_jobs", "quality": "quality_jobs", "cot": "correction_cot_jobs"}.get(step)
         jobs = self.records.get_many(namespace, job_ids) if namespace else []
         return [self.factory.collection_runs._current_paths(job) for job in jobs] if step == "collection" else jobs
 
     def submit(self, step, pipeline, retry=False):
         if step == "preprocessing":
-            previous = [pipeline["steps"][1]["retry_job_id"]] if pipeline["steps"][1].get("retry_job_id") else pipeline["steps"][1]["job_ids"]
+            state = next(item for item in pipeline["steps"] if item["id"] == step)
+            previous = [state["retry_job_id"]] if state.get("retry_job_id") else state["job_ids"]
             if retry and previous:
                 return self.preprocessing.retry(previous[-1])
             return self.preprocessing.submit(pipeline["batch_id"])
@@ -383,15 +385,23 @@ class PipelineManager:
             for step in pipeline["steps"]:
                 # The public detail needs only the jobs explicitly bound to
                 # this step. Discovery during orchestration remains separate.
-                jobs = (self.runtime.bound_jobs(step["id"], pipeline, step["job_ids"])
-                        if hasattr(self.runtime, "bound_jobs") else self.runtime.jobs(step["id"], pipeline))
+                if step["id"] == "generation":
+                    jobs = self.records.get_many("task_generation.jobs", step["job_ids"])
+                elif not pipeline.get("batch_id"):
+                    jobs = []
+                else:
+                    jobs = (self.runtime.bound_jobs(step["id"], pipeline, step["job_ids"])
+                            if hasattr(self.runtime, "bound_jobs") else self.runtime.jobs(step["id"], pipeline))
                 by_id = {j.get("job_id") or j.get("collection_run_id"): j for j in jobs}
                 step["jobs"] = [by_id[j] for j in step["job_ids"] if j in by_id]
                 if step["status"] == "running" and step["jobs"]:
                     step["percent"] = round(sum(float(j.get("percent") or (100 if j["status"] in {"completed", "succeeded"} else 0))
                                                 for j in step["jobs"]) / len(step["jobs"]), 1)
             pipeline["history_only"] = pipeline["status"] in {"terminated", "no_publishable_data"} and not pipeline.get("release_id")
-            pipeline["managed"] = pipeline["status"] not in TERMINAL and lifecycle(pipeline["batch_id"], self.root)["status"] != "published"
+            pipeline["managed"] = pipeline["status"] not in TERMINAL and (
+                not pipeline.get("batch_id") or lifecycle(pipeline["batch_id"], self.root)["status"] != "published")
+            from .badcases import pipeline_loop_summary
+            pipeline.update(pipeline_loop_summary(self.records, pipeline))
         return pipeline
 
     def list(self, batch_id=None, active_only=False):
@@ -414,6 +424,11 @@ class PipelineManager:
                    for run in self.runtime.collection_runs(batch_id))
 
     def create(self, data):
+        if data.get("start_mode") == "generate":
+            from .pipeline_generation import create
+            return create(self, data)
+        if any(data.get(key) is not None for key in ("generation_kind", "feedback_id", "parent_pipeline_id")):
+            raise PipelineError("生成来源字段仅适用于任务生成起点", 422)
         request_id, batch = str(data.get("request_id") or ""), str(data.get("batch_id") or "")
         _identifier(request_id, "请求编号")
         _identifier(batch, "batch ID")
@@ -487,6 +502,18 @@ class PipelineManager:
             diagnostics.record_pipeline(created, self.root, event="pipeline_created")
             return created
 
+    def validate_generation_binding(self, pipeline_id, kind, request_id=None):
+        from .pipeline_generation import validate_binding
+        return validate_binding(self, pipeline_id, kind, request_id)
+
+    def bind_generation(self, pipeline_id, job):
+        from .pipeline_generation import bind
+        return bind(self, pipeline_id, job)
+
+    def confirm_generation(self, pipeline_id, data):
+        from .pipeline_generation import confirm
+        return confirm(self, pipeline_id, data)
+
     def _save(self, pipeline):
         pipeline["updated_at"] = utc_now()
         pipeline["logs"] = pipeline.get("logs", [])[-200:]
@@ -508,6 +535,11 @@ class PipelineManager:
             p = self.get(pipeline_id, public=False)
             if revision != p["storage_revision"]:
                 raise RevisionConflict("流程已更新，请刷新后重试，当前草稿不会丢失")
+            if p.get("start_mode") == "generate" and not p.get("batch_id"):
+                from .pipeline_generation import control
+                control(self, p, action)
+                self._save(p)
+                return self.get(pipeline_id)
             if action == "retry" and p["status"] == "published_summary_failed":
                 self.runtime.conversion(p["release_id"], retry=True)
                 p.update(status="running", error=None)
@@ -739,6 +771,8 @@ class PipelineManager:
             pipeline.update(status="paused", error="等待已启动的旧快照作业结束；结果将保留为旧版本")
             return True
         for step in pipeline["steps"]:
+            if step["id"] == "generation":
+                continue
             step.setdefault("previous_job_ids", []).extend(step.get("job_ids", []))
             step.update(status="pending", job_ids=[], started_at=None, completed_at=None, error=None, message="等待新采集快照")
             for key in ("retry", "retry_job_id", "retry_info"):
@@ -761,6 +795,12 @@ class PipelineManager:
         with self.artifacts.batch_lock("pipeline_" + pipeline_id), internal_pipeline(pipeline_id):
             p = self.get(pipeline_id, public=False)
             original = digest(p)
+            if p.get("start_mode") == "generate" and not p.get("batch_id"):
+                from .pipeline_generation import tick
+                persisted = tick(self, p)
+                if not persisted and digest(p) != original:
+                    self._save(p)
+                return
             if p["status"] not in TERMINAL - {"failed"} and self._collection_version_fence(p):
                 if digest(p) != original:
                     self._save(p)
@@ -822,14 +862,14 @@ class PipelineManager:
                 key = step["id"]
                 if key == "collection":
                     runs_by_id = {run["collection_run_id"]: run for run in self.runtime.collection_runs(p["batch_id"])}
-                    if p["start_mode"] == "collect" and not p["collection_run_ids"]:
+                    if p["start_mode"] in {"collect", "generate"} and not p["collection_run_ids"]:
                         recovered = [run for run in runs_by_id.values() if run.get("dispatch_key") == pipeline_id]
                         p["collection_run_ids"] = [run["collection_run_id"] for run in recovered]
                     bound = [runs_by_id.get(run_id) for run_id in p["collection_run_ids"]]
                     dispatch_needed = not bound or any(run and run.get("dispatch_error")
                                                        and run.get("status") in {"failed", "dispatching"}
                                                        for run in bound)
-                    if p["start_mode"] == "collect" and dispatch_needed:
+                    if p["start_mode"] in {"collect", "generate"} and dispatch_needed:
                         retrying = bool(step.pop("retry", False))
                         if (step["status"] != "running"
                                 and (not retrying or not step.get("retry_info", {}).get("attempts"))):
@@ -861,7 +901,7 @@ class PipelineManager:
                     if not selected:
                         p["status"] = "no_publishable_data"
                         self._done(step, "没有达到阈值的轨迹，批次保持活动", skipped=True)
-                        for rest in p["steps"][5:]:
+                        for rest in p["steps"][p["steps"].index(step) + 1:]:
                             self._done(rest, "没有可发布数据", skipped=True)
                     elif p["mode"] == "automatic":
                         self._done(step, "自动模式按阈值筛选，无人工修正关卡", skipped=True)

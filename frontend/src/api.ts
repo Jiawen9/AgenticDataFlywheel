@@ -101,14 +101,15 @@ export const api = {
     if (baseVersion) form.append('base_version', baseVersion)
     return (await request<{ knowledge_base: KnowledgeBaseSummary }>(`/api/task-generation/knowledge-bases/${encodeURIComponent(kind)}`, { method: 'PUT', body: form })).knowledge_base
   },
-  async createTaskGeneration(selections: TaskGenerationSelection[], generateN: number, version: string): Promise<TaskGenerationJob> {
-    return request('/api/task-generation/jobs', { method: 'POST', body: JSON.stringify({ selections, generate_n: generateN, version }) })
+  async createTaskGeneration(selections: TaskGenerationSelection[], generateN: number, version: string, context: { request_id?: string; pipeline_id?: string } = {}): Promise<TaskGenerationJob> {
+    return request('/api/task-generation/jobs', { method: 'POST', body: JSON.stringify({ selections, generate_n: generateN, version, ...context }) })
   },
-  async createAugmentation(file: File, generateN: number, autoStart = true): Promise<TaskGenerationJob> {
+  async createAugmentation(file: File, generateN: number, autoStart = true, context: { request_id?: string; pipeline_id?: string } = {}): Promise<TaskGenerationJob> {
     const form = new FormData()
     form.append('file', file)
     form.append('generate_n', String(generateN))
     form.append('auto_start', String(autoStart))
+    for (const [key, value] of Object.entries(context)) if (value) form.append(key, value)
     return request('/api/task-generation/augmentation-jobs', { method: 'POST', body: form })
   },
   augmentationPreview(jobId: string, includeTree = true): Promise<AugmentationPreview> {

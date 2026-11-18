@@ -12,7 +12,7 @@ import re
 import sqlite3
 import threading
 
-VERSION = 2
+VERSION = 3
 LOG = logging.getLogger(__name__)
 NAMESPACES = frozenset({
     "pipelines", "collection_runs", "model_iter_runs", "remote_sync",
@@ -36,6 +36,7 @@ SCALAR_FIELDS = set("""pipeline_id collection_run_id run_id job_id name batch_id
     can_cancel_collection dispatch_attempted dispatch_confirmed dispatch_rejected dispatch_error error
     collection_snapshot_id collection_snapshot_digest source_count evaluation_control_terminal
     mode start_mode threshold session_id release_id published_at paused resume_available
+    generation_kind generation_job_id generation_attempt feedback_id parent_pipeline_id
     collector_data_state cleanup_operation_id cleaned_at cleanup_error percent preparation_control_error
     preparation_control_pending offline_evaluation_jobs_version stage task_id kind message
     total_tasks completed_tasks failed_tasks total_steps completed_steps current_task current_trajectory

@@ -15,6 +15,8 @@ import { useTaskGenerationReview } from '@/composables/useTaskGenerationReview'
 import TaskGenerationScope from '@/components/TaskGenerationScope.vue'
 import TaskGenerationResults from '@/components/TaskGenerationResults.vue'
 import CollectionBatchSubmission from '@/components/CollectionBatchSubmission.vue'
+import GenerationPipelineBanner from '@/components/GenerationPipelineBanner.vue'
+import { useGenerationPipeline } from '@/composables/useGenerationPipeline'
 import DisplayId from '@/components/DisplayId.vue'
 import { useDisplayIdentifiers } from '@/composables/useDisplayIdentifiers'
 
@@ -22,8 +24,9 @@ const { displayId, matches } = useDisplayIdentifiers()
 const pickerQuery = ref('')
 const filterJobPicker = (query: string) => { pickerQuery.value = query }
 
+const flow = useGenerationPipeline()
 const route = useRoute()
-const mode = ref<'new' | 'records'>('records')
+const mode = ref<'new' | 'records'>(flow.id.value && !route.query.job_id ? 'new' : 'records')
 const history = useGenerationHistory('task_generation')
 const resultPages = useGenerationResultPage()
 const historyTotal = history.total
@@ -117,12 +120,12 @@ async function selectGenerationJob(jobId: string) {
   if (!job || !(await review.selectJob(job))) selectedGenerationJobId.value = previousId
 }
 async function submit() {
-  if (!ready.value || !(await review.protect()) || !ready.value) return
+  if (!flow.mayGenerate.value || !ready.value || !(await review.protect()) || !ready.value) return
   submitting.value = true
   try {
-    const job = await api.createTaskGeneration(selections.value, generateN.value, version.value)
+    const job = await api.createTaskGeneration(selections.value, generateN.value, version.value, flow.submission({ selections: selections.value, generate_n: generateN.value, version: version.value }))
     if (disposed) return
-    mode.value = 'records'; await review.acceptJob(job); ElMessage.success('任务生成作业已提交')
+    mode.value = 'records'; await review.acceptJob(job); if (flow.id.value) await flow.refresh(); ElMessage.success('任务生成作业已提交')
   } catch (error) {
     if (!disposed) {
       if (error instanceof ApiError && error.status === 409) {
@@ -139,11 +142,13 @@ async function exportResults() {
 }
 function beforeUnload(event: BeforeUnloadEvent) { if (dirty.value || busy.value || submitting.value) { event.preventDefault(); event.returnValue = '' } }
 watch(() => selectedJob.value?.job_id, jobId => { selectedGenerationJobId.value = jobId || ''; if (jobId) { try { sessionStorage.setItem('adf.generation.selected', jobId) } catch { /* optional selection */ } } }, { immediate: true, flush: 'sync' })
+watch(flow.boundJob, jobId => { if (jobId && selectedJob.value?.job_id !== jobId) { mode.value = 'records'; void review.restoreJob(jobId) } })
 onBeforeRouteLeave(async () => !submitting.value && await review.protect())
 onMounted(() => {
+  if (mode.value === 'new') void refreshResources()
   void review.refreshJobs()
   let preferred = typeof route.query.job_id === 'string' ? route.query.job_id : ''
-  try { preferred ||= sessionStorage.getItem('adf.generation.selected') || '' } catch { /* optional selection */ }
+  try { if (!flow.id.value) preferred ||= sessionStorage.getItem('adf.generation.selected') || '' } catch { /* optional selection */ }
   if (preferred) void review.restoreJob(preferred)
   window.addEventListener('beforeunload', beforeUnload)
 })
@@ -152,12 +157,13 @@ onBeforeUnmount(() => { disposed = true; resourceController.abort(); review.disp
 
 <template>
   <div class="page task-generation-page">
+    <GenerationPipelineBanner :pipeline-id="flow.id.value" :pipeline="flow.pipeline.value" :error="flow.error.value" @back="flow.back()" />
     <header class="generation-header"><div><span class="eyebrow">任务池 / TASK GENERATION</span><h1>任务生成</h1><p>从场景能力中选择任务类型与 App，生成、审核并导出任务。</p></div><el-button :icon="Setting" @click="resourceOpen = true; refreshResources()">管理生成资源</el-button></header>
     <div class="generation-tabs" role="tablist" aria-label="任务生成工作区"><button role="tab" :aria-selected="mode === 'new'" :class="{ active: mode === 'new' }" @click="switchMode('new')">新建生成</button><button role="tab" :aria-selected="mode === 'records'" :class="{ active: mode === 'records' }" @click="switchMode('records')">生成记录 <span>{{ historyTotal }}</span><i v-if="jobs.some(isGenerationActive)" aria-label="存在活动作业"></i></button><span v-if="dirty" class="dirty-note">有未保存的任务修改</span></div>
     <section v-show="mode === 'new'" class="generation-panel" aria-label="新建生成">
       <div class="resource-strip"><span>知识库 <b>{{ version ? version.slice(0, 8) : '未加载' }}</b></span><span :class="{ 'resource-warning': validResources < 3 }">{{ resourceLoading ? '正在加载…' : `${validResources} / 3 项资源可用` }}</span><el-button v-if="warnings.length" text type="warning" @click="resourceOpen = true; refreshResources()">{{ warnings.length }} 项提示</el-button><el-button text :icon="Refresh" :loading="resourceLoading" :disabled="replacing || submitting" @click="refreshResources">刷新资源</el-button></div>
       <el-alert v-if="resourceError" :title="resourceError" type="error" :closable="false"><el-button text @click="refreshResources">重试加载资源</el-button></el-alert>
-      <TaskGenerationScope :tree="tree" v-model:selected="selectedApps" v-model:count="generateN" :disabled="resourceLoading || replacing || submitting" :submitting="submitting" :ready="ready" @submit="submit" />
+      <TaskGenerationScope :tree="tree" v-model:selected="selectedApps" v-model:count="generateN" :disabled="resourceLoading || replacing || submitting" :submitting="submitting" :ready="ready && flow.mayGenerate.value" @submit="submit" />
     </section>
     <section v-show="mode === 'records'" class="generation-panel" aria-label="生成记录">
       <div class="records-toolbar"><h2>生成记录</h2><el-button text :icon="Refresh" :loading="refreshing" :disabled="busy" @click="review.refreshJobs">刷新记录</el-button></div>
@@ -169,7 +175,7 @@ onBeforeUnmount(() => { disposed = true; resourceController.abort(); review.disp
           <el-option v-for="job in pickerJobs" :key="job.job_id" :label="generationJobOptionLabel(job, displayId('job', job.job_id))" :value="job.job_id" />
         </el-select>
       </div>
-      <CollectionBatchSubmission v-if="selectedJob" :key="selectedJob.job_id" :job="selectedJob" :result-count="collectionTaskCount" :busy="busy || detailLoading || refreshing || submitting" :protect="review.protect" :run-protected="review.runExternalAction" />
+      <CollectionBatchSubmission v-if="selectedJob" :pipeline-id="flow.id.value" :bound-job-id="flow.boundJob.value" :key="selectedJob.job_id" :job="selectedJob" :result-count="collectionTaskCount" :busy="busy || detailLoading || refreshing || submitting" :protect="review.protect" :run-protected="review.runExternalAction" />
       <div class="records-layout">
         <aside class="job-directory"><GenerationHistoryPager :page="historyPage" :size="Number(historyQuery.limit)" :total="historyTotal" :search="String(historyQuery.search || '')" :status="String(historyQuery.status || '')" :disabled="busy" @change="changeHistory" /><div class="job-list"><button v-for="job in filteredJobs" :key="job.job_id" :data-job-id="job.job_id" :class="{ active: selectedJob?.job_id === job.job_id }" :disabled="busy" @click="review.selectJob(job)"><div><strong>{{ job.created_at.slice(0, 16).replace('T', ' ') }}</strong><span :class="`status-${job.status}`">{{ jobLabels[job.status] }}</span></div><p>{{ job.completed_items }} / {{ job.total_items }} 个执行单元 · {{ job.result_count }} 条结果</p><small :title="job.job_id">{{ displayId('job', job.job_id) }}</small></button><el-empty v-if="!filteredJobs.length" :description="jobs.length ? '没有匹配的记录' : '暂无生成记录'" :image-size="50" /></div></aside>
         <div class="job-detail" :aria-busy="detailLoading">
