@@ -212,7 +212,8 @@ async function create() {
   if (draft.start_mode === 'collect' && collectionIssue.value) { createError.value = collectionIssue.value; return }
   submitting.value = true; createError.value = ''
   const body: Omit<CreatePipeline, 'request_id'> = { name: draft.name.trim(), ...(draft.start_mode === 'generate' ? { generation_kind: draft.generation_kind } : {}), ...(needsBatch.value ? { batch_id: draft.batch_id } : {}), start_mode: draft.start_mode, mode: draft.mode,
-    export_profile: 'corrected_selection_v1', cot_policy: draft.mode === 'manual' ? draft.cot_policy : 'generate',
+    export_profile: draft.mode === 'manual' && draft.cot_policy === 'skip' ? 'opd_prefix_v1' : 'corrected_selection_v1',
+    cot_policy: draft.mode === 'manual' ? draft.cot_policy : 'generate',
     ...(draft.mode === 'automatic' ? { threshold: draft.threshold } : {}),
     ...(draft.start_mode === 'collect' ? { collection_config: { ...modelOptions(draft.agent_type, activeModels.value), agent_type: draft.agent_type, repeat_times: draft.repeat_times, phone_id: draft.phone_id, app: draft.app, vla: draft.vla.trim(), config: { sampling_enabled: draft.sampling_enabled, temperature: draft.temperature, top_p: draft.top_p, use_experience_lib: draft.use_experience_lib, capture_logprobs: draft.capture_logprobs } } } : {}),
   }
@@ -359,7 +360,7 @@ onBeforeUnmount(() => { disposed = true; stopRetryClock(); choicesGeneration++; 
         <el-form-item v-if="draft.start_mode === 'existing'"><el-button :disabled="choicesLoading || submitting" data-testid="open-rollout-import" @click="rolloutImportVisible = true">导入已有 Rollout</el-button><span class="form-hint">已有本地轨迹尚未登记时，从这里添加新批次。</span></el-form-item>
         <el-form-item label="处理模式" required><el-radio-group v-model="draft.mode"><el-radio-button value="manual">人工修正</el-radio-button><el-radio-button value="automatic">自动发布</el-radio-button></el-radio-group></el-form-item>
         <p class="form-hint">{{ draft.mode === 'manual' ? '默认每任务 Top1，可额外勾选多条；确认后导出每条的全部保留步骤。' : '每任务选择一条达标的最高分轨迹，未达标任务跳过；发布成功后整个批次结束处理。' }}</p>
-        <el-form-item v-if="draft.mode === 'manual'" label="修正后处理"><el-radio-group v-model="draft.cot_policy"><el-radio-button value="generate">生成 COT</el-radio-button><el-radio-button value="skip">OPD：跳过 COT</el-radio-button></el-radio-group><p v-if="draft.cot_policy === 'skip'" class="form-hint">保留全部未删除步骤，导出 thought 为空，不调用 COT 或标框模型。</p></el-form-item>
+        <el-form-item v-if="draft.mode === 'manual'" label="修正后处理"><el-radio-group v-model="draft.cot_policy"><el-radio-button value="generate">生成 COT</el-radio-button><el-radio-button value="skip">OPD：跳过 COT</el-radio-button></el-radio-group><p v-if="draft.cot_policy === 'skip'" class="form-hint">有动作修正的轨迹导出至首次修正步，其他轨迹导出所有未删除步骤。导出时 thought 留空。</p></el-form-item>
         <el-form-item v-if="draft.mode === 'automatic'" label="Rubric G 阈值（0～5）" required><el-input-number v-model="draft.threshold" :min="0" :max="5" :step="0.1" /></el-form-item>
         </template>
         <el-alert v-if="confirmingGeneration" title="确认当前生成作业的全部未删除任务。这里保存本轮采集配置，确认后由后台继续。" type="info" :closable="false" />

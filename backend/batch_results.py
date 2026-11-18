@@ -137,52 +137,64 @@ def current_quality_payload(batch_id: str, root: Path | None = None, *, include_
     store = ArtifactStore(_root(root))
     with store.batch_lock(batch_id):
         _, trees = _current_tree_locked(store, batch_id)
-        reference, quality = _read(store, batch_id, "05_quality")
-        valid = trees.get("tree_hashes", {})
-        expected = quality.get("source_tree_hashes", {})
-        tasks = [item for item in quality.get("tasks", [])
-                 if item.get("task_id") in valid and expected.get(item["task_id"]) == valid[item["task_id"]]]
-        valid_ids = {item["task_id"] for item in tasks}
-        result = {**quality, "run_id": batch_id, "batch_id": batch_id, "tasks": tasks,
-                "task_fingerprints": {task: value for task, value in quality.get("task_fingerprints", {}).items()
-                                      if task in valid_ids},
-                "source_tree_hashes": {task: value for task, value in expected.items() if task in valid_ids},
-                "artifact": reference, "updated_at": quality.get("completed_at")}
-        if include_partial:
-            records = store.records
-            keys = records.matching_keys("quality_partial_results", batch_id=batch_id)
-            partials = records.get_many("quality_partial_results", keys)
-            if partials:
-                jobs = records.get_many("quality_jobs", records.matching_keys("quality_jobs", batch_id=batch_id))
-                latest = {}
-                for job in sorted(jobs, key=lambda row: (str(row.get("created_at", "")), row["job_id"])):
-                    for task in job.get("task_ids", []):
-                        latest[task] = job
-                by_task = {task["task_id"]: task for task in tasks}
-                for partial in partials:
-                    task, job_id = partial["task_id"], partial["job_id"]
-                    job = latest.get(task) or {}
-                    if (job.get("job_id") != job_id or job.get("status") == "stale"
-                            or valid.get(task) != partial.get("source_tree_hash")
-                            or job.get("task_fingerprints", {}).get(task) != partial.get("input_fingerprint")):
-                        continue
-                    lease = records.get("quality_executions", job_id) or {}
-                    if lease.get("state") == "committed" or (lease and lease.get("token") != partial.get("execution_token")):
-                        continue
-                    if quality.get("job_id") == job_id or by_task.get(task, {}).get("quality_job_id") == job_id:
-                        continue
-                    current = quality_task_fingerprints(trees, checklist_options=job.get("checklist_options")).get(task)
-                    if current != partial.get("input_fingerprint"):
-                        continue
-                    row = deepcopy(partial["result"])
-                    row.update(quality_job_id=job_id, result_state="partial", fusion_complete=False,
-                               status=job.get("status"), partial_results_available=bool(row.get("evaluations")))
-                    by_task[task] = row
-                    result["task_fingerprints"][task] = partial["input_fingerprint"]
-                    result["source_tree_hashes"][task] = partial["source_tree_hash"]
-                    result["updated_at"] = partial["updated_at"]
-                result["tasks"] = list(by_task.values())
-        return result
+        return _current_quality_locked(store, batch_id, trees, include_partial=include_partial)
+
+
+def current_tree_and_quality(batch_id: str, root: Path | None = None) -> tuple[dict | None, dict, dict]:
+    """Return both views with one validated tree read in the same batch lock."""
+    store = ArtifactStore(_root(root))
+    with store.batch_lock(batch_id):
+        reference, trees = _current_tree_locked(store, batch_id)
+        return reference, trees, _current_quality_locked(store, batch_id, trees, include_partial=True)
+
+
+def _current_quality_locked(store: ArtifactStore, batch_id: str, trees: dict, *, include_partial: bool) -> dict:
+    reference, quality = _read(store, batch_id, "05_quality")
+    valid = trees.get("tree_hashes", {})
+    expected = quality.get("source_tree_hashes", {})
+    tasks = [item for item in quality.get("tasks", [])
+             if item.get("task_id") in valid and expected.get(item["task_id"]) == valid[item["task_id"]]]
+    valid_ids = {item["task_id"] for item in tasks}
+    result = {**quality, "run_id": batch_id, "batch_id": batch_id, "tasks": tasks,
+            "task_fingerprints": {task: value for task, value in quality.get("task_fingerprints", {}).items()
+                                  if task in valid_ids},
+            "source_tree_hashes": {task: value for task, value in expected.items() if task in valid_ids},
+            "artifact": reference, "updated_at": quality.get("completed_at")}
+    if include_partial:
+        records = store.records
+        keys = records.matching_keys("quality_partial_results", batch_id=batch_id)
+        partials = records.get_many("quality_partial_results", keys)
+        if partials:
+            jobs = records.get_many("quality_jobs", records.matching_keys("quality_jobs", batch_id=batch_id))
+            latest = {}
+            for job in sorted(jobs, key=lambda row: (str(row.get("created_at", "")), row["job_id"])):
+                for task in job.get("task_ids", []):
+                    latest[task] = job
+            by_task = {task["task_id"]: task for task in tasks}
+            for partial in partials:
+                task, job_id = partial["task_id"], partial["job_id"]
+                job = latest.get(task) or {}
+                if (job.get("job_id") != job_id or job.get("status") == "stale"
+                        or valid.get(task) != partial.get("source_tree_hash")
+                        or job.get("task_fingerprints", {}).get(task) != partial.get("input_fingerprint")):
+                    continue
+                lease = records.get("quality_executions", job_id) or {}
+                if lease.get("state") == "committed" or (lease and lease.get("token") != partial.get("execution_token")):
+                    continue
+                if quality.get("job_id") == job_id or by_task.get(task, {}).get("quality_job_id") == job_id:
+                    continue
+                current = quality_task_fingerprints(trees, checklist_options=job.get("checklist_options")).get(task)
+                if current != partial.get("input_fingerprint"):
+                    continue
+                row = deepcopy(partial["result"])
+                row.update(quality_job_id=job_id, result_state="partial", fusion_complete=False,
+                           status=job.get("status"), partial_results_available=bool(row.get("evaluations")))
+                by_task[task] = row
+                result["task_fingerprints"][task] = partial["input_fingerprint"]
+                result["source_tree_hashes"][task] = partial["source_tree_hash"]
+                result["updated_at"] = partial["updated_at"]
+            result["tasks"] = list(by_task.values())
+    return result
 
 
 def assert_task_inputs(batch_id: str, expected: dict[str, str], root: Path | None = None) -> None:

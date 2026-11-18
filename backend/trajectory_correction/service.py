@@ -26,6 +26,7 @@ from ..identifiers import allocate_id
 from ..batch_lifecycle import ensure_batch_active, is_batch_active
 from .session_state import identified, row_index, reconcile, reviews_for_group, session_fingerprint, fingerprint
 from .exporter import export_full_dataset_workbook, export_session_workbook
+from .export_policy import EXPORT_PROFILE, OPD_PREFIX_PROFILE, opd_cutoff_row, validate_export_policy
 from .quality_selection import (
     QualitySelectionUnavailable,
     filter_snapshot,
@@ -236,6 +237,7 @@ def _group_summary(session_id: str, session: dict[str, Any], group: dict[str, An
     reviews = reviews_for_group(session, session.get("snapshot_payload") or _snapshot(session), group) if session.get("pending_review") else []
     rows = [_overlay_row(session_id, session, row) for row in group["rows"]]
     active = [row for row in rows if not row["deleted"]]
+    cutoff = opd_cutoff_row(group["rows"], session.get("row_edits", {}))
     return {
         "group_id": group["group_id"],
         "task_id": group.get("task_id", ""),
@@ -251,6 +253,7 @@ def _group_summary(session_id: str, session: dict[str, Any], group: dict[str, An
         "active_row_count": len(active),
         "edited_row_count": sum(1 for row in rows if row["edited"]),
         "action_edit_count": sum(1 for row in rows if row["action_edited"]),
+        "opd_cutoff_step": cutoff.get("step") if cutoff else None,
         "cot_row_count": sum(1 for row in active if row["action_edited"] or row["bbox_edited"]),
         "generated_row_count": sum(1 for row in active if (row["action_edited"] or row["bbox_edited"]) and row.get("cot_status") == "generated"),
     }
@@ -533,7 +536,7 @@ def get_session_header(session_id: str) -> dict[str, Any]:
             "source": None, "selection": session.get("selection"), "groups": [], "exports": []}
 
 
-def get_group_page(session_id: str, *, offset=0, limit=10, search="", status="", unit="group") -> dict[str, Any]:
+def get_group_page(session_id: str, *, offset=0, limit=10, search="", status="", unit="group", task_id="") -> dict[str, Any]:
     from .read_models import page_values
     session = _session_or_raise(session_id)
     snapshot = _snapshot(session)
@@ -541,6 +544,8 @@ def get_group_page(session_id: str, *, offset=0, limit=10, search="", status="",
     # Filter base metadata before overlaying only the requested page. Never build COT history here.
     groups = [group for group in snapshot["groups"] if not query or query in " ".join(
         str(group.get(key) or "") for key in ("task_id", "group_id", "task", "meta_task")).casefold()]
+    if task_id:
+        groups = [group for group in groups if str(group.get("task_id") or group.get("task")) == task_id]
     pending_tasks = set(session.get("stale_tasks", [])) | {item.get("task_id") for item in session.get("pending_review", {}).values()}
     if status in {"pending_review", "ready"}:
         groups = [group for group in groups if (group.get("task_id") in pending_tasks) == (status == "pending_review")]
@@ -913,10 +918,19 @@ def _export_view(session: dict, snapshot: dict) -> tuple[dict, dict]:
     return value, frozen
 
 
-def _existing_export(session: dict, kind: str, cot_policy: str | None = None, *, training_prefix: str | None = None) -> dict | None:
+def _existing_export(session: dict, kind: str, cot_policy: str | None = None, *, training_prefix: str | None = None,
+                     export_profile: str | None = None, score_fingerprint: str | None = None) -> dict | None:
     current_key = session_fingerprint(session)
     store = ArtifactStore(storage_root())
     for record in session.get("exports", []):
+        if str(record.get("kind") or "selected") != kind or record.get("content_fingerprint") != current_key:
+            continue
+        if cot_policy is not None and record.get("cot_policy") != cot_policy:
+            continue
+        if export_profile is not None and (record.get("export_profile") or EXPORT_PROFILE) != export_profile:
+            continue
+        if score_fingerprint is not None and record.get("score_fingerprint") != score_fingerprint:
+            continue
         if training_prefix is not None:
             training = record.get("training") or {}
             if training.get("version") != 2 or training.get("image_prefix") != training_prefix:
@@ -934,10 +948,6 @@ def _existing_export(session: dict, kind: str, cot_policy: str | None = None, *,
                         break
                 if not valid:
                     continue
-        if cot_policy is not None and record.get("cot_policy") != cot_policy:
-            continue
-        if str(record.get("kind") or "selected") != kind or record.get("content_fingerprint") != current_key:
-            continue
         ref = record.get("artifact") or {}
         if not all(ref.get(key) for key in ("batch_id", "stage", "version")) or store.get(ref["batch_id"], ref["stage"], ref["version"]) is None:
             continue
@@ -1041,27 +1051,43 @@ def export_session(session_id: str, expected_revision: int | None = None) -> dic
 
 
 @_locked_session
-def export_selected_session(session_id: str, expected_revision: int | None = None, *, export_profile="corrected_selection_v1", cot_policy="generate", training_image_prefix: str | None = None) -> dict[str, Any]:
-    from .selected_export import EXPORT_PROFILE, project_selected, selection_records
+def export_selected_session(session_id: str, expected_revision: int | None = None, *, export_profile=EXPORT_PROFILE,
+                            cot_policy="generate", training_image_prefix: str | None = None) -> dict[str, Any]:
+    from .selected_export import project_selected, selection_records
     from ..batch_results import current_tree_payload, current_quality_payload
     from ..data_publishing.paired_training import image_prefix, write_paired_workbook
-    if export_profile != EXPORT_PROFILE or cot_policy not in {"generate", "skip"}:
-        raise ValueError("不支持的已选轨迹导出策略")
+    validate_export_policy(export_profile, cot_policy)
     session = _session_or_raise(session_id)
     _check_revision(session, expected_revision)
+    draft = session
     prefix = image_prefix(training_image_prefix)
-    existing = _existing_export(session, "corrected_selection", cot_policy, training_prefix=prefix)
-    if existing is not None:
-        return existing
+    if export_profile == EXPORT_PROFILE:
+        existing = _existing_export(session, "corrected_selection", cot_policy, training_prefix=prefix, export_profile=export_profile)
+        if existing is not None:
+            return existing
     session, snapshot = _export_view(session, _snapshot(session))
     chosen = [group for group in snapshot["groups"] if session.get("group_exports", {}).get(group["group_id"], group.get("export", False))]
     batch = session_batch_id(session)
     selection = {**deepcopy(session.get("selection", {})), "batch_id": batch,
                  "tree_run_id": session.get("tree_run_id"),
                  "tasks": selection_records(chosen, session.get("selection", {}).get("candidates", []))}
+    store = ArtifactStore(storage_root())
+    tree = {**current_tree_payload(batch, storage_root()), "artifact": store.get(batch, "04_tree")}
+    quality = current_quality_payload(batch, storage_root())
+    score_fingerprint = None
+    if export_profile == OPD_PREFIX_PROFILE:
+        task_ids = {group["task_id"] for group in chosen}
+        score_fingerprint = fingerprint({
+            "tree": (tree["artifact"] or {}).get("version"),
+            "quality": (quality.get("artifact") or {}).get("version"),
+            "tasks": [task for task in quality["tasks"] if task.get("task_id") in task_ids],
+        })
+        existing = _existing_export(draft, "corrected_selection", cot_policy, training_prefix=prefix,
+                                    export_profile=export_profile, score_fingerprint=score_fingerprint)
+        if existing is not None:
+            return existing
     payload = project_selected(session=session, snapshot=snapshot, table=session["workbook_payload"],
-        selection=selection, cot_policy=cot_policy, tree_payload={**current_tree_payload(batch, storage_root()), "artifact": ArtifactStore(storage_root()).get(batch, "04_tree")},
-        quality_payload=current_quality_payload(batch, storage_root()),
+        selection=selection, cot_policy=cot_policy, export_profile=export_profile, tree_payload=tree, quality_payload=quality,
         raw_root=_source_for_session(session)[1], training_prefix=prefix)
     payload["content_fingerprint"] = session["export_fingerprint"]
     export_id = allocate_id("e", storage_root())
@@ -1072,9 +1098,11 @@ def export_selected_session(session_id: str, expected_revision: int | None = Non
     write_payload_workbook(destination, payload)
     training_filename, report_filename = f"train_{export_id}.jsonl", f"report_{export_id}.json"
     try:
+        source_id = f"{session_id}:{session['export_fingerprint']}:{cot_policy}"
+        if export_profile == OPD_PREFIX_PROFILE:
+            source_id += f":{export_profile}"
         training = write_paired_workbook(destination, output_dir / training_filename,
-            output_dir / report_filename, prefix,
-            source_id=f"{session_id}:{session['export_fingerprint']}:{cot_policy}")
+            output_dir / report_filename, prefix, source_id=source_id)
     except (OSError, ValueError, TypeError) as exc:
         training = {"version": 2, "status": "failed", "image_prefix": prefix,
                     "included_count": 0, "excluded_count": 0,
@@ -1083,13 +1111,13 @@ def export_selected_session(session_id: str, expected_revision: int | None = Non
         training["download_url"] = f"/api/correction/sessions/{session_id}/exports/{training_filename}"
         training["report_download_url"] = f"/api/correction/sessions/{session_id}/exports/{report_filename}"
     payload["training"] = training
-    store = ArtifactStore(storage_root())
     artifact = store.publish(batch, "07_cot", payload, workbooks={"full_dataset.xlsx": destination},
         source_refs=[ref for stage in ("04_tree", "05_quality") if (ref := store.get(batch, stage))],
         metadata={"session_id": session_id, "export_profile": export_profile, "cot_policy": cot_policy})
     sheets = {name: len(rows) for name, rows in payload["sheets"].items()}
     history = {"export_id": export_id, "kind": "corrected_selection", "export_profile": export_profile,
         "cot_policy": cot_policy, "content_fingerprint": session["export_fingerprint"],
+        **({"score_fingerprint": score_fingerprint} if score_fingerprint is not None else {}),
         "selection": payload["selection"], "filename": filename, "sha256": hashlib.sha256(io_path(destination).read_bytes()).hexdigest(),
         "artifact": artifact, "created_at": utc_now(), "sheets": sheets, "training": training,
         "summary": {"rows": sum(sheets.values()), "groups": len(payload["groups"]),

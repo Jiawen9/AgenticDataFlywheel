@@ -24,6 +24,7 @@ from .data_publishing.service import DatasetReleaseRegistry
 from .stage_artifacts import write_payload_workbook
 from .trajectory_correction.constants import FIXED_SOURCE_ID
 from .trajectory_correction.draft_store import utc_now
+from .trajectory_correction.export_policy import PAIRED_EXPORT_PROFILES
 from .trajectory_correction.session_state import fingerprint, identified, reconcile, session_fingerprint
 from .trajectory_correction.workbook import load_snapshot
 
@@ -393,7 +394,9 @@ def _publish_pipeline_with_diagnostics(pipeline, *, root=None, registry=None):
             session = _existing_edit_view(sessions[0], snapshot)
         intent_key = "pipeline:" + pipeline_id
         intent = records.get("release_intents", intent_key)
-        if pipeline.get("export_profile") == "corrected_selection_v1":
+        export_profile = pipeline.get("export_profile")
+        paired = export_profile in PAIRED_EXPORT_PROFILES
+        if paired:
             from .trajectory_correction.selected_export import project_selected
             from .data_publishing.paired_training import image_prefix
             tree, quality, _, _, assets = _validate_source(selection, root)
@@ -404,7 +407,7 @@ def _publish_pipeline_with_diagnostics(pipeline, *, root=None, registry=None):
                 raise RevisionConflict("同一 Pipeline 发布重试不能改变已冻结的图片前缀")
             payload = project_selected(session=session, snapshot=snapshot, table=table, selection=selection,
                 cot_policy=pipeline.get("cot_policy", "generate"), tree_payload={**tree, "artifact": store.get(batch_id, "04_tree")}, quality_payload=quality,
-                raw_root=assets, training_prefix=training_prefix)
+                raw_root=assets, training_prefix=training_prefix, export_profile=export_profile)
             payload.update(pipeline_id=pipeline_id, source_kind="pipeline_selection")
         else:
             payload = _export_payload(selection, snapshot, table, session, pipeline_id)
@@ -421,8 +424,8 @@ def _publish_pipeline_with_diagnostics(pipeline, *, root=None, registry=None):
             intent = records.put("release_intents", intent_key, {"release_id": release_id, "pipeline_id": pipeline_id,
                 "batch_id": batch_id, "request_hash": request_hash, "created_at": utc_now(), "status": "preparing",
                 **({"training_image_prefix": training_prefix, "training_version": 2}
-                   if pipeline.get("export_profile") == "corrected_selection_v1" else {})}, expected_revision=0)
-        elif pipeline.get("export_profile") == "corrected_selection_v1" and "training_image_prefix" not in intent:
+                   if paired else {})}, expected_revision=0)
+        elif paired and "training_image_prefix" not in intent:
             # Upgrade an uncommitted old publication intent once, without
             # changing its original request identity or already published data.
             intent = records.put("release_intents", intent_key, {**intent, "training_image_prefix": training_prefix,
@@ -436,8 +439,8 @@ def _publish_pipeline_with_diagnostics(pipeline, *, root=None, registry=None):
             excel = staging / "001" / filename
             write_payload_workbook(excel, payload)
             training = None
-            if pipeline.get("export_profile") == "corrected_selection_v1":
-                from .data_publishing.paired_training import write_paired_workbook, image_prefix
+            if paired:
+                from .data_publishing.paired_training import write_paired_workbook
                 try:
                     prefix = training_prefix
                     training = write_paired_workbook(excel, staging / "training/001/files/train.jsonl",

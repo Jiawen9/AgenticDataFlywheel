@@ -483,6 +483,7 @@ export interface CorrectionRow {
 }
 
 export interface CorrectionGroupSummary {
+  opd_cutoff_step?: number | null
   storage_revision?: number
   group_id: string
   task_id?: string
@@ -611,11 +612,13 @@ export interface DatasetReleaseTrainingFile extends PairedTrainingFile {
   available?: boolean
 }
 
+export type CorrectionExportProfile = 'corrected_selection_v1' | 'opd_prefix_v1'
+
 export interface CorrectionExport {
   storage_revision?: number
   export_id: string
   kind?: 'routed' | 'selected' | 'full_dataset' | 'corrected_selection'
-  export_profile?: 'corrected_selection_v1'
+  export_profile?: CorrectionExportProfile
   cot_policy?: 'generate' | 'skip'
   training?: PairedTrainingFile
   filename: string

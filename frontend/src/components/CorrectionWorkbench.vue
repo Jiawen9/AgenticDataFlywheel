@@ -4,7 +4,7 @@ import type { CorrectionGroup, CorrectionRow } from '@/types'
 import { correctionAssetUrl } from '@/api'
 import CorrectionActionEditor from '@/components/CorrectionActionEditor.vue'
 
-const props = defineProps<{ sessionId: string; group: CorrectionGroup; row: CorrectionRow | null; revision: number; storageRevision?: number; saving: boolean; readOnly?: boolean }>()
+const props = defineProps<{ sessionId: string; group: CorrectionGroup; row: CorrectionRow | null; revision: number; storageRevision?: number; saving: boolean; readOnly?: boolean; editorOnly?: boolean }>()
 // Older workbooks/drafts may contain a coordinate_info string or an unchecked
 // saved contract. Only the server's resolved response carries these markers.
 const rowCoordinateInfo = computed(() => {
@@ -24,14 +24,14 @@ function rowClassName({ row }: { row: CorrectionRow }) {
 </script>
 
 <template>
-  <section class="workbench" aria-label="轨迹修正台">
+  <section class="workbench" :class="{ 'workbench--editor-only': editorOnly }" aria-label="轨迹修正台">
     <aside class="editor-pane">
       <template v-if="row">
         <CorrectionActionEditor :key="`${sessionId}:${group.group_id}:${row.excel_row}:${revision}`" :row="row" :session-id="sessionId" :storage-revision="storageRevision" :coordinate-info="rowCoordinateInfo" :image-url="correctionAssetUrl(sessionId, row.image)" :saving="saving" :read-only="readOnly" @save="emit('action', $event)" @draft="emit('draft', $event)" />
       </template>
       <el-empty v-else description="该轨迹没有可修正步骤" :image-size="80" />
     </aside>
-    <div class="steps">
+    <div v-if="!editorOnly" class="steps">
       <div class="steps-heading"><b>轨迹步骤</b><span>点击步骤查看截图并修正</span></div>
       <el-table :data="group.rows" height="clamp(420px, 70vh, 760px)" row-key="excel_row"
         :row-class-name="rowClassName" @row-click="(item: CorrectionRow) => emit('select', item)">
@@ -50,6 +50,10 @@ function rowClassName({ row }: { row: CorrectionRow }) {
 <style scoped>
 .steps :deep(.is-active-step td.el-table__cell){background:#ecf5ff}
 .workbench{display:grid;grid-template-columns:minmax(400px,.95fr) minmax(520px,1.25fr);gap:28px;padding:6px 0 14px;align-items:start}
+.workbench.workbench--editor-only{grid-template-columns:minmax(0,1fr);padding:0}
+.workbench--editor-only :deep(.correction-editor){grid-template-columns:minmax(0,1fr) minmax(135px,38%);gap:8px;padding:8px}
+.workbench--editor-only :deep(.editor-image-shell){height:clamp(320px,59vh,560px);padding:6px}
+@media(max-width:560px){.workbench--editor-only :deep(.correction-editor){grid-template-columns:minmax(0,1fr)}}
 .editor-pane,.steps{min-width:0}.editor-pane{display:grid;gap:12px}.steps{border:1px solid var(--line);border-radius:14px;background:white;overflow:hidden}.steps-heading{display:flex;justify-content:space-between;gap:10px;padding:14px;font-size:13px}.steps-heading span{color:#64748b;font-size:12px}
 .action-text,.bbox-text{display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#334155;font-size:11px}.bbox-text{color:#0f766e}.steps :deep(.is-deleted){opacity:.5;background:#fff1f2}.steps :deep(.el-table__row){cursor:pointer}
 @media(max-width:1400px){.workbench{grid-template-columns:1fr;gap:16px}}

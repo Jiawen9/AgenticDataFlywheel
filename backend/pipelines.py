@@ -18,6 +18,7 @@ from .data_store.registry import utc_now
 from .file_io import io_path
 from .identifiers import ID_SCHEME, allocate_id
 from .pipeline_access import TERMINAL, active_pipeline, internal_pipeline
+from .trajectory_correction.export_policy import OPD_PREFIX_PROFILE, validate_export_policy
 from . import pipeline_diagnostics as diagnostics
 
 LOG = logging.getLogger(__name__)
@@ -438,10 +439,10 @@ class PipelineManager:
         if mode not in {"manual", "automatic"} or start not in {"collect", "existing"}:
             raise PipelineError("请选择有效的模式和起点", 422)
         profile, cot_policy = data.get("export_profile"), data.get("cot_policy")
-        if profile not in {None, "corrected_selection_v1"} or cot_policy not in {None, "generate", "skip"}:
-            raise PipelineError("不支持的导出或 COT 策略", 422)
-        if cot_policy is not None and profile is None:
-            raise PipelineError("COT 策略需要明确的导出配置", 422)
+        try:
+            validate_export_policy(profile, cot_policy, automatic=mode == "automatic")
+        except ValueError as exc:
+            raise PipelineError(str(exc), 422) from exc
         name = str(data.get("name") or "").strip()
         if not name or len(name) > 200:
             raise PipelineError("流程名称须为 1～200 个字符", 422)
@@ -922,7 +923,9 @@ class PipelineManager:
                         step.update(status="waiting", message="请完成修正并确认继续")
                 elif key == "cot":
                     if p.get("cot_policy") == "skip":
-                        self._done(step, "OPD：跳过 COT，导出全部保留步骤且 thought 为空", skipped=True)
+                        scope = ("导出至首个动作修正处" if p.get("export_profile") == OPD_PREFIX_PROFILE
+                                 else "导出全部保留步骤")
+                        self._done(step, f"OPD：跳过 COT，{scope}，thought 为空", skipped=True)
                     elif p["mode"] == "automatic":
                         self._done(step, "自动模式保留原始内容", skipped=True)
                     else:

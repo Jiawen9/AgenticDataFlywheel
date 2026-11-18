@@ -1,4 +1,5 @@
 import type { FactoryConfig, AgentType, ModelOverrides } from '@/phoneFactoryApi'
+import type { CorrectionExportProfile } from '@/types'
 
 export type PipelineMode = 'manual' | 'automatic'
 export type PipelineStatus = 'waiting_for_evaluation' | 'waiting_for_generation_config' | 'waiting_for_generation_review' | 'running' | 'retry_waiting' | 'paused' | 'waiting_for_correction' | 'failed' | 'terminating' | 'terminated' | 'no_publishable_data' | 'succeeded' | 'published_summary_failed'
@@ -21,7 +22,7 @@ export interface Pipeline {
   next_pipeline_ids?: string[]; next_rounds?: Array<{ pipeline_id: string; generation_job_id?: string; status: string; generated_count?: number | null }>;
   evaluation?: { index_state?: string; run_id?: string; badcases?: Record<string, number>; status?: string; summary?: Record<string, number>; final?: boolean };
 
-  export_profile?: 'corrected_selection_v1'; cot_policy?: 'generate' | 'skip';
+  export_profile?: CorrectionExportProfile; cot_policy?: 'generate' | 'skip';
   pipeline_id: string; name: string; batch_id: string | null; mode: PipelineMode; start_mode: PipelineStartMode;
   batch_role?: 'collection_result'; task_source_batch_id?: string;
   threshold?: number | null; task_ids: string[]; collection_config?: PipelineCollectionConfig | null;
@@ -32,7 +33,7 @@ export interface Pipeline {
 export interface CreatePipeline {
   generation_kind?: 'initial' | 'augmentation'; feedback_id?: string; parent_pipeline_id?: string;
 
-  export_profile?: 'corrected_selection_v1'; cot_policy?: 'generate' | 'skip';
+  export_profile?: CorrectionExportProfile; cot_policy?: 'generate' | 'skip';
   request_id: string; name: string; batch_id?: string; start_mode: PipelineStartMode; mode: PipelineMode;
   threshold?: number; collection_config?: PipelineCollectionConfig
 }

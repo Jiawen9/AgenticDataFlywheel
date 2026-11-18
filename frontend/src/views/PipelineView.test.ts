@@ -87,10 +87,10 @@ describe('Pipeline collection configuration', () => {
     expect(create.mock.calls[0]?.[0]).toMatchObject({ export_profile: 'corrected_selection_v1', cot_policy: 'generate' })
     Object.assign(view.draft, { mode: 'manual', cot_policy: 'skip' })
     await view.create()
-    expect(create.mock.calls[1]?.[0].cot_policy).toBe('skip')
+    expect(create.mock.calls[1]?.[0]).toMatchObject({ export_profile: 'opd_prefix_v1', cot_policy: 'skip' })
     view.draft.mode = 'automatic'
     await view.create()
-    expect(create.mock.calls[2]?.[0].cot_policy).toBe('generate')
+    expect(create.mock.calls[2]?.[0]).toMatchObject({ export_profile: 'corrected_selection_v1', cot_policy: 'generate' })
   })
 
   it('separates reusable collection sources from existing results and retains a published source', async () => {

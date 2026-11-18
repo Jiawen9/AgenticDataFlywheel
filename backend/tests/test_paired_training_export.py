@@ -15,6 +15,7 @@ from openpyxl import Workbook, load_workbook
 from backend.data_publishing.paired_training import write_paired_workbook, image_prefix
 from backend.tests import test_corrected_selection_export
 from backend.trajectory_correction import service, draft_store
+from backend.trajectory_correction.export_policy import OPD_PREFIX_PROFILE
 
 
 class ExcelOnlyTrainingTests(unittest.TestCase):
@@ -154,16 +155,29 @@ class PairedServiceTests(unittest.TestCase):
         app.include_router(router)
         client = TestClient(app)
         s = self.f.session
-        response = client.post(f"/api/correction/sessions/{s['session_id']}/dataset-export", json={
-            "expected_revision": s["storage_revision"], "export_profile": "corrected_selection_v1",
+        row = s["snapshot_payload"]["groups"][0]["rows"][1]
+        base_url = f"/api/correction/sessions/{s['session_id']}"
+        row_url = f"{base_url}/rows/{row['excel_row']}"
+        action = '{"action":"type","text":"new input"}'
+        edited = client.patch(row_url, json={"expected_revision": s["storage_revision"], "actions": action})
+        self.assertEqual(edited.status_code, 200, edited.text)
+        self.assertEqual(edited.json()["group"]["opd_cutoff_step"], row["step"])
+        restored = client.patch(row_url, json={"expected_revision": edited.json()["storage_revision"],
+                                               "actions": '{ "action" : "wait" }'})
+        self.assertEqual(restored.status_code, 200, restored.text)
+        self.assertIsNone(restored.json()["group"]["opd_cutoff_step"])
+        edited = client.patch(row_url, json={"expected_revision": restored.json()["storage_revision"], "actions": action})
+        self.assertEqual(edited.status_code, 200, edited.text)
+        response = client.post(f"{base_url}/dataset-export", json={
+            "expected_revision": edited.json()["storage_revision"], "export_profile": OPD_PREFIX_PROFILE,
             "cot_policy": "skip", "training_image_prefix": "s3://bucket/真实请求"})
         self.assertEqual(response.status_code, 200, response.text)
         descriptor = response.json()["training"]
         downloaded = client.get(descriptor["download_url"])
         self.assertEqual(downloaded.status_code, 200)
         self.assertEqual(downloaded.headers["content-type"], "application/x-ndjson")
-        self.assertEqual(len(downloaded.text.splitlines()), 12)
-        self.assertEqual(client.get(descriptor["report_download_url"]).json()["included_count"], 12)
+        self.assertEqual(len(downloaded.text.splitlines()), 11)
+        self.assertEqual(client.get(descriptor["report_download_url"]).json()["included_count"], 11)
 
     def test_nested_screenshots_keep_trajectory_owner_and_child_path(self):
         from backend.trajectory_correction.selected_export import _trajectory_directory, _training_image
@@ -190,13 +204,37 @@ class PairedServiceTests(unittest.TestCase):
                 image.write_bytes(b"original evidence; converter does not decode images")
                 (image.parent / "nested").mkdir(exist_ok=True)
                 (image.parent / "nested" / "keep.txt").write_text("complete directory")
-        exported = service.export_selected_session(s["session_id"], s["storage_revision"], cot_policy="skip",
+        legacy = service.export_selected_session(s["session_id"], s["storage_revision"], cot_policy="skip",
             training_image_prefix="s3://fixture-bucket/images/")
+        first = f.records.get("correction_sessions", s["session_id"])
+        first_group = first["snapshot_payload"]["groups"][0]
+        end = first_group["rows"][1]
+        first["row_edits"][str(end["excel_row"])] = {"actions": '{"action":"click","coordinate":[1,2]}'}
+        first = f.records.put("correction_sessions", s["session_id"], first)
+        summary = service.get_group(s["session_id"], first_group["group_id"])
+        self.assertEqual(summary["opd_cutoff_step"], end["step"])
+        full = service.export_selected_session(s["session_id"], first["storage_revision"], cot_policy="skip",
+            training_image_prefix="s3://fixture-bucket/images/")
+        self.assertEqual(legacy["summary"]["rows"], 12)
+        self.assertEqual(full["summary"]["rows"], 12)
+        full_bytes = service.download_export(s["session_id"], full["filename"]).read_bytes()
+        retry_legacy = service.export_selected_session(s["session_id"], full["storage_revision"], cot_policy="skip",
+            training_image_prefix="s3://fixture-bucket/images/")
+        self.assertEqual(retry_legacy["export_id"], full["export_id"])
+        exported = service.export_selected_session(s["session_id"], full["storage_revision"], cot_policy="skip",
+            training_image_prefix="s3://fixture-bucket/images/", export_profile=OPD_PREFIX_PROFILE)
+        self.assertEqual(exported["summary"]["rows"], 11)
+        self.assertNotEqual(exported["export_id"], full["export_id"])
+        reused = service.export_selected_session(s["session_id"], exported["storage_revision"], cot_policy="skip",
+            training_image_prefix="s3://fixture-bucket/images/", export_profile=OPD_PREFIX_PROFILE)
+        self.assertEqual(reused["export_id"], exported["export_id"])
+        self.assertEqual(service.download_export(s["session_id"], full["filename"]).read_bytes(), full_bytes)
         training_path = service.download_export(s["session_id"], exported["training"]["filename"])
         original = training_path.read_bytes()
         registry = DatasetReleaseRegistry(data_root=f.root, project_root=f.root, trajectory_root=f.raw,
             releases_file=f.root / "releases.json", correction_exports_dir=f.root / "exports")
         release = registry.create("真实Excel转换与上传", [s["session_id"]])
+        self.assertEqual(release["step_count"], 11)
         self.assertEqual(registry.training_file(release["release_id"], 0, "jsonl")[0].read_bytes(), original)
         adapter = DirectoryAdapter()
         manager = DatasetUploadJobManager(registry, jobs_dir=f.root / "upload-jobs", executor=ImmediateExecutor(), internal_adapter=adapter)
@@ -206,6 +244,9 @@ class PairedServiceTests(unittest.TestCase):
         job = manager.get(job["job_id"])
         self.assertEqual(job["status"], "succeeded", job.get("error"))
         samples = [json.loads(line) for line in original.decode("utf-8").splitlines()]
+        self.assertEqual(len(samples), 11)
+        self.assertFalse(any("step003" in sample["images"][0] and first_group["meta_task"] in sample["images"][0]
+                             for sample in samples))
         for sample in samples:
             uri = sample["images"][0]
             candidates = [call for call in adapter.calls if uri.startswith(f"s3://{call.bucket}/{call.bucket_path}")]
@@ -214,6 +255,7 @@ class PairedServiceTests(unittest.TestCase):
             suffix = uri.removeprefix(f"s3://{call.bucket}/{call.bucket_path}")
             self.assertTrue((call.source_dir / suffix).is_file(), (uri, call.source_dir))
             self.assertTrue((call.source_dir / "nested/keep.txt").is_file())
+            self.assertTrue((call.source_dir / "step003.jpg").is_file())
         call_count = len(adapter.calls)
         separate = manager.submit(release["release_id"], target="internal", training_only=True,
             training_destination_prefix="training/separate")
