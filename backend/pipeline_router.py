@@ -14,13 +14,22 @@ class CreatePipelineRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     request_id: str
     name: str
-    batch_id: str
+    batch_id: str | None = None
     mode: str
     start_mode: str
     threshold: float | None = Field(default=None, ge=0, le=5, strict=True)
     collection_config: dict | None = None
     export_profile: str | None = None
     cot_policy: str | None = None
+    generation_kind: str | None = None
+    feedback_id: str | None = None
+    parent_pipeline_id: str | None = None
+
+class ConfirmGenerationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    request_id: str
+    expected_revision: int
+    collection_config: dict
 
 class ControlPipelineRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -62,7 +71,7 @@ def list_pipelines(request: Request, batch_id: str | None = None, active_only: b
 def create_pipeline(body: CreatePipelineRequest, request: Request):
     value = body.model_dump()
     # Preserve the digest of requests sent before the optional export contract.
-    for key in ("export_profile", "cot_policy"):
+    for key in ("export_profile", "cot_policy", "generation_kind", "feedback_id", "parent_pipeline_id"):
         if value[key] is None:
             value.pop(key)
     return _call(lambda: {"pipeline": _manager(request).create(value)})
@@ -70,6 +79,10 @@ def create_pipeline(body: CreatePipelineRequest, request: Request):
 @router.get("/{pipeline_id}")
 def get_pipeline(pipeline_id: str, request: Request):
     return _call(lambda: {"pipeline": _manager(request).get(pipeline_id)})
+
+@router.post("/{pipeline_id}/confirm-generation")
+def confirm_generation(pipeline_id: str, body: ConfirmGenerationRequest, request: Request):
+    return _call(lambda: {"pipeline": _manager(request).confirm_generation(pipeline_id, body.model_dump())})
 
 @router.post("/{pipeline_id}/{action}")
 def control_pipeline(pipeline_id: str, action: str, body: ControlPipelineRequest, request: Request):

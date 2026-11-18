@@ -16,14 +16,15 @@ export interface DiagramStage {
 }
 
 export interface DiagramNodeState {
+  inherited?: boolean
   status: 'unavailable' | 'pending' | 'running' | 'waiting' | 'completed' | 'skipped' | 'failed'
   active: boolean
   detail: string
   percent?: number
 }
 
-// The diagram preserves the original product map. Execution continues to use
-// the eight persisted backend steps; several visual nodes share one real job.
+// Preserve original module names and order. Legacy runs retain eight steps;
+// generation-start runs additionally own a real generation job.
 export const PIPELINE_DIAGRAM_STAGES: readonly DiagramStage[] = [
   { id: 'evaluation', label: '迭代评估', iconKey: 'TrendCharts', stepIds: [], children: [
     { id: 'seed-evaluation', label: '种子任务集评测' }, { id: 'badcase-extraction', label: 'BadCase 提取' },
@@ -54,6 +55,14 @@ export const PIPELINE_DIAGRAM_STAGES: readonly DiagramStage[] = [
     { id: 'trained-model-archive', label: '增训模型归档' },
   ] },
 ]
+
+export const PIPELINE_DIAGRAM_GROUPS = [
+  { id: 'evaluation', label: '模型评测', stageIds: ['evaluation'] },
+  { id: 'governance', label: '数据治理', stageIds: ['generation', 'collection', 'quality', 'publishing'] },
+  { id: 'training', label: '模型训练', stageIds: ['training', 'model-publishing'] },
+] as const
+
+function inherited(): DiagramNodeState { return { status: 'completed', active: false, inherited: true, detail: '前置环节 · 本轮不执行' } }
 
 const substageNodes: Record<string, string> = {
   classifying_and_observing: 'page-summary',
@@ -111,6 +120,21 @@ function describeStep(step: PipelineStep): string {
 }
 
 export function diagramNodeState(pipeline: Pipeline | null | undefined, node: DiagramNode): DiagramNodeState {
+  if (pipeline && ['seed-evaluation', 'badcase-extraction'].includes(node.id)) {
+    if (!pipeline.evaluation_run_id) return inherited()
+    if (node.id === 'badcase-extraction') {
+      const index = pipeline.evaluation?.index_state
+      return { status: index === 'ready' ? 'completed' : index === 'failed' ? 'failed' : 'waiting', active: index === 'pending', detail: index === 'ready' ? '已整理 BadCase 候选' : index === 'failed' ? 'BadCase 整理失败，可重试' : '等待整理评测结果' }
+    }
+    const status = pipeline.evaluation?.status
+    const complete = ['completed', 'succeeded', 'partial'].includes(status || '')
+    return { status: complete ? 'completed' : ['failed', 'interrupted', 'cancelled'].includes(status || '') ? 'failed' : status === 'running' ? 'running' : 'pending', active: !complete && status === 'running', detail: '关联评测 ' + pipeline.evaluation_run_id + (status ? ' · ' + status : '') }
+  }
+  if (node.id === 'badcase-augmentation' && pipeline) {
+    if (pipeline.start_mode !== 'generate') return inherited()
+    if (pipeline.generation_kind !== 'augmentation') return { status: 'skipped', active: false, detail: '本轮从场景生成任务，未使用 BadCase 扩增' }
+    return diagramNodeState(pipeline, { ...node, id: 'generation-job', stepId: 'generation' })
+  }
   if (!node.stepId) return unavailable()
   const step = pipeline?.steps.find(item => item.id === node.stepId)
   if (!step) return { status: 'pending', active: false, detail: pipeline ? '等待前置步骤' : '等待创建 Pipeline' }
@@ -126,6 +150,7 @@ export function diagramNodeState(pipeline: Pipeline | null | undefined, node: Di
 }
 
 export function diagramStageTarget(pipeline: Pipeline | null | undefined, stage: DiagramStage): PipelineStepId | undefined {
+  if (stage.id === 'generation' && pipeline?.start_mode === 'generate') return 'generation'
   const actionable = (step: PipelineStep) => step.status === 'running' || step.status === 'retry_waiting' || step.status === 'waiting' || step.status === 'failed'
   const steps = stage.stepIds.map(id => pipeline?.steps.find(step => step.id === id)).filter((step): step is PipelineStep => Boolean(step))
   return steps.find(step => step.id === pipeline?.current_step && actionable(step))?.id
@@ -133,6 +158,11 @@ export function diagramStageTarget(pipeline: Pipeline | null | undefined, stage:
 }
 
 export function diagramStageState(pipeline: Pipeline | null | undefined, stage: DiagramStage): DiagramNodeState {
+  if (pipeline && stage.id === 'evaluation') return diagramNodeState(pipeline, stage.children[0]!)
+  if (pipeline && stage.id === 'generation') {
+    if (pipeline.start_mode !== 'generate') return inherited()
+    return diagramNodeState(pipeline, { id: 'generation-job', label: stage.label, stepId: 'generation' })
+  }
   if (!stage.stepIds.length) return unavailable()
   const states = stage.children.map(node => diagramNodeState(pipeline, node))
   const target = diagramStageTarget(pipeline, stage)

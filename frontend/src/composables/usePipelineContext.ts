@@ -34,7 +34,7 @@ export function usePipelineContext(options: { batchId?: MaybeRefOrGetter<string>
   let pending: Promise<void> | undefined
   function clearTimer() { if (timer) clearTimeout(timer); timer = undefined }
   function publishNotice(value: Pipeline) {
-    if (value.release_id && !publishedBatch(value.batch_id)) notifyBatchesPublished({ batch_ids: [value.batch_id], release_id: value.release_id })
+    if (value.release_id && value.batch_id && !publishedBatch(value.batch_id)) notifyBatchesPublished({ batch_ids: [value.batch_id], release_id: value.release_id })
   }
   function schedule() {
     clearTimer()

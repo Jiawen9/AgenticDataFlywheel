@@ -144,7 +144,7 @@ async function loadData(silent = false) {
     api.datasetUploadCapabilities().then(value => { if (!disposed && epoch === loadEpoch) capabilities.value = value }).catch(() => { if (epoch === loadEpoch) capabilities.value = { internal: { configured: false, reason: '无法读取云道S3上传配置，请刷新重试' } } }),
     (typeof api.pipelineBindings === 'function' ? api.pipelineBindings() : Promise.resolve([])).then(values => {
       if (disposed || epoch !== loadEpoch) return
-      managedBatchIds.value = values.map(item => item.batch_id)
+      managedBatchIds.value = values.map(item => item.batch_id).filter((id): id is string => Boolean(id))
       candidates.value = activeBatchItems(candidateRead.items.value).filter(item => !managedBatchIds.value.includes(item.batch_id || ''))
     }),
   ])

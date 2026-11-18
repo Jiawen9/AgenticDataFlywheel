@@ -52,6 +52,7 @@ from .preprocessing_router import router as preprocessing_router, configure_prep
 from .trajectory_context import AnnotationVersionConflict
 from .training_data_overview.router import router as training_overview_router, get_manager as get_overview_manager
 from .pipeline_router import router as pipeline_router
+from .badcase_router import router as badcase_router
 from .pipelines import PipelineManager, PipelineRuntime
 from .pipeline_access import PipelineManagedError
 from .rollout_imports import RolloutImportStore
@@ -135,8 +136,10 @@ async def lifespan(app: FastAPI):
     from .phone_factory import store as factory_store
     pipeline_manager = PipelineManager(PipelineRuntime(DATA_ROOT, preprocessing=preprocessing_job_manager,
         tree=job_manager, quality=quality_job_manager, cot=cot_job_manager,
-        factory=factory_store, overview=manager), DATA_ROOT)
+        factory=factory_store, overview=manager, generation=task_generation_job_manager), DATA_ROOT)
     app.state.pipelines = pipeline_manager
+    from .task_generation.router import configure_pipeline_manager
+    configure_pipeline_manager(pipeline_manager)
     pipeline_manager.start()
     # Build small list projections in the background; authoritative records and
     # control revisions remain unchanged. One worker covers the shared database.
@@ -210,6 +213,7 @@ app.include_router(model_iter_router)
 app.include_router(preprocessing_router)
 app.include_router(rollout_import_router)
 app.include_router(training_overview_router)
+app.include_router(badcase_router)
 app.include_router(pipeline_router)
 app.include_router(display_identifiers_router)
 model_job_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="model-job")

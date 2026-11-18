@@ -92,6 +92,8 @@ const modelTrainingActive = computed(() => route.path.startsWith('/model-trainin
       </nav>
       <div class="sidebar-foot"><i></i> 本地数据服务</div>
     </aside>
-    <main class="app-main"><router-view /></main>
+    <main class="app-main"><div v-if="typeof route.query.pipeline_return_id === 'string'" class="pipeline-return-link"><span>来自 Pipeline {{ route.query.pipeline_return_id }}</span><router-link :to="{ path: '/pipeline', query: { pipeline_id: route.query.pipeline_return_id } }">返回 Pipeline</router-link></div><router-view /></main>
   </div>
 </template>
+
+<style scoped>.pipeline-return-link{display:flex;justify-content:space-between;gap:14px;flex-wrap:wrap;margin:14px 24px;padding:12px 16px;background:#eef8f4;border:1px solid #b8dacd;border-radius:8px;color:#375e51;font-size:12px}.pipeline-return-link a{color:#146b57}</style>

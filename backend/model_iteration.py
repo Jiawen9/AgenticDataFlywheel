@@ -280,6 +280,12 @@ def validate_results(value, run_id, expected_phones, *, expected_sources=None, m
 def capture_results(runtime, run, *, final=False, remote_status=None):
     record = runtime.records.get("model_iter_results", run["run_id"])
     if record and record.get("final"):
+        try:
+            from .badcases import schedule_refresh
+            schedule_refresh(runtime.root, run["run_id"], store=runtime.store)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception("BadCase candidate scheduling failed: %s", run["run_id"])
         return record["result"]
     request = run.get("request", {})
     expected_sources = None
@@ -318,4 +324,11 @@ def capture_results(runtime, run, *, final=False, remote_status=None):
             # saved and must not become an evaluation failure.
             import logging
             logging.getLogger(__name__).exception("评测分页索引保存失败：%s", run["run_id"])
+    # Derived feedback must never turn a valid evaluation into a sync failure.
+    try:
+        from .badcases import schedule_refresh
+        schedule_refresh(runtime.root, run["run_id"], store=runtime.store)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("BadCase candidate scheduling failed: %s", run["run_id"])
     return saved["result"]

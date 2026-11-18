@@ -185,7 +185,7 @@ async function confirmCorrection() {
 }
 watch(pipelineContext.historyOnly, value => { if (value) { ++batchRequest; ws.setSession(null); visibleExpandedTasks.value = []; loading.value = false } })
 watch(pipelineContext.sessionId, id => {
-  if (initialized && id && id !== session.value?.session_id && !publishedNotice.value) void loadBatch(pipelineContext.pipeline.value!.batch_id)
+  if (initialized && id && id !== session.value?.session_id && !publishedNotice.value && pipelineContext.pipeline.value?.batch_id) void loadBatch(pipelineContext.pipeline.value!.batch_id)
 })
 function beforeUnload(event: BeforeUnloadEvent) {
   if (hasUnsaved.value || busy.value) { event.preventDefault(); event.returnValue = '' }

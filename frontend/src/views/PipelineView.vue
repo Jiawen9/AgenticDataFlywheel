@@ -10,14 +10,16 @@ import { useSummaryPage } from '@/composables/useSummaryPage'
 import { invalidateSummaryCache } from '@/utils/summaryCache'
 import RolloutImportDialog from '@/components/RolloutImportDialog.vue'
 import type { RolloutImportResult } from '@/rolloutImportApi'
-import { PIPELINE_DIAGRAM_STAGES, diagramNodeState, diagramStageState, diagramStageTarget, type DiagramStage, type DiagramNodeState } from '@/utils/pipelineDiagram'
+import { PIPELINE_DIAGRAM_GROUPS, PIPELINE_DIAGRAM_STAGES, diagramNodeState, diagramStageState, diagramStageTarget, type DiagramStage, type DiagramNodeState } from '@/utils/pipelineDiagram'
+import PipelineEvaluationLink from '@/components/PipelineEvaluationLink.vue'
+import { pipelineLoopApi, loopRequestId, completeLoopRequest } from '@/pipelineLoopApi'
 import CollectionAgentSelect from '@/components/CollectionAgentSelect.vue'
 import PipelineModelFields from '@/components/PipelineModelFields.vue'
 import { modelDraft, modelOptions, modelBlockedReason } from '@/utils/pipelineModels'
 import { agentBlockedReason, agentLabel } from '@/utils/collectionAgents'
 import { repeatBlockedReason } from '@/utils/collectionRepeats'
 import { isCollectionResult } from '@/utils/collectionResults'
-import { factoryBatchesApi, newRunRequestId, phoneFactoryApi, type AgentCapabilities, type AgentType, type FactoryState } from '@/phoneFactoryApi'
+import { factoryBatchesApi, phoneFactoryApi, type AgentCapabilities, type AgentType, type FactoryState } from '@/phoneFactoryApi'
 import { usePipelineContext } from '@/composables/usePipelineContext'
 import { publishedBatch, subscribeBatchLifecycle } from '@/utils/batchLifecycle'
 import { retryProgress } from '@/utils/pipelineRetry'
@@ -43,7 +45,10 @@ const models = reactive(modelDraft())
 const newagentModels = reactive(modelDraft())
 const activeModels = computed(() => draft.agent_type === 'newagent' ? newagentModels : models)
 const collectionIssue = computed(() => agentBlockedReason(agentCapabilities.value, draft.agent_type, draft.capture_logprobs) || modelBlockedReason(agentCapabilities.value, draft.agent_type, activeModels.value) || repeatBlockedReason(agentCapabilities.value, draft.agent_type, draft.repeat_times))
-const draft = reactive({ agent_type: 'newagent' as AgentType, repeat_times: 1, name: '', batch_id: '', start_mode: 'existing' as 'existing' | 'collect', mode: 'manual' as 'manual' | 'automatic', cot_policy: 'generate' as 'generate' | 'skip', threshold: 3, phone_id: '', app: '', vla: '', sampling_enabled: false, temperature: 1, top_p: 1, use_experience_lib: false, capture_logprobs: false })
+const draft = reactive({ agent_type: 'newagent' as AgentType, repeat_times: 1, name: '', batch_id: '', start_mode: 'existing' as 'existing' | 'collect' | 'generate', generation_kind: 'initial' as 'initial' | 'augmentation', mode: 'manual' as 'manual' | 'automatic', cot_policy: 'generate' as 'generate' | 'skip', threshold: 3, phone_id: '', app: '', vla: '', sampling_enabled: false, temperature: 1, top_p: 1, use_experience_lib: false, capture_logprobs: false })
+const confirmingGeneration = ref(false)
+const collapsed = reactive<Record<string, boolean>>({})
+const groups = computed(() => PIPELINE_DIAGRAM_GROUPS.map(group => ({ ...group, stages: stages.value.filter(stage => (group.stageIds as readonly string[]).includes(stage.id)) })))
 let disposed = false, choicesGeneration = 0
 const requests = new Map<string, string>()
 const icons = { TrendCharts, DataAnalysis, Collection, Upload, Cpu, Promotion }
@@ -75,22 +80,32 @@ const runSignal = computed(() => {
   if (status === 'succeeded') return 'completed'
   if (status === 'failed' || status === 'published_summary_failed') return 'failed'
   if (status === 'retry_waiting') return 'retry'
-  if (status === 'paused' || status === 'waiting_for_correction') return 'paused'
+  if (status === 'paused' || status === 'waiting_for_correction' || status?.startsWith('waiting_for_generation')) return 'paused'
   if (status === 'running' || status === 'terminating') return 'running'
   return 'pending'
 })
 function visualClass(state: DiagramNodeState) {
   if (state.status === 'running' && !state.active) return 'is-pending'
-  return 'is-' + state.status
+  return 'is-' + state.status + (state.inherited ? ' is-inherited' : '')
 }
 function openStage(stage: DiagramStage) {
+  if (stage.id === 'evaluation') { void router.push({ path: '/model-iteration-evaluation', query: { evaluation_pipeline_id: pipeline.value?.pipeline_id, ...(pipeline.value?.evaluation_run_id ? { run_id: pipeline.value.evaluation_run_id } : {}) } }); return }
+  if (stage.id === 'generation' && pipeline.value?.start_mode !== 'generate') { void router.push({ path: '/task-generation/generate', query: { pipeline_return_id: pipeline.value?.pipeline_id, ...(pipeline.value?.generation_job_id ? { job_id: pipeline.value.generation_job_id } : {}) } }); return }
+  if (stage.id === 'training' || stage.id === 'model-publishing') { void router.push({ path: stage.id === 'training' ? '/model-training/launch' : '/model-publishing', query: { pipeline_return_id: pipeline.value?.pipeline_id } }); return }
   const target = diagramStageTarget(pipeline.value, stage)
   if (target) openStep(target)
+}
+function openNode(id: string, step: PipelineStepId | undefined, stage: DiagramStage) {
+  if (step) { openStep(step); return }
+  if (id === 'badcase-augmentation' && !(pipeline.value?.start_mode === 'generate' && pipeline.value.generation_kind === 'augmentation')) { void router.push({ path: '/task-generation/augmentation', query: { pipeline_return_id: pipeline.value?.pipeline_id } }); return }
+  const trainingPaths: Record<string, string> = { 'data-mixture': '/model-training/data-mixture', 'dataset-split': '/model-training/data-mixture', 'model-training': '/model-training/launch', 'training-validation': '/model-training/validation', 'trained-model-archive': '/model-publishing' }
+  if (trainingPaths[id]) { void router.push({ path: trainingPaths[id], query: { pipeline_return_id: pipeline.value?.pipeline_id } }); return }
+  openStage(stage)
 }
 function percentage(value: number | undefined) { return Number.isFinite(value) ? Math.max(0, Math.min(100, value!)) : undefined }
 const choices = computed(() => batches.value.filter(batch => draft.start_mode === 'collect' ? batch.collectible : batch.prepared && !publishedBatch(batch.batch_id)))
 const apps = computed(() => draft.phone_id ? factory.value.phoneApps.filter(row => row.phone_id === draft.phone_id).map(row => row.app) : factory.value.apps)
-const canSubmit = computed(() => Boolean(draft.name.trim() && draft.batch_id && choices.value.some(batch => batch.batch_id === draft.batch_id) && (draft.mode !== 'automatic' || (Number.isFinite(draft.threshold) && draft.threshold >= 0 && draft.threshold <= 5)) && (draft.start_mode !== 'collect' || draft.vla.trim())))
+const canSubmit = computed(() => confirmingGeneration.value ? Boolean(draft.vla.trim() && !collectionIssue.value && pipeline.value?.status === 'waiting_for_generation_review') : Boolean(draft.name.trim() && (draft.start_mode === 'generate' || (draft.batch_id && choices.value.some(batch => batch.batch_id === draft.batch_id))) && (draft.mode !== 'automatic' || (Number.isFinite(draft.threshold) && draft.threshold >= 0 && draft.threshold <= 5)) && (draft.start_mode !== 'collect' || draft.vla.trim())))
 const done = computed(() => pipeline.value?.steps.filter(step => ['succeeded', 'skipped'].includes(step.status)).length || 0)
 const currentError = computed(() => error.value || context.error.value || pipeline.value?.error || '')
 function state(id: PipelineStepId) { return pipeline.value?.steps.find(step => step.id === id) }
@@ -107,7 +122,7 @@ watch(historyList.loading, value => { loading.value = value })
 watch(historyList.error, value => { error.value = value })
 async function loadChoices(hydrateConfig = true) {
   const generation = ++choicesGeneration; choicesLoading.value = true
-  const [collection, prepared, state, config] = await Promise.allSettled([factoryBatchesApi.list(), api.preprocessingBatches(), phoneFactoryApi.state(), phoneFactoryApi.config()])
+  const [collection, prepared, state, config] = await Promise.allSettled([confirmingGeneration.value ? Promise.resolve([]) : factoryBatchesApi.list(), confirmingGeneration.value ? Promise.resolve([]) : api.preprocessingBatches(), phoneFactoryApi.state(), phoneFactoryApi.config()])
   if (typeof phoneFactoryApi.agentCapabilities === 'function') {
     try { const value = await phoneFactoryApi.agentCapabilities(); if (!disposed && generation === choicesGeneration) agentCapabilities.value = value.agent_types } catch { if (!disposed && generation === choicesGeneration) agentCapabilities.value = null }
   }
@@ -144,25 +159,55 @@ async function importedRollout(result: RolloutImportResult) {
   ElMessage.success('原始轨迹已登记。确认当前配置后，点击“创建并开始”接续处理。')
 }
 function openCreate() {
+  confirmingGeneration.value = false
   batchSearch.value = ''
   createError.value = ''; dialogVisible.value = true
-  Object.assign(draft, { name: '', batch_id: '', start_mode: 'existing', mode: 'manual', cot_policy: 'generate', threshold: 3, phone_id: '', app: '', vla: '' })
-  void loadChoices()
+  Object.assign(draft, { name: '', batch_id: '', start_mode: 'generate', generation_kind: 'initial', mode: 'manual', cot_policy: 'generate', threshold: 3, phone_id: '', app: '', vla: '' })
+  // Generation configuration does not depend on live collector availability.
 }
+async function openGenerationConfirm() {
+  confirmingGeneration.value = true; createError.value = ''; dialogVisible.value = true
+  draft.start_mode = 'collect'
+  await loadChoices()
+}
+watch(() => route.query.pipeline_id, () => { if (confirmingGeneration.value) { dialogVisible.value = false; choicesGeneration++ } })
+let reviewedPipeline = ''
+watch([pipeline, () => route.query.review_generation], ([value, review]) => {
+  if (value && review === '1' && value.status === 'waiting_for_generation_review' && reviewedPipeline !== value.pipeline_id) {
+    reviewedPipeline = value.pipeline_id; void openGenerationConfirm()
+  }
+})
+function collectionConfig() { return { ...modelOptions(draft.agent_type, activeModels.value), agent_type: draft.agent_type, repeat_times: draft.repeat_times, phone_id: draft.phone_id, app: draft.app, vla: draft.vla.trim(), config: { sampling_enabled: draft.sampling_enabled, temperature: draft.temperature, top_p: draft.top_p, use_experience_lib: draft.use_experience_lib, capture_logprobs: draft.capture_logprobs } } }
 async function create() {
+  if (confirmingGeneration.value) {
+    const target = pipeline.value
+    if (!target || !canSubmit.value || submitting.value) return
+    submitting.value = true; createError.value = ''
+    try {
+      const collection_config = collectionConfig()
+      const updated = await pipelineLoopApi.confirm(target.pipeline_id, { request_id: loopRequestId('confirm.' + target.pipeline_id, collection_config), expected_revision: target.storage_revision, collection_config })
+      if (disposed || pipeline.value?.pipeline_id !== target.pipeline_id) return
+      pipeline.value = updated; dialogVisible.value = false; invalidateSummaryCache(); void loadHistory()
+      ElMessage.success('任务和采集配置已冻结，后台继续执行')
+    } catch (cause) { if (!disposed && pipeline.value?.pipeline_id === target.pipeline_id) createError.value = (cause as Error).message }
+    finally { submitting.value = false }
+    return
+  }
+
   if (!canSubmit.value || submitting.value) return
   if (draft.start_mode === 'collect' && collectionIssue.value) { createError.value = collectionIssue.value; return }
   submitting.value = true; createError.value = ''
-  const body: Omit<CreatePipeline, 'request_id'> = { name: draft.name.trim(), batch_id: draft.batch_id, start_mode: draft.start_mode, mode: draft.mode,
+  const body: Omit<CreatePipeline, 'request_id'> = { name: draft.name.trim(), ...(draft.start_mode === 'generate' ? { generation_kind: draft.generation_kind } : { batch_id: draft.batch_id }), start_mode: draft.start_mode, mode: draft.mode,
     export_profile: 'corrected_selection_v1', cot_policy: draft.mode === 'manual' ? draft.cot_policy : 'generate',
     ...(draft.mode === 'automatic' ? { threshold: draft.threshold } : {}),
     ...(draft.start_mode === 'collect' ? { collection_config: { ...modelOptions(draft.agent_type, activeModels.value), agent_type: draft.agent_type, repeat_times: draft.repeat_times, phone_id: draft.phone_id, app: draft.app, vla: draft.vla.trim(), config: { sampling_enabled: draft.sampling_enabled, temperature: draft.temperature, top_p: draft.top_p, use_experience_lib: draft.use_experience_lib, capture_logprobs: draft.capture_logprobs } } } : {}),
   }
-  const key = JSON.stringify(body), requestId = requests.get(key) || newRunRequestId(); requests.set(key, requestId)
+  const key = JSON.stringify(body), requestId = requests.get(key) || loopRequestId('create-pipeline', body); requests.set(key, requestId)
   try {
     const created = await api.createPipeline({ ...body, request_id: requestId })
+    requests.delete(key); completeLoopRequest('create-pipeline', requestId)
     if (disposed) return
-    requests.delete(key); history.value = [created, ...history.value.filter(item => item.pipeline_id !== created.pipeline_id)].slice(0, historySize.value); invalidateSummaryCache(); void loadHistory()
+    history.value = [created, ...history.value.filter(item => item.pipeline_id !== created.pipeline_id)].slice(0, historySize.value); invalidateSummaryCache(); void loadHistory()
     dialogVisible.value = false; selectPipeline(created.pipeline_id); ElMessage.success('Pipeline 已交给后台执行')
   } catch (cause) { if (!disposed) createError.value = (cause as Error).message }
   finally { if (!disposed) submitting.value = false }
@@ -181,7 +226,7 @@ async function control(action: PipelineAction) {
 }
 watch(pipeline, value => { if (value) history.value = history.value.map(item => item.pipeline_id === value.pipeline_id ? value : item) })
 watch(() => draft.phone_id, () => { if (draft.app && !apps.value.includes(draft.app)) draft.app = '' })
-watch(() => draft.start_mode, () => { if (!choices.value.some(batch => batch.batch_id === draft.batch_id)) draft.batch_id = '' })
+watch(() => draft.start_mode, mode => { if (!choices.value.some(batch => batch.batch_id === draft.batch_id)) draft.batch_id = ''; if (dialogVisible.value && mode !== 'generate' && !confirmingGeneration.value) void loadChoices() })
 const unsubscribe = subscribeBatchLifecycle(event => {
   batches.value = batches.value.map(batch => event.batch_ids.includes(batch.batch_id) ? { ...batch, prepared: false } : batch)
   if (draft.start_mode === 'existing' && event.batch_ids.includes(draft.batch_id)) draft.batch_id = ''
@@ -197,10 +242,10 @@ onBeforeUnmount(() => { disposed = true; stopRetryClock(); choicesGeneration++; 
     <section class="circuit-shell">
       <header class="run-strip">
         <div class="run-signal" :class="'is-' + runSignal"><i></i><span>{{ pipeline ? pipelineStatusLabels[pipeline.status] : '等待创建或选择 Pipeline' }}</span></div>
-        <span v-if="pipeline" class="run-name">{{ pipeline.name }} · 结果批次 <DisplayId kind="batch" :id="pipeline.batch_id" /><template v-if="pipeline.task_source_batch_id"> · 任务来源 <DisplayId kind="batch" :id="pipeline.task_source_batch_id" /></template></span>
+        <span v-if="pipeline" class="run-name">{{ pipeline.name }} · 结果批次 <DisplayId v-if="pipeline.batch_id" kind="batch" :id="pipeline.batch_id" /><span v-else>待任务确认后创建</span><template v-if="pipeline.task_source_batch_id"> · 任务来源 <DisplayId kind="batch" :id="pipeline.task_source_batch_id" /></template></span>
         <span class="run-current">{{ pipeline ? currentStep?.label : '点击“新建 Pipeline”配置并启动一次迭代' }}</span>
         <div v-if="pipeline" class="run-controls">
-          <el-button v-if="pipeline.status === 'running' || pipeline.status === 'retry_waiting' || pipeline.status === 'waiting_for_correction'" size="small" :loading="controlling" @click="control('pause')">暂停</el-button>
+          <el-button v-if="pipeline.status === 'running' || pipeline.status === 'retry_waiting' || pipeline.status === 'waiting_for_correction' || pipeline.status.startsWith('waiting_for_generation')" size="small" :loading="controlling" @click="control('pause')">暂停</el-button>
           <el-button v-if="pipeline.status === 'paused'" size="small" type="primary" :loading="controlling" @click="control('resume')">继续</el-button>
           <el-button v-if="pipeline.status === 'failed' || pipeline.status === 'published_summary_failed'" size="small" type="primary" :loading="controlling" @click="control('retry')">{{ pipeline.status === 'published_summary_failed' ? '重试汇总' : '重试' }}</el-button>
           <el-button v-if="!PIPELINE_TERMINAL.includes(pipeline.status) && pipeline.status !== 'terminating'" size="small" :disabled="controlling" @click="control('terminate')">终止</el-button>
@@ -224,6 +269,8 @@ onBeforeUnmount(() => { disposed = true; stopRetryClock(); choicesGeneration++; 
           <span v-for="job in currentStep.job_ids" :key="job" class="job-id"><DisplayId :kind="childJobKind(currentStep.id)" :id="job" /></span>
         </div>
         <div class="run-links">
+          <el-button v-if="pipeline.start_mode === 'generate'" type="primary" @click="openStep('generation')">{{ pipeline.generation_job_id ? '查看／审核生成任务' : '配置任务生成' }}</el-button>
+          <el-button v-if="pipeline.status === 'waiting_for_generation_review'" type="primary" data-testid="confirm-generation" @click="openGenerationConfirm">确认任务并继续采集</el-button>
           <div v-for="item in auxiliarySteps" :key="item.id" class="auxiliary-step">
             <el-button :type="pipeline.current_step === item.id ? 'primary' : undefined" :plain="pipeline.current_step === item.id" size="small" :data-testid="'pipeline-step-' + item.id" :title="state(item.id)?.error || state(item.id)?.message || ''" @click="openStep(item.id)">{{ item.label }} · {{ state(item.id) ? pipelineStepLabels[state(item.id)!.status] : '等待前置步骤' }}</el-button>
             <el-progress v-if="state(item.id)?.status === 'running' && percentage(state(item.id)?.percent) !== undefined" :percentage="percentage(state(item.id)?.percent)" />
@@ -235,26 +282,30 @@ onBeforeUnmount(() => { disposed = true; stopRetryClock(); choicesGeneration++; 
       </div>
       <div class="circuit-scroll">
         <div class="circuit-board">
-          <div class="main-bus"></div>
-          <section v-for="(stage, index) in stages" :key="stage.id" class="stage-column" :style="{ gridColumn: index + 1 }">
-            <button type="button" class="stage-node" :class="visualClass(stage.state)" :disabled="!pipeline || !stage.stepIds.length" :data-status="stage.state.status" :data-testid="'pipeline-stage-' + stage.id" :title="stage.state.detail" :aria-label="stage.label" @click="openStage(stage)">
-              <span class="node-order">{{ String(index + 1).padStart(2, '0') }}</span>
+          <section v-for="group in groups" :key="group.id" class="macro-group" :class="'macro-' + group.id" :data-testid="'pipeline-group-' + group.id">
+          <header class="macro-heading"><strong>{{ group.label }}</strong><button @click="collapsed[group.id] = !collapsed[group.id]" :aria-expanded="!collapsed[group.id]">{{ collapsed[group.id] ? '展开步骤' : '收起步骤' }}</button></header>
+          <div class="macro-stages">
+          <section v-for="(stage, index) in group.stages" :key="stage.id" class="stage-column" :style="{ gridColumn: index + 1 }">
+            <button type="button" class="stage-node" :class="visualClass(stage.state)" :disabled="!pipeline" :data-status="stage.state.status" :data-testid="'pipeline-stage-' + stage.id" :title="stage.state.detail" :aria-label="stage.label" @click="openStage(stage)">
+              <span class="node-order">{{ String(PIPELINE_DIAGRAM_STAGES.findIndex(item => item.id === stage.id) + 1).padStart(2, '0') }}</span>
               <span class="node-core"><el-icon><component :is="icons[stage.iconKey]" /></el-icon></span>
-              <strong>{{ stage.label }}</strong>
+              <strong>{{ stage.label }}<small v-if="stage.state.inherited" class="inherited-note">本轮不执行</small></strong>
               <el-icon v-if="stage.state.status === 'completed'" class="node-state"><Check /></el-icon>
               <el-icon v-else-if="stage.state.status === 'failed'" class="node-state"><WarningFilled /></el-icon>
             </button>
-            <div v-if="index < stages.length - 1" class="bus-segment" :class="stage.stepIds.length && stages[index + 1]?.stepIds.length ? visualClass(stage.state) : 'is-unavailable'"><i></i></div>
-            <div class="branch" :class="visualClass(stage.state)">
-              <button v-for="node in stage.children" :key="node.id" type="button" class="step-node" :class="visualClass(node.state)" :disabled="!pipeline || !node.stepId" :data-status="node.state.status" :data-active="node.state.active" :data-testid="'pipeline-node-' + node.id" :title="node.state.detail" @click="node.stepId && openStep(node.stepId)">
+            <div v-if="index < group.stages.length - 1" class="bus-segment" :class="stage.stepIds.length && group.stages[index + 1]?.stepIds.length ? visualClass(stage.state) : 'is-unavailable'"><i></i></div>
+            <div v-show="!collapsed[group.id]" class="branch" :class="visualClass(stage.state)">
+              <button v-for="node in stage.children" :key="node.id" type="button" class="step-node" :class="visualClass(node.state)" :disabled="!pipeline" :data-status="node.state.status" :data-active="node.state.active" :data-testid="'pipeline-node-' + node.id" :title="node.state.detail" @click="openNode(node.id, node.stepId, stage)">
                 <span class="branch-wire" :class="visualClass(node.state)"></span>
                 <i class="step-port"><el-icon v-if="node.state.status === 'completed'"><Check /></el-icon></i>
                 <span>{{ node.label }}</span>
               </button>
             </div>
           </section>
+          </div></section>
         </div>
       </div>
+      <PipelineEvaluationLink v-if="pipeline" :key="pipeline.pipeline_id" :pipeline="pipeline" @updated="pipeline = $event" />
       <footer v-if="pipeline" class="run-footer">创建于 {{ date(pipeline.created_at) }}</footer>
     </section>
     <section class="history-panel"><div class="history-heading"><h2>运行记录</h2><span>共 {{ historyList.counts.value?.total ?? '—' }} · 活动 {{ historyList.counts.value?.active ?? '—' }} · 异常 {{ historyList.counts.value?.abnormal ?? '—' }}</span><el-input v-model="historySearch" clearable placeholder="搜索编号、批次或名称" style="max-width:280px" /><el-select v-model="historyStatus" style="width:130px" aria-label="运行状态"><el-option value="all" label="全部状态" /><el-option value="active" label="活动运行" /><el-option value="abnormal" label="异常运行" /></el-select><el-button size="small" :loading="loading" @click="loadHistory"><el-icon><Refresh /></el-icon>刷新</el-button></div>
@@ -263,7 +314,7 @@ onBeforeUnmount(() => { disposed = true; stopRetryClock(); choicesGeneration++; 
       <p v-if="historyList.data.value?.updated_at">最近更新：{{ date(historyList.data.value.updated_at) }}</p>
 <div class="history-latest" v-if="historyList.latest.value.length"><span>最近 3 次：</span><el-button v-for="run in historyList.latest.value" :key="run.pipeline_id" link @click="selectPipeline(run.pipeline_id)">{{ run.name || run.pipeline_id }}</el-button></div>
       <el-table :data="filteredHistory" stripe empty-text="暂无 Pipeline，点击右上角新建" @row-click="(row: Pipeline) => selectPipeline(row.pipeline_id)">
-        <el-table-column label="名称" min-width="180"><template #default="{ row }"><div>{{ row.name }}</div><DisplayId kind="pipeline" :id="row.pipeline_id" /></template></el-table-column><el-table-column label="任务来源" min-width="150"><template #default="{ row }"><DisplayId kind="batch" :id="row.task_source_batch_id || row.batch_id" /></template></el-table-column><el-table-column label="采集结果批次" min-width="180"><template #default="{ row }"><DisplayId kind="batch" :id="row.batch_id" /><small v-if="!row.task_source_batch_id"> · 历史批次</small></template></el-table-column>
+        <el-table-column label="名称" min-width="180"><template #default="{ row }"><div>{{ row.name }}</div><DisplayId kind="pipeline" :id="row.pipeline_id" /></template></el-table-column><el-table-column label="任务来源" min-width="150"><template #default="{ row }"><DisplayId v-if="row.task_source_batch_id || row.batch_id" kind="batch" :id="row.task_source_batch_id || row.batch_id" /><span v-else>待生成</span></template></el-table-column><el-table-column label="采集结果批次" min-width="180"><template #default="{ row }"><DisplayId v-if="row.batch_id" kind="batch" :id="row.batch_id" /><span v-else>尚未创建</span><small v-if="row.batch_id && !row.task_source_batch_id"> · 历史批次</small></template></el-table-column>
         <el-table-column label="模式" width="120"><template #default="{ row }">{{ row.mode === 'manual' ? '人工修正' : '自动发布' }}</template></el-table-column>
         <el-table-column label="状态" min-width="160"><template #default="{ row }">{{ pipelineStatusLabels[row.status as Pipeline['status']] }}</template></el-table-column>
         <el-table-column label="创建时间" min-width="165"><template #default="{ row }">{{ date(row.created_at) }}</template></el-table-column>
@@ -271,18 +322,22 @@ onBeforeUnmount(() => { disposed = true; stopRetryClock(); choicesGeneration++; 
       </el-table>
       <el-pagination v-if="historyList.data.value?.counts_complete" v-model:current-page="historyPage" v-model:page-size="historySize" :page-sizes="[10,20,50]" :total="historyList.total.value" layout="total, sizes, prev, pager, next" />
     </section>
-    <el-dialog v-model="dialogVisible" title="新建 Pipeline" width="620px" :close-on-click-modal="!submitting" :close-on-press-escape="!submitting" :show-close="!submitting" destroy-on-close>
+    <el-dialog v-model="dialogVisible" :title="confirmingGeneration ? '确认任务并继续采集' : '新建 Pipeline'" width="620px" :close-on-click-modal="!submitting" :close-on-press-escape="!submitting" :show-close="!submitting" destroy-on-close>
       <el-alert v-if="createError" :title="createError" type="warning" :closable="false" />
       <el-form label-position="top" :disabled="submitting">
+        <template v-if="!confirmingGeneration">
         <el-form-item label="名称" required><el-input v-model="draft.name" maxlength="100" placeholder="例如：手机采集批次验收" /></el-form-item>
-        <el-form-item label="起点" required><el-radio-group v-model="draft.start_mode"><el-radio-button value="existing">接续已有结果</el-radio-button><el-radio-button value="collect">下发采集</el-radio-button></el-radio-group></el-form-item>
-        <el-form-item :label="draft.start_mode === 'collect' ? '任务来源' : '采集结果批次'" required><el-select v-model="draft.batch_id" filterable :filter-method="(value: string) => batchSearch = value" :loading="choicesLoading" :placeholder="draft.start_mode === 'collect' ? '选择可复用的任务来源' : '选择已有轨迹的未发布结果批次'" style="width:100%"><el-option v-for="batch in visibleChoices" :key="batch.batch_id" :label="`${displayId('batch', batch.batch_id)}${batch.label && batch.label !== batch.batch_id ? ' · ' + batch.label : ''} · ${batch.task_count} 个任务`" :value="batch.batch_id" /></el-select></el-form-item>
+        <el-form-item label="起点" required><el-radio-group v-model="draft.start_mode"><el-radio-button value="generate">从任务生成开始</el-radio-button><el-radio-button value="existing">接续已有结果</el-radio-button><el-radio-button value="collect">下发采集</el-radio-button></el-radio-group></el-form-item>
+        <el-form-item v-if="draft.start_mode !== 'generate'" :label="draft.start_mode === 'collect' ? '任务来源' : '采集结果批次'" required><el-select v-model="draft.batch_id" filterable :filter-method="(value: string) => batchSearch = value" :loading="choicesLoading" :placeholder="draft.start_mode === 'collect' ? '选择可复用的任务来源' : '选择已有轨迹的未发布结果批次'" style="width:100%"><el-option v-for="batch in visibleChoices" :key="batch.batch_id" :label="`${displayId('batch', batch.batch_id)}${batch.label && batch.label !== batch.batch_id ? ' · ' + batch.label : ''} · ${batch.task_count} 个任务`" :value="batch.batch_id" /></el-select></el-form-item>
+        <el-form-item v-if="draft.start_mode === 'generate'" label="任务生成方式"><el-radio-group v-model="draft.generation_kind"><el-radio value="initial">场景生成</el-radio><el-radio value="augmentation">BadCase 扩增</el-radio></el-radio-group><p class="form-hint">创建后进入现有生成页面配置；审核一次后接续采集。</p></el-form-item>
         <p v-if="draft.start_mode === 'collect'" class="form-hint">本次流程会创建独立结果批次，后续预处理、质检和发布仅处理本次采集。</p>
         <el-form-item v-if="draft.start_mode === 'existing'"><el-button :disabled="choicesLoading || submitting" data-testid="open-rollout-import" @click="rolloutImportVisible = true">导入已有 Rollout</el-button><span class="form-hint">已有本地轨迹尚未登记时，从这里添加新批次。</span></el-form-item>
         <el-form-item label="处理模式" required><el-radio-group v-model="draft.mode"><el-radio-button value="manual">人工修正</el-radio-button><el-radio-button value="automatic">自动发布</el-radio-button></el-radio-group></el-form-item>
         <p class="form-hint">{{ draft.mode === 'manual' ? '默认每任务 Top1，可额外勾选多条；确认后导出每条的全部保留步骤。' : '每任务选择一条达标的最高分轨迹，未达标任务跳过；发布成功后整个批次结束处理。' }}</p>
         <el-form-item v-if="draft.mode === 'manual'" label="修正后处理"><el-radio-group v-model="draft.cot_policy"><el-radio-button value="generate">生成 COT</el-radio-button><el-radio-button value="skip">OPD：跳过 COT</el-radio-button></el-radio-group><p v-if="draft.cot_policy === 'skip'" class="form-hint">保留全部未删除步骤，导出 thought 为空，不调用 COT 或标框模型。</p></el-form-item>
         <el-form-item v-if="draft.mode === 'automatic'" label="Rubric G 阈值（0～5）" required><el-input-number v-model="draft.threshold" :min="0" :max="5" :step="0.1" /></el-form-item>
+        </template>
+        <el-alert v-if="confirmingGeneration" title="确认当前生成作业的全部未删除任务。这里保存本轮采集配置，确认后由后台继续。" type="info" :closable="false" />
         <template v-if="draft.start_mode === 'collect'">
           <el-form-item label="采集引擎"><CollectionAgentSelect v-model="draft.agent_type" :capabilities="agentCapabilities" /></el-form-item>
           <el-alert v-if="collectionIssue" :title="collectionIssue" type="warning" :closable="false" />
@@ -292,7 +347,7 @@ onBeforeUnmount(() => { disposed = true; stopRetryClock(); choicesGeneration++; 
           <div class="form-grid"><el-form-item label="采集 Logprobs"><el-switch v-model="draft.capture_logprobs" /></el-form-item><el-form-item label="采样"><el-switch v-model="draft.sampling_enabled" /></el-form-item><el-form-item label="经验库"><el-switch v-model="draft.use_experience_lib" /></el-form-item><el-form-item label="temperature"><el-input-number v-model="draft.temperature" :min="0" :max="2" :step="0.1" /></el-form-item><el-form-item label="top_p"><el-input-number v-model="draft.top_p" :min="0" :max="1" :step="0.05" /></el-form-item></div>
         </template>
       </el-form>
-      <template #footer><el-button :disabled="submitting" @click="dialogVisible = false">取消</el-button><el-button type="primary" :disabled="!canSubmit || choicesLoading || (draft.start_mode === 'collect' && Boolean(collectionIssue))" :loading="submitting" @click="create">创建并开始</el-button></template>
+      <template #footer><el-button :disabled="submitting" @click="dialogVisible = false">取消</el-button><el-button type="primary" :disabled="!canSubmit || choicesLoading || (draft.start_mode === 'collect' && Boolean(collectionIssue))" :loading="submitting" @click="create">{{ confirmingGeneration ? '确认并继续采集' : '创建并开始' }}</el-button></template>
     </el-dialog>
     <RolloutImportDialog v-model="rolloutImportVisible" @imported="importedRollout" />
   </div>
@@ -428,4 +483,38 @@ onBeforeUnmount(() => { disposed = true; stopRetryClock(); choicesGeneration++; 
 
 <style scoped>
 .run-retry{display:flex;flex-wrap:wrap;align-items:center;gap:5px 12px;width:100%;padding:8px 10px;border:1px solid #fcd34d;border-radius:8px;background:#fffbeb;color:#92400e;font-size:12px;overflow-wrap:anywhere}.run-retry strong{font-weight:600}.run-retry span{min-width:0}.run-signal.is-retry{color:#b45309}.run-signal.is-retry i{background:#f59e0b;box-shadow:0 0 0 4px rgba(245,158,11,.13)}
+</style>
+
+<style scoped>
+.circuit-board{
+  --stage-width:clamp(112px,calc((100vw - 580px) / 7),176px);
+  --stage-gap:12px;
+  display:flex;justify-content:space-between;gap:14px;
+  width:100%;min-width:max-content;min-height:460px;padding:20px 16px;box-sizing:border-box
+}
+.macro-group{border:1px solid #b8cddd;border-radius:12px;background:#f0f6fb;padding:16px 12px;flex-shrink:0}
+.macro-governance{border-color:#a7cfc1;background:#eff8f3}
+.macro-training{border-color:#c6b8da;background:#f7f3fb}
+.macro-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;color:#294657;margin-bottom:52px;font-size:14px;white-space:nowrap}
+.macro-heading button{border:0;background:transparent;color:#336e61;font-size:11px;cursor:pointer}
+.macro-stages{display:grid;grid-auto-flow:column;grid-auto-columns:var(--stage-width);gap:var(--stage-gap)}
+.macro-stages .branch,.macro-stages .step-node{width:var(--stage-width)}
+.macro-stages .stage-node strong{width:var(--stage-width);font-size:14px}
+.macro-stages .step-node{padding:0 6px}
+.macro-stages .branch:before,.macro-stages .branch-wire,.macro-stages .step-port{left:50%;transform:translateX(-50%)}
+.macro-stages .bus-segment{left:calc(50% + 22px);width:calc(var(--stage-width) + var(--stage-gap) - 44px)}
+.inherited-note{display:block;margin-top:5px;color:#386c5d;font-size:10px;font-weight:normal}
+.stage-node.is-inherited,.stage-node.is-inherited .node-core{background:#f0f9f5;border-color:#519883;color:#2b7561;box-shadow:none}
+.stage-node.is-inherited strong{color:#2b6d5b}.stage-node.is-inherited .node-state{background:#519883}
+.step-node.is-inherited{border-color:#a1c6b9;background:#f4faf7;color:#376e5c}
+.stage-node:disabled,.step-node:disabled{cursor:default}.stage-node,.step-node{cursor:pointer}
+@media(max-width:760px){
+  :global(body:has(.pipeline-page)){min-width:0}
+  .pipeline-page{padding:12px}.circuit-scroll{overflow:visible}
+  .circuit-board{--stage-width:176px;display:flex;flex-direction:column;width:auto;min-width:0;padding:12px}
+  .macro-group{min-width:0;padding:14px}.macro-stages{display:flex;flex-wrap:wrap;gap:50px 12px;justify-content:center}
+  .macro-heading{margin-bottom:50px}.bus-segment{display:none}
+  .run-strip{height:auto;min-height:50px;flex-wrap:wrap;padding:12px}.run-name{max-width:100%}
+  .run-controls{flex-wrap:wrap}.run-workspace{padding:12px}
+}
 </style>

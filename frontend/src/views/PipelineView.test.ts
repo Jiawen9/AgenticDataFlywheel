@@ -15,6 +15,28 @@ vi.mock('@/composables/usePipelineContext', () => ({
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
 describe('Pipeline collection configuration', () => {
+  it('retries uncertain creation once but starts a fresh request after acknowledged success', async () => {
+    const create = vi.spyOn(api, 'createPipeline')
+      .mockRejectedValueOnce(new Error('response lost'))
+      .mockResolvedValue({ pipeline_id: 'created' } as never)
+    vi.spyOn(api, 'pipelinePage').mockResolvedValue({ items: [], latest: [], total: 0, counts: {}, counts_complete: true } as never)
+    const app = createSSRApp(PipelineView)
+    app.use(createRouter({ history: createMemoryHistory(), routes: [{ path: '/:pathMatch(.*)*', component: { render: () => null } }] }))
+    let view: any
+    app.mixin({ created() { if (this.$options.__name === 'PipelineView') view = this.$.setupState } })
+    const empty = defineComponent({ setup: () => () => h('div') })
+    for (const name of ['pagination', 'button', 'icon', 'alert', 'progress', 'table', 'table-column', 'input', 'select', 'option', 'dialog']) app.component('el-' + name, empty)
+    await renderToString(app)
+    view.openCreate(); view.draft.name = 'same name and configuration'
+    await view.create()
+    expect(view.createError).toBe('response lost')
+    await view.create()
+    expect(create.mock.calls[1]![0].request_id).toBe(create.mock.calls[0]![0].request_id)
+    view.openCreate(); view.draft.name = 'same name and configuration'
+    await view.create()
+    expect(create.mock.calls[2]![0].request_id).not.toBe(create.mock.calls[1]![0].request_id)
+  })
+
   it('searches a display alias while preserving the full batch ID in collection requests', async () => {
     const batchId = 'manual_' + 'a'.repeat(64)
     const alias = 'b261026-001'
