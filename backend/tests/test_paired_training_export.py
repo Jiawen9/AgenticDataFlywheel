@@ -265,6 +265,43 @@ class PairedServiceTests(unittest.TestCase):
         self.assertEqual((adapter.calls[-1].source_dir / "train.jsonl").read_bytes(), original)
         self.assertTrue(adapter.calls[-1].bucket_path.startswith("training/separate/"))
 
+    def test_pipeline_publication_preserves_coordinates_after_action_edit(self):
+        from backend import pipeline_release
+        from backend.coordinate_info import edit_contract
+
+        f, pipeline, session = self.f.fixture, self.f.pipeline, self.f.session
+        row = session["snapshot_payload"]["groups"][0]["rows"][0]
+        original_action = {"action": "click", "coordinate": [118, 647]}
+        corrected_action = {"action": "click", "coordinate": [123, 652]}
+        contract = edit_contract({"space": "normalized", "reason": "newagent_legacy",
+                                  "normalization_base": 1000, "source_action": original_action},
+                                 corrected_action, row["image"])
+        session["row_edits"][str(row["excel_row"])] = {
+            "actions": json.dumps(corrected_action), "coordinate_info": contract,
+        }
+        session = f.records.put("correction_sessions", session["session_id"], session)
+        pipeline.update(export_profile="corrected_selection_v1", cot_policy="skip",
+                        training_image_prefix="s3://fixture-bucket/images/", session_id=session["session_id"],
+                        confirmation=pipeline_release.confirm_manual(session["session_id"], root=f.root))
+        release = f.publish(pipeline)
+
+        path, _ = f.registry.excel_file(release["release_id"], 0)
+        book = load_workbook(path, read_only=True)
+        try:
+            rows = book.active.iter_rows(values_only=True)
+            columns = next(rows)
+            edited = next(dict(zip(columns, values)) for values in rows
+                          if values[columns.index("image")] == row["image"])
+        finally:
+            book.close()
+        self.assertEqual(json.loads(edited["coordinate_info"]), contract)
+        self.assertEqual(json.loads(edited["action"]), corrected_action)
+        artifact = f.store.read_payload(release["source_refs"][0]["artifact"])
+        published_rows = next(iter(artifact["sheets"].values()))
+        self.assertEqual(next(r["coordinate_info"] for r in published_rows if r["image"] == row["image"]), contract)
+        self.assertEqual(release["training_files"][0]["status"], "ready")
+        self.assertEqual(f.publish(pipeline)["release_id"], release["release_id"])
+
     def test_pipeline_retry_preserves_original_image_prefix(self):
         from backend import pipeline_release
         f, p, s = self.f.fixture, self.f.pipeline, self.f.session

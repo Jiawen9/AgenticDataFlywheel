@@ -60,7 +60,7 @@ class RubricRepairDeadlineTests(unittest.IsolatedAsyncioTestCase):
 
 
 class QualityDeadlinePipelineTests(unittest.TestCase):
-    def test_real_deadline_stops_at_three_attempts_and_keeps_manual_retry(self):
+    def test_real_deadline_respects_legacy_three_attempt_policy_and_keeps_manual_retry(self):
         calls = []
 
         async def request_that_never_returns(**kwargs):
@@ -102,8 +102,10 @@ class QualityDeadlinePipelineTests(unittest.TestCase):
             runtime = Runtime(root)
             runtime.ready_stages.update({"preprocessing", "tree"})
             manager = PipelineManager(runtime, root)
-            pipeline = manager.create({"request_id": "deadline-test", "name": "offline deadlines",
-                "batch_id": "batch", "mode": "automatic", "start_mode": "existing", "threshold": 4})
+            from backend.pipelines import RETRY_POLICY
+            with patch("backend.pipelines.new_retry_policy", return_value=RETRY_POLICY):
+                pipeline = manager.create({"request_id": "deadline-test", "name": "offline deadlines",
+                    "batch_id": "batch", "mode": "automatic", "start_mode": "existing", "threshold": 4})
 
             def advance(target):
                 for _ in range(12):
