@@ -168,6 +168,11 @@ class DatasetUploadJobManager(DirectoryUploadJobsMixin, InternalUploadJobsMixin)
                include_trajectories: bool = False, destination_prefix: str | None = None,
                retry_job_id: str | None = None, training_jsonl: bool = False,
                training_only: bool = False, training_destination_prefix: str | None = None) -> dict[str, Any]:
+        release = self.registry.get(release_id)
+        if release is None:
+            raise FileNotFoundError("数据集发布记录不存在")
+        if release.get("source_kind") == "external_manual" and (release.get("external_import") or {}).get("format") == "jsonl":
+            raise ValueError("历史训练 JSONL 已登记来源，平台仅提供查看和下载")
         if training_only:
             if target != "internal":
                 raise ValueError("训练 JSONL 上传只支持云道目标")
@@ -194,9 +199,6 @@ class DatasetUploadJobManager(DirectoryUploadJobsMixin, InternalUploadJobsMixin)
             raise ValueError("未知上传目标")
         if self.mode != "mock":
             raise ValueError("当前版本仅支持 DATASET_UPLOAD_MODE=mock")
-        release = self.registry.get(release_id)
-        if release is None:
-            raise FileNotFoundError("数据集发布记录不存在")
         if release.get("upload_status") in {"queued", "uploading"}:
             raise ValueError("该数据集正在上传")
         job_id = allocate_id("j", self.registry.data_root)

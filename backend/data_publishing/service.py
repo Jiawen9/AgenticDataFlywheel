@@ -210,6 +210,14 @@ class DatasetReleaseRegistry:
                 available = available and self.resolve_project_path(str(item)).is_dir()
             except ValueError:
                 available = False
+        imported = value.get("external_import") or {}
+        if value["source_kind"] == "external_manual" and imported.get("format") == "jsonl":
+            for item in value.get("training_files", []):
+                try:
+                    item["available"] = io_path(self.resolve_project_path(item["path"])).is_file()
+                except (KeyError, OSError, ValueError):
+                    item["available"] = False
+                available = available and item["available"]
         value["local_available"] = available
         return value
 

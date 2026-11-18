@@ -18,12 +18,13 @@ from ..data_store.artifacts import _write_bytes, _write_tables, _json_bytes, _sh
 from ..data_store.paths import contained_path
 from ..data_store.registry import utc_now
 from ..pipeline_retry_errors import failure_from_exception
-from .converter import ALL_DATA_COLUMNS, convert_release
+from .converter import ALL_DATA_COLUMNS, JSONL_MANUAL_RECORD_SOURCE, convert_release
 from .read_cache import OverviewReadCache
 
 log = logging.getLogger(__name__)
 CONVERSIONS = "training_overview_conversions"
 CATALOG = "training_overview_catalog"
+EXTERNAL_MANUAL_SOURCES = {"external_step_data_source", JSONL_MANUAL_RECORD_SOURCE}
 
 
 def _present(value) -> bool:
@@ -69,7 +70,7 @@ def _manual_number(value) -> float:
 def _manual_coverage(row: dict) -> tuple[int, int]:
     """Use step coverage from new external imports; keep frozen v1 semantics."""
     steps = row["step数量"]
-    if row.get("manual_record_source") == "external_step_data_source":
+    if row.get("manual_record_source") in EXTERNAL_MANUAL_SOURCES:
         known, unknown = row.get("manual_known_steps"), row.get("manual_unknown_steps")
         if type(known) is int and type(unknown) is int and known >= 0 and unknown >= 0 and known + unknown == steps:
             return known, unknown
@@ -91,10 +92,11 @@ def summarize(catalog: dict | None, conversions: list[dict], filters: dict) -> d
     all_rows = catalog.get("rows", [])
     rows = [r for r in all_rows if _matches(r, filters)]
     counts = _counts(rows)
-    flywheel = [r for r in rows if "数据飞轮" in str(r.get("生产方式", ""))]
-    external_marked = [r for r in rows if r.get("manual_record_source") == "external_step_data_source"]
+    flywheel = [r for r in rows if "数据飞轮" in str(r.get("生产方式", ""))
+                and r.get("manual_record_source") != JSONL_MANUAL_RECORD_SOURCE]
+    external_marked = [r for r in rows if r.get("manual_record_source") in EXTERNAL_MANUAL_SOURCES]
     manual_rows = [r for r in rows if "数据飞轮" in str(r.get("生产方式", ""))
-                   or r.get("manual_record_source") == "external_step_data_source"]
+                   or r.get("manual_record_source") in EXTERNAL_MANUAL_SOURCES]
     show_manual = ((bool(flywheel) and any("人工精修步骤数量" in r for r in all_rows))
                    or any(_manual_coverage(r)[0] > 0 for r in external_marked))
     coverage = [_manual_coverage(r) for r in rows]
@@ -119,8 +121,10 @@ def summarize(catalog: dict | None, conversions: list[dict], filters: dict) -> d
         scene_groups[f"{row.get('一级场景')}-{second}"].append(row)
         actions.update(row["action_box"])
         if _present(row.get("轨迹")) and _present(row.get("step数量")):
-            # DEV subtracts one record per subtask, including zero-step records.
-            steps[row["轨迹"]] += row["step数量"] - 1
+            # Historical JSONL counts trained samples verbatim. DEV-backed rows
+            # retain their convention of subtracting one record per subtask.
+            offset = 0 if row.get("manual_record_source") == JSONL_MANUAL_RECORD_SOURCE else 1
+            steps[row["轨迹"]] += row["step数量"] - offset
     trend, cumulative = [], {"total_trajectories": 0, "subtask_trajectories": 0, "total_steps": 0}
     for day, items in sorted(day_groups.items()):
         for key, value in _counts(items).items():

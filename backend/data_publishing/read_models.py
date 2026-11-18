@@ -14,6 +14,9 @@ def project_release(payload: dict) -> dict:
     training = payload.get("training_files") if isinstance(payload.get("training_files"), list) else []
     value["training_count"] = len(training)
     value["training_ready_count"] = sum(item.get("status") == "ready" and bool(item.get("included_count")) for item in training if isinstance(item, dict))
+    imported = payload.get("external_import") or {}
+    if payload.get("source_kind") == "external_manual" and imported.get("format") == "jsonl":
+        value["external_import"] = {"data_source": imported["data_source"]}
     upload = payload.get("internal_upload") if isinstance(payload.get("internal_upload"), dict) else {}
     value["internal_upload"] = {key: upload[key] for key in (
         "job_id", "status", "completed_at", "completed_files", "total_files", "percent",
