@@ -6,7 +6,7 @@ from backend.file_io import io_path
 
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Response
 from fastapi.responses import FileResponse
 
 from ..data_store import RevisionConflict
@@ -165,13 +165,21 @@ def correction_session_cot(session_id: str, group_id: str | None = None) -> dict
 
 
 @router.get("/sessions/{session_id}/tasks")
-def correction_tasks(session_id: str, view: str = "", offset: int = Query(0, ge=0), limit: int = Query(10, ge=1, le=50), search: str = "", status: str = "", unit: str = "group") -> dict[str, object]:
+def correction_tasks(session_id: str, response: Response, view: str = "", offset: int = Query(0, ge=0), limit: int = Query(10, ge=1, le=50),
+                     search: str = "", status: str = "", unit: str = "group", task_id: str = "",
+                     expected_revision: int | None = None) -> dict[str, object]:
     try:
+        if view == "tree":
+            from .tree_workspace import get_task_tree
+            response.headers["Cache-Control"] = "no-store"
+            return get_task_tree(session_id, task_id, expected_revision)
         if view == "summary":
-            return get_group_page(session_id, offset=offset, limit=limit, search=search, status=status, unit=unit)
+            return get_group_page(session_id, offset=offset, limit=limit, search=search, status=status, unit=unit, task_id=task_id)
         return {"groups": get_groups(session_id)}
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="修正任务不存在") from exc
     except RevisionConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (OSError, TypeError, ValueError) as exc:

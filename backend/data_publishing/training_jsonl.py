@@ -17,6 +17,7 @@ from PIL import Image
 from ..data_store.release_provenance import FrozenReleaseSources
 from ..file_io import io_path, resolve_path
 from ..export_markers import action_value
+from ..trajectory_correction.export_policy import PAIRED_EXPORT_PROFILES
 from .upload_sources import _Scope, _batch_id, _text
 
 VERSION = "training_jsonl_v1"
@@ -148,7 +149,7 @@ def release_rows(registry, release, items):
                         if not any(_text(value) for value in cells):
                             continue
                     image = str(excel_row.get("image") or "").replace("\\", "/")
-                    metadata = (frozen_rows.get(number, {}) if payload.get("export_profile") == "corrected_selection_v1" else {}) or scope.images.get(image, {})
+                    metadata = (frozen_rows.get(number, {}) if payload.get("export_profile") in PAIRED_EXPORT_PROFILES else {}) or scope.images.get(image, {})
                     row = {**metadata, **excel_row}
                     row["actions"] = excel_row.get("actions", excel_row.get("action", metadata.get("actions", metadata.get("action"))))
                     row.update(source_table=index, source_sheet=sheet.title, source_excel_row=number, cot_policy=payload.get("cot_policy", "generate"), batch_id=batch)

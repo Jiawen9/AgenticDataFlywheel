@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { useCorrectionWorkspace, type ActionDecision } from './useCorrectionWorkspace'
 import { correctionTasks } from '@/utils/correctionTasks'
+import { correctionNodeDecision, findTargetRow } from '@/utils/correctionTree'
 import type { CorrectionGroup, CorrectionGroupSummary, CorrectionRow, CorrectionSession } from '@/types'
 
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value))
@@ -16,7 +17,7 @@ function fixture(controls: { readOnly?: () => boolean; managed?: () => boolean }
   const groups: CorrectionGroup[] = [0, 1, 2, 3].map((index) => {
     const trajectory = index < 3 ? `TASK-A-${index + 1}` : 'TASK-B-1'
     const rows: CorrectionRow[] = [0, 1].map((step) => ({
-      excel_row: index * 2 + step + 2, step: step + 1, task: index < 3 ? '任务甲' : '任务乙', meta_task: trajectory,
+      excel_row: index * 2 + step + 2, step: step + 1, step_key: `${trajectory}:${step}`, task: index < 3 ? '任务甲' : '任务乙', meta_task: trajectory,
       image: `${trajectory}/step${step}.jpg`, image_url: '', xml: '', actions: '{"action":"click","coordinate":[10,20]}', action: { action: 'click' },
       sop: `原始 SOP ${index}-${step}`, summary: '点击搜索', task_manual_result: '', micro_manual: '', macro_manual: '', micro_pred: '', macro_pred: '',
       Bad_Interval: '', trajectory_quality_type: '', actions_box: '', deleted: false, edited: false, action_edited: false, sop_edited: false, edit_status: '',
@@ -63,13 +64,13 @@ describe('correction task list and protected workbench', () => {
     await ws.exportData('skip', ' s3://bucket/训练图片/ ')
     await ws.exportData('skip', 's3://bucket/训练图片/')
     expect(api.correctionDatasetExport).toHaveBeenLastCalledWith('old-session', undefined,
-      { export_profile: 'corrected_selection_v1', cot_policy: 'skip', training_image_prefix: 's3://bucket/训练图片/' })
+      { export_profile: 'opd_prefix_v1', cot_policy: 'skip', training_image_prefix: 's3://bucket/训练图片/' })
     expect(ws.session.value!.exports).toHaveLength(1)
     expect(ws.session.value!.groups).toEqual(before)
     await ws.exportData(undefined, 'ignored for legacy')
     expect(api.correctionExport).toHaveBeenCalledWith('old-session')
   })
-  it('sends OPD as an explicit complete export and keeps all group choices', async () => {
+  it('sends OPD with the versioned prefix export and keeps all group choices', async () => {
     const { ws, api, groups } = fixture()
     await ws.toggleExport(groups[0]!)
     await ws.toggleExport(groups[1]!)
@@ -77,7 +78,7 @@ describe('correction task list and protected workbench', () => {
     const result = await ws.exportData('skip')
     expect(result?.filename).toBe('data_e1.xlsx')
     expect(api.correctionDatasetExport).toHaveBeenCalledWith('old-session', undefined,
-      { export_profile: 'corrected_selection_v1', cot_policy: 'skip' })
+      { export_profile: 'opd_prefix_v1', cot_policy: 'skip' })
     expect(api.correctionExport).not.toHaveBeenCalled()
   })
   it('groups three trajectories under one case ID, keeps tie order and old-session metadata', () => {
@@ -109,6 +110,30 @@ describe('correction task list and protected workbench', () => {
     await ws.toggleTask('TASK-A')
     expect(ws.openGroupId.value).toBe('')
     expect(ws.expandedTasks.value).toEqual(['TASK-B'])
+  })
+
+  it('edits the chosen occurrence of a shared node and rejects a stale step mapping', async () => {
+    const { ws, api, feedback, groups } = fixture()
+    const targets = groups.slice(0, 2).map((group, index) => ({
+      group_id: group.group_id, trajectory_id: group.meta_task, step: group.rows[index]!.step,
+      step_key: group.rows[index]!.step_key!, excel_row: group.rows[index]!.excel_row, edited: false, deleted: false,
+    }))
+    const [first, second] = targets as [typeof targets[number], typeof targets[number]]
+    expect(correctionNodeDecision(targets, '').choices).toEqual(targets)
+    expect(correctionNodeDecision(targets, first.group_id).target).toEqual(first)
+    await ws.openTask('TASK-A')
+    expect(await ws.focusStep(first.group_id, group => findTargetRow(group, first))).toBe(true)
+    ws.actionDraft.value = '{"action":"wait"}'
+    feedback.actionDecision.mockResolvedValueOnce('cancel')
+    expect(await ws.focusStep(second.group_id, group => findTargetRow(group, second))).toBe(false)
+    expect(ws.activeRow.value?.excel_row).toBe(first.excel_row)
+    feedback.actionDecision.mockResolvedValueOnce('discard')
+    expect(await ws.focusStep(second.group_id, group => findTargetRow(group, second))).toBe(true)
+    await ws.saveAction('{"action":"wait"}')
+    expect(api.patchCorrectionRow).toHaveBeenCalledExactlyOnceWith('old-session', second.excel_row, { actions: '{"action":"wait"}' })
+    expect(ws.session.value?.groups.every(group => !group.export)).toBe(true)
+    expect(await ws.focusStep(second.group_id, group => findTargetRow(group, { ...second, step_key: first.step_key }))).toBe(false)
+    expect(ws.activeRow.value?.excel_row).toBe(second.excel_row)
   })
 
   it('ignores a delayed trajectory response after a faster selection', async () => {

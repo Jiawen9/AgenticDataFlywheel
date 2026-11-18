@@ -12,6 +12,7 @@ from .data_store.artifacts import _identifier
 from .data_store.registry import utc_now
 from .identifiers import ID_SCHEME, allocate_id
 from .pipeline_access import TERMINAL, active_pipeline
+from .trajectory_correction.export_policy import validate_export_policy
 
 WAIT_CONFIG = "waiting_for_generation_config"
 WAIT_REVIEW = "waiting_for_generation_review"
@@ -54,10 +55,10 @@ def create(manager, data):
             or not math.isfinite(threshold) or not 0 <= threshold <= 5):
         raise _error("自动发布总分阈值必须在 0～5 之间", 422)
     profile, cot_policy = data.get("export_profile"), data.get("cot_policy")
-    if profile not in {None, "corrected_selection_v1"} or cot_policy not in {None, "generate", "skip"}:
-        raise _error("不支持的导出或 COT 策略", 422)
-    if cot_policy is not None and profile is None:
-        raise _error("COT 策略需要明确的导出配置", 422)
+    try:
+        validate_export_policy(profile, cot_policy, automatic=mode == "automatic")
+    except ValueError as exc:
+        raise _error(str(exc), 422) from exc
     fingerprint, key = _digest(data), _digest(request_id)
     with manager.artifacts.batch_lock("pipeline_create"):
         old = manager.records.get("pipeline_requests", key)

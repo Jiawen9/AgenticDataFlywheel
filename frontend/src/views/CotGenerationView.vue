@@ -339,7 +339,7 @@ async function exportDataset(complete = false, cotPolicy: 'generate' | 'skip' = 
   const sessionId = selectedSessionId.value
   try {
     const result = await api.correctionDatasetExport(sessionId, sessionCot.value?.storage_revision ?? selectedHeader.value?.storage_revision,
-      complete ? { export_profile: 'corrected_selection_v1', cot_policy: cotPolicy } : undefined)
+      complete ? { export_profile: cotPolicy === 'skip' ? 'opd_prefix_v1' : 'corrected_selection_v1', cot_policy: cotPolicy } : undefined)
     if (disposed || sessionId !== selectedSessionId.value) return
     if (result.storage_revision !== undefined && sessionCot.value) sessionCot.value.storage_revision = result.storage_revision
     window.open(correctionDownloadUrl(selectedSessionId.value, result.filename), '_blank', 'noopener')
@@ -407,7 +407,7 @@ onBeforeUnmount(() => { document.removeEventListener('visibilitychange', resumeP
       <DisplayId v-if="selectedBatchId" kind="batch" :id="selectedBatchId" />
       <el-button type="primary" :loading="saving && jobRunning" :disabled="pipelineReadOnly || !selectedSessionId || !editedRows || jobRunning || hasUnsaved || !selectedHeader?.eligible_cot_row_count" @click="generateAll">批量生成 bbox + COT</el-button>
       <el-button type="success" :loading="exporting" :disabled="pipelineReadOnly || !selectedSessionId || jobRunning || hasUnsaved || saving" @click="exportDataset(true)">导出已选完整轨迹</el-button>
-      <el-button :loading="exporting" :disabled="pipelineReadOnly || !selectedSessionId || jobRunning || hasUnsaved || saving" @click="exportDataset(true, 'skip')">OPD 导出（thought 为空）</el-button>
+      <el-button :loading="exporting" :disabled="pipelineReadOnly || !selectedSessionId || jobRunning || hasUnsaved || saving" @click="exportDataset(true, 'skip')">OPD 导出（截至首个修正动作）</el-button>
       <el-button :loading="exporting" :disabled="pipelineReadOnly || !selectedSessionId || !editedRows || jobRunning || hasUnsaved || saving" @click="exportDataset(false)">旧版完整表导出</el-button>
       <el-button :icon="Refresh" text :disabled="loadingCot || jobRunning || hasUnsaved" @click="refreshCot">刷新</el-button>
     </section>

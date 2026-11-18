@@ -9,6 +9,7 @@ from openpyxl import load_workbook
 from backend.tests import test_pipeline_release, test_pipelines
 from backend import pipeline_release
 from backend.trajectory_correction import service, draft_store
+from backend.trajectory_correction.export_policy import OPD_PREFIX_PROFILE
 from backend.trajectory_correction.session_state import fingerprint, reconcile, reviews_for_group
 from backend.trajectory_correction.selected_export import project_selected
 
@@ -26,12 +27,12 @@ class CompleteSelectionTests(TestCase):
             self.session["group_exports"][group["group_id"]] = True
         self.session = f.records.put("correction_sessions", self.session["session_id"], self.session)
 
-    def project(self, policy="skip"):
+    def project(self, policy="skip", **options):
         f, s = self.fixture, self.session
         confirmation = pipeline_release.confirm_manual(s["session_id"], root=f.root)
         tree, quality, table, snapshot, _ = pipeline_release._validate_source(confirmation["selection"], f.root)
         return project_selected(session=s, snapshot=snapshot, table=table, selection=confirmation["selection"],
-                                cot_policy=policy, tree_payload=tree, quality_payload=quality)
+                                cot_policy=policy, tree_payload=tree, quality_payload=quality, **options)
 
     def test_full_steps_skip_thought_flags_and_source_immutability(self):
         s = self.session
@@ -121,6 +122,43 @@ class CompleteSelectionTests(TestCase):
         self.assertEqual(payload["cot_policy"], "skip")
         self.assertEqual(len(payload["selection"]["selected_trajectory_ids"]["A"]), 2)
 
+    def test_opd_prefix_uses_first_active_effective_action_per_trajectory(self):
+        s = self.session
+        first, second, third, fourth = s["snapshot_payload"]["groups"]
+        def row_key(group, position):
+            return str(group["rows"][position]["excel_row"])
+        action = {"actions": '{"action":"click","coordinate":[1,2]}'}
+        s["row_edits"] = {
+            row_key(first, 0): {"actions": '{ "action" : "wait" }', "sop": "manual SOP"},
+            row_key(first, 1): action,
+            row_key(first, 2): action,
+            row_key(second, 0): {**action, "deleted": True},
+            row_key(second, 1): action,
+            row_key(third, 0): {"sop": "manual SOP only"},
+        }
+        self.fixture.records.put("correction_sessions", s["session_id"], s)
+        payload = self.project(export_profile=OPD_PREFIX_PROFILE)
+        self.assertEqual(payload["export_profile"], OPD_PREFIX_PROFILE)
+        self.assertEqual([len(group["rows"]) for group in payload["groups"]], [2, 1, 3, 3])
+        self.assertEqual([item["opd_cutoff_step"] for item in payload["selection"]["tasks"]],
+                         [first["rows"][1]["step"], second["rows"][1]["step"], None, None])
+        self.assertEqual(len(self.project()["groups"][0]["rows"]), 3)
+        self.assertEqual(len(fourth["rows"]), 3)
+        self.assertTrue(all(row["thought"] == "" for rows in payload["sheets"].values() for row in rows))
+
+    def test_pipeline_opd_release_freezes_cutoff_and_skips_cot(self):
+        f, p, s = self.fixture, self.pipeline, self.session
+        first = s["snapshot_payload"]["groups"][0]
+        s["row_edits"][str(first["rows"][0]["excel_row"])] = {"actions": '{"action":"click","coordinate":[1,2]}'}
+        f.records.put("correction_sessions", s["session_id"], s)
+        p.update(export_profile=OPD_PREFIX_PROFILE, cot_policy="skip", session_id=s["session_id"],
+                 confirmation=pipeline_release.confirm_manual(s["session_id"], root=f.root))
+        with patch("backend.data_publishing.paired_training.image_prefix", return_value="s3://bucket/images/"):
+            release = f.publish(p)
+        self.assertEqual(release["step_count"], 10)
+        self.assertEqual(release["training_files"][0]["included_count"], 10)
+        self.assertEqual(f.publish(p)["release_id"], release["release_id"])
+
     def test_service_export_is_short_and_policy_specific_without_changing_draft(self):
         f, s = self.fixture, self.session
         with patch.object(draft_store, "CORRECTION_SESSIONS_DIR", f.root / "sessions"), \
@@ -158,13 +196,14 @@ class OpdSchedulingTests(TestCase):
         self.addCleanup(f.doCleanups)
         f.runtime.cot_needed = True
         f.runtime.ready_stages.update({"preprocessing", "tree", "quality"})
-        p = f.create("manual", export_profile="corrected_selection_v1", cot_policy="skip")
+        p = f.create("manual", export_profile=OPD_PREFIX_PROFILE, cot_policy="skip")
         p = f.tick(p, 5)
         p = f.control(p, "confirm-correction", session_revision=4)
         p = f.tick(p, 3)
         self.assertFalse(any(step == "cot" for step, _ in f.runtime.calls))
         self.assertEqual(p["steps"][5]["status"], "skipped")
         self.assertEqual(p["cot_policy"], "skip")
+        self.assertEqual(p["export_profile"], OPD_PREFIX_PROFILE)
 
 
 class OrdinarySelectionFlowTests(TestCase):

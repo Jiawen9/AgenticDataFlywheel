@@ -56,6 +56,20 @@ describe('lazy correction and COT pages', () => {
     expect(state.activeRow.excel_row).toBe(2)
     expect(calls.correctionSessionCot).not.toHaveBeenCalled()
   })
+  it('locates an exact correction task from the Quality deep link outside the first page', async () => {
+    route.query = { batch_id: 'batch-one', correction_task_id: 't-one', correction_trajectory_id: 'tr-one', correction_step: '4' }
+    calls.session.mockResolvedValue({
+      ...header,
+      selection: { tasks: [{ task_id: 't-one', trajectory_id: 'tr-one', global_score: 4 }] },
+    })
+    const state = mount(CorrectionView)
+    await flush()
+    expect(calls.groups).toHaveBeenCalledExactlyOnceWith('session-one', { offset: 0, limit: 10, unit: 'task', task_id: 't-one' })
+    expect(state.visibleExpandedTasks).toEqual(['t-one'])
+    expect(state.linkedTrajectoryId).toBe('tr-one')
+    expect(state.linkedStep).toBe(4)
+    expect(calls.createCorrectionSession).not.toHaveBeenCalled()
+  })
   it('bulk generation covers the frozen session, not only the visible page', async () => {
     route.query = { session_id: 'session-one' }
     const state = mount(CotGenerationView); await flush()

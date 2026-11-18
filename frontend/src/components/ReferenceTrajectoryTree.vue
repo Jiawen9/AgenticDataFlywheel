@@ -8,6 +8,9 @@ const props = defineProps<{
   selectedId?: number
   nodeScores?: Record<string, QualityNodeScore>
   highlightTrajectoryId?: string
+  focusId?: number
+  keyNodeIds?: readonly number[]
+  editedNodes?: Record<string, { edited: number; total: number }>
 }>()
 
 const emit = defineEmits<{
@@ -36,6 +39,7 @@ const highlightedPath = computed(() => trajectoryPath(props.root, props.highligh
 const highlightedNodes = computed(() => new Set(highlightedPath.value.nodeIds))
 const highlightedEdges = computed(() => new Set(highlightedPath.value.edgeIds))
 const topology = computed(() => treeTopology(props.root))
+const keyNodes = computed(() => new Set(props.keyNodeIds))
 
 const layout = computed(() => {
   const nodes: LayoutNode[] = []
@@ -87,6 +91,11 @@ const sceneTransform = computed(
 )
 
 function resetView() {
+  const focus = layout.value.nodes.find((item) => item.node.id === props.focusId)
+  if (focus && svg.value?.clientWidth) {
+    viewport.value = { x: Math.min(0, svg.value.clientWidth * .4 - focus.x), y: svg.value.clientHeight / 2 - focus.y, scale: 1 }
+    return
+  }
   const root = layout.value.nodes.find((item) => item.node.id === props.root.id)
   const height = svg.value?.clientHeight || 610
   if (!root) return
@@ -146,6 +155,10 @@ watch(topology, async () => {
   await nextTick()
   resetView()
 })
+watch(() => props.focusId, async () => {
+  await nextTick()
+  resetView()
+})
 
 onMounted(() => {
   void nextTick(resetView)
@@ -178,10 +191,12 @@ onMounted(() => {
           class="reference-node"
           :class="{ selected: selectedId === item.node.id, 'reference-node--highlighted': highlightedNodes.has(item.node.id) }"
           :transform="`translate(${item.x}, ${item.y})`"
+          :data-node-id="item.node.id"
           role="button"
           tabindex="0"
           @click.stop="selectNode(item.node)"
           @keydown.enter.stop="selectNode(item.node)"
+          @keydown.space.stop.prevent="selectNode(item.node)"
         >
           <circle class="page-ring" r="27" />
           <circle :class="['action-dot', `action-dot--${item.actionClass}`]" r="20" />
@@ -199,6 +214,10 @@ onMounted(() => {
             cy="-20"
             r="7"
           />
+          <path v-if="keyNodes.has(item.node.id)" d="M -26,-25 l 7,-7 7,7 -7,7 z" class="reference-key-step" />
+          <text v-if="editedNodes?.[item.node.id]?.edited" x="33" y="45" class="reference-refined">
+            ✓{{ editedNodes[item.node.id].total > 1 ? ` ${editedNodes[item.node.id].edited}/${editedNodes[item.node.id].total}` : '' }}
+          </text>
           <text class="quality-score" x="33" y="29">
             {{ nodeScoreLabel(item.score, item.node.id === root.id) }}
           </text>
@@ -212,7 +231,7 @@ onMounted(() => {
       <button type="button" title="缩小" @click="zoomBy(0.84)">－</button>
       <button type="button" class="tree-controls__reset" @click="resetView">初始视角</button>
     </div>
-    <div class="tree-hint">Q 为经过该节点的有效融合分均值 · 分数后标注部分评分覆盖 · 点击终点查看各条轨迹</div>
+    <div class="tree-hint"><slot name="hint">Q 为经过该节点的有效融合分均值 · 分数后标注部分评分覆盖 · 点击终点查看各条轨迹</slot></div>
   </div>
 </template>
 
@@ -231,13 +250,15 @@ onMounted(() => {
 .action-dot--click { fill: #2f80ed; }
 .action-dot--swipe { fill: #f2994a; }
 .action-dot--other { fill: #27ae60; }
-.reference-node:hover .action-dot { stroke: #67b7ff; stroke-width: 3; }
+.reference-node:hover .action-dot, .reference-node:focus-visible .action-dot { stroke: #67b7ff; stroke-width: 3; }
 .reference-node.selected .action-dot { stroke: #ffd166; stroke-width: 4; filter: drop-shadow(0 0 5px rgba(255,209,102,.8)); }
 .reference-node text { fill: #dce7f5; font-size: 12px; pointer-events: none; }
 .reference-node .node-count { font-weight: 750; }
 .reference-node .node-action { font-weight: 700; }
 .reference-node .node-summary { fill: #91a6c0; font-size: 10px; }
 .terminal { fill: #ffd166; stroke: #0b1220; stroke-width: 1; }
+.reference-key-step { fill: #f0abfc; stroke: #0b1220; stroke-width: 1.5; pointer-events: none; }
+.reference-node .reference-refined { fill: #86efac; font-size: 11px; font-weight: 800; }
 .reference-node .quality-score { fill: #f8fafc; font-size: 11px; font-weight: 800; }
 .tree-controls { position: absolute; top: 14px; left: 14px; z-index: 4; display: flex; overflow: hidden; border: 1px solid #58708f; border-radius: 6px; background: rgba(17,24,39,.92); box-shadow: 0 6px 18px rgba(0,0,0,.3); }
 .tree-controls button { min-width: 34px; height: 32px; padding: 0 9px; border: 0; border-right: 1px solid #354158; background: transparent; color: #dce7f5; cursor: pointer; }

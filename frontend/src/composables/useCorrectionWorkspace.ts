@@ -25,6 +25,7 @@ export function useCorrectionWorkspace(api: WorkspaceApi, feedback: Feedback) {
   const groupError = ref('')
   const savingCount = ref(0)
   const guarding = ref(false)
+  const treeRefreshVersion = ref(0)
   const cache = new Map<string, CorrectionGroup>()
   // Summary mutations may advance the session without reading this group's
   // rows. Keep the detail snapshot's revision separate from summary metadata.
@@ -110,6 +111,7 @@ export function useCorrectionWorkspace(api: WorkspaceApi, feedback: Feedback) {
         if (cacheRevisions.get(cacheKey) === revision) cacheRevisions.set(cacheKey, result.storage_revision)
       }
       applySummary({ ...result.group, storage_revision: result.storage_revision ?? result.group.storage_revision })
+      ++treeRefreshVersion.value
       return true
     })
   }
@@ -139,8 +141,8 @@ export function useCorrectionWorkspace(api: WorkspaceApi, feedback: Feedback) {
     } finally { guarding.value = false }
   }
 
-  async function loadGroup(groupId: string) {
-    if (!session.value) return
+  async function loadGroup(groupId: string, findRow?: (group: CorrectionGroup) => CorrectionRow | undefined): Promise<boolean> {
+    if (!session.value) return false
     clearDetail()
     openGroupId.value = groupId
     const sessionId = session.value.session_id, version = epoch, request = ++detailRequest
@@ -149,18 +151,49 @@ export function useCorrectionWorkspace(api: WorkspaceApi, feedback: Feedback) {
     try {
       const cached = cache.get(cacheKey)
       const group = cached && cacheRevisions.get(cacheKey) === session.value?.storage_revision ? cached : await api.correctionGroup(sessionId, groupId)
-      if (epoch !== version || request !== detailRequest) return
+      if (epoch !== version || request !== detailRequest) return false
+      if (group.group_id !== groupId) throw new Error('返回的轨迹与当前选择不一致')
       if (olderRevision(group.storage_revision)) throw new Error('批次已有更新，请重新加载轨迹')
+      const target = findRow?.(group)
+      if (findRow && !target) throw new Error('该节点与修正步骤的对应关系已变化，请重新加载任务')
       if (group.storage_revision !== undefined && session.value) session.value.storage_revision = group.storage_revision
       cache.set(cacheKey, group)
       cacheRevisions.set(cacheKey, group.storage_revision)
       activeGroup.value = group
-      selectRow(group.rows.find((row) => row.excel_row === rememberedRows.get(cacheKey)) ?? group.rows.find((row) => !row.deleted) ?? group.rows[0] ?? null)
+      selectRow(target ?? group.rows.find((row) => row.excel_row === rememberedRows.get(cacheKey)) ?? group.rows.find((row) => !row.deleted) ?? group.rows[0] ?? null)
+      return true
     } catch (error) {
       if (epoch === version && request === detailRequest) groupError.value = error instanceof Error ? error.message : String(error)
+      return false
     } finally {
       if (epoch === version && request === detailRequest) loadingGroup.value = false
     }
+  }
+
+  async function openTask(taskId: string) {
+    if ((expandedTasks.value[0] || '') === taskId) return true
+    const version = epoch
+    if (!await prepareTransition() || epoch !== version) return false
+    clearDetail()
+    expandedTasks.value = taskId ? [taskId] : []
+    return true
+  }
+
+  async function focusStep(groupId: string, findRow: (group: CorrectionGroup) => CorrectionRow | undefined) {
+    const sessionId = session.value?.session_id
+    if (!sessionId) return false
+    const version = epoch
+    if (!await prepareTransition() || epoch !== version) return false
+    const current = activeGroup.value
+    if (current?.group_id === groupId && cacheRevisions.get(key(sessionId, groupId)) === session.value?.storage_revision) {
+      const row = findRow(current)
+      if (!row) { feedback.error('请重新加载任务，确认当前轨迹步骤'); return false }
+      if (row.excel_row !== activeRowId.value) selectRow(row)
+      return true
+    }
+    const ok = await loadGroup(groupId, findRow)
+    if (!ok && groupError.value) feedback.error(groupError.value)
+    return ok
   }
 
   async function toggleTask(taskId: string) {
@@ -215,11 +248,12 @@ export function useCorrectionWorkspace(api: WorkspaceApi, feedback: Feedback) {
     await trackWrite(async () => {
       if (cotPolicy && !api.correctionDatasetExport) throw new Error('当前接口不支持已选轨迹导出，请同步前端接口适配')
       output = cotPolicy && api.correctionDatasetExport
-        ? await api.correctionDatasetExport(current.session_id, current.storage_revision, { export_profile: 'corrected_selection_v1', cot_policy: cotPolicy,
+        ? await api.correctionDatasetExport(current.session_id, current.storage_revision, { export_profile: cotPolicy === 'skip' ? 'opd_prefix_v1' : 'corrected_selection_v1', cot_policy: cotPolicy,
           ...(trainingImagePrefix?.trim() ? { training_image_prefix: trainingImagePrefix.trim() } : {}) })
         : current.storage_revision === undefined ? await api.correctionExport(current.session_id) : await api.correctionExport(current.session_id, current.storage_revision)
       if (output.storage_revision !== undefined) current.storage_revision = output.storage_revision
       current.exports = [output, ...current.exports.filter(item => item.export_id !== output!.export_id)]
+      if (session.value === current) ++treeRefreshVersion.value
       return true
     })
     return output
@@ -239,5 +273,5 @@ export function useCorrectionWorkspace(api: WorkspaceApi, feedback: Feedback) {
     })
   }
 
-  return { session, tasks, expandedTasks, openGroupId, activeGroup, activeRow, actionDraft, actionRevision, loadingGroup, groupError, savingCount, guarding, busy, hasUnsaved, setSession, loadGroup, reviewGroup, toggleTask, toggleTrajectory, chooseRow, saveAction, toggleExport, toggleDeleted, prepareTransition, exportData }
+  return { session, tasks, expandedTasks, openGroupId, activeGroup, activeRow, actionDraft, actionRevision, loadingGroup, groupError, savingCount, guarding, busy, hasUnsaved, treeRefreshVersion, setSession, loadGroup, openTask, focusStep, reviewGroup, toggleTask, toggleTrajectory, chooseRow, saveAction, toggleExport, toggleDeleted, prepareTransition, exportData }
 }

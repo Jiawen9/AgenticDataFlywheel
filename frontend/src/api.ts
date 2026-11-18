@@ -3,7 +3,7 @@ import { activeBatchItems, notifyBatchesPublished } from '@/utils/batchLifecycle
 import type { Pipeline, CreatePipeline, PipelineAction } from './types/pipeline'
 import type { BuildJob, CorrectionBatch, CorrectionCotJob, CorrectionCotResponse, CorrectionExport, CorrectionGroup, CorrectionGroupSummary, CorrectionRecommendation, CorrectionSession, DatasetRelease, DatasetReleaseCandidate, DatasetUploadJob, KnowledgeBaseSummary, QualityJob, RunQualitySummary, TaskGenerationExport, TaskGenerationJob, TaskGenerationResult, TaskGenerationTree, TaskGenerationSelection, TaskGenerationTreeNode, TaskQualityResult, TaskSummary, TrajectoryRecord, TrajectorySummary, TrajectoryTreeNode, TreeRun } from './types'
 
-import type { AugmentationPreview, CollectionSourceRun, CollectionSourceTask, DatasetUploadCapabilities, DatasetUploadOptions, PreprocessingBatch, PreprocessingJob, StageArtifact, TrajectoryScope } from './types'
+import type { AugmentationPreview, CollectionSourceRun, CollectionSourceTask, CorrectionExportProfile, DatasetUploadCapabilities, DatasetUploadOptions, PreprocessingBatch, PreprocessingJob, StageArtifact, TrajectoryScope } from './types'
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
 
@@ -294,7 +294,7 @@ export const api = {
   correctionExport(sessionId: string, expectedRevision?: number): Promise<CorrectionExport> {
     return request(`/api/correction/sessions/${encodeURIComponent(sessionId)}/export`, { method: 'POST', body: JSON.stringify({ expected_revision: expectedRevision }) })
   },
-  correctionDatasetExport(sessionId: string, expectedRevision?: number, options?: { export_profile: 'corrected_selection_v1'; cot_policy: 'generate' | 'skip'; training_image_prefix?: string }): Promise<CorrectionExport> {
+  correctionDatasetExport(sessionId: string, expectedRevision?: number, options?: { export_profile: CorrectionExportProfile; cot_policy: 'generate' | 'skip'; training_image_prefix?: string }): Promise<CorrectionExport> {
     return request(`/api/correction/sessions/${encodeURIComponent(sessionId)}/dataset-export`, { method: 'POST', body: JSON.stringify({ expected_revision: expectedRevision, ...options }) })
   },
   async datasetReleaseCandidates(): Promise<DatasetReleaseCandidate[]> {

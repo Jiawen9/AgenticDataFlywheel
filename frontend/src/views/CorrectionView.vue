@@ -16,6 +16,7 @@ import { readPageApi } from '@/readPageApi'
 import { useSummaryPage } from '@/composables/useSummaryPage'
 import type { CorrectionBatch, CorrectionRow } from '@/types'
 import CorrectionWorkbench from '@/components/CorrectionWorkbench.vue'
+import CorrectionTreeTask from '@/components/CorrectionTreeTask.vue'
 import { useCorrectionWorkspace, type ActionDecision } from '@/composables/useCorrectionWorkspace'
 
 const route = useRoute(), router = useRouter()
@@ -35,6 +36,14 @@ const loading = ref(true)
 const pageError = ref('')
 const actionPrompt = ref(false)
 const exportPolicy = ref<'generate' | 'skip'>('generate')
+const opdPrefix = computed(() => pipelineContext.managed.value || pipelineContext.isPipelineRoute.value
+  ? pipelineContext.pipeline.value?.export_profile === 'opd_prefix_v1' : exportPolicy.value === 'skip')
+const linkedTaskId = ref('')
+const linkedTrajectoryId = computed(() => typeof route.query.correction_trajectory_id === 'string' ? route.query.correction_trajectory_id : '')
+const linkedStep = computed(() => {
+  const value = route.query.correction_step
+  return typeof value === 'string' && /^\d+$/.test(value) && Number.isSafeInteger(Number(value)) ? Number(value) : undefined
+})
 const trainingImagePrefix = ref('')
 const exportHistoryOpen = ref(false)
 let resolveDecision: ((decision: ActionDecision) => void) | null = null
@@ -70,18 +79,33 @@ async function loadChoices() {
   if (!pipelineContext.historyOnly.value) await batchRead.refresh()
 }
 
-async function loadTaskPage(page = taskPage.value, size = taskLimit.value) {
+async function loadTaskPage(page = taskPage.value, size = taskLimit.value, followLink = false) {
   if (!session.value || !await ws.prepareTransition()) return
   const id = session.value.session_id, request = ++batchRequest
   try {
-    const result = await readPageApi.groups(id, { offset: (page - 1) * size, limit: size, unit: 'task', search: taskSearch.value, status: taskStatus.value })
+    const taskQuery = route.query.correction_task_id
+    const target = (followLink && typeof taskQuery === 'string' ? taskQuery : '')
+    const result = await readPageApi.groups(id, {
+      offset: (page - 1) * size, limit: size, unit: 'task',
+      ...(target ? { task_id: target } : { search: taskSearch.value, status: taskStatus.value }),
+    })
     if (disposed || request !== batchRequest || session.value?.session_id !== id) return
     taskPage.value = page; taskLimit.value = size; taskTotal.value = result.filtered_total ?? result.total ?? 0
     ws.setSession({ ...session.value, groups: result.items, storage_revision: (result as typeof result & { storage_revision?: number }).storage_revision ?? session.value.storage_revision })
-    visibleExpandedTasks.value = []
+    linkedTaskId.value = target
+    pageError.value = ''
+    if (target) {
+      if (tasks.value.some(task => task.task_id === target)) await ws.openTask(target)
+      else pageError.value = '当前修正会话未包含该任务'
+    }
+    visibleExpandedTasks.value = [...expandedTasks.value]
   } catch (cause) { if (!disposed && request === batchRequest) pageError.value = (cause as Error).message }
 }
-watch([taskSearch, taskStatus], () => { if (session.value && !busy.value && !hasUnsaved.value) void loadTaskPage(1) })
+watch([taskSearch, taskStatus], () => { if (session.value && !linkedTaskId.value && !busy.value && !hasUnsaved.value) void loadTaskPage(1) })
+
+async function clearTaskLink() {
+  await router.replace({ query: { ...route.query, correction_task_id: undefined, correction_trajectory_id: undefined, correction_step: undefined } })
+}
 
 function decideAction(decision: ActionDecision) {
   actionPrompt.value = false
@@ -103,14 +127,14 @@ async function loadBatch(batchId: string) {
       if (!id) return
       const saved = await readPageApi.session(id, true)
       if (saved.batch_id !== batchId) throw new Error('Pipeline 修正会话与当前批次不一致')
-      if (!disposed && request === batchRequest) { ws.setSession(saved); taskPage.value = 1; await loadTaskPage(1) }
+      if (!disposed && request === batchRequest) { ws.setSession(saved); taskPage.value = 1; await loadTaskPage(1, taskLimit.value, true) }
       return
     }
     if (pipelineContext.error.value) throw new Error(pipelineContext.error.value)
     const existing = (await readPageApi.sessions({ batch_id: batchId, limit: 1 })).items[0]
     if (disposed || request !== batchRequest) return
     const saved = existing ? await readPageApi.session(existing.session_id, true) : await api.createCorrectionSession(batchId)
-    if (!disposed && request === batchRequest) { ws.setSession(saved); taskPage.value = 1; await loadTaskPage(1) }
+    if (!disposed && request === batchRequest) { ws.setSession(saved); taskPage.value = 1; await loadTaskPage(1, taskLimit.value, true) }
   } catch (error) { if (!disposed && request === batchRequest) pageError.value = (error as Error).message }
   finally { if (!disposed && selectedBatchId.value === batchId) loading.value = false }
 }
@@ -127,17 +151,16 @@ function reviewText(value: unknown) { return value === undefined || value === nu
 function currentReviewValue(stepKey: string, field: string) { return (activeGroup.value?.rows.find(row => row.step_key === stepKey) as unknown as Record<string, unknown> | undefined)?.[field] }
 async function onTaskCollapse(next: string[]) {
   const current = visibleExpandedTasks.value
-  const removed = current.find((taskId) => !next.includes(taskId))
   const added = next.find((taskId) => !current.includes(taskId))
-  if (removed) await ws.toggleTask(removed)
-  else if (added) await ws.toggleTask(added)
+  const target = added ?? next[0] ?? ''
+  await ws.openTask(target)
   visibleExpandedTasks.value = [...expandedTasks.value]
 }
 
 async function onTrajectoryCollapse(next: string | string[]) {
   const nextGroupId = Array.isArray(next) ? next[0] || '' : next
   const currentGroupId = openGroupId.value
-  if (nextGroupId === currentGroupId) await ws.toggleTrajectory(currentGroupId)
+  if (!nextGroupId && currentGroupId) await ws.toggleTrajectory(currentGroupId)
   else if (nextGroupId) await ws.toggleTrajectory(nextGroupId)
 }
 
@@ -146,7 +169,7 @@ async function changeBatch(batchId: string) {
   if (batchId === selectedBatchId.value) return
   if (!await lifecycle.checkBatch(batchId)) return
   publishedNotice.value = null
-  await router.replace({ query: { ...route.query, batch_id: batchId, tree_run_id: undefined } })
+  await router.replace({ query: { ...route.query, batch_id: batchId, tree_run_id: undefined, correction_task_id: undefined, correction_trajectory_id: undefined, correction_step: undefined } })
 }
 
 async function toggleDeleted(row: CorrectionRow) {
@@ -191,7 +214,11 @@ function beforeUnload(event: BeforeUnloadEvent) {
   if (hasUnsaved.value || busy.value) { event.preventDefault(); event.returnValue = '' }
 }
 onBeforeRouteLeave(() => ws.prepareTransition())
-onBeforeRouteUpdate((to, from) => publishedNotice.value && to.query.batch_id === undefined && to.query.tree_run_id === undefined ? true : to.query.batch_id !== from.query.batch_id || to.query.tree_run_id !== from.query.tree_run_id ? ws.prepareTransition() : true)
+const locationKeys = ['batch_id', 'tree_run_id', 'correction_task_id', 'correction_trajectory_id', 'correction_step'] as const
+onBeforeRouteUpdate((to, from) => {
+  if (publishedNotice.value && to.query.batch_id === undefined && to.query.tree_run_id === undefined) return true
+  return locationKeys.some(key => to.query[key] !== from.query[key]) ? ws.prepareTransition() : true
+})
 async function loadRouteBatch() {
   const request = ++routeSelectionRequest
   ++batchRequest
@@ -215,6 +242,11 @@ watch(() => [route.query.batch_id, route.query.tree_run_id], ([batchId, legacyRu
   if ((publishedNotice.value && batchId === undefined && legacyRunId === undefined) || !initialized || (batchId === selectedBatchId.value && legacyRunId === undefined)) return
   publishedNotice.value = null
   void loadRouteBatch()
+})
+watch(() => [route.query.correction_task_id, route.query.correction_trajectory_id, route.query.correction_step], () => {
+  if (initialized && session.value && !loading.value && route.query.batch_id === selectedBatchId.value) {
+    void loadTaskPage(1, taskLimit.value, true)
+  }
 })
 onMounted(async () => {
   window.addEventListener('beforeunload', beforeUnload)
@@ -257,8 +289,8 @@ onBeforeUnmount(() => {
       <el-button :disabled="busy || loading" @click="refreshBatch">刷新当前结果</el-button>
       <span class="save-status" role="status">{{ savingCount ? '正在保存…' : hasUnsaved ? '有未保存修改' : session ? '草稿已加载' : '' }}</span>
       <template v-if="!pipelineContext.managed.value && !pipelineContext.isPipelineRoute.value">
-        <el-select v-model="exportPolicy" aria-label="已选轨迹导出方式" style="width:230px" :disabled="busy"><el-option value="generate" label="普通：保留有效 COT" /><el-option value="skip" label="OPD：不生成 COT，thought 为空" /></el-select>
-        <el-button type="success" :loading="savingCount > 0" :disabled="!session || busy || loading" @click="exportData(true)">导出已选完整轨迹</el-button>
+        <el-select v-model="exportPolicy" aria-label="已选轨迹导出方式" style="width:230px" :disabled="busy"><el-option value="generate" label="普通：保留有效 COT" /><el-option value="skip" label="OPD：截至首次动作修正" /></el-select>
+        <el-button type="success" :loading="savingCount > 0" :disabled="!session || busy || loading" @click="exportData(true)">{{ opdPrefix ? '导出已选 OPD 数据' : '导出已选完整轨迹' }}</el-button>
         <el-button :loading="savingCount > 0" :disabled="!session || busy || loading" @click="exportData(false)">旧版 SFT / RL / 原生分流导出</el-button>
       </template>
       <el-button v-if="pipelineContext.canCorrect.value" type="success" :loading="pipelineContext.controlling.value" :disabled="!session || busy || loading" @click="confirmCorrection">完成修正并继续</el-button>
@@ -266,9 +298,10 @@ onBeforeUnmount(() => {
     <div v-if="!pipelineContext.managed.value && !pipelineContext.isPipelineRoute.value" class="training-prefix">
       <label for="training-image-prefix">JSONL 图片路径前缀</label>
       <el-input id="training-image-prefix" v-model="trainingImagePrefix" data-testid="training-image-prefix" :disabled="busy || loading" clearable placeholder="s3://bucket/图片目录/；留空沿用后端云道默认配置" />
-      <small>完整导出会同时生成 Excel 与一份 JSONL，每个动作步骤一行。图片前缀后会接上批次、用例、轨迹及图片相对路径，后续图片上传沿用该地址；JSONL 文件本身的上传目录可在数据发布时单独配置。</small>
+      <small>选轨导出会同时生成 Excel 与一份 JSONL，每个动作步骤一行。图片前缀后会接上批次、用例、轨迹及图片相对路径，后续图片上传沿用该地址。JSONL 文件本身的上传目录可在数据发布时单独配置。</small>
     </div>
-    <p class="form-hint">同一任务可选择多条轨迹；完整导出保留全部未删除步骤。普通导出仅使用已保存的有效 COT，不会自动调用模型。</p>
+    <p v-if="opdPrefix" class="form-hint">OPD 导出保留至每条轨迹首次生效的动作修正步。无动作修正时保留所有未删除步骤，thought 留空。</p>
+    <p v-else class="form-hint">同一任务可选择多条轨迹。完整导出保留全部未删除步骤，使用已保存的有效 COT。</p>
     <el-pagination v-model:current-page="batchPage" v-model:page-size="batchLimit" :page-sizes="[10,20,50]" :total="batchRead.total.value" layout="total, sizes, prev, pager, next" />
     <el-alert v-if="batchRead.error.value" :title="batchRead.error.value" type="warning" :closable="false" />
     <el-alert v-if="batchRead.data.value && !batchRead.data.value.counts_complete" title="历史批次摘要正在准备，已有摘要仍可查看。" type="info" :closable="false" />
@@ -277,12 +310,13 @@ onBeforeUnmount(() => {
     <el-alert v-else-if="selectedBatch && selectedBatch.reviewed_task_count < selectedBatch.total_task_count" title="该批次仅部分任务完成质检，当前展示可修正的任务。" type="info" :closable="false" show-icon />
 
     <section v-loading="loading" class="task-list" aria-label="修正任务列表">
-      <div v-if="session" class="toolbar">
+      <div v-if="session && linkedTaskId" class="toolbar"><span>已定位到指定任务</span><el-button :disabled="busy" @click="clearTaskLink">查看全部任务</el-button></div>
+      <div v-else-if="session" class="toolbar">
         <el-input v-model="taskSearch" clearable :disabled="busy || hasUnsaved" placeholder="搜索任务或轨迹" />
         <el-select v-model="taskStatus" :disabled="busy || hasUnsaved" aria-label="修正任务状态"><el-option value="" label="全部状态" /><el-option value="ready" label="可编辑" /><el-option value="pending_review" label="待复核" /></el-select>
       </div>
       <el-empty v-if="!loading && !tasks.length" :description="!selectedBatchId ? '请选择批次后查看修正任务' : pageError ? '暂无可修正任务' : '该草稿没有入选轨迹'" :image-size="90" />
-      <el-pagination v-if="session" :current-page="taskPage" :page-size="taskLimit" :page-sizes="[10,20,50]" :total="taskTotal" :disabled="busy || hasUnsaved" layout="total, sizes, prev, pager, next" @current-change="(page: number) => loadTaskPage(page)" @size-change="(size: number) => loadTaskPage(1, size)" />
+      <el-pagination v-if="session && !linkedTaskId" :current-page="taskPage" :page-size="taskLimit" :page-sizes="[10,20,50]" :total="taskTotal" :disabled="busy || hasUnsaved" layout="total, sizes, prev, pager, next" @current-change="(page: number) => loadTaskPage(page)" @size-change="(size: number) => loadTaskPage(1, size)" />
       <el-collapse v-if="tasks.length" :model-value="visibleExpandedTasks" @change="onTaskCollapse">
         <el-collapse-item v-for="task in tasks" :key="task.task_id" :name="task.task_id">
           <template #title>
@@ -293,7 +327,10 @@ onBeforeUnmount(() => {
               <span class="task-title__stats">{{ task.trajectories.length }} 轨迹 · 已改 {{ task.edited_row_count }} 步 · 导出 {{ task.export_count }}/{{ task.trajectories.length }}</span>
             </div>
           </template>
-          <div class="trajectory-list">
+          <CorrectionTreeTask v-if="session && visibleExpandedTasks.includes(task.task_id)" :task="task" :workspace="ws"
+            :trajectory-id="task.task_id === linkedTaskId ? linkedTrajectoryId : ''" :step="task.task_id === linkedTaskId ? linkedStep : undefined"
+            :read-only="pipelineReadOnly" :opd="opdPrefix" :display-trajectory="id => displayId('trajectory', id, selectedBatchId)">
+          <template #list><div class="trajectory-list">
             <el-collapse :model-value="openGroupId" accordion @change="onTrajectoryCollapse">
               <el-collapse-item v-for="trajectory in task.trajectories" :key="trajectory.group.group_id" :name="trajectory.group.group_id">
                 <template #title>
@@ -306,6 +343,7 @@ onBeforeUnmount(() => {
                     <el-tag size="small" :type="trajectory.passed_threshold ? 'success' : 'warning'">{{ trajectory.passed_threshold ? 'Rubric 达标' : 'Rubric 未达标' }}</el-tag>
                     <el-tag v-if="trajectory.group.pending_review" type="warning">人工修改待复核</el-tag>
                     <span>{{ trajectory.group.active_row_count }}/{{ trajectory.group.row_count }} 步 · 已改 {{ trajectory.group.edited_row_count }} 步</span>
+                    <span v-if="opdPrefix && trajectory.group.opd_cutoff_step != null" class="rank">OPD 导出至第 {{ trajectory.group.opd_cutoff_step }} 步</span>
                     <el-button class="trajectory-export" size="small" :type="trajectory.group.export ? 'success' : 'default'" plain :disabled="pipelineReadOnly || busy || trajectory.group.pending_review" @click.stop="chooseExport(task.task_id, trajectory.group.group_id)">{{ trajectory.group.export ? '取消导出' : '加入导出' }}</el-button>
                   </div>
                 </template>
@@ -324,7 +362,8 @@ onBeforeUnmount(() => {
                 </div>
               </el-collapse-item>
             </el-collapse>
-          </div>
+          </div></template>
+          </CorrectionTreeTask>
         </el-collapse-item>
       </el-collapse>
     </section>

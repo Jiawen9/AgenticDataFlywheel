@@ -9,7 +9,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 
-EXPORT_PROFILE = "corrected_selection_v1"
+from .export_policy import EXPORT_PROFILE, OPD_PREFIX_PROFILE, opd_cutoff_row, validate_export_policy
 
 
 def _relative_path(value, raw_root):
@@ -79,7 +79,9 @@ def selection_records(groups, candidates=()):
     return [{**deepcopy(metadata.get((str(group["task_id"]), str(group["meta_task"])), {})),
              "task_id": group["task_id"], "trajectory_id": group["meta_task"],
              "group_id": group["group_id"], "goal": group.get("task", ""),
-             "trajectory_count": 1, "step_count": len(group.get("rows", []))} for group in groups]
+             "trajectory_count": 1, "step_count": len(group.get("rows", [])),
+             **({"opd_cutoff_step": group["opd_cutoff_step"]} if "opd_cutoff_step" in group else {})}
+            for group in groups]
 
 
 def selected_identity(items):
@@ -89,11 +91,11 @@ def selected_identity(items):
     return result
 
 
-def project_selected(*, session, snapshot, table, selection, cot_policy, tree_payload, quality_payload, raw_root=None, training_prefix=""):
+def project_selected(*, session, snapshot, table, selection, cot_policy, tree_payload, quality_payload,
+                     raw_root=None, training_prefix="", export_profile=EXPORT_PROFILE):
     from .service import _overlay_row
     from ..export_markers import annotate_rows
-    if cot_policy not in {"generate", "skip"}:
-        raise ValueError("COT 策略必须为 generate 或 skip")
+    validate_export_policy(export_profile, cot_policy)
     chosen = {item["group_id"] for item in selection["tasks"]}
     active = next(iter(table["sheets"]))
     source_rows = table["sheets"][active]
@@ -107,15 +109,20 @@ def project_selected(*, session, snapshot, table, selection, cot_policy, tree_pa
     raw_root = raw_root or (session.get("source_snapshot") or {}).get("raw_root") or tree_payload.get("raw_root")
     from ..data_publishing.paired_training import current_box
     from ..data_publishing.training_jsonl import parse_action, _description
+    row_edits = session.get("row_edits", {})
     for group in snapshot["groups"]:
         if group["group_id"] not in chosen:
             continue
         frozen = {**deepcopy(group), "export": True, "trajectory_id": group["meta_task"], "rows": []}
         history = []
         directory = _trajectory_directory(group, raw_root)
+        cutoff = None
+        if export_profile == OPD_PREFIX_PROFILE:
+            cutoff = opd_cutoff_row(group["rows"], row_edits)
+            frozen["opd_cutoff_step"] = cutoff.get("step") if cutoff else None
         for base in group["rows"]:
             source_number = int(base["excel_row"])
-            edit = session.get("row_edits", {}).get(str(source_number), {})
+            edit = row_edits.get(str(source_number), {})
             if edit.get("deleted"):
                 continue
             stored_cot = session.get("cot", {}).get(str(source_number), {})
@@ -176,6 +183,8 @@ def project_selected(*, session, snapshot, table, selection, cot_policy, tree_pa
                 if session.get("cot", {}).get(str(source_number)):
                     cot[str(number)] = deepcopy(session["cot"][str(source_number)])
             number += 1
+            if base is cutoff:
+                break
         if not frozen["rows"]:
             raise ValueError(f"入选轨迹 {group['meta_task']} 没有保留步骤")
         groups.append(frozen)
@@ -189,7 +198,7 @@ def project_selected(*, session, snapshot, table, selection, cot_policy, tree_pa
                         "tasks": selection_records(groups, selection.get("tasks", []))}
     frozen_selection["selected_trajectory_ids"] = selected_identity(frozen_selection["tasks"])
     frozen_selection["selected_groups"] = [item["group_id"] for item in frozen_selection["tasks"]]
-    return {"schema_version": 3, "export_profile": EXPORT_PROFILE, "cot_policy": cot_policy,
+    return {"schema_version": 3, "export_profile": export_profile, "cot_policy": cot_policy,
             "refinement_contract": "effective_action_sop_v1", "session_id": session.get("session_id"),
             "batch_id": selection["batch_id"], "tree_run_id": selection.get("tree_run_id"),
             "selection": frozen_selection, "groups": groups, "row_edits": edits, "cot": cot,
