@@ -1,0 +1,36 @@
+{
+  "datasets": [
+    {
+      "file": "data_flywheel.jsonl",
+      "name": "数据飞轮历史训练",
+      "version": "v1",
+      "data_source": "数据飞轮",
+      "cloud_uri": "s3://your-bucket/history/data_flywheel.jsonl",
+      "adapter": "data_flywheel"
+    },
+    {
+      "file": "factory.jsonl",
+      "name": "工厂历史训练",
+      "version": "v1",
+      "data_source": "工厂",
+      "cloud_uri": "s3://your-bucket/history/factory.jsonl",
+      "adapter": "factory"
+    },
+    {
+      "file": "health.jsonl",
+      "name": "健康云历史训练",
+      "version": "v1",
+      "data_source": "健康云",
+      "cloud_uri": "s3://your-bucket/history/health.jsonl",
+      "adapter": "health"
+    },
+    {
+      "file": "middle.jsonl",
+      "name": "middle 历史训练",
+      "version": "v1",
+      "data_source": "middle",
+      "cloud_uri": "s3://your-bucket/history/middle.jsonl",
+      "adapter": "middle"
+    }
+  ]
+}

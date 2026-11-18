@@ -134,6 +134,13 @@ def dataset_release(release_id: str) -> dict[str, object]:
     release = registry.get(release_id)
     if release is None:
         raise HTTPException(status_code=404, detail="数据集发布记录不存在")
+    imported = release.get("external_import") or {}
+    if release.get("source_kind") == "external_manual" and imported.get("format") == "jsonl":
+        # The page already renders this label under 来源文件. Keep the
+        # registered basename and download descriptor unchanged.
+        release["external_import"] = {
+            **imported, "filename": f'{imported["filename"]} · 云道地址 {imported["cloud_uri"]}',
+        }
     return {"release": release}
 
 

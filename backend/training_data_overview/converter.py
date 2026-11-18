@@ -1,4 +1,4 @@
-"""Read frozen published workbooks and derive the DataVue all_data contract.
+"""Read frozen publications and derive the DataVue all_data contract.
 
 No current correction/session values, raw directories, or latest stage versions
 are consulted. Conversion never writes application data.
@@ -17,11 +17,15 @@ from openpyxl import load_workbook
 
 from ..data_store import ArtifactStore
 from ..data_store.release_provenance import FrozenReleaseSources
+from ..file_io import io_path, resolve_path
 
 ALL_DATA_COLUMNS = [
     "轨迹", "子任务轨迹", "step数量", "APP", "一级场景", "二级场景",
     "时间", "生产方式", "人工精修步骤数量", "action_box",
 ]
+JSONL_MANUAL_RECORD_SOURCE = "external_jsonl_is_refined"
+JSONL_METADATA_FIELDS = ("data_source", "data_date", "app", "level1", "level2",
+                        "version", "cloud_uri", "adapter", "date_defaulted")
 
 
 class ConversionError(ValueError):
@@ -39,7 +43,7 @@ def _image(value: Any) -> str:
 
 def _sha(path: Path) -> str:
     value = hashlib.sha256()
-    with path.open("rb") as stream:
+    with io_path(path).open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             value.update(block)
     return value.hexdigest()
@@ -260,19 +264,122 @@ def _field(row: dict, names: tuple[str, ...], fallback: Any) -> str:
 
 
 
-def _external_frozen_file(registry: Any, release_id: str, reference: dict, label: str) -> tuple[Path, bytes]:
+def _external_frozen_path(registry: Any, release_id: str, reference: dict, label: str) -> Path:
     if not isinstance(reference, dict) or not reference.get("path") or not reference.get("sha256"):
         raise ConversionError(f"{label}：冻结文件登记信息不完整")
-    path = registry.resolve_project_path(reference["path"])
-    expected_root = (Path(registry.data_root) / "releases" / release_id).resolve()
-    if not path.resolve().is_relative_to(expected_root):
+    path = resolve_path(registry.resolve_project_path(reference["path"]))
+    expected_root = resolve_path(Path(registry.data_root) / "releases" / release_id)
+    if not path.is_relative_to(expected_root):
         raise ConversionError(f"{label}：只允许读取该发布的冻结文件")
-    if not path.is_file():
+    if not io_path(path).is_file():
         raise ConversionError(f"{label}：冻结文件不存在")
-    data = path.read_bytes()
+    return path
+
+
+def _external_frozen_file(registry: Any, release_id: str, reference: dict, label: str) -> tuple[Path, bytes]:
+    path = _external_frozen_path(registry, release_id, reference, label)
+    data = io_path(path).read_bytes()
     if hashlib.sha256(data).hexdigest() != reference["sha256"]:
         raise ConversionError(f"{label}：SHA256 校验失败")
     return path, data
+
+
+def _jsonl_rows(canonical: dict, metadata: dict, release: dict, release_id: str) -> list[dict]:
+    rows = canonical.get("rows")
+    if not isinstance(rows, list) or not rows:
+        raise ConversionError("历史 JSONL 规范化数据没有可统计的轨迹")
+    result, identities, refined_source_rows = [], set(), set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ConversionError("历史 JSONL 规范化轨迹格式无效")
+        identity, steps, actions = row.get("trajectory_identity"), row.get("step数量"), row.get("action_box")
+        if not isinstance(identity, str) or not identity or identity in identities:
+            raise ConversionError("历史 JSONL 规范化轨迹身份无效或重复")
+        identities.add(identity)
+        if (type(steps) is not int or steps < 1 or not isinstance(actions, dict)
+                or any(not isinstance(name, str) or not name or type(count) is not int or count < 1
+                       for name, count in actions.items()) or sum(actions.values()) != steps):
+            raise ConversionError("历史 JSONL 步骤数和动作数量不一致")
+        if row.get("时间") != metadata["data_date"] or row.get("生产方式") != metadata["data_source"]:
+            raise ConversionError("历史 JSONL 轨迹的日期或数据来源与登记不符")
+        for field, known_field in (("APP", "app_known"), ("一级场景", "level1_known"), ("二级场景", "level2_known")):
+            label = row.get(field)
+            if not isinstance(label, str) or not label or row.get(known_field) is not _classification_known(label):
+                raise ConversionError("历史 JSONL 轨迹分类无效")
+        known, unknown = row.get("manual_known_steps"), row.get("manual_unknown_steps")
+        refined, source_rows = row.get("人工精修步骤数量"), row.get("manual_refined_jsonl_rows")
+        if (row.get("manual_record_source") != JSONL_MANUAL_RECORD_SOURCE
+                or type(known) is not int or type(unknown) is not int or known < 0 or unknown < 0
+                or known + unknown != steps or row.get("manual_known") is not (unknown == 0)
+                or (known == 0 and refined is not None)
+                or (known > 0 and (type(refined) is not int or not 0 <= refined <= known))
+                or not isinstance(source_rows, list) or len(source_rows) != (refined or 0)
+                or any(type(line) is not int or line < 1 for line in source_rows)
+                or len(set(source_rows)) != len(source_rows) or refined_source_rows.intersection(source_rows)):
+            raise ConversionError("历史 JSONL 轨迹的人工精修统计无效")
+        refined_source_rows.update(source_rows)
+        unique_id = f"{release_id}/001/{quote(identity, safe='')}"
+        result.append({**row, "轨迹": unique_id, "子任务轨迹": f"{unique_id}/subtask-1",
+                       "release_id": release_id, "source_file_index": 1})
+    summary = canonical.get("summary")
+    count = (len(result), sum(row["step数量"] for row in result))
+    if (not isinstance(summary, dict)
+            or count != (summary.get("trajectory_count"), summary.get("step_count"))
+            or count != (release.get("trajectory_count"), release.get("step_count"))):
+        raise ConversionError("历史 JSONL 发布规模与统计文件不一致")
+    return result
+
+
+def _convert_jsonl_release(registry: Any, release: dict, release_id: str, imported: dict) -> dict:
+    try:
+        metadata = {key: imported.get(key) for key in JSONL_METADATA_FIELDS}
+        if (type(imported.get("parser_version")) is not int or imported["parser_version"] != 1
+                or type(metadata["date_defaulted"]) is not bool
+                or any(not isinstance(value, str) for key, value in metadata.items() if key != "date_defaulted")
+                or not metadata["data_source"] or not metadata["version"]):
+            raise ConversionError("历史 JSONL 导入元数据格式无效")
+        date = metadata["data_date"]
+        if datetime.strptime(date, "%Y-%m-%d").date().isoformat() != date:
+            raise ConversionError("历史 JSONL 数据日期无效")
+        source, canonical_ref = imported.get("source"), imported.get("canonical")
+        original = _external_frozen_path(registry, release_id, source, "历史 JSONL 原件")
+        training_root = resolve_path(Path(registry.data_root) / "releases" / release_id / "training")
+        files = release.get("training_files")
+        if (original.suffix.lower() != ".jsonl" or not original.is_relative_to(training_root)
+                or not isinstance(files, list) or len(files) != 1 or not isinstance(files[0], dict)
+                or any(files[0].get(key) != source[key] for key in ("path", "sha256"))
+                or source["sha256"] != imported.get("source_sha256") or _sha(original) != source["sha256"]):
+            raise ConversionError("历史 JSONL 原件与冻结文件校验信息不一致")
+        _, canonical_data = _external_frozen_file(registry, release_id, canonical_ref, "历史 JSONL 规范化数据")
+        _, manifest_data = _external_frozen_file(registry, release_id, imported.get("manifest"), "历史 JSONL 导入清单")
+        canonical, manifest = json.loads(canonical_data), json.loads(manifest_data)
+        for value in (canonical, manifest):
+            if (not isinstance(value, dict) or value.get("schema_version") != 1
+                    or value.get("parser_version") != imported["parser_version"] or value.get("metadata") != metadata):
+                raise ConversionError("历史 JSONL 导入版本或元数据与冻结登记不一致")
+        batches = release.get("batch_ids")
+        if (not isinstance(batches, list) or len(batches) != 1 or not batches[0]
+                or manifest.get("release_id") != release_id or manifest.get("batch_id") != batches[0]
+                or not imported.get("filename") or manifest.get("filename") != imported["filename"]
+                or manifest.get("source") != source or manifest.get("canonical") != canonical_ref):
+            raise ConversionError("历史 JSONL 导入清单与发布身份不一致")
+        rows = _jsonl_rows(canonical, metadata, release, release_id)
+        warnings = canonical.get("warnings")
+        if not isinstance(warnings, list):
+            raise ConversionError("历史 JSONL 规范化数据缺少诊断信息")
+        messages = []
+        for warning in warnings:
+            if not isinstance(warning, dict) or not isinstance(warning.get("message"), str):
+                raise ConversionError("历史 JSONL 诊断格式无效")
+            location = imported["filename"]
+            if warning.get("row") is not None:
+                location += f" 第 {warning['row']} 行"
+            _warn(messages, f"{location}：{warning['message']}")
+        return {"release_id": release_id, "rows": rows, "warnings": messages}
+    except ConversionError:
+        raise
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise ConversionError(f"历史 JSONL 发布转换失败：{exc}") from exc
 
 
 def _convert_external_release(registry: Any, release: dict, release_id: str) -> dict:
@@ -387,11 +494,14 @@ def _convert_external_release(registry: Any, release: dict, release_id: str) -> 
 
 
 def convert_release(registry: Any, release: dict) -> dict:
-    """Convert all frozen full export files, using only each active business sheet."""
+    """Convert frozen historical JSONL or full export workbooks for the catalog."""
     release_id = _text(release.get("release_id"))
     if not release_id or any(value in release_id for value in ("/", "\\", "..")):
         raise ConversionError("发布记录缺少有效发布编号")
     if release.get("source_kind") == "external_manual":
+        imported = release.get("external_import")
+        if isinstance(imported, dict) and imported.get("format") == "jsonl":
+            return _convert_jsonl_release(registry, release, release_id, imported)
         return _convert_external_release(registry, release, release_id)
     try:
         created = datetime.fromisoformat(_text(release.get("created_at")).replace("Z", "+00:00"))
