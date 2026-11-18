@@ -157,6 +157,62 @@ class PipelineFeedbackHttpTests(unittest.TestCase):
         self.assertIn(child["pipeline_id"], self.manager.get(p["pipeline_id"])["next_pipeline_ids"])
         self.assertEqual(self.records.get("model_iter_results", run_id), before)
 
+    def test_evaluation_entry_continues_to_collection_in_same_round(self):
+        prior = self.prepare()
+        source = self.factory.collection_runs.batch(prior["batch_id"])
+        task = source["snapshot"]["tasks"][0]
+        run_id = "eval-offline-same-round"
+        self.records.put("model_iter_runs", run_id, {
+            "run_id": run_id, "batch_id": prior["batch_id"], "status": "succeeded",
+            "request": {"execution_mode": "collect_and_evaluate"},
+        })
+        self.records.put("model_iter_results", run_id, {"final": True, "result": {
+            "run_id": run_id, "summary": {}, "cases": [{
+                "case_key": "phone-a/first", "case_id": task["collection_case_id"], "phone_id": "phone-a",
+                "collection_status": "completed", "evaluation_status": "completed", "verdict": "fail",
+                "failure_reason": "没有核对收藏状态",
+            }],
+        }})
+        BadCaseService(self.root).refresh_run(run_id)
+        candidate = self.http.get("/api/badcases", params={"run_id": run_id, "status": "candidate"}).json()["items"][0]
+        request = {"request_id": "create-evaluation-entry", "name": "同轮评测回流", "mode": "manual", "start_mode": "evaluation"}
+        pipeline = self.post("/api/pipelines", request, 201)["pipeline"]
+        pid = pipeline["pipeline_id"]
+        root = f"/api/pipelines/{pid}"
+        self.assertEqual(pipeline["current_step"], "evaluation")
+        self.assertIsNone(pipeline["batch_id"])
+        selection = {"request_id": "same-round-badcases", "run_id": run_id,
+                     "candidate_ids": [candidate["candidate_id"]], "expected_revision": pipeline["storage_revision"]}
+        pipeline = self.post(root + "/confirm-badcases", selection)["pipeline"]
+        self.assertEqual(pipeline["pipeline_id"], pid)
+        self.assertEqual(pipeline["current_step"], "generation")
+        self.assertIsNone(pipeline["batch_id"])
+        self.assertEqual(self.post(root + "/confirm-badcases", selection)["pipeline"]["feedback_id"], pipeline["feedback_id"])
+
+        regenerated = self.post("/api/task-generation/badcase-jobs", {
+            "feedback_id": pipeline["feedback_id"], "pipeline_id": pid, "generate_n": 1,
+            "request_id": "same-round-augment", "auto_start": True,
+        }, 202)
+        self.queue.run_all()
+        restarted = PipelineManager(self.runtime, self.root)
+        restarted.tick(pid)
+        self.assertEqual(self.generation.get(regenerated["job_id"])["status"], "succeeded")
+        self.assertTrue(any("没有核对收藏状态" in prompt for _stage, _item, prompt in self.model.calls))
+        after = restarted.get(pid)
+        self.assertEqual(after["status"], "waiting_for_generation_review")
+        self.assertEqual(after["evaluation_run_id"], run_id)
+        accepted = self.post(root + "/confirm-generation", {
+            "request_id": "same-round-collection", "expected_revision": after["storage_revision"],
+            "collection_config": {"agent_type": "newagent", "phone_id": "phone-a", "app": "AppA",
+                                  "vla": "http://mock.invalid/vla", "repeat_times": 1},
+        })["pipeline"]
+        self.assertEqual(accepted["pipeline_id"], pid)
+        self.assertNotEqual(accepted["batch_id"], prior["batch_id"])
+        self.assertEqual(len(self.manager.list()), 2)
+        self.assertFalse(any(call[0] == "start-run" for call in self.calls))
+        restarted.tick(pid)
+        self.assertEqual(sum(call[0] == "start-run" for call in self.calls), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -55,8 +55,27 @@ class UploadResult:
     url: str | None = None
 
 
+def normalize_prefix(value):
+    value = str(value).strip().replace("\\", "/")
+    if "://" in value or any(ord(char) < 32 for char in value):
+        raise ValueError("云道目标请填写 bucket 内的目录前缀，不填写 URL 或控制字符")
+    parts = [part for part in value.split("/") if part]
+    if any(part in {".", ".."} for part in parts):
+        raise ValueError("云道目录前缀不能包含 . 或 .. 路径段")
+    return "/".join(parts)
+
+
+def default_training_prefix(default_prefix, training_prefix=None):
+    if training_prefix:
+        return normalize_prefix(training_prefix) or "training_jsonl"
+    base = normalize_prefix(default_prefix or "")
+    parent, _, leaf = base.rpartition("/")
+    root = parent if leaf == "figures" else base
+    return f"{root}/training_jsonl" if root else "training_jsonl"
+
+
 def _configuration() -> dict:
-    names = ("python", "script", "app_token", "region", "bucket", "prefix")
+    names = ("python", "script", "app_token", "region", "bucket", "prefix", "training_prefix")
     keys = {"ADF_YUNDAO_" + name.upper() for name in names}
     values = {}
     path = io_path(BACKEND_DIR / ".env")
@@ -90,7 +109,8 @@ def get_configuration() -> dict:
     elif psutil is None:
         reason = "云道上传缺少 psutil 依赖，请安装平台后端 requirements.txt"
     return {"configured": reason is None, "reason": reason, "directory_upload": True,
-            "default_prefix": config["prefix"], "region": config["region"], "bucket": config["bucket"]}
+            "default_prefix": config["prefix"], "training_prefix": config["training_prefix"],
+            "region": config["region"], "bucket": config["bucket"]}
 
 
 def is_configured() -> bool:

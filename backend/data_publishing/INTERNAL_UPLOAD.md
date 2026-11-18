@@ -80,11 +80,13 @@ npm run build
 
 上传增加 `training_only:true`（仅传配套训练文件）和 `training_destination_prefix`（bucket 内目标目录），能力 `internal.training_pair_version=2`。单传不会读取或上传原轨迹目录。综合上传的新图片目标使用导出时已冻结的图片前缀，单独改变 JSONL 目标不改变文件内容。训练文件父目录仅放 JSONL，报告单独保存供下载。旧请求／旧发布沿用下面的兼容方式。
 
+在后端 `.env` 配置 `ADF_YUNDAO_TRAINING_PREFIX=AgenticFlywheel_train_data/training_jsonl` 可为所有发布设置统一目录。省略时从 `ADF_YUNDAO_PREFIX` 推导，末级为 `figures` 则使用其同级 `training_jsonl`，其他情形追加 `training_jsonl`。上传能力返回 `internal.training_default_prefix`。每次新上传默认采用 `<默认目录>/<发布编号>/train.jsonl`，多份文件用 `001`、`002` 等目录区分。上传弹窗可修改本次目标，失败重试采用任务冻结的原目标。
+
 ### 旧发布兼容转换
 
 上传弹窗增加“生成并上传训练 JSONL”，默认关闭。能力 `internal.training_jsonl_version=1`；请求附 `training_jsonl:true`，同时必须为 `target:internal`、`include_trajectories:true`。旧请求不改变。开关参与任务指纹，同目标同范围同开关复用任务；重试继承开关与目标。
 
-先上传冻结发布 Excel 和其中轨迹的完整目录，再在后台生成一份合并 JSONL，最后上传该文件。训练文件失败不撤销表格／轨迹回执，重试跳过成功目录并复用已生成文件。单批次目标为 `<前缀>/<批次>/训练数据/<发布编号>/<任务摘要>/train.jsonl`；多批次发布以发布编号替代批次根目录，图片始终引用各自实际 `s3://bucket/key`。本地仅新增 `releases/<发布编号>/training/<任务摘要>/files/train.jsonl` 与同级 `exclusions.json`，不复制图片、不打 ZIP。
+先上传冻结的发布 Excel 和其中轨迹的完整目录，再在后台生成一份合并 JSONL，最后上传该文件。训练文件失败时保留表格及轨迹的成功回执，重试跳过成功目录并复用已生成文件。新上传采用上面的统一默认目录或自定义目标。旧任务重试保留历史规则，包括 `<前缀>/<批次>/训练数据/<发布编号>/<任务摘要>/train.jsonl` 形式的隐式目标。图片仍引用实际的 `s3://bucket/key`。本地生成 `releases/<发布编号>/training/<任务摘要>/files/train.jsonl` 与对应 `exclusions.json`。
 
 样本保留附件的 `messages/solution/images` 与 `<thought>/<tool_call>/<action>/sftcall/uuid/metaID` 结构，另外增加 `is_key_step`、`is_refined`。原树有效 Q 不同的分叉动作标记关键步；没有对应评分或映射为 null。人工修正仅统计生效的 action／SOP 修改，两个标记互不替代，不暗含修正后的动作已经重评。
 

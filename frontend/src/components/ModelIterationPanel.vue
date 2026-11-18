@@ -1,5 +1,6 @@
 <template>
   <section class="evaluation-panel" data-testid="model-iteration-panel">
+    <template v-if="!creationBlocked">
     <div class="heading"><h2>评测模型配置</h2><el-button :loading="loading" :disabled="saving || starting" @click="load">刷新配置与服务能力</el-button></div>
     <el-radio-group v-model="executionMode" :disabled="starting" data-testid="evaluation-mode">
       <el-radio-button value="collect_and_evaluate">采集并评测</el-radio-button>
@@ -73,9 +74,10 @@
       <el-alert v-if="startMessage" :title="startMessage" type="success" :closable="false" />
       <el-alert v-if="startError" :title="startError" type="error" :closable="false" />
     </section>
+    </template>
 
     <div class="heading"><h2>用例评测进度</h2><el-button :disabled="!selectedRun" @click="emit('details')">查看用例明细</el-button></div>
-    <el-select :model-value="selectedRun" filterable :filter-method="filterRuns" placeholder="选择评估运行" class="run-picker" :disabled="progressBusy" @update:model-value="selectRun">
+    <el-select v-if="!lockedRunId" :model-value="selectedRun" filterable :filter-method="filterRuns" placeholder="选择评估运行" class="run-picker" :disabled="progressBusy" @update:model-value="selectRun">
       <el-option v-for="run in filteredRuns" :key="run.run_id" :label="`${displayId('run', run.run_id)} · ${evaluationModeLabel(run.execution_mode)} · ${run.evaluation_profile_id || '历史规则'}${run.stale_collection_snapshot ? ' · 旧采集快照' : ''}`" :value="run.run_id" />
     </el-select>
     <p v-if="selectedRun" class="hint">运行：<DisplayId kind="run" :id="selectedRun" /></p>
@@ -119,7 +121,7 @@ import CollectionRunProgress from '@/components/CollectionRunProgress.vue'
 import { useDisplayIdentifiers } from '@/composables/useDisplayIdentifiers'
 import { defaultEvaluatorConfig, formatSuccessRate, evaluationIssueText, evaluationModeLabel, evaluationSourceLabel, collectionSnapshotLabel } from '@/utils/modelIteration'
 
-const props = defineProps<{ runs: FactoryRun[]; progress: EvaluationProgress }>()
+const props = defineProps<{ runs: FactoryRun[]; progress: EvaluationProgress; pipelineId?: string; pipelineAttempt?: number; creationBlocked?: boolean; lockedRunId?: string }>()
 const { displayId, matches, resolve } = useDisplayIdentifiers()
 const sourceQuery = ref(''), runQuery = ref('')
 const filterSources = (query: string) => { sourceQuery.value = query }
@@ -140,11 +142,11 @@ const sources = ref<EvaluationSource[]>([]), allowedRoots = ref<string[]>([]), s
 const filteredSources = computed(() => sources.value.filter(source => matches(sourceQuery.value, 'run', source.run_id, '', source.status || '', source.created_at || '')))
 const preview = ref<EvaluationPreview | null>(null), previewLoading = ref(false), starting = ref(false), startError = ref(''), startMessage = ref('')
 const requestIds = new Map<string, string>()
-const session = evaluationPreviewSession()
+const session = evaluationPreviewSession(undefined, props.pipelineId ? `pipeline:${props.pipelineId}:${props.pipelineAttempt || 0}:${import.meta.env.VITE_API_BASE_URL || 'same-origin'}` : undefined)
 const controllingPreview = ref(false), retryingPreparation = ref(false), sessionRevision = ref(0)
 const preparationRequestIds = new Map<string, string>()
 const dirty = computed(() => JSON.stringify(draft) !== saved.value)
-const ready = computed(() => supported.value && profilesSupported.value && !!selectedProfile.value && !dirty.value && !loading.value && !saving.value && !starting.value && roles.every(role => draft[role].base_url && draft[role].model))
+const ready = computed(() => !props.creationBlocked && supported.value && profilesSupported.value && !!selectedProfile.value && !dirty.value && !loading.value && !saving.value && !starting.value && roles.every(role => draft[role].base_url && draft[role].model))
 const sourceInput = computed<EvaluationSourceInput>(() => sourceKind.value === 'run' ? { source_run_id: sourceRunId.value } : { source_path: sourcePath.value.trim() })
 const sourceKey = computed(() => evaluationSourceKey(sourceInput.value))
 const pendingStart = computed(() => { void sessionRevision.value; return session.get(sourceKey.value)?.start_request })
@@ -309,13 +311,14 @@ function resetPreviewPage() { previewPage.value = 1; void loadPreviewPage() }
 async function startOffline() {
   if (!canStartOffline.value || !preview.value || !selectedProfile.value) return
   const parameters = { preview_id: preview.value.preview_id, evaluator_config: JSON.parse(JSON.stringify(draft)) as EvaluatorConfig,
-    evaluation_profile_id: selectedProfile.value.id, evaluation_profile_digest: selectedProfile.value.digest, checklist_source: 'auto' as const }
+    evaluation_profile_id: selectedProfile.value.id, evaluation_profile_digest: selectedProfile.value.digest, checklist_source: 'auto' as const,
+    ...(props.pipelineId ? { pipeline_id: props.pipelineId } : {}) }
   const key = JSON.stringify(parameters), requestId = requestIds.get(key) || newRunRequestId()
   requestIds.set(key, requestId)
   await submitEvaluation({ ...parameters, request_id: requestId })
 }
 async function recoverStart() {
-  if (!pendingStart.value || starting.value) return
+  if (!pendingStart.value || props.creationBlocked || starting.value) return
   await submitEvaluation(pendingStart.value)
 }
 async function submitEvaluation(parameters: StartEvaluationOptions) {

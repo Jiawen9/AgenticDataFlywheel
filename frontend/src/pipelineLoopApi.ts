@@ -4,16 +4,17 @@ import { invalidateSummaryCache } from './utils/summaryCache'
 import type { Pipeline, PipelineCollectionConfig } from './types/pipeline'
 import type { TaskGenerationJob } from './types'
 export interface BadCase { candidate_id: string; source_run_id: string; case_id: string; task: string; app: string; verdicts: string[]; source_count: number; missing_fields: string[]; failures: Array<{ reason?: string; failure_reason?: string; checklist?: unknown; [key: string]: unknown }>; status?: string }
-export interface BadCasePage { index_state?: string; error?: string; items: BadCase[]; total: number; summary: { candidate: number; technical: number; needs_completion: number } }
+export interface BadCasePage { index_state?: string; final?: boolean; error?: string; items: BadCase[]; total: number; summary: { candidate: number; technical: number; needs_completion: number } }
 const post = <T>(path: string, body: unknown) => request<T>(path, { method: 'POST', body: JSON.stringify(body) })
 export const pipelineLoopApi = {
   async confirm(id: string, body: { request_id: string; expected_revision: number; collection_config: PipelineCollectionConfig }) {
     const value = await post<{ pipeline: Pipeline }>(`/api/pipelines/${encodeURIComponent(id)}/confirm-generation`, body)
     invalidateSummaryCache(); return value.pipeline
   },
-  async associate(id: string, runId: string, revision: number) {
-    const value = await post<{ pipeline: Pipeline }>(`/api/pipelines/${encodeURIComponent(id)}/evaluation`, { run_id: runId, expected_revision: revision })
-    invalidateSummaryCache(); return value.pipeline
+  async confirmBadcases(id: string, body: { run_id: string; candidate_ids: string[]; request_id: string; expected_revision: number }) {
+    const value = await post<{ pipeline: Pipeline }>(`/api/pipelines/${encodeURIComponent(id)}/confirm-badcases`, body)
+    invalidateSummaryCache()
+    return value.pipeline
   },
   refresh(runId: string) { return post('/api/badcases/refresh', { run_id: runId }) },
   badcases(runId: string, offset: number, limit: number, status = 'candidate', signal?: AbortSignal) {

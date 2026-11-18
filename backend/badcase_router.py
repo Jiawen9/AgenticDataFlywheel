@@ -87,6 +87,8 @@ def bind_evaluation(pipeline_id: str, value: EvaluationBinding, request: Request
         pipeline = service.records.get("pipelines", pipeline_id)
         if not pipeline:
             raise BadCaseError("Pipeline 不存在", 404)
+        if pipeline.get("start_mode") == "evaluation":
+            raise BadCaseError("请从本轮评测入口启动评测，或确认已有结果的 BadCase")
         run = service.records.get("model_iter_runs", value.run_id)
         if not run:
             raise BadCaseError("评测运行不存在", 404)

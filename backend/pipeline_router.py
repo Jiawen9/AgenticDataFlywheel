@@ -31,6 +31,13 @@ class ConfirmGenerationRequest(BaseModel):
     expected_revision: int
     collection_config: dict
 
+class ConfirmBadCasesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    request_id: str = Field(min_length=1, max_length=128)
+    run_id: str
+    candidate_ids: list[str]
+    expected_revision: int
+
 class ControlPipelineRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_revision: int
@@ -83,6 +90,11 @@ def get_pipeline(pipeline_id: str, request: Request):
 @router.post("/{pipeline_id}/confirm-generation")
 def confirm_generation(pipeline_id: str, body: ConfirmGenerationRequest, request: Request):
     return _call(lambda: {"pipeline": _manager(request).confirm_generation(pipeline_id, body.model_dump())})
+
+@router.post("/{pipeline_id}/confirm-badcases")
+def confirm_badcases(pipeline_id: str, body: ConfirmBadCasesRequest, request: Request):
+    from .pipeline_evaluation import confirm_badcases
+    return _call(lambda: {"pipeline": confirm_badcases(_manager(request), pipeline_id, body.model_dump())})
 
 @router.post("/{pipeline_id}/{action}")
 def control_pipeline(pipeline_id: str, action: str, body: ControlPipelineRequest, request: Request):

@@ -9,7 +9,7 @@ from ..identifiers import allocate_id
 from ..file_io import io_path
 
 from ..trajectory_correction.draft_store import utc_now
-from .internal_uploader import UploadContext, UploadError, UploadResult
+from .internal_uploader import UploadContext, UploadError, UploadResult, default_training_prefix
 
 
 class InternalUploadConflict(ValueError):
@@ -30,6 +30,12 @@ class InternalUploadJobsMixin:
                 if isinstance(config, dict):
                     result.update({key: config.get(key) for key in
                                    ("directory_upload", "default_prefix", "region", "bucket")})
+                    if result["directory_upload"]:
+                        try:
+                            result["training_default_prefix"] = default_training_prefix(
+                                config.get("default_prefix"), config.get("training_prefix"))
+                        except ValueError as exc:
+                            result["training_default_prefix_error"] = str(exc)
                     if not configured:
                         result["reason"] = config.get("reason") or reason
             except Exception:

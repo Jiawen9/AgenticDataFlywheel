@@ -311,6 +311,7 @@ def build_parser():
     run.add_argument("--evaluation-mode", choices=["checklist"], default="checklist")
     run.add_argument("--evaluation-profile-id")
     run.add_argument("--evaluation-profile-digest")
+    run.add_argument("--server")
     sub.add_parser("status").add_argument("phones")
     sub.add_parser("adb-devices")
     sub.add_parser("capabilities").add_argument("--server")

@@ -76,6 +76,8 @@ class BadCaseService:
         fingerprint = digest(result)
         old_head = self.records.get("badcase_heads", run_id)
         if old_head and old_head.get("result_digest") == fingerprint and old_head.get("status") == "ready":
+            if snapshot.get("final") and not old_head.get("final"):
+                return self.records.update("badcase_heads", run_id, lambda row: row.update(final=True, updated_at=utc_now()))
             return old_head
         tasks, sources = self._sources(run)
         request = run.get("request") or {}
@@ -294,10 +296,16 @@ def pipeline_loop_summary(records, pipeline):
                       "source": binding.get("source"), "execution_mode": binding.get("execution_mode"),
                       "summary_unavailable": run.get("summary_unavailable", False),
                       "summary": run.get("evaluation_summary"), "badcases": head.get("summary", {}),
-                      "index_state": head.get("status", "pending")}
+                      "index_state": head.get("status", "pending"), "final": bool(head.get("final"))}
     children, next_rounds = [], []
+    source_run_id = pipeline.get("source_evaluation_run_id")
     if records.database_path.exists():
         with records._connection() as connection:
+            if not source_run_id and pipeline.get("feedback_id"):
+                feedback = connection.execute("SELECT json_extract(payload,'$.run_id') FROM records "
+                    "WHERE namespace='badcase_feedback' AND record_key=?", (pipeline["feedback_id"],)).fetchone()
+                if feedback:
+                    source_run_id = feedback[0]
             rows = connection.execute("""SELECT p.record_key,json_extract(p.payload,'$.generation_job_id'),
                 json_extract(p.payload,'$.status'),json_extract(j.payload,'$.result_count'),json_extract(j.payload,'$.status')
                 FROM records p LEFT JOIN records j ON j.namespace='task_generation.jobs'
@@ -307,7 +315,8 @@ def pipeline_loop_summary(records, pipeline):
                 children.append(pid)
                 next_rounds.append({"pipeline_id": pid, "generation_job_id": jid, "status": status,
                     "generated_count": count if isinstance(count, int) and (count > 0 or job_status in {"succeeded", "partial"}) else None})
-    return {"evaluation_run_id": binding["run_id"] if binding else None, "evaluation": evaluation, "next_pipeline_ids": children, "next_rounds": next_rounds}
+    return {"evaluation_run_id": binding["run_id"] if binding else None, "evaluation": evaluation,
+            "source_evaluation_run_id": source_run_id, "next_pipeline_ids": children, "next_rounds": next_rounds}
 
 
 def schedule_refresh(root, run_id, *, store=None):

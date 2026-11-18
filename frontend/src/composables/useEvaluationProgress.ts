@@ -6,7 +6,7 @@ import { factoryRunActive, newestFactoryRuns } from '@/utils/factoryHistory'
 import { collectorDataUnavailable } from '@/utils/phoneFactoryRuns'
 
 /** A single page-owned progress session shared by the summary and details drawer. */
-export function useEvaluationProgress(runs: Ref<FactoryRun[]>, onChanged: (runId: string) => void | Promise<void>) {
+export function useEvaluationProgress(runs: Ref<FactoryRun[]>, onChanged: (runId: string) => void | Promise<void>, selectLatest = true) {
   const selectedRun = ref(''), results = ref<EvaluationResults | null>(null), resultError = ref('')
   const cancelling = ref(false), downloading = ref('')
   let disposed = false, mounted = false, selectionEpoch = 0
@@ -48,7 +48,7 @@ export function useEvaluationProgress(runs: Ref<FactoryRun[]>, onChanged: (runId
   }, { flush: 'sync' })
   watch(runs, values => {
     // A just-created run may not be present in the next list snapshot yet.
-    if (!selectedRun.value) selectedRun.value = newestFactoryRuns(values)[0]?.run_id || ''
+    if (selectLatest && !selectedRun.value) selectedRun.value = newestFactoryRuns(values)[0]?.run_id || ''
   }, { immediate: true })
   function selectRun(runId: string) {
     if (!busy.value && runId !== selectedRun.value) selectedRun.value = runId
