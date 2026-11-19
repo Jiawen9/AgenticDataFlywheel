@@ -362,6 +362,8 @@ def publish_pipeline(pipeline, *, root=None, registry=None):
 
 
 def _publish_pipeline_with_diagnostics(pipeline, *, root=None, registry=None):
+    from .pipeline_job_stop import check_pipeline_stop, pipeline_commit_guard
+
     root = _root(root)
     records, store = RecordStore(root), ArtifactStore(root)
     pipeline_id, batch_id = str(pipeline["pipeline_id"]), str(pipeline["batch_id"])
@@ -374,6 +376,7 @@ def _publish_pipeline_with_diagnostics(pipeline, *, root=None, registry=None):
                 raise ValueError("Pipeline 发布幂等编号冲突")
             diagnostics.log_event("publication_reused", release_id=release_id)
             return registry.get(release_id)
+        check_pipeline_stop(records, pipeline_id)
         from .pipeline_access import ensure_pipeline_write
         ensure_pipeline_write(batch_id, root, action="publish")
         sessions = _sessions(batch_id, root)
@@ -452,9 +455,11 @@ def _publish_pipeline_with_diagnostics(pipeline, *, root=None, registry=None):
                                 "error": f"Excel 已生成，配套 JSONL 生成失败：{exc}"}
                 payload["training"] = training
             refs = [store.get(batch_id, stage) for stage in ("04_tree", "05_quality")]
+            check_pipeline_stop(records, pipeline_id)
             artifact = store.publish(batch_id, "07_cot", payload,
                 workbooks={filename: excel}, source_refs=[ref for ref in refs if ref],
-                metadata={"pipeline_id": pipeline_id, "row_count": sum(len(rows) for rows in payload["sheets"].values())})
+                metadata={"pipeline_id": pipeline_id, "row_count": sum(len(rows) for rows in payload["sheets"].values())},
+                commit_guard=lambda: pipeline_commit_guard(records, pipeline_id))
             created_at = intent["created_at"]
             release = {"release_id": release_id, "name": pipeline["name"], "created_at": created_at,
                 "source_kind": "workflow", "pipeline_id": pipeline_id, "batch_ids": [batch_id], "source_count": 1,
@@ -486,7 +491,8 @@ def _publish_pipeline_with_diagnostics(pipeline, *, root=None, registry=None):
                 entries.append({"namespace": "correction_sessions", "key": current["session_id"], "payload": current,
                                 "expected_revision": current["storage_revision"]})
             try:
-                records.put_many(entries)
+                with pipeline_commit_guard(records, pipeline_id):
+                    records.put_many(entries)
             except Exception:
                 # SQLite may have committed before the caller lost its response.
                 # A failed read propagates and deliberately keeps the frozen files.

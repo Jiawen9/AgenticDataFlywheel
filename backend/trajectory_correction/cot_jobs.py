@@ -28,6 +28,7 @@ from ..bounding_box.qwen_reviewer import QwenBoxReviewer
 from ..trajectory_data import _format_manual_actions_box
 from .draft_store import load_session, update_session, storage_root, session_batch_id
 from .service import _snapshot, session_asset, publish_stage_snapshot, publish_cot_snapshot, _check_revision, active_session_lock
+from ..pipeline_job_stop import PipelineJobCancelled, check_job_stop, job_commit_guard
 from .session_state import identified, row_index, fingerprint
 from ..batch_lifecycle import BatchPublishedError, is_batch_active
 from ..pipeline_retry_errors import failure_from_exception, failure_from_payload
@@ -103,7 +104,12 @@ class CotJobManager:
     def _write(self, payload: dict[str, Any]) -> None:
         if execution_pipeline_id():
             payload.setdefault("pipeline_id", execution_pipeline_id())
-        saved = self._records.put("correction_cot_jobs", str(payload["job_id"]), payload)
+        def update(current):
+            stop_requested_at = current.get("stop_requested_at")
+            if stop_requested_at and payload.get("status") in {"queued", "running"}:
+                return current
+            return {**payload, **({"stop_requested_at": stop_requested_at} if stop_requested_at else {})}
+        saved = self._records.update("correction_cot_jobs", str(payload["job_id"]), update, default={})
         payload["storage_revision"] = saved["storage_revision"]
         diagnostics.record_job_snapshot(payload, "cot", storage_root())
 
@@ -124,6 +130,11 @@ class CotJobManager:
     def mark_interrupted_jobs(self) -> None:
         for payload in self.list_jobs():
             if payload.get("status") in {"queued", "running"}:
+                try:
+                    check_job_stop(self._records, "correction_cot_jobs", payload["job_id"])
+                except PipelineJobCancelled:
+                    self._cancelled(payload["job_id"])
+                    continue
                 payload.update(status="interrupted", completed_at=_now(), error="服务重启导致 COT 生成中断；重新提交可复用已完成结果。",
                                failure=failure_from_payload({"category": "service_restart"}))
                 self._write(payload)
@@ -284,10 +295,18 @@ class CotJobManager:
         payload = self.get(job_id)
         if payload is None:
             return
-        self._progress(job_id, {"status": "running", "stage": "generating_bbox" if payload.get("generate_bbox") else "generating_cot", "started_at": _now()})
+        def check_stop():
+            check_job_stop(self._records, "correction_cot_jobs", job_id)
+
+        def commit_guard():
+            return job_commit_guard(self._records, "correction_cot_jobs", job_id)
+
         generator = reviewer = None
+        session_id = str(payload["session_id"])
         try:
-            session = load_session(str(payload["session_id"]))
+            with self._lock, commit_guard():
+                self._progress(job_id, {"status": "running", "stage": "generating_bbox" if payload.get("generate_bbox") else "generating_cot", "started_at": _now()})
+            session = load_session(session_id)
             if session is None:
                 raise FileNotFoundError("纠偏会话不存在")
             with active_session_lock(str(payload["session_id"])):
@@ -307,6 +326,7 @@ class CotJobManager:
             completed_bbox = int(payload.get("completed_bbox") or 0)
             completed_cot = int(payload.get("completed_cot") or 0)
             for target in payload["targets"]:
+                check_stop()
                 with active_session_lock(str(payload["session_id"])):
                     pass
                 self._progress(job_id, {"current_task": target["task"], "current_trajectory": target["trajectory_id"], "current_step": target["step"]})
@@ -333,13 +353,15 @@ class CotJobManager:
                             raise RuntimeError("生成期间标框已被修改，请重新提交")
                         edit.update(actions_box=box, bbox_source="generated", bbox_generated_at=_now(), bbox_model=reviewer.model)
                         current.setdefault("cot", {}).pop(str(target["excel_row"]), None)
-                    update_session(str(payload["session_id"]), save_bbox)
+                    with active_session_lock(session_id), commit_guard():
+                        update_session(session_id, save_bbox)
                     target["reference_answer"] = box
                     target["bbox_hash"] = _bbox_hash(box)
                     completed_bbox += 1
                     self._progress(job_id, {"stage": "generating_bbox", "completed_bbox": completed_bbox})
                 with active_session_lock(str(payload["session_id"])):
                     pass
+                check_stop()
                 with diagnostics.trace_context(task_id=target.get("task_id"), trajectory_id=target["trajectory_id"],
                                                step=target["step"], step_key=target.get("step_key")):
                     result = generator.generate(task=target["task"], trajectory_id=target["trajectory_id"], step=int(target["step"]), history=target["history"], action=target["action"], image=image, reference_answer=str(target.get("reference_answer") or ""))
@@ -363,10 +385,14 @@ class CotJobManager:
                         for field in ("summary", "thought"):
                             if field in baseline and edit.get(field) == baseline[field]:
                                 edit.pop(field, None)
-                update_session(str(payload["session_id"]), save_cot)
+                with active_session_lock(session_id), commit_guard():
+                    update_session(session_id, save_cot)
                 completed += 1
                 completed_cot += 1
                 self._progress(job_id, {"stage": "generating_cot", "completed_steps": completed, "completed_cot": completed_cot, "percent": round(completed / len(payload["targets"]) * 100), "error": None})
+        except PipelineJobCancelled:
+            self._cancelled(job_id)
+            return
         except BatchPublishedError as exc:
             diagnostics.log_event("job_exception", error=diagnostics.format_exception(exc))
             self._progress(job_id, {"status": "failed", "stage": "batch_published", "completed_at": _now(),
@@ -388,8 +414,13 @@ class CotJobManager:
                 with suppress(Exception):
                     reviewer.client.close()
         try:
-            artifact = publish_cot_snapshot(str(payload["session_id"]))
+            check_stop()
+            artifact = (publish_cot_snapshot(session_id, commit_guard=commit_guard) if payload.get("pipeline_id")
+                        else publish_cot_snapshot(session_id))
             self._progress(job_id, {"artifact": artifact})
+        except PipelineJobCancelled:
+            self._cancelled(job_id)
+            return
         except BatchPublishedError as exc:
             diagnostics.log_event("job_exception", error=diagnostics.format_exception(exc))
             self._progress(job_id, {"status": "failed", "stage": "batch_published", "completed_at": _now(),
@@ -400,6 +431,10 @@ class CotJobManager:
             self._progress(job_id, {"status": "failed", "stage": "export_failed", "completed_at": _now(), "error": f"COT 已保存，过程表导出失败；可重新导出，无需重新生成：{exc}"})
             return
         self._progress(job_id, {"status": "succeeded", "stage": "succeeded", "completed_at": _now(), "percent": 100, "error": None})
+
+    def _cancelled(self, job_id):
+        self._progress(job_id, {"status": "cancelled", "stage": "cancelled", "completed_at": _now(),
+                                "error": None, "failure": None})
 
     @staticmethod
     def _validate_target(session, target):

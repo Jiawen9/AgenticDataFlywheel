@@ -291,10 +291,15 @@ class WorkbookAnnotationTests(unittest.TestCase):
                  patch("backend.bounding_box.qwen_reviewer.OpenAI", return_value=client):
                 reviewer = QwenBoxReviewer("test-model", root / "cache.json", client_settings=settings)
                 reviewer.max_output_attempts = 1
+                checkpoint = SimpleNamespace(completed={}, save=MagicMock())
                 counts = annotate_trajectory_workbook(source_path, output_path, reviewer=reviewer,
-                                                      trajectory_root=trajectory_root)
+                                                      trajectory_root=trajectory_root, checkpoint=checkpoint)
 
             self.assertEqual(client.chat.completions.create.call_count, 3)
+            saved = [call.args for call in checkpoint.save.call_args_list]
+            self.assertEqual([entry[1] for entry in saved],
+                             ["model_output_invalid", "annotated", "annotated", "no_box_needed"])
+            self.assertIn("invalid_bbox", saved[0][3])
             self.assertEqual(counts["rows"], 4)
             self.assertEqual(counts["annotated"], 2)
             self.assertEqual(counts["blank"], 2)
@@ -312,6 +317,51 @@ class WorkbookAnnotationTests(unittest.TestCase):
             finally:
                 workbook.close()
 
+    def test_resume_restores_sparse_rows_in_json_and_excel_and_counts_only_pending_work(self):
+        from backend.preprocessing_service import annotate_input, SHEET
+        from backend.stage_artifacts import workbook_payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_path, trajectory_root = self._create_workbook_fixture(root)
+            payload = workbook_payload(source_path)
+            for step, row in enumerate(payload["sheets"][SHEET], start=1):
+                row.update(task_id="t1", step=step)
+            json_path = root / "frozen.json"
+            json_path.write_text(json.dumps(payload), encoding="utf-8")
+            output = root / "resumed.xlsx"
+            restored_box = "click(bbox=<bbox>[10,10,50,50]</bbox>)"
+            checkpoint = SimpleNamespace(
+                bind=MagicMock(), save=MagicMock(),
+                completed={2: ("annotated", restored_box), 4: ("model_output_invalid", None),
+                           5: ("no_box_needed", None)})
+            reviewer = MagicMock(wraps=AcceptingReviewer())
+            events = []
+            # These target rows must be hydrated without opening their annotation evidence.
+            run = trajectory_root / "group" / "run-1"
+            for step in (1, 3):
+                (run / f"step{step:03d}_vla_input_stability.jpg").unlink()
+
+            def progress(event):
+                if event["completed_steps"] == 4:
+                    checkpoint.save.assert_called_once()
+                events.append(event)
+
+            result, counts = annotate_input(json_path, payload, output, snapshot={"raw_root": str(trajectory_root)},
+                config={"max_review_rounds": 1}, cache_path=root / "cache", env_file=root / ".env",
+                progress=progress, reviewer_factory=lambda **kwargs: reviewer, checkpoint=checkpoint)
+            checkpoint.bind.assert_called_once_with(payload["sheets"][SHEET], payload["columns"][SHEET])
+            self.assertNotIn("actions_box", payload["columns"][SHEET])
+            self.assertEqual(counts, {"rows": 4, "annotated": 2, "blank": 2})
+            self.assertEqual([event["completed_steps"] for event in events], [3, 3, 4])
+            self.assertEqual(reviewer.review.call_count, 1)
+            values = [row["actions_box"] for row in result["sheets"][SHEET]]
+            self.assertEqual(values[0], restored_box)
+            self.assertTrue(values[1].startswith("swipe_screen("))
+            self.assertEqual(values[2:], [None, None])
+            self.assertEqual(values, [row["actions_box"] for row in workbook_payload(output)["sheets"][SHEET]])
+            self.assertEqual(checkpoint.save.call_args.args, (3, "annotated", values[1], None))
+
     def test_failure_does_not_publish_annotated_workbook(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -326,6 +376,26 @@ class WorkbookAnnotationTests(unittest.TestCase):
                     trajectory_root=trajectory_root,
                 )
             self.assertFalse(output_path.exists())
+
+    def test_checkpoint_write_failure_after_invalid_output_retains_storage_cause(self):
+        from backend.bounding_box.qwen_reviewer import BoxReviewOutputError
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source, trajectory_root = self._create_workbook_fixture(root)
+            output = root / "annotated.xlsx"
+            reviewer = MagicMock()
+            reviewer.review.side_effect = BoxReviewOutputError("invalid_json")
+            write_error = OSError("checkpoint disk is full")
+            checkpoint = SimpleNamespace(completed={}, save=MagicMock(side_effect=write_error))
+            progress = MagicMock()
+            with self.assertRaisesRegex(RuntimeError, "checkpoint disk is full") as failure:
+                annotate_trajectory_workbook(source, output, reviewer=reviewer, trajectory_root=trajectory_root,
+                                             checkpoint=checkpoint, progress=progress)
+            self.assertIs(failure.exception.__cause__, write_error)
+            self.assertIsNone(write_error.__context__)
+            self.assertEqual([call.args[0]["phase"] for call in progress.call_args_list], ["start"])
+            self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ from pathlib import Path
 from .batch_operations import _process_identity
 from .data_store import ArtifactStore, RecordStore
 from .data_store.registry import utc_now
+from .pipeline_job_stop import check_job_stop
 
 NAMESPACE = "quality_executions"
 _context: ContextVar[tuple[Path, str, str] | None] = ContextVar("quality_execution", default=None)
@@ -104,7 +105,7 @@ def update_job_progress(root: Path, job_id: str, token: str, changes: dict) -> d
                 connection.rollback()
                 return None
             job = records._read(connection, "quality_jobs", job_id)
-            if job is None or job.get("status") != "running":
+            if job is None or job.get("status") != "running" or job.get("stop_requested_at"):
                 connection.rollback()
                 return None
             saved = records._save(connection, "quality_jobs", job_id, {**job, **changes},
@@ -125,12 +126,13 @@ def save_partial_result(root: Path, job_id: str, task_id: str, source_tree_hash:
     context = _context.get()
     token = context[2] if context and context[:2] == (Path(root), job_id) else None
     records = RecordStore(root)
+    check_job_stop(records, "quality_jobs", job_id)
     with records._connection(write=True) as connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
             job = records._read(connection, "quality_jobs", job_id)
             lease = records._read(connection, NAMESPACE, job_id)
-            if not job or job.get("status") != "running":
+            if not job or job.get("status") != "running" or job.get("stop_requested_at"):
                 connection.rollback()
                 return
             if lease and (not token or lease.get("state") != "active" or
@@ -157,7 +159,10 @@ def check_execution(root: Path, job_id: str, token: str, *, allow_committed: boo
     record = _matching(root, job_id, token, active=False)
     if record.get("state") not in ({"active", "committed"} if allow_committed else {"active"}):
         raise QualityExecutionRevoked("质检执行凭证已撤销")
-    job = RecordStore(root).get("quality_jobs", job_id)
+    records = RecordStore(root)
+    if record.get("state") != "committed":
+        check_job_stop(records, "quality_jobs", job_id)
+    job = records.get("quality_jobs", job_id)
     if (job and job.get("status") != "running" and
             not (allow_committed and record.get("state") == "committed")):
         raise QualityExecutionRevoked("质检作业已结束，拒绝迟到回写")

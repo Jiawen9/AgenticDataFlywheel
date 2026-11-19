@@ -16,6 +16,7 @@ except ImportError:  # Keep the API usable before optional dependencies are inst
     pinyin = None  # type: ignore[assignment]
 
 from .config import load_model_config
+from ..pipeline_job_stop import PipelineJobCancelled
 from .knowledge_base import merged_nodes, node_id, scene_tree_text
 from .model_client import TaskGenerationModel, parse_json_value, parse_jsonl_tasks
 from .response_parser import valid_task_text
@@ -38,9 +39,9 @@ def _text(value: Any, default: str = "") -> str:
 
 
 def _model(model: TaskGenerationModel | None, kb_root: Path,
-           diagnostic_id_factory: IdFactory | None = None, model_config=None) -> TaskGenerationModel:
+           diagnostic_id_factory: IdFactory | None = None, model_config=None, check_stop=None) -> TaskGenerationModel:
     return model or TaskGenerationModel(config=model_config, diagnostics_dir=kb_root.parent / "model_calls",
-                                        diagnostic_id_factory=diagnostic_id_factory)
+                                        diagnostic_id_factory=diagnostic_id_factory, check_stop=check_stop)
 
 
 class PartialGenerationError(ValueError):
@@ -68,6 +69,8 @@ def _checked_json(prompt: str, validate: Callable[[dict[str, Any]], Any], *, mod
             correction = "" if not attempt else f"\n上次输出未通过校验：{issue[:300]}。请重新给出严格 JSON 最终答案，不要分析过程。"
             raw = model.complete(prompt + correction, temperature=0.2, max_tokens=config.classification_max_tokens, stage=stage, item_id=item_id)
             return validate(parse_json_value(raw, dict))
+        except PipelineJobCancelled:
+            raise
         except (ValueError, RuntimeError) as exc:
             issue = f"{exc}{_trace_hint(raw)}"
     raise ValueError(f"{stage} 输出校验失败：{issue}")
@@ -102,6 +105,8 @@ def _generate_tasks(prompt: str, count: int, *, model: TaskGenerationModel, item
                 except ValueError as exc:
                     issues.append(f"第 {index} 项：{exc}")
             last_issue = "；".join(issues[:5]) or "有效任务数量不足"
+        except PipelineJobCancelled:
+            raise
         except (ValueError, RuntimeError) as exc:
             last_issue = str(exc)
         last_issue += _trace_hint(raw)
@@ -193,6 +198,8 @@ def _initial_node(row: dict[str, Any], *, generate_n: int, kb_root: Path, model:
         })
         try:
             results.extend(_dependency_tasks(normalized, kb_root=kb_root, model=model, id_factory=id_factory))
+        except PipelineJobCancelled:
+            raise
         except Exception as exc:
             errors.append({"stage": "dependency", "task_index": task_index + 1, "error": f"第 {task_index + 1} 条任务依赖检查失败，未纳入结果：{exc}"})
     if errors:
@@ -215,6 +222,8 @@ def _run_initial_generation(node_ids: list[str], generate_n: int, *, kb_root: Pa
             current_id = futures[future]
             try:
                 results.extend(future.result())
+            except PipelineJobCancelled:
+                raise
             except PartialGenerationError as exc:
                 results.extend(exc.results)
                 errors.extend({"item_id": current_id, **error} for error in exc.errors)
@@ -353,6 +362,8 @@ def _run_augmentation_classification(seeds: list[dict[str, Any]], *, kb_root: Pa
             identifiers = paths.get((*labels, current["app"]), [])
             current.update({"classification_status": "classified", "node_path_ids": identifiers,
                             "mapping_status": "matched" if identifiers else "unclassified" if labels == ("Unclassified",) * 3 else "not_found"})
+        except PipelineJobCancelled:
+            raise
         except Exception as exc:
             current.update({"classification_status": "failed", "mapping_status": "classification_failed",
                             "node_path_ids": [], "generation_status": "skipped", "error": str(exc)})
@@ -388,6 +399,8 @@ def _run_augmentation_generation(seeds: list[dict[str, Any]], generate_n: int, *
         try:
             rows = _variant_records(current, generate_n=generate_n, kb_root=kb_root, model=model, id_factory=id_factory)
             issues = []
+        except PipelineJobCancelled:
+            raise
         except PartialGenerationError as exc:
             rows, issues = exc.results, exc.errors
         except Exception as exc:
@@ -415,8 +428,8 @@ def _run_augmentation_generation(seeds: list[dict[str, Any]], generate_n: int, *
 
 def run_augmentation_classification(seeds: list[dict[str, Any]], *, kb_root: Path, progress: Progress,
                                    on_seed: SeedProgress | None = None, model: TaskGenerationModel | None = None,
-                                   diagnostic_id_factory: IdFactory | None = None, model_config=None) -> dict[str, Any]:
-    active = _model(model, kb_root, diagnostic_id_factory, model_config)
+                                   diagnostic_id_factory: IdFactory | None = None, model_config=None, check_stop=None) -> dict[str, Any]:
+    active = _model(model, kb_root, diagnostic_id_factory, model_config, check_stop)
     try:
         return _run_augmentation_classification(seeds, kb_root=kb_root, progress=progress, model=active, on_seed=on_seed)
     finally:
@@ -427,8 +440,8 @@ def run_augmentation_classification(seeds: list[dict[str, Any]], *, kb_root: Pat
 def run_augmentation_generation(seeds: list[dict[str, Any]], generate_n: int, *, kb_root: Path, progress: Progress,
                                on_seed: SeedProgress | None = None, model: TaskGenerationModel | None = None,
                                id_factory: IdFactory | None = None,
-                               diagnostic_id_factory: IdFactory | None = None, model_config=None) -> dict[str, Any]:
-    active = _model(model, kb_root, diagnostic_id_factory, model_config)
+                               diagnostic_id_factory: IdFactory | None = None, model_config=None, check_stop=None) -> dict[str, Any]:
+    active = _model(model, kb_root, diagnostic_id_factory, model_config, check_stop)
     try:
         return _run_augmentation_generation(seeds, generate_n, kb_root=kb_root, progress=progress, model=active, on_seed=on_seed, id_factory=id_factory)
     finally:
@@ -444,8 +457,8 @@ def _run_augmentation(path: Path, generate_n: int, *, kb_root: Path, progress: P
     return outcome
 
 
-def run_initial_generation(node_ids: list[str], generate_n: int, *, kb_root: Path, progress: Progress, model: TaskGenerationModel | None = None, id_factory: IdFactory | None = None, diagnostic_id_factory: IdFactory | None = None, model_config=None) -> dict[str, Any]:
-    active = _model(model, kb_root, diagnostic_id_factory, model_config)
+def run_initial_generation(node_ids: list[str], generate_n: int, *, kb_root: Path, progress: Progress, model: TaskGenerationModel | None = None, id_factory: IdFactory | None = None, diagnostic_id_factory: IdFactory | None = None, model_config=None, check_stop=None) -> dict[str, Any]:
+    active = _model(model, kb_root, diagnostic_id_factory, model_config, check_stop)
     try:
         return _run_initial_generation(node_ids, generate_n, kb_root=kb_root, progress=progress, model=active, id_factory=id_factory)
     finally:
@@ -453,8 +466,8 @@ def run_initial_generation(node_ids: list[str], generate_n: int, *, kb_root: Pat
             active.close()
 
 
-def run_augmentation(path: Path, generate_n: int, *, kb_root: Path, progress: Progress, model: TaskGenerationModel | None = None, id_factory: IdFactory | None = None, diagnostic_id_factory: IdFactory | None = None, model_config=None) -> dict[str, Any]:
-    active = _model(model, kb_root, diagnostic_id_factory, model_config)
+def run_augmentation(path: Path, generate_n: int, *, kb_root: Path, progress: Progress, model: TaskGenerationModel | None = None, id_factory: IdFactory | None = None, diagnostic_id_factory: IdFactory | None = None, model_config=None, check_stop=None) -> dict[str, Any]:
+    active = _model(model, kb_root, diagnostic_id_factory, model_config, check_stop)
     try:
         return _run_augmentation(path, generate_n, kb_root=kb_root, progress=progress, model=active, id_factory=id_factory)
     finally:

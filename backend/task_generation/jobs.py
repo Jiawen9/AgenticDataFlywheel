@@ -7,7 +7,7 @@ import sqlite3
 import tempfile
 import threading
 from concurrent.futures import Executor, ThreadPoolExecutor
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -22,6 +22,7 @@ from ..data_store.paths import DATA_ROOT
 from ..data_store.registry import RecordStore
 from ..identifiers import allocate_id, batch_uses_short_ids
 from .. import pipeline_diagnostics as diagnostics
+from ..pipeline_job_stop import PipelineJobCancelled, check_job_stop, job_commit_guard
 from ..short_paths import short_temporary_file
 from ..file_io import io_path
 from ..data_store.artifacts import ArtifactStore
@@ -169,7 +170,12 @@ class TaskGenerationJobManager:
     def _write_json(self, path: Path, value: Any) -> None:
         # Mutable records exist only in SQLite. Frozen manifests remain JSON.
         if path.parent == self.jobs_dir and isinstance(value, dict):
-            self.store.put("task_generation.jobs", str(value["job_id"]), value)
+            def update(current):
+                stop_requested_at = current.get("stop_requested_at")
+                if stop_requested_at and value.get("status") in {"queued", "running", "awaiting_confirmation"}:
+                    return current
+                return {**value, **({"stop_requested_at": stop_requested_at} if stop_requested_at else {})}
+            self.store.update("task_generation.jobs", str(value["job_id"]), update, default={})
             return
         elif path.parent.parent == self.runs_dir and path.name in {"results.json", "seeds.json"}:
             with active_batch_lock(path.parent.name, self.data_root):
@@ -197,7 +203,8 @@ class TaskGenerationJobManager:
         # runners keep their existing contracts and never discover DATA_ROOT.
         if runner is not default:
             return {}
-        options = {"diagnostic_id_factory": lambda: diagnostics.diagnostic_id("q", root=self.data_root)}
+        options = {"diagnostic_id_factory": lambda: diagnostics.diagnostic_id("q", root=self.data_root),
+                   "check_stop": lambda: self._check_stop(job_id)}
         frozen = (self.get(job_id) or {}).get("model_config")
         if frozen:
             from .config import TaskGenerationConfig, load_model_config
@@ -235,6 +242,11 @@ class TaskGenerationJobManager:
             if payload is None:
                 continue
             if isinstance(payload, dict) and payload.get("status") in {"queued", "running"}:
+                try:
+                    self._check_stop(payload["job_id"])
+                except PipelineJobCancelled:
+                    self._cancelled(payload["job_id"])
+                    continue
                 # A final seed checkpoint can reach disk immediately before the
                 # ready job update. Recover that completed classification only;
                 # never resume model calls during application startup.
@@ -538,7 +550,7 @@ class TaskGenerationJobManager:
         return self.get(job_id) or job
 
     def _checkpoint_seed(self, job_id: str, seed: dict[str, Any], rows: list[dict[str, Any]] | None) -> None:
-        with active_batch_lock(job_id, self.data_root), self._lock:
+        with active_batch_lock(job_id, self.data_root), self._lock, self._commit_guard(job_id):
             seeds = self._read_seeds(job_id)
             index = next(index for index, item in enumerate(seeds) if item["seed_id"] == seed["seed_id"])
             seeds[index] = seed
@@ -569,13 +581,13 @@ class TaskGenerationJobManager:
             self._progress(job_id, changes)
 
     def _run_augmentation_classification(self, job_id: str) -> None:
-        self._progress(job_id, {"status": "running", "stage": "classifying", "started_at": _now()})
-        self._log(job_id, "开始匹配失败任务与作业快照场景树")
         try:
+            self._begin(job_id, stage="classifying", started_at=_now())
+            self._log(job_id, "开始匹配失败任务与作业快照场景树")
             with batch_operation(job_id, "augmentation_classification", self.data_root):
                 outcome = self.classification_runner(
                     self._read_seeds(job_id), kb_root=self._source_file(job_id, "KnowledgeBase"),
-                    progress=lambda value: self._progress(job_id, value),
+                    progress=lambda value: self._worker_progress(job_id, value),
                     on_seed=lambda seed, rows: self._checkpoint_seed(job_id, seed, rows),
                     **self._runner_options(self.classification_runner, run_augmentation_classification, job_id),
                 )
@@ -584,7 +596,8 @@ class TaskGenerationJobManager:
                     raise ValueError("分类未完成全部种子，不能进入确认阶段")
                 stats = self._seed_stats(seeds)
                 with active_batch_lock(job_id, self.data_root), self._lock:
-                    self._write_json(self._seeds_path(job_id), seeds)
+                    with self._commit_guard(job_id):
+                        self._write_json(self._seeds_path(job_id), seeds)
                     ready = {**(self.get(job_id) or {}), "classification_completed": True, "seed_stats": stats,
                                            "status": "awaiting_confirmation" if stats["eligible"] else "failed",
                                            "stage": "awaiting_confirmation" if stats["eligible"] else "failed",
@@ -593,8 +606,11 @@ class TaskGenerationJobManager:
                                            "completed_at": None if stats["eligible"] else _now(),
                                            "error": None if stats["eligible"] else "所有种子分类失败，无法扩增"}
                     try:
-                        ready["latest_artifact"] = self._publish_snapshot(ready, stage="00_scene_matching")
+                        ready["latest_artifact"] = self._publish_snapshot(ready, stage="00_scene_matching",
+                            commit_guard=lambda: self._commit_guard(job_id))
                         ready["artifact_error"] = None
+                    except PipelineJobCancelled:
+                        raise
                     except Exception as exc:
                         ready["artifact_error"] = f"中间产物保存失败，可重试保存：{exc}"
                     self._write_job(ready)
@@ -604,20 +620,22 @@ class TaskGenerationJobManager:
                         self.start_augmentation(job_id)
                     except GenerationPaused:
                         self._log(job_id, "所属 Pipeline 未允许下一阶段，保留分类预览等待继续")
+        except PipelineJobCancelled:
+            self._cancelled(job_id)
         except Exception as exc:
             self._fail_augmentation(job_id, exc)
 
     def _run_augmentation_generation(self, job_id: str) -> None:
-        self._progress(job_id, {"status": "running", "stage": "generating"})
-        self._log(job_id, "开始从已保存的分类记录扩增任务")
         try:
+            self._begin(job_id, stage="generating")
+            self._log(job_id, "开始从已保存的分类记录扩增任务")
             with batch_operation(job_id, "augmentation_generation", self.data_root):
                 job = self.get(job_id)
                 if job is None:
                     return
                 outcome = self.generation_runner(
                     self._read_seeds(job_id), job["generate_n"], kb_root=self._execution_library(job_id),
-                    progress=lambda value: self._progress(job_id, value),
+                    progress=lambda value: self._worker_progress(job_id, value),
                     on_seed=lambda seed, rows: self._checkpoint_seed(job_id, seed, rows),
                     **self._runner_options(self.generation_runner, run_augmentation_generation, job_id, tasks=True),
                 )
@@ -625,8 +643,34 @@ class TaskGenerationJobManager:
                 outcome["warnings"] = list(job.get("warnings", [])) + outcome.get("warnings", [])
                 self._finish(job_id, outcome)
                 self._log(job_id, f"扩增结束，结果数={len(outcome.get('results', []))}")
+        except PipelineJobCancelled:
+            self._cancelled(job_id)
         except Exception as exc:
             self._fail_augmentation(job_id, exc)
+
+    def _check_stop(self, job_id):
+        check_job_stop(self.store, "task_generation.jobs", job_id)
+
+    def _commit_guard(self, job_id):
+        return job_commit_guard(self.store, "task_generation.jobs", job_id)
+
+    def _begin(self, job_id, **changes):
+        with self._lock, self._commit_guard(job_id):
+            self._progress(job_id, {"status": "running", **changes})
+
+    def _worker_progress(self, job_id, changes):
+        self._check_stop(job_id)
+        self._progress(job_id, changes)
+
+    def _cancelled(self, job_id):
+        with self.artifacts.batch_lock(job_id), self._lock:
+            changes = {"status": "cancelled", "stage": "cancelled", "completed_at": _now(), "error": None}
+            job = self.get(job_id) or {}
+            if job.get("augmentation_preview_version"):
+                stats = self._stop_pending_seeds(job_id, "所属 Pipeline 已终止")
+                if stats is not None:
+                    changes["seed_stats"] = stats
+            self._progress(job_id, changes)
 
     def _progress(self, job_id: str, changes: dict[str, Any]) -> None:
         with self._lock:
@@ -640,7 +684,8 @@ class TaskGenerationJobManager:
         results = outcome.get("results", [])
         errors = outcome.get("errors", [])
         with active_batch_lock(job_id, self.data_root), self._lock:
-            self._write_json(self._results_path(job_id), results)
+            with self._commit_guard(job_id):
+                self._write_json(self._results_path(job_id), results)
             payload = self.get(job_id)
             if payload is None:
                 return
@@ -656,36 +701,42 @@ class TaskGenerationJobManager:
                 "error": None if status in {"succeeded", "partial"} else (errors[0].get("error") if errors else "作业未生成结果"),
             })
             try:
-                payload["latest_artifact"] = self._publish_snapshot(payload)
+                payload["latest_artifact"] = self._publish_snapshot(payload, commit_guard=lambda: self._commit_guard(job_id))
                 payload["artifact_error"] = None
+            except PipelineJobCancelled:
+                raise
             except Exception as exc:
                 payload["artifact_error"] = f"中间产物保存失败，可重试保存：{exc}"
             self._write_job(payload)
 
     def _run_initial(self, job_id: str, node_ids: list[str], generate_n: int) -> None:
-        self._progress(job_id, {"status": "running", "stage": "preparing", "started_at": _now()})
-        self._log(job_id, f"开始任务生成，节点数={len(node_ids)}，每节点={generate_n}")
         try:
+            self._begin(job_id, stage="preparing", started_at=_now())
+            self._log(job_id, f"开始任务生成，节点数={len(node_ids)}，每节点={generate_n}")
             with batch_operation(job_id, "initial", self.data_root):
                 outcome = self.initial_runner(node_ids, generate_n, kb_root=self._run_dir(job_id) / "KnowledgeBase",
-                    progress=lambda value: self._progress(job_id, value),
+                    progress=lambda value: self._worker_progress(job_id, value),
                     **self._runner_options(self.initial_runner, run_initial_generation, job_id, tasks=True))
                 self._log(job_id, f"任务生成结束，结果数={len(outcome.get('results', []))}，错误数={len(outcome.get('errors', []))}")
                 self._finish(job_id, outcome)
+        except PipelineJobCancelled:
+            self._cancelled(job_id)
         except Exception as exc:
             self._log(job_id, f"任务生成失败：{exc}")
             self._progress(job_id, {"status": "failed", "stage": "failed", "completed_at": _now(), "error": str(exc), "errors": [{"error": str(exc)}]})
 
     def _run_augmentation(self, job_id: str, input_path: Path, generate_n: int) -> None:
-        self._progress(job_id, {"status": "running", "stage": "preparing", "started_at": _now()})
-        self._log(job_id, f"开始任务扩增，输入={input_path.name}，每种子={generate_n}")
         try:
+            self._begin(job_id, stage="preparing", started_at=_now())
+            self._log(job_id, f"开始任务扩增，输入={input_path.name}，每种子={generate_n}")
             with batch_operation(job_id, "augmentation", self.data_root):
                 outcome = self.augmentation_runner(input_path, generate_n, kb_root=self._run_dir(job_id) / "KnowledgeBase",
-                    progress=lambda value: self._progress(job_id, value),
+                    progress=lambda value: self._worker_progress(job_id, value),
                     **self._runner_options(self.augmentation_runner, run_augmentation, job_id, tasks=True))
                 self._log(job_id, f"任务扩增结束，结果数={len(outcome.get('results', []))}，错误数={len(outcome.get('errors', []))}")
                 self._finish(job_id, outcome)
+        except PipelineJobCancelled:
+            self._cancelled(job_id)
         except Exception as exc:
             self._log(job_id, f"任务扩增失败：{exc}")
             self._progress(job_id, {"status": "failed", "stage": "failed", "completed_at": _now(), "error": str(exc), "errors": [{"error": str(exc)}]})
@@ -873,7 +924,8 @@ class TaskGenerationJobManager:
             self._progress(job_id, {"artifact_error": None, "latest_artifact": manifest})
             return manifest
 
-    def _publish_snapshot(self, job: dict[str, Any], *, stage: str | None = None) -> dict[str, Any]:
+    def _publish_snapshot(self, job: dict[str, Any], *, stage: str | None = None,
+                          commit_guard=nullcontext) -> dict[str, Any]:
         job_id = job["job_id"]
         results = self.results(job_id)
         try:
@@ -890,7 +942,7 @@ class TaskGenerationJobManager:
         payload.update({key: job[key] for key in ("pipeline_id", "feedback_id", "feedback_digest", "source_evaluation_run_id") if job.get(key)})
         return self.artifacts.publish(job_id, chosen_stage, payload, tables=tables,
             source_refs=[{"kind": "knowledge_base", "version": job.get("knowledge_base_version")}],
-            metadata={"source_job_id": job_id, "source_status": job["status"]})
+            metadata={"source_job_id": job_id, "source_status": job["status"]}, commit_guard=commit_guard)
 
     def _save_snapshot_or_warning(self, job_id: str, *, stage: str | None = None) -> None:
         try:

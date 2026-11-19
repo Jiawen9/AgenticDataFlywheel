@@ -94,12 +94,14 @@ def schedule(runtime, run_id):
 def dispatch(runtime, run_id):
     from .collector_storage import unavailable
     from .pipeline_evaluation import dispatch_guard, may_dispatch
+    from .pipeline_job_stop import check_pipeline_stop, termination_lock
     if unavailable(runtime.records, run_id):
         return
     run = runtime.records.get("model_iter_runs", run_id)
     if not run or run.get("dispatch_confirmed") or run.get("dispatch_rejected"):
         return
-    if run.get("evaluation_control_terminal") or not may_dispatch(runtime.records, run, allow_stop=True):
+    allow_stop = not run.get("pipeline_id")
+    if run.get("evaluation_control_terminal") or not may_dispatch(runtime.records, run, allow_stop=allow_stop):
         return
     epoch = run.get("evaluation_control_epoch", 0)
     try:
@@ -109,10 +111,11 @@ def dispatch(runtime, run_id):
                            preparation={**row["preparation"], "status": "cancelled", "phase": "cancelled"})
                 return
             row.update(dispatch_attempted=True, submitted_at=utc_now())
-        with dispatch_guard(runtime, run):
+        with dispatch_guard(runtime, run), termination_lock(runtime.root, run.get("pipeline_id")):
             run = runtime.records.get("model_iter_runs", run_id)
-            if not run or run.get("dispatch_confirmed") or run.get("dispatch_rejected") or not may_dispatch(runtime.records, run, allow_stop=True):
+            if not run or run.get("dispatch_confirmed") or run.get("dispatch_rejected") or not may_dispatch(runtime.records, run, allow_stop=allow_stop):
                 return
+            check_pipeline_stop(runtime.records, run.get("pipeline_id"))
             run = runtime.records.update("model_iter_runs", run_id, mark)
         if run.get("evaluation_control_terminal"):
             return

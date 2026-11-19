@@ -19,6 +19,9 @@ from .data_store.registry import utc_now
 from .file_io import io_path
 from .identifiers import ID_SCHEME, allocate_id
 from .pipeline_access import TERMINAL, active_pipeline, internal_pipeline
+from .pipeline_job_stop import (PipelineJobCancelled, check_pipeline_stop,
+                                request_local_stops, termination_lock)
+from .remote_sync import BoundedSyncPool
 from .trajectory_correction.export_policy import OPD_PREFIX_PROFILE, validate_export_policy
 from . import pipeline_diagnostics as diagnostics
 
@@ -30,11 +33,20 @@ ACTIVE_JOBS = {"queued", "starting", "running", "dispatching", "pending"}
 FAILED_JOBS = {"failed", "interrupted", "cancelled", "stale"}
 RETRY_POLICY = {"version": 1, "max_attempts": 3, "delays_seconds": [30, 120]}
 MODEL_STAGE_LIMITS = {"preprocessing": 6, "quality": 6}
+OVERNIGHT_RETRIES = 100
 RETRYABLE_STEPS = {"collection", "preprocessing", "tree", "quality", "cot", "publication", "overview"}
 
 
 def new_retry_policy():
     return {**RETRY_POLICY, "stage_max_attempts": dict(MODEL_STAGE_LIMITS)}
+
+
+def _overnight_enabled():
+    from .trajectories_preprocessing import read_env_file
+    try:
+        return read_env_file(Path(__file__).with_name(".env")).get("ADF_PIPELINE_OVERNIGHT_RETRY") == "1"
+    except (OSError, ValueError):
+        return False
 
 
 def _upgrade_retry_limits(pipeline):
@@ -155,6 +167,10 @@ class PipelineRuntime:
 
     def collection_runs(self, batch_id):
         return self.factory.collection_runs.list_runs(batch_id)
+
+    def request_phone_stops(self, pipeline):
+        from .pipeline_phone_stop import request_phone_stops
+        return request_phone_stops(self, pipeline)
 
     def prepare_collection(self, source_batch_id, request_id, options):
         """Freeze a result batch before acquiring downstream ownership."""
@@ -411,6 +427,7 @@ class PipelineManager:
         self.root, self.runtime = Path(root), runtime
         self.records, self.artifacts = RecordStore(root), ArtifactStore(root)
         self.interval, self._stop, self._thread = interval, threading.Event(), None
+        self._termination_workers = BoundedSyncPool("pipeline-termination", max_workers=2)
 
     def get(self, pipeline_id, *, public=True):
         _identifier(pipeline_id, "Pipeline ID")
@@ -419,6 +436,9 @@ class PipelineManager:
             raise PipelineError("Pipeline 不存在", 404)
         if public:
             for step in pipeline["steps"]:
+                night = step.get("overnight_retry")
+                if night and step.get("retry_info"):
+                    step["retry_info"].update(attempts=night["used"] + 1, max_attempts=OVERNIGHT_RETRIES + 1)
                 # The public detail needs only the jobs explicitly bound to
                 # this step. Discovery during orchestration remains separate.
                 if step["id"] == "evaluation":
@@ -566,7 +586,39 @@ class PipelineManager:
 
     def control(self, pipeline_id, action, revision, *, session_revision=None):
         with diagnostics.trace_context(root=self.root, pipeline_id=pipeline_id):
+            if action == "terminate":
+                return self._request_termination(pipeline_id)
             return self._control_with_diagnostics(pipeline_id, action, revision, session_revision=session_revision)
+
+    def _request_termination(self, pipeline_id):
+        self.get(pipeline_id, public=False)
+
+        def stop(pipeline):
+            if pipeline["status"] == "terminated" and pipeline.get("termination"):
+                return
+            if pipeline["status"] in TERMINAL - {"published_summary_failed"}:
+                raise PipelineError("该 Pipeline 已结束")
+            now = utc_now()
+            termination = pipeline.get("termination")
+            if termination:
+                termination["retry_requested_at"] = now
+            else:
+                pipeline["termination"] = {
+                    "requested_at": now,
+                    "pending": [{"stage": pipeline["current_step"], "message": "正在登记和核对停止状态"}],
+                }
+            for step in pipeline["steps"]:
+                if step.get("retry_info"):
+                    step["retry_info"]["next_retry_at"] = None
+            pipeline.update(status="terminating", error=None, updated_at=now)
+
+        # This lock only fences final commits. Slow dispatch, export preparation
+        # and model calls may hold the orchestrator lock and must not delay acceptance.
+        with termination_lock(self.root, pipeline_id):
+            self.records.update("pipelines", pipeline_id, stop)
+        if self._thread and self._thread.is_alive():
+            self._termination_workers.submit(pipeline_id, lambda: self._poll_one(pipeline_id))
+        return self.get(pipeline_id)
 
     def _control_with_diagnostics(self, pipeline_id, action, revision, *, session_revision=None):
         with self.artifacts.batch_lock("pipeline_" + pipeline_id):
@@ -600,11 +652,17 @@ class PipelineManager:
                 p["status"] = p.pop("paused_from", "running")
             elif action == "retry" and p["status"] == "failed":
                 step = next(s for s in p["steps"] if s["id"] == p["current_step"])
-                self._retry_current_stage(p, step)
+                self._clear_overnight(step)
                 if p.get("retry_policy"):
                     step["retry_info"] = retry_info(p["retry_policy"], step["id"])
-            elif action == "terminate":
-                p["status"] = "terminated" if p.get("release_id") else "terminating"
+                if step["id"] in MODEL_STAGE_LIMITS and _overnight_enabled():
+                    # Keep the bound child until the scheduler has reconciled its exit.
+                    self._begin_overnight(p, step)["manual_pending"] = True
+                    step["retry_info"]["next_retry_at"] = _retry_at(0)
+                    step.update(status="retry_waiting", error=None)
+                    p.update(status="retry_waiting", error=None)
+                else:
+                    self._retry_current_stage(p, step)
             elif action == "confirm-correction" and p["status"] == "waiting_for_correction":
                 if session_revision is None:
                     raise PipelineError("请携带修正会话修订号确认", 422)
@@ -620,7 +678,7 @@ class PipelineManager:
                 raise PipelineError("当前状态不能执行该操作")
             if p.get("collection_resume_wait") and action in {"pause", "resume"}:
                 p["collection_resume_wait"]["previous_status"] = "paused" if action == "pause" else "running"
-            self._log(p, {"pause": "暂停后续派发", "resume": "继续执行", "retry": "重试当前阶段", "terminate": "等待已启动作业结束后终止"}.get(action, action))
+            self._log(p, {"pause": "暂停后续派发", "resume": "继续执行", "retry": "重试当前阶段"}.get(action, action))
             self._save(p)
             return self.get(pipeline_id)
 
@@ -629,7 +687,50 @@ class PipelineManager:
             step["retry_info"]["attempts"] += 1
             step["retry_info"]["next_retry_at"] = None
 
-    def _schedule_or_fail(self, pipeline, step, exc):
+    def _overnight_progress(self, pipeline, step):
+        from .pipeline_retry_progress import progress
+        try:
+            return progress(self.root, self.records, pipeline, step)
+        except (OSError, sqlite3.Error, ValueError, KeyError, TypeError) as exc:
+            LOG.warning("Pipeline %s stage=%s checkpoint unavailable: %s",
+                        pipeline["pipeline_id"], step["id"], diagnostics.sanitize(str(exc)))
+            return None
+
+    def _begin_overnight(self, pipeline, step):
+        state = {"used": 0, "high_water": self._overnight_progress(pipeline, step),
+                 "added_retry_info": not bool(step.get("retry_info"))}
+        step["overnight_retry"] = state
+        if state["added_retry_info"]:
+            step["retry_info"] = retry_info(pipeline.get("retry_policy") or RETRY_POLICY, step["id"], attempts=1)
+        return state
+
+    @staticmethod
+    def _clear_overnight(step):
+        state = step.pop("overnight_retry", None)
+        if state and state["added_retry_info"]:
+            step.pop("retry_info", None)
+
+    def _restore_daytime(self, pipeline, step):
+        state = step["overnight_retry"]
+        if pipeline["status"] == "retry_waiting":
+            info = step["retry_info"]
+            allowed = (not state["added_retry_info"] and pipeline.get("retry_policy")
+                       and state.get("day_retryable") and info["attempts"] < info["max_attempts"])
+            if not allowed:
+                # The preceding submit could still have reached the executor.
+                from .pipeline_retry_reconcile import reconcile
+                if reconcile(self, pipeline, step):
+                    if state.get("manual_pending"):
+                        self._retry_current_stage(pipeline, step)
+                    else:
+                        reason = info.get("last_error") or step.get("error") or "已恢复常规重试策略"
+                        info["next_retry_at"] = None
+                        step.update(status="failed", error=reason, message="执行失败，可重试或终止")
+                        pipeline.update(status="failed", error=reason)
+                        self._log(pipeline, step["label"] + "：" + reason)
+        self._clear_overnight(step)
+
+    def _schedule_or_fail(self, pipeline, step, exc, *, overnight=False):
         from .pipeline_retry_errors import failure_from_exception, failure_from_payload
 
         child_failure = getattr(exc, "failure", None)
@@ -641,11 +742,11 @@ class PipelineManager:
         policy = pipeline.get("retry_policy") or {}
         failed_job_id = getattr(exc, "failed_job_id", None)
         retryable = failure["retryable"]
-        if step["id"] in policy.get("stage_max_attempts", {}) and failed_job_id:
+        if (overnight or step["id"] in policy.get("stage_max_attempts", {})) and failed_job_id:
             step["failed_retry_job_id"] = failed_job_id
         waiting = pipeline["status"] == "retry_waiting"
         retry_preflight = step["status"] == "pending" and step.get("retry")
-        if step["id"] in MODEL_STAGE_LIMITS and (waiting or retry_preflight):
+        if not overnight and step["id"] in MODEL_STAGE_LIMITS and (waiting or retry_preflight):
             # This is a check of an existing attempt. A poll cannot start another backoff.
             deadline = (info or {}).get("next_retry_at")
             exhausted = info and info["attempts"] >= info["max_attempts"]
@@ -656,20 +757,41 @@ class PipelineManager:
             if not isinstance(exc, PipelineError):
                 message = f"重试前核对失败：{type(exc).__name__}，{diagnostics.sanitize(str(exc))}"[:600]
         diagnostics.log_event("pipeline_stage_exception", step_id=step["id"], error=diagnostics.format_exception(exc))
-        if (policy and info and step["id"] in RETRYABLE_STEPS and retryable
-                and int(info["attempts"]) < int(info["max_attempts"])):
+        if overnight:
+            state = step.get("overnight_retry")
+            if state is None:
+                state = self._begin_overnight(pipeline, step)
+            else:
+                mark = self._overnight_progress(pipeline, step)
+                previous = state["high_water"]
+                if mark is not None and (previous is None or mark > previous):
+                    state["high_water"] = mark
+                    if previous is not None:
+                        state["used"] = 0
+            state["day_retryable"] = failure["retryable"]
+            info = step["retry_info"]
+            info["attempts"] = max(1, info["attempts"])
+            attempt, limit = state["used"] + 1, OVERNIGHT_RETRIES + 1
+            retryable = attempt < limit
+            delay = 30 if state["used"] == 0 else 120
+        else:
+            attempt, limit = (info or {}).get("attempts", 0), (info or {}).get("max_attempts", 0)
+            retryable = bool(policy and info and step["id"] in RETRYABLE_STEPS and retryable and attempt < limit)
+            if retryable:
+                attempt = max(1, attempt)
+                delays = policy["delays_seconds"]
+                delay = int(delays[min(attempt - 1, len(delays) - 1)])
+        if retryable:
             # A network failure before an acknowledgement is still one attempt.
             if not info["attempts"]:
                 info["attempts"] = 1
-            delays = policy["delays_seconds"]
-            delay = int(delays[min(int(info["attempts"]) - 1, len(delays) - 1)])
             info.update(last_error=message, next_retry_at=_retry_at(delay))
             pipeline.update(status="retry_waiting", error=message)
             step.update(status="retry_waiting", error=message,
-                        message=f"临时故障，{delay} 秒后进行第 {info['attempts'] + 1}/{info['max_attempts']} 次尝试")
+                        message=f"临时故障，{delay} 秒后进行第 {attempt + 1}/{limit} 次尝试")
             self._log(pipeline, step["label"] + f"，{delay} 秒后重试：" + message)
             diagnostics.log_event("pipeline_retry_scheduled", step_id=step["id"], error=message,
-                                  attempts=info["attempts"], next_retry_at=info["next_retry_at"])
+                                  attempts=attempt, max_attempts=limit, next_retry_at=info["next_retry_at"])
         else:
             if info:
                 info.update(last_error=message, next_retry_at=None)
@@ -681,15 +803,15 @@ class PipelineManager:
             self._log(pipeline, step["label"] + "失败：" + message)
         job_id = failed_job_id or next(reversed(step.get("job_ids", [])), None)
         LOG.warning("Pipeline %s stage=%s job=%s attempt=%s/%s code=%s reason=%s next_retry_at=%s",
-                    pipeline["pipeline_id"], step["id"], job_id or "-", (info or {}).get("attempts", "-"),
-                    (info or {}).get("max_attempts", "-"), failure.get("code") or failure["category"],
+                    pipeline["pipeline_id"], step["id"], job_id or "-", attempt,
+                    limit, failure.get("code") or failure["category"],
                     message, (info or {}).get("next_retry_at") or "-")
 
     def _retry_current_stage(self, pipeline, step):
         job_ids = step["job_ids"]
         policy = pipeline.get("retry_policy") or {}
         previous = job_ids[-1] if job_ids else None
-        if step["id"] in policy.get("stage_max_attempts", {}):
+        if step.get("overnight_retry") or step["id"] in policy.get("stage_max_attempts", {}):
             previous = step.pop("failed_retry_job_id", None) or previous or step.get("retry_job_id")
         step["retry_job_id"] = previous
         step.setdefault("previous_job_ids", []).extend(job_ids)
@@ -826,6 +948,7 @@ class PipelineManager:
         return completed
 
     def _done(self, step, message="已完成", *, skipped=False):
+        self._clear_overnight(step)
         step.update(status="skipped" if skipped else "succeeded", percent=100, completed_at=step.get("completed_at") or utc_now(), message=message, error=None)
         if step.get("retry_info"):
             step["retry_info"].update(last_error=None, next_retry_at=None)
@@ -856,20 +979,29 @@ class PipelineManager:
                 if key == "quality" and hasattr(self.runtime, "quality_incomplete_message"):
                     raise PipelineError(self.runtime.quality_incomplete_message(p))
                 raise PipelineError("作业已结束但整批有效结果不完整，不能继续发布")
-        if self.runtime.configurations().get(key) != p["config_fingerprints"].get(key):
+        frozen_retry = step.get("overnight_retry") and step.get("retry") and step.get("retry_job_id")
+        if not frozen_retry and self.runtime.configurations().get(key) != p["config_fingerprints"].get(key):
             raise PipelineError("处理配置已变化，请结束流程后重新创建")
         if key != "cot" and self.runtime.ready(key, p):
             self._done(step, "复用当前有效结果")
             diagnostics.log_event("stage_reused", step_id=key, task_ids=p["task_ids"], source="current_valid_artifacts")
             return
         if step["status"] == "running" and not step["job_ids"]:
-            previous = set(step.get("previous_job_ids", []))
-            recovered = [job for job in jobs.values() if job.get("pipeline_id") == p["pipeline_id"]
-                         and job["job_id"] not in previous]
-            if recovered:
-                recovered.sort(key=lambda job: (str(job.get("created_at") or ""), job["job_id"]))
-                step["job_ids"].append(recovered[-1]["job_id"])
-                return
+            if step.get("overnight_retry"):
+                from .pipeline_retry_reconcile import reconcile
+                if not reconcile(self, p, step):
+                    return
+                if any(child != step.get("retry_job_id") for child in step["job_ids"]):
+                    return  # Recovered a terminal child. Observe its result on the next poll.
+                step["job_ids"] = []
+            else:
+                previous = set(step.get("previous_job_ids", []))
+                recovered = [job for job in jobs.values() if job.get("pipeline_id") == p["pipeline_id"]
+                             and job["job_id"] not in previous]
+                if recovered:
+                    recovered.sort(key=lambda job: (str(job.get("created_at") or ""), job["job_id"]))
+                    step["job_ids"].append(recovered[-1]["job_id"])
+                    return
         # Persist intent before submission. Child services durably deduplicate the
         # exact input, so losing the response does not create another computation.
         if step["status"] != "running":
@@ -877,6 +1009,7 @@ class PipelineManager:
         step.update(status="running", started_at=step["started_at"] or utc_now(), message="提交并跟踪作业")
         saved = self._save(p)
         p["storage_revision"] = saved["storage_revision"]
+        check_pipeline_stop(self.records, p["pipeline_id"])
         job = self.runtime.submit(key, p, retry=bool(step.pop("retry", False)))
         if job is None:
             self._done(step, "没有需要生成 COT 的步骤", skipped=True)
@@ -897,7 +1030,58 @@ class PipelineManager:
 
     def tick(self, pipeline_id):
         with diagnostics.trace_context(root=self.root, pipeline_id=pipeline_id):
-            return self._tick_with_diagnostics(pipeline_id)
+            try:
+                pipeline = self.get(pipeline_id, public=False)
+                if pipeline["status"] == "terminating":
+                    return self._reconcile_termination(pipeline)
+                return self._tick_with_diagnostics(pipeline_id)
+            except (RevisionConflict, PipelineJobCancelled):
+                if self.get(pipeline_id, public=False)["status"] != "terminating":
+                    raise
+
+    def _reconcile_termination(self, pipeline):
+        pipeline_id = pipeline["pipeline_id"]
+        if not pipeline.get("termination"):
+            # Adopt a still-pending request made with the previous implementation.
+            self._request_termination(pipeline_id)
+            pipeline = self.get(pipeline_id, public=False)
+        with internal_pipeline(pipeline_id):
+            pending = self.runtime.request_phone_stops(pipeline)
+        def signal_quality(job_id):
+            return self.runtime.quality.signal_pipeline_stop(job_id)
+
+        pending.extend(request_local_stops(self.records, pipeline, signal_quality))
+        if not pending:
+            # An in-flight submit may have been holding the orchestrator lock.
+            # Scan again after it returns so we see any newly registered child.
+            with self.artifacts.batch_lock("pipeline_" + pipeline_id):
+                pass
+            with internal_pipeline(pipeline_id):
+                pending = self.runtime.request_phone_stops(pipeline)
+            pending.extend(request_local_stops(self.records, pipeline, signal_quality))
+        with self.artifacts.batch_lock("pipeline_" + pipeline_id):
+            current = self.get(pipeline_id, public=False)
+            if current["status"] != "terminating" or current["storage_revision"] != pipeline["storage_revision"]:
+                return
+            previous = current["termination"].get("pending")
+            current["termination"]["pending"] = pending
+            if pending:
+                if pending != previous:
+                    self._save(current)
+                return
+
+            if current.get("batch_id"):
+                state = lifecycle(current["batch_id"], self.root)
+                if state["status"] == "published":
+                    current["release_id"] = state["release_id"]
+                    self._done(next(s for s in current["steps"] if s["id"] == "publication"), "已提交发布")
+            for step in current["steps"]:
+                if step["status"] not in {"succeeded", "skipped", "failed"}:
+                    self._done(step, "流程已终止", skipped=True)
+            current.update(status="terminated", error=None)
+            current["termination"]["confirmed_at"] = utc_now()
+            self._log(current, "本轮执行已终止，保留已完成结果")
+            self._save(current)
 
     def _collection_version_fence(self, pipeline):
         """Pause on durable resume intent; late old jobs cannot advance new data."""
@@ -935,7 +1119,7 @@ class PipelineManager:
                 continue
             step.setdefault("previous_job_ids", []).extend(step.get("job_ids", []))
             step.update(status="pending", job_ids=[], started_at=None, completed_at=None, error=None, message="等待新采集快照")
-            for key in ("retry", "retry_job_id", "retry_info", "failed_retry_job_id"):
+            for key in ("retry", "retry_job_id", "retry_info", "failed_retry_job_id", "overnight_retry"):
                 step.pop(key, None)
             policy = pipeline.get("retry_policy") or {}
             if step["id"] in policy.get("stage_max_attempts", {}):
@@ -957,6 +1141,8 @@ class PipelineManager:
     def _tick_with_diagnostics(self, pipeline_id):
         with self.artifacts.batch_lock("pipeline_" + pipeline_id), internal_pipeline(pipeline_id):
             p = self.get(pipeline_id, public=False)
+            if p["status"] == "terminating":
+                return
             if _upgrade_retry_limits(p):
                 p = self._save(p)
             original = digest(p)
@@ -979,11 +1165,6 @@ class PipelineManager:
             if state["status"] == "published":
                 p["release_id"] = state["release_id"]
                 self._done(p["steps"][-2], "已发布，批次处理结束")
-                if p["status"] == "terminating":
-                    p["status"] = "terminated"
-                    self._log(p, "发布已提交，流程终止后续派发")
-                    self._save(p)
-                    return
                 if p["current_step"] == "publication":
                     # Commit succeeded even if its acknowledgement was lost.
                     if p["steps"][-2].get("retry_info"):
@@ -997,12 +1178,6 @@ class PipelineManager:
                 elif p["status"] not in {"retry_waiting", "paused", "published_summary_failed"}:
                     p.update(status="running", error=None)
                 p["current_step"] = "overview"
-            elif p["status"] == "terminating":
-                if not self._busy(p["batch_id"]):
-                    p["status"] = "terminated"
-                    self._log(p, "流程已终止，保留所有已完成结果")
-                    self._save(p)
-                return
             elif p["status"] in {"paused", "failed", "waiting_for_correction"}:
                 return
             step = next((s for s in p["steps"] if s["status"] not in {"succeeded", "skipped"}), None)
@@ -1015,9 +1190,33 @@ class PipelineManager:
             p["current_step"] = step["id"]
             if p["status"] in {"paused", "failed", "waiting_for_correction"}:
                 return
+            overnight = step["id"] in MODEL_STAGE_LIMITS and _overnight_enabled()
             try:
+                night_due = overnight and p["status"] == "retry_waiting"
+                if night_due:
+                    deadline = (step.get("retry_info") or {}).get("next_retry_at")
+                    if deadline and not _retry_due(deadline):
+                        return
+                    state = step.get("overnight_retry") or self._begin_overnight(p, step)
+                    manual = state.pop("manual_pending", False)
+                    if not manual:
+                        state["used"] += 1
                 if not p.get("release_id") and self.runtime.snapshot(p["batch_id"]) != p["batch_snapshot"]:
                     raise PipelineError("批次任务范围或来源已变化，请结束流程后重新创建")
+                if not overnight and step.get("overnight_retry"):
+                    self._restore_daytime(p, step)
+                    if p["status"] == "failed" or step["status"] in {"succeeded", "skipped"}:
+                        self._save(p)
+                        return
+                if night_due:
+                    from .pipeline_retry_reconcile import reconcile
+                    if not reconcile(self, p, step):
+                        if not manual and step.get("overnight_retry"):
+                            state["used"] -= 1
+                        self._save(p)
+                        return
+                    self._retry_current_stage(p, step)
+                    step["retry_info"]["next_retry_at"] = None
                 if p["status"] == "retry_waiting":
                     if (step["id"] in p["config_fingerprints"] and
                             self.runtime.configurations().get(step["id"]) != p["config_fingerprints"][step["id"]]):
@@ -1033,6 +1232,7 @@ class PipelineManager:
                     if not self._resume_scheduled_retry(p, step):
                         return
                 key = step["id"]
+                check_pipeline_stop(self.records, pipeline_id)
                 if key == "collection":
                     runs_by_id = {run["collection_run_id"]: run for run in self.runtime.collection_runs(p["batch_id"])}
                     if p["start_mode"] in {"collect", "generate", "evaluation"} and not p["collection_run_ids"]:
@@ -1050,6 +1250,7 @@ class PipelineManager:
                         step.update(status="running", started_at=step["started_at"] or utc_now(), message="下发采集")
                         saved = self._save(p)
                         p["storage_revision"] = saved["storage_revision"]
+                        check_pipeline_stop(self.records, pipeline_id)
                         with diagnostics.trace_context(batch_id=p["batch_id"], step_id="collection"):
                             diagnostics.log_event("collection_dispatch_started", collection_config=p["collection_config"])
                             run = self.runtime.dispatch_collection(p)
@@ -1121,8 +1322,15 @@ class PipelineManager:
                         step.update(status="failed", error=p["error"], message="已发布，汇总失败；可单独重试转换")
                 if step["status"] in {"succeeded", "skipped"}:
                     self._log(p, step["label"] + "：" + step["message"])
+            except (PipelineJobCancelled, RevisionConflict):
+                if self.get(pipeline_id, public=False)["status"] == "terminating":
+                    return
+                raise
             except Exception as exc:
-                self._schedule_or_fail(p, step, exc)
+                check_pipeline_stop(self.records, pipeline_id)
+                if not overnight:
+                    self._clear_overnight(step)
+                self._schedule_or_fail(p, step, exc, overnight=overnight)
                 # Dispatch may have been accepted even when its HTTP response was
                 # lost; retain the durable run identity before returning an error.
                 if step["id"] == "collection":
@@ -1142,16 +1350,28 @@ class PipelineManager:
 
     def _poll(self):
         while not self._stop.is_set():
-            for pipeline_id in self.records.matching_keys("pipelines", excluded_statuses=TERMINAL - {"published_summary_failed"}):
+            keys = self.records.matching_keys("pipelines", excluded_statuses=TERMINAL - {"published_summary_failed"})
+            running = []
+            for pipeline_id in keys:
+                pipeline = self.records.get("pipelines", pipeline_id)
+                if pipeline and pipeline["status"] == "terminating":
+                    self._termination_workers.submit(pipeline_id, lambda key=pipeline_id: self._poll_one(key))
+                elif pipeline:
+                    running.append(pipeline_id)
+            for pipeline_id in running:
                 if self._stop.is_set():
                     break
-                try:
-                    self.tick(pipeline_id)
-                except Exception:
-                    LOG.exception("Pipeline reconciliation failed: %s", pipeline_id)
+                self._poll_one(pipeline_id)
             self._stop.wait(self.interval)
+
+    def _poll_one(self, pipeline_id):
+        try:
+            self.tick(pipeline_id)
+        except Exception:
+            LOG.exception("Pipeline reconciliation failed: %s", pipeline_id)
 
     def close(self):
         self._stop.set()
         if self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout=5)
+        self._termination_workers.close()

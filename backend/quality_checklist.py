@@ -186,26 +186,31 @@ def _control_store(root):
     return PhoneFactoryStore(root, run_client_fn=client)
 
 
-def cancel_remote_jobs(root, job_id, *, store=None):
+def cancel_remote_jobs(root, job_id, *, store=None) -> bool:
     """Best-effort bounded compensation after a local worker has been fenced.
 
     Only this quality job's unfinished remote generation is addressed. A late
     cancellation cannot stop a retried generation or any phone collection.
+    Return whether each known remote job acknowledged a terminal state.
     """
     records = RecordStore(root)
     index = records.get("quality_checklist_by_job", job_id) or {}
     if not index.get('keys'):
-        return
+        return True
     control = store or _control_store(root)
     deadline = time.monotonic() + 10
+    stopped = True
     for key in index.get("keys", []):
         row = records.get("quality_checklist_jobs", key) or {}
         if row.get("last_quality_job_id") != job_id or row.get("complete") or row.get("remote_terminal"):
             continue
         remote_id, server = row.get("remote_job_id"), row.get("collector_server")
-        if not remote_id or not server or time.monotonic() >= deadline:
+        if not remote_id:
             # An accepted response may have been lost. Replaying the frozen
             # request will recover its ID; cleanup must not create new work.
+            continue
+        if not server or time.monotonic() >= deadline:
+            stopped = False
             continue
         changes = {"retryable": True}
         try:
@@ -218,6 +223,8 @@ def cancel_remote_jobs(root, job_id, *, store=None):
             payload = {"request_id": "stop_" + digest({"job_id": job_id, "key": key, "generation": generation}),
                        "expected_generation": generation}
             state = control._remote_result(["quality-checklist-cancel", remote_id, "--payload", json.dumps(payload), "--server", server])
+            if state.get("job_id", remote_id) != remote_id:
+                raise ValueError("Checklist 停止响应身份不匹配")
             changes.update(remote_generation=state.get("generation", generation),
                            remote_terminal=state.get("status") in TERMINAL, cleanup_error=None)
         except Exception as exc:
@@ -226,7 +233,10 @@ def cancel_remote_jobs(root, job_id, *, store=None):
         def update(current):
             if current.get("last_quality_job_id") == job_id:
                 current.update(changes)
-        records.update("quality_checklist_jobs", key, update)
+        saved = records.update("quality_checklist_jobs", key, update)
+        if saved.get("last_quality_job_id") == job_id and not saved.get("remote_terminal"):
+            stopped = False
+    return stopped
 
 
 def _result_checklist(row, state):

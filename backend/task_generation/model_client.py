@@ -63,11 +63,13 @@ class ModelText(str):
 
 class TaskGenerationModel:
     def __init__(self, config: TaskGenerationConfig | None = None, call: Callable[[str], str] | None = None, *,
-                 diagnostics_dir: Path | None = None, diagnostic_id_factory: Callable[[], str] | None = None) -> None:
+                 diagnostics_dir: Path | None = None, diagnostic_id_factory: Callable[[], str] | None = None,
+                 check_stop: Callable[[], None] | None = None) -> None:
         self.config = config or load_model_config()
         self._call_override = call
         self.diagnostics_dir = diagnostics_dir or LOGS_DIR / "model_calls"
         self._diagnostic_id_factory = diagnostic_id_factory
+        self._check_stop = check_stop
         if call is None:
             try:
                 import httpx
@@ -111,6 +113,8 @@ class TaskGenerationModel:
 
     def complete(self, prompt: str, *, temperature: float = 0.4, max_tokens: int = 8192, stage: str = "generation", item_id: str = "") -> str:
         if self._call_override is not None:
+            if self._check_stop is not None:
+                self._check_stop()
             return self._call_override(prompt)
         request: dict[str, Any] = {
             "model": self.config.model,
@@ -128,6 +132,8 @@ class TaskGenerationModel:
         last_error: Exception | None = None
         last_trace: str | None = None
         for attempt in range(self.config.max_retries + 1):
+            if self._check_stop is not None:
+                self._check_stop()
             record: dict[str, Any] = {
                 "trace_id": self._trace_id(), "created_at": datetime.now(timezone.utc).isoformat(),
                 "stage": stage, "item_id": item_id, "attempt": attempt + 1,
@@ -170,6 +176,8 @@ class TaskGenerationModel:
                 record["error"] = f"{type(exc).__name__}: {exc}"
                 last_trace = self._trace(record)
                 if attempt < self.config.max_retries:
+                    if self._check_stop is not None:
+                        self._check_stop()
                     time.sleep(min(2**attempt, 10))
         detail = redact(str(last_error) or type(last_error).__name__, self.config.api_key)
         suffix = f"；诊断记录 {last_trace}.json" if last_trace else ""

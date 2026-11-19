@@ -7,12 +7,36 @@ import { factoryBatchesApi, phoneFactoryApi } from '@/phoneFactoryApi'
 import PipelineView from './PipelineView.vue'
 import { useDisplayIdentifiers } from '@/composables/useDisplayIdentifiers'
 import { notifyBatchesPublished } from '@/utils/batchLifecycle'
+import type { Pipeline } from '@/types/pipeline'
 
+let pipelineFixture: Pipeline | null = null
 vi.mock('element-plus', () => ({ ElMessage: { success: vi.fn() }, ElMessageBox: {} }))
 vi.mock('@/composables/usePipelineContext', () => ({
-  usePipelineContext: () => ({ pipeline: ref(null), error: ref(''), refresh: vi.fn() }),
+  usePipelineContext: () => ({ pipeline: ref(pipelineFixture), error: ref(''), refresh: vi.fn() }),
 }))
-afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals() })
+afterEach(() => { pipelineFixture = null; vi.restoreAllMocks(); vi.unstubAllGlobals() })
+
+it('shows the pending phone and offers a stop retry during termination', async () => {
+  pipelineFixture = {
+    pipeline_id: 'p-terminating', batch_id: 'batch', name: '采集流程', mode: 'automatic',
+    start_mode: 'collect', status: 'terminating', current_step: 'collection', task_ids: ['task'],
+    storage_revision: 2, created_at: '', updated_at: '', collection_run_ids: ['run'],
+    termination: { pending: [{ stage: 'collection', job_id: 'run', phone_id: 'serial-a',
+      message: '等待 9011 确认' }] },
+    steps: [{ id: 'collection', label: '采集与回传', status: 'running', job_ids: ['run'] }],
+  }
+  const app = createSSRApp(PipelineView)
+  app.use(createRouter({ history: createMemoryHistory(), routes: [{ path: '/:pathMatch(.*)*', component: { render: () => null } }] }))
+  const pass = defineComponent({ setup: (_props, { slots }) => () => h('div', null, slots.default?.()) })
+  const empty = defineComponent({ setup: () => () => h('div') })
+  app.component('el-button', pass)
+  for (const name of ['pagination', 'icon', 'alert', 'progress', 'table', 'input', 'select', 'option', 'dialog', 'tag', 'popover']) app.component('el-' + name, empty)
+  const html = await renderToString(app)
+  expect(html).toContain('pipeline-termination-status')
+  expect(html).toContain('手机 serial-a')
+  expect(html).toContain('等待 9011 确认')
+  expect(html).toContain('重试停止')
+})
 
 describe('Pipeline collection configuration', () => {
   it('opens the evaluation stage after creating a Pipeline without a collection batch', async () => {

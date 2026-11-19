@@ -33,6 +33,7 @@ from backend.batch_results import (current_tree_payload, current_tree_batch, mer
 from backend.trajectory_data import resolve_tree_run_dir
 from backend.quality_data import quality_manifest
 from backend.pipeline_retry_errors import failure_from_exception
+from backend.pipeline_job_stop import PipelineJobCancelled, job_commit_guard
 from backend import pipeline_diagnostics as diagnostics
 from backend.quality_execution import (
     execution_context, execution_write_guard, check_execution, commit_record_entry,
@@ -73,7 +74,7 @@ def worker_telemetry(job_id: str, token: str | None):
             if token:
                 try:
                     check_execution(DATA_ROOT, job_id, token, allow_committed=True)
-                except QualityExecutionRevoked:
+                except (PipelineJobCancelled, QualityExecutionRevoked):
                     # The supervisor owns final classification. No orphan may keep
                     # calling a model or write after its parent has disappeared.
                     os._exit(2)
@@ -532,13 +533,15 @@ def _publish_legacy_quality(run_id: str, job_id: str, task_ids: list[str], manif
                 entries.append(committed)
             return entries
 
-        store.publish_many(batch_id, [{"stage": "05_quality",
-            "payload": {"schema_version": 1, "run_id": run_id, "job_id": job_id, "tasks": task_results},
-            "tables": quality_tables(task_results),
-            "source_refs": [item for item in manifest.get("artifacts", []) if item.get("stage") == "04_tree"]
-                or [{"kind": "tree_run", "run_id": run_id}],
-            "metadata": {"run_id": run_id, "job_id": job_id, "task_ids": task_ids}}],
-            record_entries=indexes)
+        tables = quality_tables(task_results)
+        with job_commit_guard(store.records, "quality_jobs", job_id):
+            store.publish_many(batch_id, [{"stage": "05_quality",
+                "payload": {"schema_version": 1, "run_id": run_id, "job_id": job_id, "tasks": task_results},
+                "tables": tables,
+                "source_refs": [item for item in manifest.get("artifacts", []) if item.get("stage") == "04_tree"]
+                    or [{"kind": "tree_run", "run_id": run_id}],
+                "metadata": {"run_id": run_id, "job_id": job_id, "task_ids": task_ids}}],
+                record_entries=indexes)
         return RecordStore(DATA_ROOT).get("quality_manifests", run_id)
 
 
