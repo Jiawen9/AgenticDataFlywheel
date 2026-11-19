@@ -25,7 +25,7 @@ from openpyxl.utils import get_column_letter
 
 try:
     from .bounding_box.build_annotations import resolve_action_box
-    from .bounding_box.qwen_reviewer import QwenBoxReviewer
+    from .bounding_box.qwen_reviewer import BoxReviewOutputError, QwenBoxReviewer
     from .pipeline_retry_errors import ModelConfigurationError
     from .export_vla_trajectories import collect_rows, write_xlsx
     from .batch_operations import batch_operation, active_batch_lock
@@ -33,7 +33,7 @@ try:
     from .stage_artifacts import publish_workbooks, store_root, workbook_payload, write_sidecar, assert_unmanaged_output, register_annotation_view
 except ImportError:  # Keep direct `python backend/trajectories_preprocessing.py` usage working.
     from bounding_box.build_annotations import resolve_action_box
-    from bounding_box.qwen_reviewer import QwenBoxReviewer
+    from bounding_box.qwen_reviewer import BoxReviewOutputError, QwenBoxReviewer
     from export_vla_trajectories import collect_rows, write_xlsx
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from backend.batch_operations import batch_operation, active_batch_lock
@@ -286,17 +286,23 @@ def annotate_trajectory_workbook(
                 raise FileNotFoundError(f"UI XML does not exist: {xml_path}")
             xml_text = io_path(xml_path).read_text(encoding="utf-8", errors="replace")
             summary_value = sheet.cell(row_number, headers["summary"]).value
-            resolution = resolve_action_box(
-                image_path=stability_path,
-                xml_text=xml_text,
-                action=executed_action,
-                action_summary=str(summary_value or ""),
-                reviewer=reviewer,
-                max_review_rounds=max_review_rounds,
-            )
-            box_cell.value = format_actions_box(executed_action, resolution.result.bbox)
-            counts["annotated"] += 1
-            print(f"Annotated {row_label}: {box_cell.value}", flush=True)
+            try:
+                resolution = resolve_action_box(
+                    image_path=stability_path,
+                    xml_text=xml_text,
+                    action=executed_action,
+                    action_summary=str(summary_value or ""),
+                    reviewer=reviewer,
+                    max_review_rounds=max_review_rounds,
+                )
+            except BoxReviewOutputError as exc:
+                box_cell.value = None
+                counts["blank"] += 1
+                print(f"Missing model box at {row_label}: {exc}", flush=True)
+            else:
+                box_cell.value = format_actions_box(executed_action, resolution.result.bbox)
+                counts["annotated"] += 1
+                print(f"Annotated {row_label}: {box_cell.value}", flush=True)
             if progress:
                 progress({"phase": "done", "excel_row": row_number, "actions_box": box_cell.value,
                           "completed_steps": row_number - 1, "total_steps": sheet.max_row - 1})

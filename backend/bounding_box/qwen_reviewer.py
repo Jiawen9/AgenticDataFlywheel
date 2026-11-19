@@ -191,7 +191,9 @@ def _parse_response(
     detail = {"decision": decision, "model_bbox": value.get("bbox"),
               "candidate_bbox_pixels": list(candidate_bbox), "image_size": list(image_size)}
     if decision not in {"accept", "replace"}:
-        raise BoxReviewOutputError("invalid_decision", detail)
+        if "bbox" not in value:
+            raise BoxReviewOutputError("invalid_decision", detail)
+        decision = "replace"
     bbox_value = candidate_bbox if decision == "accept" else value.get("bbox")
     if (not isinstance(bbox_value, (list, tuple)) or len(bbox_value) != 4
             or any(isinstance(item, bool) or not isinstance(item, (int, float)) for item in bbox_value)):
@@ -203,51 +205,19 @@ def _parse_response(
         raise BoxReviewOutputError("invalid_bbox", detail) from exc
     if not all(math.isfinite(item) for item in values):
         raise BoxReviewOutputError("invalid_bbox", detail)
-    out_of_range = decision == "replace" and normalized_output and any(item < 0 or item > 1000 for item in values)
-    ordered = values[0] < values[2] and values[1] < values[3]
     if decision == "replace" and normalized_output:
-        # This reviewer contract is independent of the collection model's adapter.
-        values = [
-            values[0] / 1000.0 * width,
-            values[1] / 1000.0 * height,
-            values[2] / 1000.0 * width,
-            values[3] / 1000.0 * height,
-        ]
-    detail["selected_coordinate_space"] = "normalized_1000" if decision == "replace" and normalized_output else "pixel"
-    detail["pixel_bbox_before_clamp"] = values
-    if not all(math.isfinite(item) for item in values):
-        raise BoxReviewOutputError("bbox_out_of_range", detail)
-    x1, y1, x2, y2 = (round(item) for item in values)
-    x1, x2 = sorted((max(0, min(width - 2, x1)), max(1, min(width - 1, x2))))
-    y1, y2 = sorted((max(0, min(height - 2, y1)), max(1, min(height - 1, y2))))
-    detail["pixel_bbox_after_clamp"] = [x1, y1, x2, y2]
-    if out_of_range:
-        raise BoxReviewOutputError("bbox_out_of_range", detail)
-    if not ordered:
-        raise BoxReviewOutputError("bbox_order_invalid", detail)
-    if x2 - x1 < 8 or y2 - y1 < 8:
-        raise BoxReviewOutputError("bbox_too_small", detail)
-    if action:
-        kind = action.get("action")
-        keys = ("coordinate",) if kind in {"click", "long_press"} else (
-            ("start_coordinate", "end_coordinate") if kind == "swipe" else ())
-        points = [action.get(key) for key in keys]
-        for point in points:
-            if (not isinstance(point, (list, tuple)) or len(point) != 2
-                    or any(isinstance(v, bool) or not isinstance(v, (int, float))
-                           or not math.isfinite(v) for v in point)):
-                raise ValueError("Executed action requires finite pixel coordinates")
-            if not (0 <= point[0] < width and 0 <= point[1] < height):
-                raise ValueError("Executed action pixel coordinates are outside the screenshot")
-        detail["executed_points_pixels"] = points
-        if any(not (x1 <= point[0] <= x2 and y1 <= point[1] <= y2) for point in points):
-            raise BoxReviewOutputError("bbox_excludes_action", detail)
+        values = [max(0.0, min(1000.0, v)) / 1000 * size
+                  for v, size in zip(values, (width, height, width, height))]
+    x1, y1, x2, y2 = (max(0, min(size - 1, round(v)))
+                      for v, size in zip(values, (width, height, width, height)))
+    x1, x2 = sorted((x1, x2))
+    y1, y2 = sorted((y1, y2))
     try:
         confidence = float(value.get("confidence", 0.5))
-    except (ValueError, TypeError, OverflowError) as exc:
-        raise BoxReviewOutputError("invalid_confidence", detail) from exc
+    except (ValueError, TypeError, OverflowError):
+        confidence = 0.5
     if not math.isfinite(confidence):
-        raise BoxReviewOutputError("invalid_confidence", detail)
+        confidence = 0.5
     confidence = max(0.0, min(1.0, confidence))
     return ReviewResult(
         decision=decision,
@@ -326,7 +296,11 @@ class QwenBoxReviewer:
                 "observed_at": _small_diagnostic(item.get("observed_at")),
                 "raw_response_truncated": bool(item.get("raw_response_truncated")),
                 "raw_response_sha256": _small_diagnostic(item.get("raw_response_sha256"))})
-        return _OUTPUT_FEEDBACK[code], previous
+        # Keep historical evidence but only request corrections for errors
+        # that still prevent us from reading a box.
+        obsolete = {"bbox_excludes_action", "bbox_too_small", "bbox_order_invalid",
+                    "bbox_out_of_range", "invalid_confidence"}
+        return ("" if code in obsolete else _OUTPUT_FEEDBACK[code]), previous
 
     def _write_failures(self, key: str, payload: dict, image_path: Path, attempts: list,
                         *, resolved: bool = False) -> Path:
@@ -491,14 +465,14 @@ class QwenBoxReviewer:
                     raise BoxReviewOutputError("empty_choices")
                 choice = response.choices[0]
                 raw = choice.message.content
-                if getattr(choice, "finish_reason", None) == "length":
-                    raise BoxReviewOutputError("truncated")
                 if not isinstance(raw, str) or not raw.strip():
                     raise BoxReviewOutputError("empty_content")
                 raw = raw.strip()
                 result = _parse_response(raw, candidate_bbox, image_size, normalized_output=True, action=action)
             except BoxReviewOutputError as exc:
                 error = exc
+                if response.choices and getattr(response.choices[0], "finish_reason", None) == "length":
+                    error = BoxReviewOutputError("truncated", exc.details)
             # Outside except: I/O failures must not inherit a model-error context
             # and be incorrectly classified for automatic model retries.
             if error is not None:

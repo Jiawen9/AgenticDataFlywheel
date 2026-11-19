@@ -5,12 +5,14 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from openpyxl import load_workbook
 from PIL import Image
 
 from backend.bounding_box.build_annotations import resolve_action_box
+from backend.bounding_box.qwen_reviewer import QwenBoxReviewer
 from backend.export_vla_trajectories import collect_rows, write_xlsx
 from backend.trajectories_preprocessing import (
     annotate_trajectory_workbook,
@@ -84,17 +86,6 @@ class FakeReviewResult:
 
 class AcceptingReviewer:
     def review(self, **kwargs):
-        return FakeReviewResult("accept", kwargs["candidate_bbox"])
-
-
-class ReplacingThenAcceptingReviewer:
-    def __init__(self):
-        self.calls = 0
-
-    def review(self, **kwargs):
-        self.calls += 1
-        if self.calls == 1:
-            return FakeReviewResult("replace", (0, 0, 10, 10))
         return FakeReviewResult("accept", kwargs["candidate_bbox"])
 
 
@@ -199,11 +190,12 @@ class BoxResolutionTests(unittest.TestCase):
             x1, y1, x2, y2 = resolution.result.bbox
             self.assertTrue(x1 <= 50 <= x2 and y1 <= 50 <= y2)
 
-    def test_replacement_excluding_click_is_corrected_and_reviewed_again(self):
+    def test_first_replacement_excluding_long_press_is_final(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             image_path = Path(temp_dir) / "image.jpg"
             Image.new("RGB", (200, 300), "white").save(image_path)
-            reviewer = ReplacingThenAcceptingReviewer()
+            reviewer = MagicMock()
+            reviewer.review.return_value = FakeReviewResult("replace", (0, 0, 10, 10))
             resolution = resolve_action_box(
                 image_path=image_path,
                 xml_text=UI_XML,
@@ -211,9 +203,8 @@ class BoxResolutionTests(unittest.TestCase):
                 action_summary="long press item",
                 reviewer=reviewer,
             )
-            self.assertEqual(reviewer.calls, 2)
-            x1, y1, x2, y2 = resolution.result.bbox
-            self.assertTrue(x1 <= 100 <= x2 and y1 <= 150 <= y2)
+            reviewer.review.assert_called_once()
+            self.assertEqual(resolution.result.bbox, (0, 0, 10, 10))
 
 
 class WorkbookAnnotationTests(unittest.TestCase):
@@ -277,6 +268,49 @@ class WorkbookAnnotationTests(unittest.TestCase):
             self.assertIsNone(sheet.cell(5, 6).value)
             self.assertEqual(sheet.auto_filter.ref, "A1:F5")
             self.assertEqual(sheet.freeze_panes, "A2")
+
+    def test_malformed_model_output_leaves_one_blank_and_keeps_next_model_boxes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_path, trajectory_root = self._create_workbook_fixture(root)
+            output_path = root / "annotated.xlsx"
+            client = MagicMock()
+            outputs = [
+                {"decision": "replace", "bbox": [100]},
+                {"decision": "replace", "bbox": [50, 50, 150, 100]},
+                {"decision": "replace", "bbox": [0, 0, 5, 10]},
+            ]
+            client.chat.completions.create.side_effect = [
+                SimpleNamespace(choices=[SimpleNamespace(finish_reason="stop",
+                    message=SimpleNamespace(content=json.dumps(payload)))])
+                for payload in outputs
+            ]
+            settings = {"proxy": "", "verify": True, "timeout": 2, "trust_env": False,
+                        "api_key": "test-key", "base_url": "https://example.invalid/v1"}
+            with patch("backend.bounding_box.qwen_reviewer.httpx.Client"), \
+                 patch("backend.bounding_box.qwen_reviewer.OpenAI", return_value=client):
+                reviewer = QwenBoxReviewer("test-model", root / "cache.json", client_settings=settings)
+                reviewer.max_output_attempts = 1
+                counts = annotate_trajectory_workbook(source_path, output_path, reviewer=reviewer,
+                                                      trajectory_root=trajectory_root)
+
+            self.assertEqual(client.chat.completions.create.call_count, 3)
+            self.assertEqual(counts["rows"], 4)
+            self.assertEqual(counts["annotated"], 2)
+            self.assertEqual(counts["blank"], 2)
+            diagnostics = list((root / "box_failures").glob("*.json"))
+            self.assertEqual(len(diagnostics), 1)
+            failure = json.loads(diagnostics[0].read_text(encoding="utf-8"))
+            self.assertEqual(failure["attempts"][-1]["failure_code"], "invalid_bbox")
+            workbook = load_workbook(output_path)
+            try:
+                sheet = workbook.active
+                self.assertIsNone(sheet.cell(2, 6).value)
+                self.assertEqual(sheet.cell(3, 6).value, "swipe_screen(bbox=<bbox>[10,15,30,30]</bbox>, direction=up)")
+                self.assertEqual(sheet.cell(4, 6).value, "long_press(bbox=<bbox>[0,0,1,3]</bbox>)")
+                self.assertIsNone(sheet.cell(5, 6).value)
+            finally:
+                workbook.close()
 
     def test_failure_does_not_publish_annotated_workbook(self):
         with tempfile.TemporaryDirectory() as temp_dir:
