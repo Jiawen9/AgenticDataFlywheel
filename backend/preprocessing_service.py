@@ -11,6 +11,7 @@ from typing import Any, Callable
 
 from .data_store.paths import contained_path, rebase_data_path
 from .export_vla_trajectories import STEP_RESPONSE_RE, extract_response_fields
+from .preprocessing_revision import compatible_revision
 from .stage_artifacts import fingerprint
 from .agent_types import PROVENANCE_FIELDS
 from .trajectories_preprocessing import DEFAULT_ENV_FILE, read_env_file
@@ -42,7 +43,7 @@ def processing_config(env_file: Path = DEFAULT_ENV_FILE) -> dict:
                   "bounding_box/build_annotations.py", "bounding_box/action_box.py"]
     code = {name: fingerprint(Path(__file__).parent / name) for name in code_files}
     return {"model": values.get("MODEL_NAME"), "base_url": values.get("MODEL_URL"),
-            "max_review_rounds": 4, "pipeline_revision": digest(code),
+            "max_review_rounds": 4, "pipeline_revision": compatible_revision(digest(code)),
             "configuration_error": error}
 
 
@@ -147,7 +148,8 @@ def convert_input(snapshot: dict, progress: Callable[[dict], None], *, data_root
 
 def annotate_input(json_path: Path, payload: dict, output_path: Path, *, snapshot: dict,
                    config: dict, cache_path: Path, env_file: Path,
-                   progress: Callable[[dict], None], reviewer_factory=None, data_root: Path | None = None) -> tuple[dict, dict]:
+                   progress: Callable[[dict], None], reviewer_factory=None, data_root: Path | None = None,
+                   checkpoint=None) -> tuple[dict, dict]:
     from .bounding_box.qwen_reviewer import QwenBoxReviewer, qwen_settings
     from .trajectories_preprocessing import annotate_trajectory_workbook
 
@@ -176,9 +178,15 @@ def annotate_input(json_path: Path, payload: dict, output_path: Path, *, snapsho
                   "current_step": row.get("step")})
 
     try:
+        checkpoint_args = {}
+        if checkpoint is not None:
+            checkpoint.bind(payload["sheets"][SHEET], payload["columns"][SHEET])
+            for excel_row, (_, box) in checkpoint.completed.items():
+                rows[excel_row - 2]["actions_box"] = box
+            checkpoint_args["checkpoint"] = checkpoint
         counts = annotate_trajectory_workbook(json_path, output_path, reviewer=reviewer,
             trajectory_root=rebase_data_path(snapshot["raw_root"], data_root) if data_root is not None else Path(snapshot["raw_root"]), allow_excel_import=False,
-            max_review_rounds=config["max_review_rounds"], progress=row_progress)
+            max_review_rounds=config["max_review_rounds"], progress=row_progress, **checkpoint_args)
     finally:
         if reviewer_factory is None:
             reviewer.client.close()

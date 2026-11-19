@@ -19,12 +19,20 @@ backend_workspace/raw/collection_batches/<batch_id>/runs/<collection_run_id>/
   <collection_case_id>/<原轨迹目录>/原始文件
 backend_workspace/system/preprocessing/<batch_id>/<job_id>/
   input.json
-  # 计算JSON/Excel完成后清理，只保留输入清单
+  rows.sqlite  # 自动 Pipeline 的逐步结果，保存在本次重试链的起始作业目录
 backend_workspace/batches/<batch_id>/01_conversion/
 backend_workspace/batches/<batch_id>/02_annotation/
 ```
 
 作业及进度保存在 SQLite 的 `preprocessing_jobs`。输入文件清单先写入 `input.json`，其路径和SHA256保存到作业与01清单。内部转换／标框读取冻结 JSON，Excel仅供查看下载。缺失或损坏的JSON明确报错，不从Excel或目录扫描补回。
+
+### 自动 Pipeline 标框续跑
+
+每处理完一个数据步骤，后端先提交标框结果，再更新已完成数。无需框的动作和因模型输出无法解析而留空的动作也会登记，后者保留诊断。HTTP 请求失败、文件读取错误或取消时，未提交的步骤留给下次重试。原有错误分类决定是自动重试还是由用户修复后点击「重试」。
+
+例如 300 个数据步骤中已有 81 个保存，第 82 个请求失败。重试作业从 81/300 开始，重新校验冻结输入，然后继续第 82 个步骤。若该步骤已有匹配的模型回复缓存，重试仍可复用。全部步骤就绪后才按原行序生成 Excel 和阶段 JSON；输入变化、人工标框版本和终止仍在发布前核对。
+
+升级仅需同步平台后端，建议在当前作业结束后重启。上一版直接采用模型框的作业没有逐步结果，首次重试按原冻结输入和配置恢复，可复用匹配的转换产物和模型缓存，并建立逐步记录。此前进度百分比不能作为跳行依据。兼容映射按六个规则文件的整套摘要匹配，覆盖标准 LF、CRLF 和已核对的本地基线。内网额外修改或其他未登记的文件字节组合仍按独立版本处理；请同步一致版本，或按新配置启动预处理。更换模型或 URL 时也沿用新配置启动流程。
 
 同批次多次采集累计已完成结果，作业启动时固定范围；后续采集留到下次处理。步骤JSON携带 `task_id、trajectory_id、source_trajectory_id、collection_run_id、collected_at、collection_case_id、source_result_id`。内部轨迹ID为 `tr_` 加 `SHA256(JSON[batch_id, collection_run_id, task_id, relative_dir])`，JSON编码使用UTF-8、无额外空格；步骤保留原编号。同名原轨迹不会因补采或跨批次而合并。
 

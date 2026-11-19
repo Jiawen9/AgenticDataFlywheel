@@ -203,6 +203,7 @@ def annotate_trajectory_workbook(
     trajectory_root: Path | None = None,
     allow_excel_import: bool = True,
     progress: Callable[[dict[str, Any]], None] | None = None,
+    checkpoint=None,
 ) -> dict[str, int]:
     """Append actions_box values, publishing the output only after all rows succeed."""
     source_path = resolve_path(source_path.expanduser())
@@ -238,23 +239,38 @@ def annotate_trajectory_workbook(
     sheet.column_dimensions[get_column_letter(box_column)].width = 70
 
     action_cache: dict[Path, dict[int, dict[str, Any]]] = {}
-    counts = {"rows": 0, "annotated": 0, "blank": 0}
-    for row_number in range(2, sheet.max_row + 1):
+    total_steps = sheet.max_row - 1
+    restored = dict(checkpoint.completed) if checkpoint is not None else {}
+    counts = {"rows": len(restored), "annotated": 0, "blank": 0}
+    for excel_row, (kind, box) in restored.items():
+        sheet.cell(excel_row, box_column).value = box
+        counts["annotated" if kind == "annotated" else "blank"] += 1
+    if progress and restored:
+        progress({"phase": "restored", "excel_row": max(restored),
+                  "completed_steps": counts["rows"], "total_steps": total_steps})
+
+    def finish_row(excel_row, kind, box=None, diagnostic=None):
+        if checkpoint is not None:
+            checkpoint.save(excel_row, kind, box, diagnostic)
+        sheet.cell(excel_row, box_column).value = box
         counts["rows"] += 1
+        counts["annotated" if kind == "annotated" else "blank"] += 1
+        if progress:
+            progress({"phase": "done", "excel_row": excel_row, "actions_box": box,
+                      "completed_steps": counts["rows"], "total_steps": total_steps})
+
+    for row_number in range(2, total_steps + 2):
+        if row_number in restored:
+            continue
         row_label = f"Excel row {row_number}"
         if progress:
             progress({"phase": "start", "excel_row": row_number,
-                      "completed_steps": row_number - 2, "total_steps": sheet.max_row - 1})
+                      "completed_steps": counts["rows"], "total_steps": total_steps})
         try:
             raw_action = parse_action_cell(sheet.cell(row_number, headers["action"]).value)
             raw_kind = str(raw_action.get("action", "")).lower()
-            box_cell = sheet.cell(row_number, box_column)
             if raw_kind not in TARGET_ACTIONS:
-                box_cell.value = None
-                counts["blank"] += 1
-                if progress:
-                    progress({"phase": "done", "excel_row": row_number, "actions_box": None,
-                              "completed_steps": row_number - 1, "total_steps": sheet.max_row - 1})
+                finish_row(row_number, "no_box_needed")
                 continue
 
             image_path = resolve_artifact_path(
@@ -286,6 +302,7 @@ def annotate_trajectory_workbook(
                 raise FileNotFoundError(f"UI XML does not exist: {xml_path}")
             xml_text = io_path(xml_path).read_text(encoding="utf-8", errors="replace")
             summary_value = sheet.cell(row_number, headers["summary"]).value
+            diagnostic = None
             try:
                 resolution = resolve_action_box(
                     image_path=stability_path,
@@ -296,16 +313,15 @@ def annotate_trajectory_workbook(
                     max_review_rounds=max_review_rounds,
                 )
             except BoxReviewOutputError as exc:
-                box_cell.value = None
-                counts["blank"] += 1
-                print(f"Missing model box at {row_label}: {exc}", flush=True)
+                diagnostic = str(exc)
+            if diagnostic is None:
+                box = format_actions_box(executed_action, resolution.result.bbox)
+                finish_row(row_number, "annotated", box)
+                print(f"Annotated {row_label}: {box}", flush=True)
             else:
-                box_cell.value = format_actions_box(executed_action, resolution.result.bbox)
-                counts["annotated"] += 1
-                print(f"Annotated {row_label}: {box_cell.value}", flush=True)
-            if progress:
-                progress({"phase": "done", "excel_row": row_number, "actions_box": box_cell.value,
-                          "completed_steps": row_number - 1, "total_steps": sheet.max_row - 1})
+                # Keep storage failures independent of the model-output error.
+                finish_row(row_number, "model_output_invalid", diagnostic=diagnostic)
+                print(f"Missing model box at {row_label}: {diagnostic}", flush=True)
         except Exception as exc:
             raise RuntimeError(f"failed to annotate {row_label}: {exc}") from exc
 
