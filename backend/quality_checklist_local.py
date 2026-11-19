@@ -121,6 +121,34 @@ def _owner_dead(row):
     return observed is False or (observed is not None and observed != expected)
 
 
+def _release_stopped_slot(records, key, row):
+    child = row.get('child') or {}
+    if child and not stop_recorded_process(child):
+        return False
+    with records._connection(write=True) as connection:
+        connection.execute('BEGIN IMMEDIATE')
+        current = records._read(connection, SLOTS, key) or {}
+        if current.get('token') == row.get('token'):
+            records._save(connection, SLOTS, key,
+                {**current, 'state': 'released', 'child': {}, 'recovered_at': utc_now()},
+                current.get('storage_revision', 0) + 1)
+        connection.commit()
+    return True
+
+
+def stop_job_children(records, job_id):
+    """Reconcile only Checklist processes owned by an exited quality worker."""
+    stopped = True
+    for slot in range(GLOBAL_CONCURRENCY):
+        key = str(slot)
+        row = records.get(SLOTS, key) or {}
+        if row.get('state') != 'active' or row.get('quality_job_id') != job_id:
+            continue
+        if not _owner_dead(row) or not _release_stopped_slot(records, key, row):
+            stopped = False
+    return stopped
+
+
 class _Lease:
     def __init__(self, root, key, job, check, progress):
         self.records = RecordStore(root); self.key = key; self.job = job
@@ -141,17 +169,7 @@ class _Lease:
             if row.get('state') != 'active' or not (
                     _owner_dead(row) or (row.get('child') or {}).get('cleanup_failed')):
                 continue
-            child = row.get('child') or {}
-            if child and not stop_recorded_process(child):
-                continue  # Retain this slot; a different free slot remains usable.
-            with self.records._connection(write=True) as connection:
-                connection.execute('BEGIN IMMEDIATE')
-                current = self.records._read(connection, SLOTS, key) or {}
-                if current.get('token') == row.get('token'):
-                    self.records._save(connection, SLOTS, key,
-                        {**current, 'state': 'released', 'child': {}, 'recovered_at': utc_now()},
-                        current.get('storage_revision', 0) + 1)
-                connection.commit()
+            _release_stopped_slot(self.records, key, row)
         with self.records._connection(write=True) as connection:
             queued = connection.execute("SELECT record_key,payload FROM records WHERE namespace=? "
                 "AND json_extract(payload,'$.queued')=1 LIMIT ?", (TASKS, MAX_QUEUED + 1)).fetchall()

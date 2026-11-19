@@ -24,7 +24,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.file_io import io_path, resolve_path
 
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from openpyxl import load_workbook
 
@@ -735,6 +735,7 @@ def build_tree(
     trajectory_root: Path,
     alignment_reviewer: AlignmentReviewer | None,
     max_incidental_skip: int = MAX_INCIDENTAL_SKIP,
+    check_stop: Callable[[], None] | None = None,
 ) -> tuple[Node, list[dict[str, Any]], BuildStatistics]:
     root = Node(id=0, depth=0)
     next_id = 1
@@ -774,6 +775,8 @@ def build_tree(
         current = root
         position = 0
         while position < len(steps):
+            if check_stop is not None:
+                check_stop()
             step = steps[position]
             parent_id = current.id
 

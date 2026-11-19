@@ -19,6 +19,9 @@ from .data_store.registry import utc_now
 from .file_io import io_path
 from .identifiers import ID_SCHEME, allocate_id
 from .pipeline_access import TERMINAL, active_pipeline, internal_pipeline
+from .pipeline_job_stop import (PipelineJobCancelled, check_pipeline_stop,
+                                request_local_stops, termination_lock)
+from .remote_sync import BoundedSyncPool
 from .trajectory_correction.export_policy import OPD_PREFIX_PROFILE, validate_export_policy
 from . import pipeline_diagnostics as diagnostics
 
@@ -155,6 +158,10 @@ class PipelineRuntime:
 
     def collection_runs(self, batch_id):
         return self.factory.collection_runs.list_runs(batch_id)
+
+    def request_phone_stops(self, pipeline):
+        from .pipeline_phone_stop import request_phone_stops
+        return request_phone_stops(self, pipeline)
 
     def prepare_collection(self, source_batch_id, request_id, options):
         """Freeze a result batch before acquiring downstream ownership."""
@@ -411,6 +418,7 @@ class PipelineManager:
         self.root, self.runtime = Path(root), runtime
         self.records, self.artifacts = RecordStore(root), ArtifactStore(root)
         self.interval, self._stop, self._thread = interval, threading.Event(), None
+        self._termination_workers = BoundedSyncPool("pipeline-termination", max_workers=2)
 
     def get(self, pipeline_id, *, public=True):
         _identifier(pipeline_id, "Pipeline ID")
@@ -566,7 +574,39 @@ class PipelineManager:
 
     def control(self, pipeline_id, action, revision, *, session_revision=None):
         with diagnostics.trace_context(root=self.root, pipeline_id=pipeline_id):
+            if action == "terminate":
+                return self._request_termination(pipeline_id)
             return self._control_with_diagnostics(pipeline_id, action, revision, session_revision=session_revision)
+
+    def _request_termination(self, pipeline_id):
+        self.get(pipeline_id, public=False)
+
+        def stop(pipeline):
+            if pipeline["status"] == "terminated" and pipeline.get("termination"):
+                return
+            if pipeline["status"] in TERMINAL - {"published_summary_failed"}:
+                raise PipelineError("该 Pipeline 已结束")
+            now = utc_now()
+            termination = pipeline.get("termination")
+            if termination:
+                termination["retry_requested_at"] = now
+            else:
+                pipeline["termination"] = {
+                    "requested_at": now,
+                    "pending": [{"stage": pipeline["current_step"], "message": "正在登记和核对停止状态"}],
+                }
+            for step in pipeline["steps"]:
+                if step.get("retry_info"):
+                    step["retry_info"]["next_retry_at"] = None
+            pipeline.update(status="terminating", error=None, updated_at=now)
+
+        # This lock only fences final commits. Slow dispatch, export preparation
+        # and model calls may hold the orchestrator lock and must not delay acceptance.
+        with termination_lock(self.root, pipeline_id):
+            self.records.update("pipelines", pipeline_id, stop)
+        if self._thread and self._thread.is_alive():
+            self._termination_workers.submit(pipeline_id, lambda: self._poll_one(pipeline_id))
+        return self.get(pipeline_id)
 
     def _control_with_diagnostics(self, pipeline_id, action, revision, *, session_revision=None):
         with self.artifacts.batch_lock("pipeline_" + pipeline_id):
@@ -603,8 +643,6 @@ class PipelineManager:
                 self._retry_current_stage(p, step)
                 if p.get("retry_policy"):
                     step["retry_info"] = retry_info(p["retry_policy"], step["id"])
-            elif action == "terminate":
-                p["status"] = "terminated" if p.get("release_id") else "terminating"
             elif action == "confirm-correction" and p["status"] == "waiting_for_correction":
                 if session_revision is None:
                     raise PipelineError("请携带修正会话修订号确认", 422)
@@ -620,7 +658,7 @@ class PipelineManager:
                 raise PipelineError("当前状态不能执行该操作")
             if p.get("collection_resume_wait") and action in {"pause", "resume"}:
                 p["collection_resume_wait"]["previous_status"] = "paused" if action == "pause" else "running"
-            self._log(p, {"pause": "暂停后续派发", "resume": "继续执行", "retry": "重试当前阶段", "terminate": "等待已启动作业结束后终止"}.get(action, action))
+            self._log(p, {"pause": "暂停后续派发", "resume": "继续执行", "retry": "重试当前阶段"}.get(action, action))
             self._save(p)
             return self.get(pipeline_id)
 
@@ -877,6 +915,7 @@ class PipelineManager:
         step.update(status="running", started_at=step["started_at"] or utc_now(), message="提交并跟踪作业")
         saved = self._save(p)
         p["storage_revision"] = saved["storage_revision"]
+        check_pipeline_stop(self.records, p["pipeline_id"])
         job = self.runtime.submit(key, p, retry=bool(step.pop("retry", False)))
         if job is None:
             self._done(step, "没有需要生成 COT 的步骤", skipped=True)
@@ -897,7 +936,58 @@ class PipelineManager:
 
     def tick(self, pipeline_id):
         with diagnostics.trace_context(root=self.root, pipeline_id=pipeline_id):
-            return self._tick_with_diagnostics(pipeline_id)
+            try:
+                pipeline = self.get(pipeline_id, public=False)
+                if pipeline["status"] == "terminating":
+                    return self._reconcile_termination(pipeline)
+                return self._tick_with_diagnostics(pipeline_id)
+            except (RevisionConflict, PipelineJobCancelled):
+                if self.get(pipeline_id, public=False)["status"] != "terminating":
+                    raise
+
+    def _reconcile_termination(self, pipeline):
+        pipeline_id = pipeline["pipeline_id"]
+        if not pipeline.get("termination"):
+            # Adopt a still-pending request made with the previous implementation.
+            self._request_termination(pipeline_id)
+            pipeline = self.get(pipeline_id, public=False)
+        with internal_pipeline(pipeline_id):
+            pending = self.runtime.request_phone_stops(pipeline)
+        def signal_quality(job_id):
+            return self.runtime.quality.signal_pipeline_stop(job_id)
+
+        pending.extend(request_local_stops(self.records, pipeline, signal_quality))
+        if not pending:
+            # An in-flight submit may have been holding the orchestrator lock.
+            # Scan again after it returns so we see any newly registered child.
+            with self.artifacts.batch_lock("pipeline_" + pipeline_id):
+                pass
+            with internal_pipeline(pipeline_id):
+                pending = self.runtime.request_phone_stops(pipeline)
+            pending.extend(request_local_stops(self.records, pipeline, signal_quality))
+        with self.artifacts.batch_lock("pipeline_" + pipeline_id):
+            current = self.get(pipeline_id, public=False)
+            if current["status"] != "terminating" or current["storage_revision"] != pipeline["storage_revision"]:
+                return
+            previous = current["termination"].get("pending")
+            current["termination"]["pending"] = pending
+            if pending:
+                if pending != previous:
+                    self._save(current)
+                return
+
+            if current.get("batch_id"):
+                state = lifecycle(current["batch_id"], self.root)
+                if state["status"] == "published":
+                    current["release_id"] = state["release_id"]
+                    self._done(next(s for s in current["steps"] if s["id"] == "publication"), "已提交发布")
+            for step in current["steps"]:
+                if step["status"] not in {"succeeded", "skipped", "failed"}:
+                    self._done(step, "流程已终止", skipped=True)
+            current.update(status="terminated", error=None)
+            current["termination"]["confirmed_at"] = utc_now()
+            self._log(current, "本轮执行已终止，保留已完成结果")
+            self._save(current)
 
     def _collection_version_fence(self, pipeline):
         """Pause on durable resume intent; late old jobs cannot advance new data."""
@@ -957,6 +1047,8 @@ class PipelineManager:
     def _tick_with_diagnostics(self, pipeline_id):
         with self.artifacts.batch_lock("pipeline_" + pipeline_id), internal_pipeline(pipeline_id):
             p = self.get(pipeline_id, public=False)
+            if p["status"] == "terminating":
+                return
             if _upgrade_retry_limits(p):
                 p = self._save(p)
             original = digest(p)
@@ -979,11 +1071,6 @@ class PipelineManager:
             if state["status"] == "published":
                 p["release_id"] = state["release_id"]
                 self._done(p["steps"][-2], "已发布，批次处理结束")
-                if p["status"] == "terminating":
-                    p["status"] = "terminated"
-                    self._log(p, "发布已提交，流程终止后续派发")
-                    self._save(p)
-                    return
                 if p["current_step"] == "publication":
                     # Commit succeeded even if its acknowledgement was lost.
                     if p["steps"][-2].get("retry_info"):
@@ -997,12 +1084,6 @@ class PipelineManager:
                 elif p["status"] not in {"retry_waiting", "paused", "published_summary_failed"}:
                     p.update(status="running", error=None)
                 p["current_step"] = "overview"
-            elif p["status"] == "terminating":
-                if not self._busy(p["batch_id"]):
-                    p["status"] = "terminated"
-                    self._log(p, "流程已终止，保留所有已完成结果")
-                    self._save(p)
-                return
             elif p["status"] in {"paused", "failed", "waiting_for_correction"}:
                 return
             step = next((s for s in p["steps"] if s["status"] not in {"succeeded", "skipped"}), None)
@@ -1033,6 +1114,7 @@ class PipelineManager:
                     if not self._resume_scheduled_retry(p, step):
                         return
                 key = step["id"]
+                check_pipeline_stop(self.records, pipeline_id)
                 if key == "collection":
                     runs_by_id = {run["collection_run_id"]: run for run in self.runtime.collection_runs(p["batch_id"])}
                     if p["start_mode"] in {"collect", "generate", "evaluation"} and not p["collection_run_ids"]:
@@ -1050,6 +1132,7 @@ class PipelineManager:
                         step.update(status="running", started_at=step["started_at"] or utc_now(), message="下发采集")
                         saved = self._save(p)
                         p["storage_revision"] = saved["storage_revision"]
+                        check_pipeline_stop(self.records, pipeline_id)
                         with diagnostics.trace_context(batch_id=p["batch_id"], step_id="collection"):
                             diagnostics.log_event("collection_dispatch_started", collection_config=p["collection_config"])
                             run = self.runtime.dispatch_collection(p)
@@ -1121,7 +1204,12 @@ class PipelineManager:
                         step.update(status="failed", error=p["error"], message="已发布，汇总失败；可单独重试转换")
                 if step["status"] in {"succeeded", "skipped"}:
                     self._log(p, step["label"] + "：" + step["message"])
+            except (PipelineJobCancelled, RevisionConflict):
+                if self.get(pipeline_id, public=False)["status"] == "terminating":
+                    return
+                raise
             except Exception as exc:
+                check_pipeline_stop(self.records, pipeline_id)
                 self._schedule_or_fail(p, step, exc)
                 # Dispatch may have been accepted even when its HTTP response was
                 # lost; retain the durable run identity before returning an error.
@@ -1142,16 +1230,28 @@ class PipelineManager:
 
     def _poll(self):
         while not self._stop.is_set():
-            for pipeline_id in self.records.matching_keys("pipelines", excluded_statuses=TERMINAL - {"published_summary_failed"}):
+            keys = self.records.matching_keys("pipelines", excluded_statuses=TERMINAL - {"published_summary_failed"})
+            running = []
+            for pipeline_id in keys:
+                pipeline = self.records.get("pipelines", pipeline_id)
+                if pipeline and pipeline["status"] == "terminating":
+                    self._termination_workers.submit(pipeline_id, lambda key=pipeline_id: self._poll_one(key))
+                elif pipeline:
+                    running.append(pipeline_id)
+            for pipeline_id in running:
                 if self._stop.is_set():
                     break
-                try:
-                    self.tick(pipeline_id)
-                except Exception:
-                    LOG.exception("Pipeline reconciliation failed: %s", pipeline_id)
+                self._poll_one(pipeline_id)
             self._stop.wait(self.interval)
+
+    def _poll_one(self, pipeline_id):
+        try:
+            self.tick(pipeline_id)
+        except Exception:
+            LOG.exception("Pipeline reconciliation failed: %s", pipeline_id)
 
     def close(self):
         self._stop.set()
         if self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout=5)
+        self._termination_workers.close()

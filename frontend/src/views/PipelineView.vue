@@ -232,9 +232,15 @@ async function create() {
 }
 async function control(action: PipelineAction) {
   if (!pipeline.value || controlling.value) return
-  if (action === 'terminate') {
-    try { await ElMessageBox.confirm('停止后续派发。已启动的作业将完成并保留结果，正在提交的发布以最终结果为准。', '终止 Pipeline', { type: 'warning', confirmButtonText: '终止流程', cancelButtonText: '取消' }) } catch { return }
+  const pipelineId = pipeline.value.pipeline_id
+  if (action === 'terminate' && pipeline.value.status !== 'terminating') {
+    try {
+      await ElMessageBox.confirm('停止本轮采集和其他未完成作业。已完成的轨迹仍会回传，已提交的发布保留。', '终止 Pipeline', {
+        type: 'warning', confirmButtonText: '终止流程', cancelButtonText: '取消',
+      })
+    } catch { return }
   }
+  if (disposed || pipeline.value?.pipeline_id !== pipelineId || controlling.value) return
   const target = pipeline.value; controlling.value = true
   try {
     const updated = await api.controlPipeline(target.pipeline_id, action, target.storage_revision)
@@ -266,7 +272,7 @@ onBeforeUnmount(() => { disposed = true; stopRetryClock(); choicesGeneration++; 
           <el-button v-if="pipeline.status === 'running' || pipeline.status === 'retry_waiting' || pipeline.status === 'waiting_for_correction' || pipeline.status === 'waiting_for_evaluation' || pipeline.status.startsWith('waiting_for_generation')" size="small" :loading="controlling" @click="control('pause')">暂停</el-button>
           <el-button v-if="pipeline.status === 'paused'" size="small" type="primary" :loading="controlling" @click="control('resume')">继续</el-button>
           <el-button v-if="pipeline.status === 'failed' || pipeline.status === 'published_summary_failed'" size="small" type="primary" :loading="controlling" @click="control('retry')">{{ pipeline.status === 'published_summary_failed' ? '重试汇总' : '重试' }}</el-button>
-          <el-button v-if="!PIPELINE_TERMINAL.includes(pipeline.status) && pipeline.status !== 'terminating'" size="small" :disabled="controlling" @click="control('terminate')">终止</el-button>
+          <el-button v-if="!PIPELINE_TERMINAL.includes(pipeline.status)" size="small" :loading="controlling" @click="control('terminate')">{{ pipeline.status === 'terminating' ? '重试停止' : '终止' }}</el-button>
         </div>
       </header>
       <div v-if="pipeline" class="run-workspace" data-testid="pipeline-run-status">
@@ -275,7 +281,19 @@ onBeforeUnmount(() => { disposed = true; stopRetryClock(); choicesGeneration++; 
           <span>本轮执行：{{ done }}/{{ pipeline.steps.length }} 步骤已处理</span>
           <el-progress :percentage="pipeline.steps.length ? Math.round(done / pipeline.steps.length * 100) : 0" :show-text="false" />
         </div>
-        <div v-if="currentStep" class="run-detail">
+        <div v-if="pipeline.status === 'terminating'" class="run-stop-status" data-testid="pipeline-termination-status" role="status">
+          <strong>正在停止本轮作业</strong>
+          <ul v-if="pipeline.termination?.pending?.length">
+            <li v-for="(item, index) in pipeline.termination.pending" :key="`${item.stage}:${item.job_id}:${item.phone_id}:${index}`">
+              {{ pipeline.steps.find(step => step.id === item.stage)?.label || '作业' }}
+              <span v-if="item.phone_id"> · 手机 {{ item.phone_id }}</span>
+              <span v-else-if="item.job_id"> · {{ item.job_id }}</span>
+              <span> · {{ item.message }}</span>
+            </li>
+          </ul>
+          <span v-else>等待后台核对采集和作业状态</span>
+        </div>
+        <div v-else-if="currentStep" class="run-detail">
           <span>{{ currentStep.label }} · {{ pipelineStepLabels[currentStep.status] }}</span>
           <el-progress v-if="currentStep.status === 'running' && percentage(currentStep.percent) !== undefined" :percentage="percentage(currentStep.percent)" />
           <span v-if="currentDetails">{{ currentDetails }}</span>
@@ -481,6 +499,8 @@ onBeforeUnmount(() => { disposed = true; stopRetryClock(); choicesGeneration++; 
 .run-summary,.run-detail,.run-links{display:flex;align-items:center;flex-wrap:wrap;gap:10px 18px}
 .run-summary>.el-progress{width:140px}
 .run-detail{margin-top:12px;line-height:1.6}
+.run-stop-status{display:grid;gap:4px;margin-top:12px;padding:8px 10px;border:1px solid #fcd34d;border-radius:8px;background:#fffbeb;color:#92400e;font-size:12px;overflow-wrap:anywhere}
+.run-stop-status ul{margin:0;padding-left:20px}
 .run-detail>.el-progress{width:180px}
 .run-detail .job-id{overflow-wrap:anywhere;font:11px monospace}
 .run-error{color:#b91c1c}

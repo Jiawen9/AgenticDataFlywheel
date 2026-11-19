@@ -493,7 +493,7 @@ def _convert_external_release(registry: Any, release: dict, release_id: str) -> 
         raise ConversionError(f"外部发布数据转换失败：{exc}") from exc
 
 
-def convert_release(registry: Any, release: dict) -> dict:
+def convert_release(registry: Any, release: dict, *, check_stop=None) -> dict:
     """Convert frozen historical JSONL or full export workbooks for the catalog."""
     release_id = _text(release.get("release_id"))
     if not release_id or any(value in release_id for value in ("/", "\\", "..")):
@@ -523,6 +523,8 @@ def convert_release(registry: Any, release: dict) -> dict:
         store = FrozenReleaseSources(registry.data_root, release) if any(
             ref.get("artifact") for ref in refs) else None
         for file_index, item in enumerate(files, start=1):
+            if check_stop is not None:
+                check_stop()
             label = f"文件 {file_index}"
             path = registry.resolve_project_path(item.get("path", ""))
             expected_root = (Path(registry.data_root) / "releases" / release_id).resolve()
@@ -546,6 +548,8 @@ def convert_release(registry: Any, release: dict) -> dict:
                 if "action" not in headers and "actions" not in headers:
                     raise ConversionError(f"{label}：发布表缺少最终动作列")
                 for row_number, cells in enumerate(values, start=2):
+                    if check_stop is not None and row_number % 128 == 0:
+                        check_stop()
                     if not any(cell is not None and cell != "" for cell in cells):
                         continue
                     row = dict(zip(headers, cells))

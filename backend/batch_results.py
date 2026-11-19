@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -207,7 +208,7 @@ def assert_task_inputs(batch_id: str, expected: dict[str, str], root: Path | Non
 
 
 def merge_tree_results(batch_id: str, incoming: dict, observation: dict,
-                       observation_rows: list[dict], root: Path | None = None) -> dict:
+                       observation_rows: list[dict], root: Path | None = None, *, commit_guard=nullcontext) -> dict:
     """Publish 03/04 together, preserving other tasks against the current input."""
     store = ArtifactStore(_root(root))
     replaced = set(incoming["trees"])
@@ -241,7 +242,7 @@ def merge_tree_results(batch_id: str, incoming: dict, observation: dict,
              "source_refs": [annotation] if annotation else [], "metadata": {"task_ids": sorted(result["trees"])}},
             {"stage": "04_tree", "payload": result, "source_stages": ["03_observation"],
              "metadata": {"run_id": batch_id, "task_ids": sorted(result["trees"])}},
-        ], record_entries=[invalidation_record_entry(store, batch_id, "tree", changed)])
+        ], record_entries=[invalidation_record_entry(store, batch_id, "tree", changed)], commit_guard=commit_guard)
         drain_batch_invalidations(batch_id, root)
         return current_tree_batch(batch_id, root)
 

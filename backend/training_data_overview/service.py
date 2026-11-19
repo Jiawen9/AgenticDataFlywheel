@@ -1,7 +1,8 @@
 """Durable, rebuildable summaries; publication files are never modified."""
 from __future__ import annotations
 from .. import pipeline_diagnostics as diagnostics
-from ..pipeline_access import submit_with_context
+from ..pipeline_access import execution_pipeline_id, submit_with_context
+from ..pipeline_job_stop import PipelineJobCancelled, check_job_stop, job_commit_guard
 
 from collections import Counter, defaultdict
 from concurrent.futures import Executor, ThreadPoolExecutor
@@ -221,8 +222,16 @@ class TrainingOverviewManager:
                 return current
             if current and current["status"] in {"queued", "running"} and not recover and not self._started:
                 return current
+            if recover and current:
+                try:
+                    check_job_stop(self.records, CONVERSIONS, release_id)
+                except PipelineJobCancelled:
+                    return self._cancelled(release_id)
             queued = {"release_id": release_id, "name": release["name"], "status": "queued", "error": None,
                       "failure": None, "warnings": [], "updated_at": utc_now(), "converter_version": 1}
+            pipeline_id = (current or {}).get("pipeline_id") if recover else execution_pipeline_id()
+            if pipeline_id:
+                queued["pipeline_id"] = pipeline_id
             saved = self.records.put(CONVERSIONS, release_id, queued, expected_revision=current.get("storage_revision", 0) if current else 0)
             diagnostics.record_job_snapshot({**saved, "pipeline_id": release.get("pipeline_id")}, "overview", self.root)
             if self._started:
@@ -258,19 +267,26 @@ class TrainingOverviewManager:
             state = self.records.get(CONVERSIONS, release_id) or state
         except Exception:
             pass
-        with diagnostics.trace_context(_reset=True, root=self.root, pipeline_id=release.get("pipeline_id")), \
-                diagnostics.job_context({**state, "pipeline_id": release.get("pipeline_id"),
+        with diagnostics.trace_context(_reset=True, root=self.root, pipeline_id=state.get("pipeline_id")), \
+                diagnostics.job_context({**state,
                 "batch_id": next(iter(release.get("batch_ids") or []), None)}, "overview", self.root):
             return self._run_with_diagnostics(release_id)
 
     def _run_with_diagnostics(self, release_id: str) -> None:
+        def check_stop():
+            check_job_stop(self.records, CONVERSIONS, release_id)
+
         with self._conversion_lock:
             try:
-                state = self.records.update(CONVERSIONS, release_id, lambda c: c.update(status="running", updated_at=utc_now()))
+                with job_commit_guard(self.records, CONVERSIONS, release_id):
+                    state = self.records.update(CONVERSIONS, release_id, lambda c: c.update(status="running", updated_at=utc_now()))
                 diagnostics.record_job_snapshot(state, "overview", self.root)
                 release = self.registry.get(release_id)
-                converted = self.converter(self.registry, release)
+                options = {"check_stop": check_stop} if self.converter is convert_release and state.get("pipeline_id") else {}
+                converted = self.converter(self.registry, release, **options)
                 self._publish(release_id, converted)
+            except PipelineJobCancelled:
+                self._cancelled(release_id)
             except Exception as exc:
                 diagnostics.log_event("conversion_exception", error=diagnostics.format_exception(exc))
                 log.exception("Training overview conversion failed for %s", release_id)
@@ -278,7 +294,14 @@ class TrainingOverviewManager:
                     status="failed", error=str(exc), failure=failure_from_exception(exc), updated_at=utc_now()))
                 diagnostics.record_job_snapshot(state, "overview", self.root)
 
+    def _cancelled(self, release_id):
+        state = self.records.update(CONVERSIONS, release_id, lambda c: c.update(
+            status="cancelled", error=None, failure=None, updated_at=utc_now()))
+        diagnostics.record_job_snapshot(state, "overview", self.root)
+        return state
+
     def _publish(self, release_id: str, converted: dict) -> None:
+        check_job_stop(self.records, CONVERSIONS, release_id)
         # A single worker assembles immutable files, then atomically exposes one catalog.
         catalog = self.records.get(CATALOG, "current") or {}
         rows = [r for r in catalog.get("rows", []) if r["release_id"] != release_id] + converted["rows"]
@@ -294,15 +317,16 @@ class TrainingOverviewManager:
             _write_tables(temporary / "all_data.xlsx", {"all_data": [{key: r[key] for key in ALL_DATA_COLUMNS} for r in rows]})
             files = {name: {"path": (final / name).relative_to(self.root).as_posix(), "sha256": _sha256(temporary / name)}
                      for name in ("conversion.json", "all_data.json", "all_data.xlsx")}
-            temporary.rename(final)
-            state = self.records.get(CONVERSIONS, release_id)
-            state.update(status="succeeded", error=None, failure=None, warnings=converted.get("warnings", []), updated_at=utc_now(),
-                         version=version, files=files, trajectory_count=len(converted["rows"]))
-            self.records.put_many([
-                {"namespace": CATALOG, "key": "current", "expected_revision": catalog.get("storage_revision", 0),
-                 "payload": {"schema_version": 1, "version": version, "updated_at": utc_now(), "rows": rows, "files": files}},
-                {"namespace": CONVERSIONS, "key": release_id, "expected_revision": state["storage_revision"], "payload": state},
-            ])
+            with job_commit_guard(self.records, CONVERSIONS, release_id):
+                temporary.rename(final)
+                state = self.records.get(CONVERSIONS, release_id)
+                state.update(status="succeeded", error=None, failure=None, warnings=converted.get("warnings", []), updated_at=utc_now(),
+                             version=version, files=files, trajectory_count=len(converted["rows"]))
+                self.records.put_many([
+                    {"namespace": CATALOG, "key": "current", "expected_revision": catalog.get("storage_revision", 0),
+                     "payload": {"schema_version": 1, "version": version, "updated_at": utc_now(), "rows": rows, "files": files}},
+                    {"namespace": CONVERSIONS, "key": release_id, "expected_revision": state["storage_revision"], "payload": state},
+                ])
             diagnostics.record_job_snapshot(state, "overview", self.root)
             diagnostics.log_event("conversion_committed", release_id=release_id, files=files,
                                   trajectory_count=len(converted["rows"]))

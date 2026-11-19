@@ -28,6 +28,8 @@ from .data_store import RecordStore, DATA_ROOT, ArtifactStore
 from .batch_results import (current_tree_payload, current_quality_payload, quality_task_fingerprints, StaleTaskInput)
 from .stage_artifacts import store_root
 from .pipeline_retry_errors import failure_from_exception, failure_from_payload
+from .pipeline_job_stop import PipelineJobCancelled, check_job_stop
+from .data_store.registry import RevisionConflict
 from .identifiers import allocate_id
 from .file_io import io_path
 from . import quality_execution
@@ -151,6 +153,20 @@ def _result_changes(report: dict, task_ids: list[str]) -> dict:
             "diagnostic_log": [], "warnings": report.get("warnings", []), **summary}
 
 
+def _cancelled_changes() -> dict:
+    return {"status": "cancelled", "stage": "cancelled", "completed_at": _now(),
+            "error": None, "failure": None, "active_model_requests": []}
+
+
+def _checklist_workers_stopped(records: RecordStore, job_id: str) -> bool:
+    from .quality_checklist_local import stop_job_children
+    from .quality_checklist import cancel_remote_jobs
+
+    local_stopped = stop_job_children(records, job_id)
+    remote_stopped = cancel_remote_jobs(records.root, job_id)
+    return local_stopped and remote_stopped
+
+
 def _env_values(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     if io_path(path).is_file():
@@ -216,6 +232,7 @@ def _run_quality_subprocess(run_id: str, task_ids: list[str], *, job_id: str, pr
     diagnostics.register_secrets(token, *[value for key, value in {**os.environ, **values}.items()
                                           if any(part in key.upper() for part in ("API_KEY", "TOKEN", "PASSWORD", "SECRET"))])
     try:
+        check_job_stop(RecordStore(root), "quality_jobs", job_id)
         process = subprocess.Popen(
             command, cwd=str(BACKEND_DIR.parent), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1,
@@ -265,6 +282,7 @@ def _run_quality_subprocess(run_id: str, task_ids: list[str], *, job_id: str, pr
     try:
         quality_execution.update_process(root, job_id, token,
                                          {**process_metadata(process), "launch_released": True})
+        check_job_stop(RecordStore(root), "quality_jobs", job_id)
         if stop_event is not None and stop_event.is_set():
             raise QualitySubprocessError({"category": "service_restart"}, -1)
         # The worker must not start until its identity is durable. If the parent
@@ -405,7 +423,8 @@ class QualityJobManager:
     def _write(self, payload: dict[str, Any]) -> None:
         if execution_pipeline_id():
             payload.setdefault("pipeline_id", execution_pipeline_id())
-        payload.update(self.records.put("quality_jobs", payload["job_id"], payload))
+        payload.update(self.records.put("quality_jobs", payload["job_id"], payload,
+                                        expected_revision=payload.get("storage_revision", 0)))
         diagnostics.record_job_snapshot(payload, "quality", self.data_root)
 
     def get(self, job_id: str) -> dict[str, Any] | None:
@@ -452,6 +471,12 @@ class QualityJobManager:
                              if cleanup.get(payload["job_id"], True) else None)
                 if committed is not None and cleanup.get(payload["job_id"], True):
                     payload.update(_result_changes(committed, payload.get("task_ids", [])))
+                    self._write(payload)
+                    continue
+                if self._stop_requested(payload["job_id"]):
+                    # The Pipeline control worker will reconcile Checklist children
+                    # and any legacy remote jobs after this service starts.
+                    payload["stage"] = "stopping"
                     self._write(payload)
                     continue
                 failure = failure_from_payload({"category": "service_restart"} if cleanup.get(payload["job_id"], True)
@@ -629,11 +654,55 @@ class QualityJobManager:
                 except Exception:
                     diagnostics.log_event("diagnostic_lookup_failed", operation="quality_progress_snapshot")
             else:
-                payload = self.get(job_id)
-                if payload is None or payload.get("status") not in {"queued", "running"}:
-                    return
-                payload.update(changes)
-                self._write(payload)
+                while True:
+                    payload = self.get(job_id)
+                    if payload is None or payload.get("status") not in {"queued", "running"}:
+                        return
+                    payload.update(changes)
+                    try:
+                        self._write(payload)
+                        return
+                    except RevisionConflict:
+                        # Merge control writes that arrive between the snapshot and update.
+                        continue
+
+    def _stop_requested(self, job_id: str) -> bool:
+        try:
+            check_job_stop(self.records, "quality_jobs", job_id)
+        except PipelineJobCancelled:
+            return True
+        return False
+
+    def signal_pipeline_stop(self, job_id: str) -> bool:
+        """Signal the supervisor and confirm this job's subprocesses have exited."""
+        if not self._stop_requested(job_id):
+            return False
+        with self._lock:
+            event = self._stop_events.get(job_id)
+            if event is not None:
+                event.set()
+                return False
+            future = self._futures.get(job_id)
+            if future is not None and not future.done() and not future.cancel():
+                return False
+        execution = quality_execution.get_execution(self.data_root, job_id) or {}
+        metadata = execution.get("process") or {}
+        if execution and metadata.get("exited") is not True:
+            if not stop_recorded_process(metadata):
+                return False
+            quality_execution.revoke_execution(self.data_root, job_id, execution["token"], "pipeline_stopped")
+            quality_execution.update_process(self.data_root, job_id, execution["token"],
+                                             {"exited": True, "cleanup_failed": False})
+        if not _checklist_workers_stopped(self.records, job_id):
+            return False
+        current = self.get(job_id) or {}
+        if current.get("status") in {"queued", "running", "interrupted", "failed"}:
+            committed = quality_execution.committed_result(self.data_root, job_id)
+            changes = (_result_changes(committed, current.get("task_ids", [])) if committed is not None
+                       else _cancelled_changes())
+            self.records.update("quality_jobs", job_id, lambda job: job.update(changes)
+                                if job.get("status") in {"queued", "running", "interrupted", "failed"} else None)
+        return True
 
     def _run(self, job_id: str, run_id: str, task_ids: list[str]) -> None:
         try:
@@ -652,9 +721,11 @@ class QualityJobManager:
             with self._lock:
                 if self._closed or (self.get(job_id) or {}).get("status") != "queued":
                     return
+                check_job_stop(self.records, "quality_jobs", job_id)
                 self._stop_events[job_id] = stop_event
                 self._progress(job_id, {"status": "running", "stage": "preparing", "started_at": _now()})
             with batch_operation(run_id, "quality_worker", self.data_root):
+                check_job_stop(self.records, "quality_jobs", job_id)
                 job = self.get(job_id) or {}
                 if job.get("source_tree_hashes"):
                     trees = current_tree_payload(run_id, self.data_root)
@@ -669,6 +740,8 @@ class QualityJobManager:
                     options = {}
                 report = self.runner(run_id, task_ids, job_id=job_id,
                                      progress=lambda value: self._progress(job_id, value, token=token), **options)
+                if not token:
+                    check_job_stop(self.records, "quality_jobs", job_id)
         except Exception as exc:
             diagnostics.log_event("job_exception", error=diagnostics.format_exception(exc))
             execution = quality_execution.get_execution(self.data_root, job_id) if token else None
@@ -682,6 +755,12 @@ class QualityJobManager:
             if committed is not None:
                 self._progress(job_id, _result_changes(committed, task_ids))
                 return
+            if (isinstance(exc, PipelineJobCancelled) or self._stop_requested(job_id)) and (
+                    not token or (execution or {}).get("process", {}).get("exited") is True):
+                if _checklist_workers_stopped(self.records, job_id):
+                    self._progress(job_id, _cancelled_changes())
+                    return
+                exc = QualitySubprocessError({"category": "unknown", "code": "quality_worker_cleanup_failed"}, -1)
             status = "stale" if isinstance(exc, StaleTaskInput) else "failed"
             failure = failure_from_payload(getattr(exc, "failure", None)) if getattr(exc, "failure", None) else failure_from_exception(exc)
             diagnostic = exc.diagnostic_log if isinstance(exc, QualitySubprocessError) else [

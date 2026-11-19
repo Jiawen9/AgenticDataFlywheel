@@ -216,6 +216,20 @@ class QualityChecklistTests(unittest.TestCase):
         cancel_remote_jobs(self.root, "old", store=self.remote)
         self.assertEqual(self.remote.calls, [])
 
+    def test_known_remote_stop_waits_for_terminal_acknowledgement(self):
+        self.remote.records.put("quality_checklist_by_job", "old", {"keys": ["owned"]})
+        self.remote.records.put("quality_checklist_jobs", "owned", {
+            "remote_job_id": "remote", "collector_server": "http://localhost:9011",
+            "remote_generation": 4, "last_quality_job_id": "old",
+        })
+        with patch.object(self.remote, "_remote_result", side_effect=[
+            ConnectionError("response lost"),
+            {"job_id": "remote", "status": "cancelled", "generation": 5},
+        ]):
+            self.assertFalse(cancel_remote_jobs(self.root, "old", store=self.remote))
+            self.assertTrue(cancel_remote_jobs(self.root, "old", store=self.remote))
+        self.assertTrue(self.remote.records.get("quality_checklist_jobs", "owned")["remote_terminal"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -16,6 +16,7 @@ from unittest.mock import Mock, patch
 
 from backend import quality_execution, quality_jobs, quality_process
 from backend.data_store import RecordStore
+from backend.pipeline_job_stop import PipelineJobCancelled
 
 
 class QualityProcessTests(unittest.TestCase):
@@ -322,6 +323,60 @@ print('RESULT {"warnings":[]}',flush=True)
             runner.assert_not_called()
         finally:
             manager.shutdown()
+
+    def test_pipeline_stop_preserves_running_state_until_runner_exits(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def runner(*args, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return {"tasks": [{"task_id": "task"}]}
+
+        manager = quality_jobs.QualityJobManager(self.root / "jobs", runner=runner, data_root=self.root)
+        try:
+            job_id = manager._submit_job("batch", ["task"])["job_id"]
+            self.assertTrue(entered.wait(5))
+            manager.records.update("quality_jobs", job_id, lambda job: job.update(stop_requested_at="requested"))
+            self.assertFalse(manager.signal_pipeline_stop(job_id))
+            self.assertEqual(manager.get(job_id)["status"], "running")
+            release.set()
+            manager._futures[job_id].result(timeout=5)
+            self.assertEqual(manager.get(job_id)["status"], "cancelled")
+            self.assertEqual(manager.get(job_id)["stop_requested_at"], "requested")
+            self.assertTrue(manager.signal_pipeline_stop(job_id))
+        finally:
+            release.set()
+            manager.shutdown()
+
+    def test_pipeline_stop_fences_child_write_and_retries_unconfirmed_checklist_exit(self):
+        from backend import quality_checklist_local
+        manager = quality_jobs.QualityJobManager(self.root / "jobs", data_root=self.root)
+        self.addCleanup(manager.shutdown)
+        job_id = "quality-owned"
+        manager.records.put("quality_jobs", job_id, {
+            "job_id": job_id, "run_id": "batch", "status": "running", "stop_requested_at": "requested",
+        })
+        execution = quality_execution.start_execution(self.root, job_id, "batch")
+        token = execution["token"]
+        with self.assertRaises(PipelineJobCancelled):
+            with quality_execution.execution_context(self.root, job_id, token):
+                self.fail("the child must stop before doing any work")
+        quality_execution.update_process(self.root, job_id, token, {"exited": True})
+        child = {"pid": 17, "process_identity": "checklist"}
+        manager.records.put(quality_checklist_local.SLOTS, "0", {
+            "state": "active", "token": "owned", "quality_job_id": job_id, "child": child,
+        })
+        manager.records.put(quality_checklist_local.SLOTS, "1", {
+            "state": "active", "token": "other", "quality_job_id": "other", "child": {"pid": 18},
+        })
+        with patch.object(quality_checklist_local, "_owner_dead", return_value=True), \
+             patch.object(quality_checklist_local, "stop_recorded_process", side_effect=[False, True]) as stop:
+            self.assertFalse(manager.signal_pipeline_stop(job_id))
+            self.assertEqual(manager.get(job_id)["status"], "running")
+            self.assertTrue(manager.signal_pipeline_stop(job_id))
+        self.assertEqual([call.args for call in stop.call_args_list], [(child,), (child,)])
+        self.assertEqual(manager.get(job_id)["status"], "cancelled")
+        self.assertEqual(manager.records.get(quality_checklist_local.SLOTS, "1")["state"], "active")
 
     def test_request_diagnostics_strip_secrets_and_bodies(self):
         safe = quality_jobs._safe_request_frame({"local_request_id": "r", "event": "started",

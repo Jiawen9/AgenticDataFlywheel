@@ -331,7 +331,7 @@ class CollectionRunStore:
             def mutate(run):
                 # A fast collector may finish before its dispatch response arrives.
                 if run["status"] not in {"completed", "interrupted"}:
-                    run["status"] = "running"
+                    run["status"] = "stopping" if run.get("stop_requested_at") else "running"
                 run.update(dispatch_response=response, dispatched_at=_now(), dispatch_error=None,
                            dispatch_rejected=False)
                 run.pop("dispatch_rejection", None)

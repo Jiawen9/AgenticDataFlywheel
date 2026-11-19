@@ -8,7 +8,7 @@ import shutil
 import threading
 from collections import OrderedDict
 from copy import deepcopy
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import wraps
 from pathlib import Path
 from backend.file_io import io_path, resolve_path
@@ -804,15 +804,17 @@ def patch_group_export(session_id: str, group_id: str, export: bool, expected_re
     return {**_group_summary(session_id, session, group), "storage_revision": session.get("storage_revision")}
 
 
-def publish_stage_snapshot(session: dict[str, Any], snapshot: dict[str, Any], stage: str, *, workbook: Path | None = None) -> dict[str, Any]:
+def publish_stage_snapshot(session: dict[str, Any], snapshot: dict[str, Any], stage: str, *,
+                           workbook: Path | None = None, commit_guard=nullcontext) -> dict[str, Any]:
     """Publish the batch's valid steps, including deleted/unexported rows."""
     batch_id = session_batch_id(session)
     with ArtifactStore(storage_root()).batch_lock(batch_id):
         ensure_batch_active(batch_id, storage_root())
-        return _publish_stage_snapshot(session, snapshot, stage, workbook=workbook)
+        return _publish_stage_snapshot(session, snapshot, stage, workbook=workbook, commit_guard=commit_guard)
 
 
-def _publish_stage_snapshot(session: dict[str, Any], snapshot: dict[str, Any], stage: str, *, workbook: Path | None = None) -> dict[str, Any]:
+def _publish_stage_snapshot(session: dict[str, Any], snapshot: dict[str, Any], stage: str, *,
+                            workbook: Path | None = None, commit_guard=nullcontext) -> dict[str, Any]:
     session, snapshot = _export_view(session, snapshot)
     groups = []
     table = []
@@ -844,7 +846,7 @@ def _publish_stage_snapshot(session: dict[str, Any], snapshot: dict[str, Any], s
         tables={"完整步骤": table}, workbooks={"full_dataset.xlsx": workbook} if workbook else None,
         source_refs=[{"kind": "correction_session", "id": session["session_id"], "revision": session.get("storage_revision")},
                      {"kind": "trajectory_tree", "id": session.get("tree_run_id")}] + lineage,
-        metadata={"session_id": session["session_id"], "row_count": len(table)})
+        metadata={"session_id": session["session_id"], "row_count": len(table)}, commit_guard=commit_guard)
 
 
 @contextmanager
@@ -998,7 +1000,7 @@ def _remember_export(session_id: str, history: dict) -> dict:
 
 
 @_locked_session
-def publish_cot_snapshot(session_id: str, expected_revision: int | None = None) -> dict[str, Any]:
+def publish_cot_snapshot(session_id: str, expected_revision: int | None = None, *, commit_guard=nullcontext) -> dict[str, Any]:
     session = _session_or_raise(session_id)
     _check_revision(session, expected_revision)
     session, snapshot = _export_view(session, _snapshot(session))
@@ -1009,7 +1011,7 @@ def publish_cot_snapshot(session_id: str, expected_revision: int | None = None) 
                                           output_dir=output_dir, export_id=allocate_id("e", storage_root()))
     generated = output_dir / result["filename"]
     try:
-        return publish_stage_snapshot(session, snapshot, "07_cot", workbook=generated)
+        return publish_stage_snapshot(session, snapshot, "07_cot", workbook=generated, commit_guard=commit_guard)
     finally:
         io_path(generated).unlink(missing_ok=True)
 

@@ -6,6 +6,7 @@ import hashlib
 import json
 import shutil
 import threading
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from backend.file_io import io_path, resolve_path
@@ -84,6 +85,7 @@ class _ProgressClassifier:
         task_id: str,
         offset: int,
         total_steps: int,
+        check_stop: Callable[[], None] | None,
     ) -> None:
         self.classifier = classifier
         self.model = classifier.model
@@ -91,10 +93,13 @@ class _ProgressClassifier:
         self.task_id = task_id
         self.offset = offset
         self.total_steps = total_steps
+        self.check_stop = check_stop
         self.completed = 0
         self._lock = threading.Lock()
 
     def classify(self, **kwargs: Any):
+        if self.check_stop is not None:
+            self.check_stop()
         result = self.classifier.classify(**kwargs)
         with self._lock:
             self.completed += 1
@@ -154,6 +159,8 @@ def build_tree_run(
     annotation_version: str | None = None,
     expected_task_inputs: dict[str, str] | None = None,
     expected_build_config: dict[str, Any] | None = None,
+    check_stop: Callable[[], None] | None = None,
+    commit_guard=nullcontext,
 ) -> tuple[str, dict[str, Any]]:
     operation_batch = batch_id
     if operation_batch is None and structured_input_exists(xlsx_path):
@@ -263,7 +270,7 @@ def build_tree_run(
                     }
                 )
                 progress_classifier = _ProgressClassifier(
-                    classifier, progress, task_id, completed_steps, total_steps
+                    classifier, progress, task_id, completed_steps, total_steps, check_stop
                 )
                 classify_trajectories(
                     trajectories,
@@ -302,6 +309,7 @@ def build_tree_run(
                     trajectory_root=trajectory_root,
                     alignment_reviewer=alignment_reviewer,
                     max_incidental_skip=max_incidental_skip,
+                    check_stop=check_stop,
                 )
                 tree_path = temporary_dir / f"{task_id}.json"
                 write_output(
@@ -339,6 +347,7 @@ def build_tree_run(
                 env_path=env_path,
                 progress=progress,
                 max_concurrent=summary_max_concurrent,
+                **({"check_stop": check_stop} if quality_builder is build_quality_workbook else {}),
             )
 
             progress({"stage": "publishing", "classified_steps": total_steps, "total_steps": total_steps})
@@ -369,7 +378,8 @@ def build_tree_run(
                             "tree_hashes": {task: digest(value) for task, value in tree_payloads.items()},
                             "build_config": config, "quality_input_prompt_version": intermediate_state_classifier.PROMPT_VERSION}
                 incoming["tree_hashes"] = tree_result_hashes(tree_payloads, incoming["quality_input"], incoming["task_fingerprints"])
-                manifest = merge_tree_results(batch_id, incoming, observation, observation_rows, data_root)
+                manifest = merge_tree_results(batch_id, incoming, observation, observation_rows, data_root,
+                                              **({"commit_guard": commit_guard} if commit_guard is not nullcontext else {}))
                 shutil.rmtree(io_path(temporary_dir))
                 return batch_id, manifest
             tree_payloads = {item["task_id"]: json.loads((io_path(temporary_dir / item["tree_file"])).read_text(encoding="utf-8")) for item in task_manifests}
@@ -380,7 +390,7 @@ def build_tree_run(
                  "metadata": {"run_id": run_id, "model": model_name, "includes_all_steps": True}},
                 {"stage": "04_tree", "payload": {"schema_version": 1, "run_id": run_id, "trees": tree_payloads, "quality_input": quality_input},
                  "source_stages": ["03_observation"], "metadata": {"run_id": run_id, "task_ids": task_ids}},
-            ])
+            ], commit_guard=commit_guard)
             manifest = {
                 "run_id": run_id,
                 "completed_at": completed_at.isoformat(),

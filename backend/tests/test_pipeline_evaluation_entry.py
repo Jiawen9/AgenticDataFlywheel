@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from backend import model_iteration, phonefactory_client, pipeline_router
 from backend.badcases import BadCaseService
 from backend.phone_factory import PhoneFactoryStore, create_router
-from backend.pipelines import PipelineManager
+from backend.pipelines import PipelineManager, PipelineRuntime
 from backend.tests.collector_protocol_support import current_capabilities
 from backend.tests.test_model_iteration import evaluator_config, results
 from backend.tests.test_offline_evaluation_jobs import ManualPool
@@ -41,7 +41,9 @@ class EvaluationPipelineTests(unittest.TestCase):
         self.runtime._evaluation_pool = ManualPool()
         self.addCleanup(self.runtime.close)
         self.records = self.factory.records
-        self.pipeline = PipelineManager(None, root=self.root)
+        pipeline_runtime = PipelineRuntime(self.root, factory=self.factory, preprocessing=None,
+                                           tree=None, quality=None, cot=None, overview=None)
+        self.pipeline = PipelineManager(pipeline_runtime, root=self.root)
         app = FastAPI()
         app.state.pipelines = self.pipeline
         app.include_router(pipeline_router.router)
@@ -170,6 +172,8 @@ class EvaluationPipelineTests(unittest.TestCase):
             self.start_online(pipeline)
         ready = self.pipeline.get(pipeline["pipeline_id"])
         terminated = self.control(ready, "terminate")
+        self.pipeline.tick(pipeline["pipeline_id"])
+        terminated = self.pipeline.get(pipeline["pipeline_id"])
         self.assertEqual(terminated["status"], "terminated")
         replay = self.start_online(pipeline)
         self.assertEqual(replay.status_code, 200, replay.text)

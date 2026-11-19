@@ -160,7 +160,8 @@ class RecordStore:
         if self._summary_worker:
             self._summary_worker.close()
 
-    def matching_keys(self, namespace: str, *, batch_id=None, session_id=None, excluded_statuses=()) -> list[str]:
+    def matching_keys(self, namespace: str, *, batch_id=None, session_id=None, pipeline_id=None,
+                      excluded_statuses=()) -> list[str]:
         """Authoritative metadata selection for controls and legacy readers.
 
         Unlike UI projections, this remains complete during migration. SQLite
@@ -171,6 +172,9 @@ class RecordStore:
         if not io_path(self.database_path).exists():
             return []
         where, args = ["namespace=?"], [namespace]
+        if pipeline_id is not None:
+            where.append("json_extract(payload,'$.pipeline_id')=?")
+            args.append(pipeline_id)
         if batch_id is not None or session_id is not None:
             scopes = []
             if batch_id is not None:
@@ -187,7 +191,7 @@ class RecordStore:
             connection.execute("BEGIN")
             if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='records'").fetchone() is None:
                 return []
-            if namespace in summary_index.NAMESPACES and summary_index.ready(connection):
+            if pipeline_id is None and namespace in summary_index.NAMESPACES and summary_index.ready(connection):
                 # Same-transaction index maintenance makes this exact, while
                 # controls still reread the selected authoritative records.
                 index_where, index_args = ["namespace=?", "projection_version=?"], [namespace, summary_index.VERSION]

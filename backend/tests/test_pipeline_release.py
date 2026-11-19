@@ -68,6 +68,25 @@ class PipelineReleaseTests(unittest.TestCase):
     def publish(self, pipeline):
         return publishing.publish_pipeline(pipeline, root=self.root, registry=self.registry)
 
+    def test_termination_during_publication_preparation_leaves_batch_unpublished(self):
+        from backend.pipeline_job_stop import PipelineJobCancelled
+
+        pipeline = self.pipeline()
+        self.records.put("pipelines", pipeline["pipeline_id"], {**pipeline, "status": "running"})
+        real_writer = publishing.write_payload_workbook
+
+        def write_then_stop(*args, **kwargs):
+            result = real_writer(*args, **kwargs)
+            self.records.update("pipelines", pipeline["pipeline_id"], lambda p: p.update(status="terminating"))
+            return result
+
+        with patch.object(publishing, "write_payload_workbook", side_effect=write_then_stop):
+            with self.assertRaises(PipelineJobCancelled):
+                self.publish(pipeline)
+        self.assertEqual(lifecycle(self.batch, self.root)["status"], "active")
+        self.assertEqual(self.records.list("dataset_releases"), [])
+        self.assertIsNone(self.store.get(self.batch, "07_cot"))
+
     def test_threshold_tie_stability_and_automatic_no_session(self):
         pipeline = self.pipeline()
         self.assertEqual(pipeline["selection"]["selected_trajectories"], {"A": "a-first"})

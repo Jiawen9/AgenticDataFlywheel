@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .pipeline_access import submit_with_context, execution_pipeline_id, retry_enabled_for_pipeline
+from .pipeline_job_stop import PipelineJobCancelled, check_job_stop, job_commit_guard
 from . import pipeline_diagnostics as diagnostics
 
 import json
@@ -54,7 +55,12 @@ class TreeBuildJobManager:
     def _write(self, payload: dict[str, Any]) -> None:
         if execution_pipeline_id():
             payload.setdefault("pipeline_id", execution_pipeline_id())
-        payload.update(self.records.put("tree_jobs", payload["job_id"], payload))
+        def update(current):
+            stop_requested_at = current.get("stop_requested_at")
+            if stop_requested_at and payload.get("status") in {"queued", "running"}:
+                return current
+            return {**payload, **({"stop_requested_at": stop_requested_at} if stop_requested_at else {})}
+        payload.update(self.records.update("tree_jobs", payload["job_id"], update, default={}))
         diagnostics.record_job_snapshot(payload, "tree", self.data_root)
 
     def get(self, job_id: str) -> dict[str, Any] | None:
@@ -80,6 +86,11 @@ class TreeBuildJobManager:
             except (OSError, ValueError, json.JSONDecodeError):
                 continue
             if payload.get("status") in {"queued", "running"}:
+                try:
+                    check_job_stop(self.records, "tree_jobs", job_id)
+                except PipelineJobCancelled:
+                    self._cancelled(job_id)
+                    continue
                 payload.update(
                     {
                         "status": "interrupted",
@@ -168,6 +179,7 @@ class TreeBuildJobManager:
         return payload
 
     def _progress(self, job_id: str, changes: dict[str, Any]) -> None:
+        check_job_stop(self.records, "tree_jobs", job_id)
         with self._lock:
             payload = self.get(job_id)
             if payload is None:
@@ -197,13 +209,16 @@ class TreeBuildJobManager:
             return self._run_with_diagnostics(job_id, task_ids)
 
     def _run_with_diagnostics(self, job_id: str, task_ids: list[str]) -> None:
-        with self._lock:
-            payload = self.get(job_id)
-            if payload is None:
-                return
-            payload.update({"status": "running", "stage": "classifying_and_observing", "started_at": _now()})
-            self._write(payload)
+        def check_stop():
+            check_job_stop(self.records, "tree_jobs", job_id)
+
         try:
+            with self._lock, job_commit_guard(self.records, "tree_jobs", job_id):
+                payload = self.get(job_id)
+                if payload is None:
+                    return
+                payload.update({"status": "running", "stage": "classifying_and_observing", "started_at": _now()})
+                self._write(payload)
             with batch_operation(payload.get("batch_id"), "tree_build_worker", self.data_root):
                 context_options = {}
                 if payload.get("batch_id"):
@@ -214,6 +229,9 @@ class TreeBuildJobManager:
                     if self.runner is build_tree_run:
                         context_options.update(expected_task_inputs=payload["source_task_fingerprints"],
                                                expected_build_config=payload["build_config"])
+                if self.runner is build_tree_run:
+                    context_options.update(check_stop=check_stop,
+                        commit_guard=lambda: job_commit_guard(self.records, "tree_jobs", job_id))
                 run_id, _ = self.runner(
                     task_ids,
                     job_id=job_id,
@@ -221,6 +239,13 @@ class TreeBuildJobManager:
                     **context_options,
                 )
         except Exception as exc:
+            try:
+                if isinstance(exc, PipelineJobCancelled):
+                    raise exc
+                check_stop()
+            except PipelineJobCancelled:
+                self._cancelled(job_id)
+                return
             diagnostics.log_event("job_exception", error=diagnostics.format_exception(exc))
             with self._lock:
                 payload = self.get(job_id) or {"job_id": job_id}
@@ -250,6 +275,13 @@ class TreeBuildJobManager:
                 }
             )
             self._write(payload)
+
+    def _cancelled(self, job_id):
+        with self._lock:
+            payload = self.get(job_id)
+            if payload is not None:
+                payload.update(status="cancelled", stage="cancelled", completed_at=_now(), error=None, failure=None)
+                self._write(payload)
 
     def shutdown(self) -> None:
         if self._owns_executor:

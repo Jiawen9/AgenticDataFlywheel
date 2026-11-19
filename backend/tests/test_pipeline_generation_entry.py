@@ -298,7 +298,7 @@ class GenerationPipelineTests(unittest.TestCase):
             self.confirm(p)
 
     def test_unconfigured_terminate_finishes_without_batch(self):
-        p = self.control(self.create(), "terminate")
+        p = self.tick(self.control(self.create(), "terminate"))
         self.assertEqual(p["status"], "terminated")
         self.assertIsNone(p["batch_id"])
 

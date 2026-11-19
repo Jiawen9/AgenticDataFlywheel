@@ -36,6 +36,7 @@ from .pipeline_evaluation import (
     check_start as check_pipeline_evaluation, create_run as create_evaluation_run,
     dispatch_guard, may_dispatch, start_context,
 )
+from .pipeline_phone_stop import collection_owner, devices_stopped, dispatch_never_accepted
 
 TERMINAL = {"completed", "succeeded", "partial", "failed", "interrupted", "cancelled"}
 
@@ -118,6 +119,15 @@ class FactoryRuntime:
             self.records.update("collection_runs", run_id, begin)
             self.sync_policy.reset("collection", run_id)
         self.sync_policy.reset("collection" if mode == "generate" else "evaluation", run_id)
+
+    def _admit_pipeline_dispatch(self, current, run_id, mode, incremental):
+        from .pipeline_job_stop import check_pipeline_stop, termination_lock
+        owner = collection_owner(self.records, current) if mode == "generate" else None
+        pipeline_id = owner["pipeline_id"] if owner else current.get("pipeline_id")
+        batch = active_batch_lock(current["batch_id"], self.root) if mode == "generate" or incremental else nullcontext()
+        with batch, termination_lock(self.root, pipeline_id):
+            check_pipeline_stop(self.records, pipeline_id)
+            self._begin_dispatch(run_id, mode, incremental)
 
     def download_archive(self, run_id, destination):
         self.store._remote_result(["run-archive", run_id, "--out", str(destination)])
@@ -875,11 +885,7 @@ class FactoryRuntime:
                     with dispatch_guard(self, current):
                         if not may_dispatch(self.records, current):
                             return {"ok": True, "reused": True, **self._public_run(current)}
-                        if mode == "generate" or incremental:
-                            with active_batch_lock(current["batch_id"], self.root):
-                                self._begin_dispatch(run_id, mode, incremental)
-                        else:
-                            self._begin_dispatch(run_id, mode, incremental)
+                        self._admit_pipeline_dispatch(current, run_id, mode, incremental)
                     response = self.store._remote_result([*args, "--server", collector] if collector else args)
                     if response.get("agent_type", "newagent") != options["agent_type"]:
                         raise PhoneFactoryError("远端接受运行的采集引擎与请求不匹配", 502)
@@ -1021,8 +1027,7 @@ class FactoryRuntime:
                 with dispatch_guard(self, current):
                     if not may_dispatch(self.records, current):
                         return {"ok": True, "reused": True, **self._public_run(current)}
-                    self.records.update("model_iter_runs", run_id,
-                        lambda item: item.update(dispatch_attempted=True, submitted_at=utc_now()))
+                    self._admit_pipeline_dispatch(current, run_id, "modeliter", False)
                 self.sync_policy.reset("evaluation", run_id)
                 args = ["start-evaluation", "--payload", json.dumps(remote_request, ensure_ascii=False)]
                 if frozen.get("collector_server"):
@@ -1404,7 +1409,8 @@ class FactoryRuntime:
         for run in self.records.list("model_iter_runs"):
             if unavailable(self.records, run["run_id"]):
                 continue
-            if run.get("stop_requested_at") and not run.get("evaluation_control_terminal"):
+            if run.get("stop_requested_at") and (not run.get("evaluation_control_terminal")
+                    or run.get("pipeline_stop_requested") and not run.get("pipeline_stop_confirmed")):
                 delay = min(60, 2 ** min(run.get("stop_attempt_count", 0), 6))
                 memory = self._control_memory.get(run["run_id"], {})
                 if time.time() >= max(run.get("stop_last_attempt_epoch", 0), memory.get("last_attempt", 0)) + delay:
@@ -1416,7 +1422,9 @@ class FactoryRuntime:
                 continue
             if unavailable(self.records, run["collection_run_id"]):
                 continue
-            if not run.get("stop_requested_at") or (run.get("control_terminal") and not can_cancel(run)):
+            waiting_pipeline = run.get("pipeline_stop_requested") and not devices_stopped(run)
+            if not run.get("stop_requested_at") or (
+                    run.get("control_terminal") and not can_cancel(run) and not waiting_pipeline):
                 continue
             if not is_batch_active(run["batch_id"], self.root):
                 continue
@@ -1455,11 +1463,16 @@ class FactoryRuntime:
         run = self.records.get("model_iter_runs", run_id)
         if not run or not run.get("stop_requested_at"):
             return
-        if run.get("request", {}).get("offline_evaluation_jobs_version") == 1 and run.get("evaluation_control_terminal"):
+        pipeline_stop = run.get("pipeline_stop_requested")
+        if pipeline_stop and run.get("pipeline_stop_confirmed"):
+            return
+        if (not pipeline_stop and run.get("request", {}).get("offline_evaluation_jobs_version") == 1
+                and run.get("evaluation_control_terminal")):
             return
         self._control_attempt("model_iter_runs", run_id, run)
         try:
-            if run.get("request", {}).get("offline_evaluation_jobs_version") == 1 and not run.get("dispatch_confirmed"):
+            if (not pipeline_stop and run.get("request", {}).get("offline_evaluation_jobs_version") == 1
+                    and not run.get("dispatch_confirmed")):
                 from .offline_evaluation_dispatch import dispatch
                 if run.get("dispatch_rejected") and run.get("dispatch_uncertain"):
                     self.records.update("model_iter_runs", run_id, lambda row: row.update(dispatch_rejected=False))
@@ -1479,12 +1492,23 @@ class FactoryRuntime:
                     or result.get("status") not in TERMINAL | {"stopping", "needs_attention"}):
                 raise PhoneFactoryError("采集电脑尚未确认停止评测", 502)
             self._collection_stopped(run_id, result)
+            collection = self.store.collection_runs.get(run_id) or {}
+            if pipeline_stop:
+                request = run.get("request", {})
+                phones_stopped = (request.get("execution_mode") == "evaluate_only"
+                    or devices_stopped({**collection, "request": {"metadata": request},
+                        "phone_states": result.get("phone_states") or collection.get("phone_states"),
+                        "control_terminal": result["status"] in TERMINAL}))
+                stop_confirmed = (result["status"] in TERMINAL and phones_stopped
+                                  and result.get("stop_intent_durable") is not False)
             def update(row):
                 status = result["status"]
                 if row.get("evaluation_control_terminal") and status not in TERMINAL:
                     return
                 row.update(status=status, remote_status=status, control_error=None,
                            evaluation_control_terminal=status in TERMINAL, updated_at=utc_now())
+                if pipeline_stop:
+                    row["pipeline_stop_confirmed"] = stop_confirmed
                 if "preparation" in result:
                     row["preparation"] = result["preparation"]
             self.records.update("model_iter_runs", run_id, update)
@@ -1493,7 +1517,7 @@ class FactoryRuntime:
         except Exception as exc:
             self._control_failure("model_iter_runs", run_id, exc)
 
-    def cancel_evaluation(self, run_id):
+    def cancel_evaluation(self, run_id, *, pipeline_stop=False, pipeline_retry_id=None):
         run_id = _identifier(run_id, "评估运行编号")
         run = self.records.get("model_iter_runs", run_id)
         if not run:
@@ -1503,6 +1527,10 @@ class FactoryRuntime:
                 row["evaluation_control_epoch"] = row.get("evaluation_control_epoch", 0) + 1
                 row.pop("pending_preparation_control", None)
             row.update(stop_requested_at=row.get("stop_requested_at") or utc_now(), control_error=None)
+            if pipeline_stop:
+                row.update(pipeline_stop_requested=True, pipeline_stop_retry_id=pipeline_retry_id)
+                if dispatch_never_accepted(row):
+                    row.update(status="cancelled", evaluation_control_terminal=True, pipeline_stop_confirmed=True)
             if (row.get("request", {}).get("offline_evaluation_jobs_version") == 1
                     and not row.get("dispatch_confirmed") and (not row.get("dispatch_attempted")
                     or row.get("dispatch_rejected") and not row.get("dispatch_uncertain"))):
@@ -1515,7 +1543,8 @@ class FactoryRuntime:
         if collection and is_batch_active(collection["batch_id"], self.root):
             self.records.update("collection_runs", run_id, lambda row: row.update(
                 stop_requested_at=row.get("stop_requested_at") or utc_now(), can_cancel_collection=True))
-        self._control_pool.submit("evaluation:" + run_id, lambda: self._cancel_evaluation_remote(run_id))
+        if not saved.get("pipeline_stop_confirmed"):
+            self._control_pool.submit("evaluation:" + run_id, lambda: self._cancel_evaluation_remote(run_id))
         return {**saved, "ok": True, "stop_accepted": True}
 
     def _cancel_collection_remote(self, run_id):
@@ -1531,6 +1560,7 @@ class FactoryRuntime:
             remote = self.get_run(run_id)
             if (not isinstance(remote, dict) or remote.get("run_id", remote.get("collection_run_id")) != run_id
                     or remote.get("run_mode") != "generate"
+                    or remote.get("batch_id", run["batch_id"]) != run["batch_id"]
                     or remote.get("agent_type", "newagent") != metadata.get("agent_type", "newagent")):
                 raise PhoneFactoryError("远端采集运行身份或引擎不匹配，未请求停止", 502)
             # Even a terminal record must reconcile tracked workers; do not infer
@@ -1546,12 +1576,13 @@ class FactoryRuntime:
             # durable stop intent so a late accepted request is also cancelled.
             self._control_failure("collection_runs", run_id, exc)
 
-    def cancel_collection(self, run_id):
+    def cancel_collection(self, run_id, *, pipeline_stop=False, pipeline_retry_id=None):
         run_id = _identifier(run_id, "采集运行编号")
         run = self.store.collection_runs.get(run_id)
         if run is None:
             raise PhoneFactoryError("采集运行不存在", 404)
-        if self.records.get("collection_resume_heads",run_id):
+        head = self.records.get("collection_resume_heads", run_id)
+        if head and (head.get("active") or not pipeline_stop):
             return self.resume_service.cancel(run_id)
         metadata = run.get("request", {}).get("metadata", {})
         if metadata.get("result_transport") == "legacy":
@@ -1564,6 +1595,10 @@ class FactoryRuntime:
             def intent(current):
                 current.update(stop_requested_at=current.get("stop_requested_at") or utc_now(),
                                can_cancel_collection=True, updated_at=utc_now())
+                if pipeline_stop:
+                    current["pipeline_stop_requested"] = True
+                if pipeline_retry_id:
+                    current["pipeline_stop_retry_id"] = pipeline_retry_id
                 if not current.get("control_terminal"):
                     current["collection_status"] = "stopping"
             saved = self.records.update("collection_runs", run_id, intent)

@@ -8,6 +8,12 @@ export type PipelineStartMode = 'evaluation' | 'generate' | 'collect' | 'existin
 export type PipelineStepStatus = 'pending' | 'running' | 'retry_waiting' | 'waiting' | 'succeeded' | 'skipped' | 'failed'
 export interface PipelineJob { job_id?: string; collection_run_id?: string; run_id?: string; status: string; [key: string]: unknown }
 export interface PipelineRetryInfo { attempts: number; max_attempts: number; last_error: string | null; next_retry_at: string | null }
+export interface PipelineStopPending {
+  stage: string
+  job_id?: string
+  phone_id?: string
+  message: string
+}
 export interface PipelineStep {
   id: PipelineStepId; label: string; status: PipelineStepStatus; job_ids: string[];
   percent?: number; message?: string | null; error?: string | null; jobs?: PipelineJob[];
@@ -28,6 +34,7 @@ export interface Pipeline {
   threshold?: number | null; task_ids: string[]; collection_config?: PipelineCollectionConfig | null;
   status: PipelineStatus; current_step: PipelineStepId; storage_revision: number; created_at: string; updated_at: string;
   history_only?: boolean; error?: string | null; steps: PipelineStep[]; session_id?: string | null; release_id?: string | null;
+  termination?: { requested_at?: string; pending?: PipelineStopPending[] }
   collection_run_ids: string[]; selection?: Record<string, unknown> | null
 }
 export interface CreatePipeline {
@@ -42,7 +49,7 @@ export const PIPELINE_TERMINAL: PipelineStatus[] = ['terminated', 'no_publishabl
 export const pipelineStatusLabels: Record<PipelineStatus, string> = {
   waiting_for_evaluation: '等待评测与 BadCase 回流', waiting_for_generation_config: '等待配置任务生成', waiting_for_generation_review: '等待审核生成任务',
   running: '正在执行', retry_waiting: '等待自动重试', paused: '已暂停', waiting_for_correction: '等待人工修正', failed: '执行失败',
-  terminating: '正在终止，等待作业结束', terminated: '已终止', no_publishable_data: '无可发布数据',
+  terminating: '终止中', terminated: '已终止', no_publishable_data: '无可发布数据',
   succeeded: '已发布并完成汇总', published_summary_failed: '已发布，汇总失败',
 }
 export const pipelineStepLabels: Record<PipelineStepStatus, string> = {

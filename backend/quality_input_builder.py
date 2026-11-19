@@ -37,7 +37,8 @@ def build_quality_workbook(*, grouped: dict[str, list[tuple[str, list[Any]]]], t
                            trajectory_root: Path, output: Path, env_path: Path,
                            progress: Callable[[dict[str, Any]], None] | None = None,
                            summarizer: Any | None = None,
-                           max_concurrent: int = 1) -> tuple[int, int, int]:
+                           max_concurrent: int = 1,
+                           check_stop: Callable[[], None] | None = None) -> tuple[int, int, int]:
     values = _env(env_path) if summarizer is None else {"MODEL_NAME": getattr(summarizer, "model", "test-model")}
     owned = summarizer is None
     if owned:
@@ -45,7 +46,8 @@ def build_quality_workbook(*, grouped: dict[str, list[tuple[str, list[Any]]]], t
                                     http_options=model_http_options(values))
     try:
         return _build_quality_workbook(grouped=grouped, task_goals=task_goals, trajectory_root=trajectory_root, output=output,
-            progress=progress, summarizer=summarizer, max_concurrent=max_concurrent, model=values["MODEL_NAME"])
+            progress=progress, summarizer=summarizer, max_concurrent=max_concurrent, model=values["MODEL_NAME"],
+            check_stop=check_stop)
     finally:
         if owned:
             with suppress(Exception):
@@ -56,7 +58,7 @@ def _build_quality_workbook(*, grouped: dict[str, list[tuple[str, list[Any]]]],
                             task_goals: dict[str, str], trajectory_root: Path, output: Path,
                             progress: Callable[[dict[str, Any]], None] | None,
                             summarizer: Any, max_concurrent: int,
-                            model: str) -> tuple[int, int, int]:
+                            model: str, check_stop: Callable[[], None] | None = None) -> tuple[int, int, int]:
     if not Path(trajectory_root).is_absolute():
         raise ValueError("质检输入原件根目录必须为明确的绝对路径")
     raw_root = resolve_path(trajectory_root)
@@ -66,6 +68,8 @@ def _build_quality_workbook(*, grouped: dict[str, list[tuple[str, list[Any]]]],
     for task_id, items in grouped.items():
         task_text = tasks[task_id].task_text
         for trajectory_id, source_steps in items:
+            if check_stop is not None:
+                check_stop()
             records: list[StepRecord] = []
             retained_steps = [step for step in source_steps if step.counted_in_tree]
             if not retained_steps:
@@ -102,6 +106,8 @@ def _build_quality_workbook(*, grouped: dict[str, list[tuple[str, list[Any]]]],
     final_answers: list[str | None] = [None] * total
 
     def _summarize(item: tuple[str, str, str, str, list[StepRecord]]) -> str:
+        if check_stop is not None:
+            check_stop()
         task_id, task_text, trajectory_id, _, records = item
         with trace_context(task_id=task_id, trajectory_id=trajectory_id,
                            operation="trajectory_summary", concurrency=max(1, int(max_concurrent))):

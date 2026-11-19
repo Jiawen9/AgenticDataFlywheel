@@ -28,6 +28,9 @@ from .data_store import RevisionConflict
 from .data_store.locking import batch_lock
 from .data_store.registry import utc_now
 from .phone_factory import PhoneFactoryError
+from .pipeline_job_stop import termination_lock
+from .collection_control import TERMINAL
+from .pipeline_phone_stop import collection_owner
 from .remote_sync import BoundedSyncPool
 from .task_generation.collection_batches import payload_digest
 
@@ -86,6 +89,10 @@ class ResumeService:
             raise PhoneFactoryError("采集运行不存在", 404)
         self.run_cache[run_id] = run
         return run
+
+    def _pipeline_owner(self, run):
+        owner = collection_owner(self.records, run)
+        return owner if owner and owner["status"] != "terminated" else {}
 
     @staticmethod
     def _eligible(run):
@@ -344,13 +351,17 @@ class ResumeService:
             head = self.records.get("collection_resume_heads", run_id) or {"run_id": run_id, "batch_id": run["batch_id"], "revision": 0}
             saved = {"operation_id": operation_id, "run_id": run_id, "batch_id": run["batch_id"],
                      "request": request, "request_digest": signature, "status": "pending", "created_at": utc_now(),
-                     "epoch": head["revision"] + 1, "instances": preview["instances"]}
+                     "epoch": head["revision"] + 1, "instances": preview["instances"], "dispatch_attempted": False}
             # Barrier and durable request are atomic; disk-full means no POST.
-            self.records.put_many([
-                {"namespace": "collection_resume_operations", "key": operation_id, "payload": saved, "expected_revision": 0},
-                {"namespace": "collection_resume_heads", "key": run_id,
-                 "payload": {**head,"revision": saved["epoch"],"active": True,"remote_revision":request["expected_revision"]},
-                 "expected_revision": head.get("storage_revision", 0)}])
+            pipeline_id = self._pipeline_owner(run).get("pipeline_id")
+            with termination_lock(self.root, pipeline_id):
+                if self._pipeline_owner(run).get("status") == "terminating":
+                    raise PhoneFactoryError("Pipeline 正在终止，不能启动续采", 409)
+                self.records.put_many([
+                    {"namespace": "collection_resume_operations", "key": operation_id, "payload": saved, "expected_revision": 0},
+                    {"namespace": "collection_resume_heads", "key": run_id,
+                     "payload": {**head,"revision": saved["epoch"],"active": True,"remote_revision":request["expected_revision"]},
+                     "expected_revision": head.get("storage_revision", 0)}])
         self.pool.submit(run_id, lambda: self._send_operation(run, operation_id))
         return self._public_operation(saved)
 
@@ -368,10 +379,17 @@ class ResumeService:
         for op in self.records.list("collection_resume_operations"):
             if op["run_id"] != run["collection_run_id"]:
                 continue
-            if op["status"] in {"pending", "uncertain"}:
+            stopping = self._pipeline_owner(run).get("status") == "terminating"
+            if op["status"] in {"pending", "uncertain"} and (
+                    not stopping or op.get("dispatch_attempted") is False):
                 self._send_operation(run, op["operation_id"])
-            elif op["status"] in {"accepted","preparing","started"}:
-                response = self._remote("resume-operation",run["collection_run_id"],extra=[op["operation_id"]])
+            elif op["status"] in {"accepted","preparing","started","pending","uncertain"}:
+                try:
+                    response = self._remote("resume-operation",run["collection_run_id"],extra=[op["operation_id"]])
+                except PhoneFactoryError as exc:
+                    if stopping and exc.remote_status == 404:
+                        continue  # The operation POST may still arrive.
+                    raise
                 if response.get("operation_id")!=op["operation_id"] or response.get("root_run_id")!=op["run_id"]:
                     raise ValueError("续采操作状态身份不一致")
                 status = response.get("status")
@@ -388,6 +406,15 @@ class ResumeService:
             op = self.records.get("collection_resume_operations", operation_id)
             if not op or op["status"] not in {"pending", "uncertain"}:
                 return
+            owner = self._pipeline_owner(run)
+            with termination_lock(self.root, owner.get("pipeline_id")):
+                if self._pipeline_owner(run).get("status") == "terminating":
+                    if op.get("dispatch_attempted") is False:
+                        self.records.update("collection_resume_operations", operation_id,
+                            lambda row: row.update(status="cancelled", error="Pipeline 在下发前已终止"))
+                    return
+                self.records.update("collection_resume_operations", operation_id,
+                    lambda row: row.update(dispatch_attempted=True))
             try:
                 response = self._remote("resume-collection", run["collection_run_id"], op["request"])
                 if response.get("root_run_id", response.get("run_id")) != run["collection_run_id"] or response.get("operation_id", operation_id) != operation_id:
@@ -629,47 +656,71 @@ class ResumeService:
                 "collection_snapshot_id":head.get("current_snapshot_id"),
                 "collection_snapshot_digest":head.get("current_snapshot_digest")}
 
-    def cancel(self, run_id):
+    def cancel(self, run_id, *, pipeline_id=None, retry_id=None):
         run = self._run(run_id)
-        previous = self.records.get("collection_resume_heads",run_id) or {}
+        previous = self.records.get("collection_resume_heads", run_id) or {}
+        old = previous.get("cancel_intent") or {}
         refreshed_revision = None
-        if (previous.get("cancel_intent") or {}).get("rejected"):
-            current = self._remote("collection-executions",run_id)
-            if current.get("root_run_id")!=run_id or type(current.get("revision")) is not int:
-                raise PhoneFactoryError("无法确认本次停止的执行版本",409)
+        replacing = pipeline_id and old.get("pipeline_id") != pipeline_id
+        if old.get("rejected") or replacing:
+            current = self._remote("collection-executions", run_id)
+            if current.get("root_run_id") != run_id or type(current.get("revision")) is not int:
+                raise PhoneFactoryError("无法确认本次停止的执行版本", 409)
             refreshed_revision = current["revision"]
-        with active_batch_lock(run["batch_id"],self.root),batch_lock(self.root,"resume_"+run_id):
+            if pipeline_id:
+                expected_revision = old.get("expected_revision") if not replacing else previous.get("remote_revision")
+                executions = current.get("executions")
+                operations = {op["operation_id"] for op in self.records.list("collection_resume_operations")
+                              if op.get("run_id") == run_id and op.get("epoch", 0) <= previous.get("revision", 0)}
+                newer = executions[expected_revision + 1:] if isinstance(executions, list) and type(expected_revision) is int else None
+                if (current.get("batch_id") != run["batch_id"] or newer is None
+                        or refreshed_revision < expected_revision
+                        or any(not isinstance(execution, dict) or execution.get("request_id") not in operations
+                               for execution in newer)):
+                    raise PhoneFactoryError("续采执行版本变化，请核对新执行的归属", 409)
+        with active_batch_lock(run["batch_id"], self.root), batch_lock(self.root, "resume_" + run_id):
             head = self.records.get("collection_resume_heads",run_id)
             if not head or not head.get("active"):
                 raise PhoneFactoryError("当前没有活动的续采分段",409)
-            intent = head.get("cancel_intent")
-            if not intent or intent.get("epoch") != head["revision"] or intent.get("rejected"):
-                revision = head.get("remote_revision",head["revision"])
-                if intent and intent.get("rejected"):
-                    # Only a new explicit user action may widen a rejected stop
-                    # to the current generation. Background retries keep scope.
-                    if refreshed_revision is None:
-                        raise PhoneFactoryError("无法确认本次停止的执行版本",409)
-                    revision = refreshed_revision
-                intent = {"request_id":"stop_"+uuid.uuid4().hex,"expected_revision":head.get("remote_revision",head["revision"]),
-                          "epoch":head["revision"],"created_at":utc_now(),"acknowledged":False}
-                intent["expected_revision"] = revision
-                self.records.update("collection_resume_heads",run_id,lambda h:h.update(cancel_intent=intent))
+            intent = head.get("cancel_intent") or {}
+            if pipeline_id and head["revision"] != previous.get("revision"):
+                raise PhoneFactoryError("续采执行版本变化，请核对新执行的归属", 409)
+            if not intent or intent.get("epoch") != head["revision"] or intent.get("rejected") or replacing:
+                if intent.get("rejected") and refreshed_revision is None:
+                    raise PhoneFactoryError("无法确认本次停止的执行版本", 409)
+                revision = head.get("remote_revision", head["revision"]) if refreshed_revision is None else refreshed_revision
+                intent = {"request_id": "stop_" + uuid.uuid4().hex, "expected_revision": revision,
+                          "epoch": head["revision"], "created_at": utc_now(), "acknowledged": False}
+                if pipeline_id:
+                    intent.update(pipeline_id=pipeline_id, retry_id=retry_id)
+                self.records.update("collection_resume_heads", run_id, lambda h: h.update(cancel_intent=intent))
         self.pool.submit(run_id,lambda:self._send_cancel(run_id))
         return {"ok":True,"stop_accepted":True,"collection_run_id":run_id,"status":"stopping"}
 
     def _send_cancel(self, run_id):
         head = self.records.get("collection_resume_heads",run_id) or {}
         intent = head.get("cancel_intent")
-        if not intent or intent.get("acknowledged") or intent.get("rejected"):
+        if not intent or intent.get("epoch") != head.get("revision") or intent.get("rejected"):
+            return
+        managed = bool(intent.get("pipeline_id"))
+        if intent.get("confirmed" if managed else "acknowledged"):
             return
         try:
             response = self._remote("executions-cancel",run_id,{k:intent[k] for k in ("request_id","expected_revision")})
             if response.get("ok") is False or response.get("root_run_id",run_id)!=run_id:
                 raise ValueError("续采停止响应身份不匹配")
+            durable = response.get("stop_intent_durable") is not False
+            confirmations = response.get("responses") or {}
+            if managed and (response.get("root_run_id") != run_id
+                    or response.get("request_id") != intent["request_id"]
+                    or response.get("revision") != intent["expected_revision"]):
+                raise ValueError("续采停止确认的请求身份或版本不匹配")
+            confirmed = (durable and response.get("status") in TERMINAL and run_id in confirmations
+                         and all(status in TERMINAL for status in confirmations.values()))
             def acknowledged(head):
                 if (head.get("cancel_intent") or {}).get("request_id")==intent["request_id"]:
-                    head["cancel_intent"].update(acknowledged=True,error=None)
+                    head["cancel_intent"].update(acknowledged=durable, confirmed=confirmed,
+                        error=None if durable else "采集端暂未持久保存停止请求")
             self.records.update("collection_resume_heads",run_id,acknowledged)
         except Exception as exc:
             self.runtime._control_memory.setdefault(run_id,{})["error"]=str(exc)[:500]

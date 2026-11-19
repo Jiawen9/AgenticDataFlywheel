@@ -34,6 +34,10 @@ class OfflineRuntime:
     def prepare_collection(self, source, request_id, options):
         return {"batch_id": "result-" + request_id, "batch_role": "collection_result", "task_source_batch_id": source}
     def collection_runs(self, batch): return deepcopy(self.collection_values)
+    def request_phone_stops(self, pipeline):
+        return [{"stage": "collection", "job_id": row["collection_run_id"], "message": "等待停止确认"}
+                for row in self.collection_values
+                if row.get("dispatch_key") == pipeline["pipeline_id"] and not row.get("remote_status")]
     def input_ready(self, p): return not self.collection_values or all(j["status"] == "completed" for j in self.collection_values)
     def ready(self, step, p): return step in self.ready_stages
     def jobs(self, step, p): return deepcopy(self.collection_values if step == "collection" else self.children.get(step, []))
@@ -672,7 +676,7 @@ class PipelineTests(unittest.TestCase):
         p = self.tick(p)
         self.assertEqual(p["status"], "retry_waiting")
         p = self.control(p, "terminate")
-        self.assertEqual(p["status"], "terminated")
+        self.assertEqual(p["status"], "terminating")
         with patch("backend.pipelines._retry_due", return_value=True):
             self.assertEqual(self.tick(p)["status"], "terminated")
         self.assertEqual(self.runtime.publish_count, 1)
@@ -787,10 +791,15 @@ class PipelineTests(unittest.TestCase):
         ensure_pipeline_write("batch-test", self.root)
 
     def test_terminate_waits_child_and_then_releases_ownership(self):
-        p = self.control(self.tick(self.create(), 2), "terminate")
+        p = self.tick(self.create(), 2)
+        job_id = self.runtime.children["preprocessing"][-1]["job_id"]
+        self.manager.records.update("preprocessing_jobs", job_id, lambda job: job.update(status="running"))
+        p = self.control(p, "terminate")
         self.assertEqual(self.tick(p)["status"], "terminating")
         with self.assertRaises(PipelineManagedError): ensure_pipeline_write("batch-test", self.root)
-        self.runtime.complete("preprocessing")
+        stopped = self.manager.records.get("preprocessing_jobs", job_id)
+        self.assertEqual(stopped["stop_requested_at"], p["termination"]["requested_at"])
+        self.manager.records.update("preprocessing_jobs", job_id, lambda job: job.update(status="cancelled"))
         self.assertEqual(self.tick(p)["status"], "terminated")
         ensure_pipeline_write("batch-test", self.root)
         self.assertEqual(len(self.runtime.calls), 1)
@@ -877,11 +886,43 @@ class PipelineTests(unittest.TestCase):
     def test_unknown_collector_acknowledgement_keeps_ownership_while_terminating(self):
         p = self.create()
         self.runtime.collection_values = [{"collection_run_id": "uncertain", "status": "failed",
+                                           "dispatch_key": p["pipeline_id"],
                                            "dispatch_attempted": True, "dispatch_error": "response lost"}]
         p = self.control(p, "terminate")
         self.assertEqual(self.tick(p)["status"], "terminating")
         self.runtime.collection_values[0].update(remote_status="failed", transfer_status="remote_failed")
         self.assertEqual(self.tick(p)["status"], "terminated")
+
+    def test_stop_acceptance_does_not_wait_for_orchestrator_and_survives_restart(self):
+        from threading import Event
+        from backend.pipeline_job_stop import PipelineJobCancelled, check_job_stop
+
+        p = self.tick(self.create(), 2)
+        job_id = self.runtime.children["preprocessing"][-1]["job_id"]
+        external = {"job_id": "external", "pipeline_id": "another", "batch_id": p["batch_id"], "status": "queued"}
+        self.manager.records.put("preprocessing_jobs", "external", external)
+        entered = Event()
+        release = Event()
+        def busy():
+            with self.manager.artifacts.batch_lock("pipeline_" + p["pipeline_id"]):
+                entered.set()
+                release.wait(5)
+
+        with ThreadPoolExecutor(max_workers=2) as threads:
+            holder = threads.submit(busy)
+            self.assertTrue(entered.wait(3))
+            try:
+                stopped = threads.submit(self.control, p, "terminate").result(timeout=3)
+            finally:
+                release.set()
+            holder.result()
+        self.assertEqual(stopped["status"], "terminating")
+        with self.assertRaises(PipelineJobCancelled):
+            check_job_stop(self.manager.records, "preprocessing_jobs", job_id)
+        self.manager = PipelineManager(self.runtime, self.root)
+        self.assertEqual(self.tick(stopped)["status"], "terminated")
+        self.assertEqual(self.manager.records.get("preprocessing_jobs", job_id)["status"], "cancelled")
+        self.assertEqual(self.manager.records.get("preprocessing_jobs", "external")["status"], "queued")
 
     def test_tasks_changed_after_creation_do_not_start_computation(self):
         p = self.create()

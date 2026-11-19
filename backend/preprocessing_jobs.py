@@ -4,6 +4,7 @@ from __future__ import annotations
 from .pipeline_access import submit_with_context, execution_pipeline_id, retry_enabled_for_pipeline
 from . import pipeline_diagnostics as diagnostics
 from .pipeline_diagnostic_http import install_box_reviewer_logging
+from .pipeline_job_stop import PipelineJobCancelled, check_job_stop, job_commit_guard
 
 import copy
 import hashlib
@@ -45,9 +46,14 @@ class PreprocessingJobManager:
         self._executor = executor or ThreadPoolExecutor(max_workers=1, thread_name_prefix="preprocessing")
         for job in self.records.list("preprocessing_jobs"):
             if job["status"] in ACTIVE:
-                self._update(job["job_id"], status="interrupted", stage="interrupted",
-                             completed_at=utc_now(), error="服务重启导致预处理中断，可使用原输入重试",
-                             failure=failure_from_payload({"category": "service_restart"}))
+                try:
+                    check_job_stop(self.records, "preprocessing_jobs", job["job_id"])
+                except PipelineJobCancelled:
+                    self._cancelled(job["job_id"])
+                else:
+                    self._update(job["job_id"], status="interrupted", stage="interrupted",
+                                 completed_at=utc_now(), error="服务重启导致预处理中断，可使用原输入重试",
+                                 failure=failure_from_payload({"category": "service_restart"}))
 
     @staticmethod
     def _public(job):
@@ -213,8 +219,19 @@ class PreprocessingJobManager:
             return self._run_with_diagnostics(job_id)
 
     def _run_with_diagnostics(self, job_id):
-        self._update(job_id, status="running", stage="scanning", started_at=utc_now())
+        def check_stop():
+            check_job_stop(self.records, "preprocessing_jobs", job_id)
+
+        def progress(event):
+            check_stop()
+            self._update(job_id, **event)
+
+        def commit_guard():
+            return job_commit_guard(self.records, "preprocessing_jobs", job_id)
+
         try:
+            with commit_guard():
+                self._update(job_id, status="running", stage="scanning", started_at=utc_now())
             job = self._get(job_id)
             with batch_operation(job["batch_id"], "preprocessing", self.root):
                 snapshot = self._snapshot(job)
@@ -227,7 +244,7 @@ class PreprocessingJobManager:
                 annotation = next((item for item in saved if item["stage"] == "02_annotation"), None)
                 pending_conversion = None
                 if conversion is None:
-                    payload, counts = convert_input(snapshot, lambda event: self._update(job_id, **event), data_root=self.root)
+                    payload, counts = convert_input(snapshot, progress, data_root=self.root)
                     payload = adapt_conversion_identity(payload, snapshot, self.root)
                     verify_input(snapshot, self.root)
                     self._update(job_id, stage="publishing", warnings=counts["warnings"])
@@ -253,7 +270,7 @@ class PreprocessingJobManager:
                         with active_batch_lock(job["batch_id"], self.root):
                             if is_current_collection_snapshot(self.records, job["batch_id"], snapshot):
                                 conversion = self.artifacts.publish_many(job["batch_id"], [pending_conversion],
-                                                                         record_entries=display_entries)[0]
+                                                    record_entries=display_entries, commit_guard=commit_guard)[0]
                                 pending_conversion = None
                                 saved = [conversion]
                                 self._update(job_id, artifacts=saved)
@@ -296,10 +313,11 @@ class PreprocessingJobManager:
                             one_shot_reviewers.append(reviewer)
                             return reviewer
                     try:
+                        check_stop()
                         result, counts = self.annotator(json_path, payload, output, snapshot=snapshot,
                             config=job["config"], cache_path=cache, env_file=self.env_file,
                             reviewer_factory=reviewer_factory, data_root=self.root,
-                            progress=lambda event: self._update(job_id, **event))
+                            progress=progress)
                     finally:
                         for reviewer in one_shot_reviewers:
                             reviewer.client.close()
@@ -338,10 +356,12 @@ class PreprocessingJobManager:
                             from .display_identifiers import DisplayIdentifierStore
                             notifications.extend(DisplayIdentifierStore(self.root).conversion_entries(job["batch_id"], payload))
                             entry["source_stages"] = ["01_conversion"]
-                            conversion, annotation = self.artifacts.publish_many(job["batch_id"], [pending_conversion, entry], record_entries=notifications)
+                            conversion, annotation = self.artifacts.publish_many(job["batch_id"], [pending_conversion, entry],
+                                                                record_entries=notifications, commit_guard=commit_guard)
                         else:
                             entry["source_refs"] = [conversion]
-                            annotation = self.artifacts.publish_many(job["batch_id"], [entry], record_entries=notifications)[0]
+                            annotation = self.artifacts.publish_many(job["batch_id"], [entry],
+                                                        record_entries=notifications, commit_guard=commit_guard)[0]
                         drain_batch_invalidations(job["batch_id"], self.root)
                     saved = [conversion, annotation]
                 else:
@@ -353,11 +373,22 @@ class PreprocessingJobManager:
                 for name in ("trajectories_to_excel.xlsx", "trajectories_to_excel.json", "annotated_trajectories.xlsx", "annotated_trajectories.json"):
                     io_path(work / name).unlink(missing_ok=True)
         except Exception as exc:
+            try:
+                if isinstance(exc, PipelineJobCancelled):
+                    raise exc
+                check_stop()
+            except PipelineJobCancelled:
+                self._cancelled(job_id)
+                return
             diagnostics.log_event("job_exception", error=diagnostics.format_exception(exc))
             failure = failure_from_exception(exc)
+            job = self._get(job_id) or {}
             self._update(job_id, status="failed", stage="failed", completed_at=utc_now(),
                          error=(failure["message"] if retry_enabled_for_pipeline(job.get("pipeline_id"), self.root)
                                 else str(exc)), failure=failure)
+
+    def _cancelled(self, job_id):
+        self._update(job_id, status="cancelled", stage="cancelled", completed_at=utc_now(), error=None, failure=None)
 
     def batches(self):
         manifests = self.artifacts.list()

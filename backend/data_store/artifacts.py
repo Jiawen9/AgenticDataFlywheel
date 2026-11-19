@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import uuid
+from contextlib import nullcontext
 from itertools import chain
 from pathlib import Path
 from typing import Any, Callable
@@ -123,10 +124,10 @@ class ArtifactStore:
                 workbooks: dict[str, Path] | None = None,
                 tables: dict[str, list[dict]] | None = None,
                 source_refs: list | None = None, metadata: dict | None = None,
-                expected_version: str | None = None) -> dict:
+                expected_version: str | None = None, *, commit_guard=nullcontext) -> dict:
         return self.publish_many(batch_id, [dict(stage=stage, payload=payload,
             workbooks=workbooks, tables=tables, source_refs=source_refs,
-            metadata=metadata, expected_version=expected_version)])[0]
+            metadata=metadata, expected_version=expected_version)], commit_guard=commit_guard)[0]
 
     def _remove(self, path: Path) -> None:
         target = contained_path(self.root, str(path))
@@ -183,11 +184,13 @@ class ArtifactStore:
 
     def publish_many(self, batch_id: str, entries: list[dict], *,
                      replace_legacy: bool = False,
-                     record_entries: list[dict] | Callable[[list[dict]], list[dict]] | None = None) -> list[dict]:
+                     record_entries: list[dict] | Callable[[list[dict]], list[dict]] | None = None,
+                     commit_guard=nullcontext) -> list[dict]:
         """Commit whole stages together; version is a CAS token, never a folder.
 
         source_stages references earlier entries in this publication.
         replace_legacy is reserved for the backed-up offline migration.
+        commit_guard runs after preparation and covers the final file and record commit.
         """
         _identifier(batch_id, "batch ID")
         if not entries:
@@ -298,21 +301,23 @@ class ArtifactStore:
                     display_records.extend(projection_entries(manifest, entry["payload"]))
                 extra_records = [*(extra_records or []), *display_records]
                 if not changes:
-                    if extra_records:
-                        self.records.put_many(extra_records)
+                    with commit_guard():
+                        if extra_records:
+                            self.records.put_many(extra_records)
                     return manifests
-                io_path(transaction / "previous").mkdir(parents=True, exist_ok=True)
-                _write_bytes(transaction / "commit.json", _json_bytes({"batch_id": batch_id, "op_id": op_id, "changes": changes}))
-                for change in changes:
-                    final = contained_path(self.root, "batches", batch_id, change["stage"])
-                    io_path(final.parent).mkdir(parents=True, exist_ok=True)
-                    if io_path(final).exists():
-                        io_path(final).rename(io_path(transaction / "previous" / change["stage"]))
-                    io_path(transaction / "prepared" / change["stage"]).rename(io_path(final))
                 writes.extend(extra_records or [])
                 writes.append({"namespace": "artifact_commits", "key": batch_id, "payload": {"op_id": op_id}})
                 deletes = [{"namespace": "artifacts", "key": key} for change in changes for key in change["legacy_keys"]]
-                self.records.put_many(writes, deletes=deletes)
+                with commit_guard():
+                    io_path(transaction / "previous").mkdir(parents=True, exist_ok=True)
+                    _write_bytes(transaction / "commit.json", _json_bytes({"batch_id": batch_id, "op_id": op_id, "changes": changes}))
+                    for change in changes:
+                        final = contained_path(self.root, "batches", batch_id, change["stage"])
+                        io_path(final.parent).mkdir(parents=True, exist_ok=True)
+                        if io_path(final).exists():
+                            io_path(final).rename(io_path(transaction / "previous" / change["stage"]))
+                        io_path(transaction / "prepared" / change["stage"]).rename(io_path(final))
+                    self.records.put_many(writes, deletes=deletes)
                 self._remove(transaction)
                 return manifests
             except BaseException:
