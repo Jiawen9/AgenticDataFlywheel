@@ -39,37 +39,6 @@ class ActionBoxResolution:
     verified: bool
 
 
-def _contains_point(bbox: tuple[int, int, int, int], point: list[Any]) -> bool:
-    if not isinstance(point, list) or len(point) < 2:
-        return True
-    x1, y1, x2, y2 = bbox
-    x, y = float(point[0]), float(point[1])
-    return x1 <= x <= x2 and y1 <= y <= y2
-
-
-def _point_fallback(point: list[Any], image_size: tuple[int, int]) -> tuple[int, int, int, int]:
-    width, height = image_size
-    x, y = float(point[0]), float(point[1])
-    radius_x = max(45, round(width * 0.045))
-    radius_y = max(45, round(width * 0.045))
-    return (
-        max(0, round(x - radius_x)),
-        max(0, round(y - radius_y)),
-        min(width - 1, round(x + radius_x)),
-        min(height - 1, round(y + radius_y)),
-    )
-
-
-def _iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
-    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
-    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
-    intersection = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-    area_a = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
-    area_b = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
-    union = area_a + area_b - intersection
-    return intersection / union if union else 0.0
-
-
 def xml_for_step(directory: Path, step: int, action_record: dict[str, Any]) -> tuple[str, str]:
     xml_path = directory / f"step{step:03d}_vla_input_stability_ui.xml"
     if not io_path(xml_path).exists():
@@ -104,65 +73,36 @@ def resolve_action_box(
     reviewer: QwenBoxReviewer | None,
     max_review_rounds: int = 4,
 ) -> ActionBoxResolution:
-    """Infer and optionally review one executable GUI action bounding box."""
+    """Use the first usable decision. Older callers supply a review round limit."""
     with Image.open(io_path(image_path)) as image:
         image_size = image.size
 
     result = infer_box(action, xml_text, image_size)
     rule_box = result.to_dict()
-    final_bbox = result.bbox
     reviews: list[dict[str, Any]] = []
     verified = reviewer is None
 
     if reviewer is not None:
-        for round_index in range(1, max(1, max_review_rounds) + 1):
-            reviewed_candidate = final_bbox
-            review = reviewer.review(
-                image_path=image_path,
-                action=action,
-                action_summary=action_summary,
-                candidate_bbox=final_bbox,
-                image_size=image_size,
-                rule_context={
-                    "source": result.source,
-                    "confidence": result.confidence,
-                    "reason": result.reason,
-                    "target": result.target,
-                },
-                round_index=round_index,
-            )
-            review_record = review.to_dict()
-            final_bbox = review.bbox
-            kind = str(action.get("action", "")).lower()
-            if kind in {"click", "long_press"} and not _contains_point(
-                final_bbox, action.get("coordinate", [])
-            ):
-                final_bbox = _point_fallback(action.get("coordinate", []), image_size)
-                review_record["constraint_adjustment"] = (
-                    "Qwen replacement excluded the observed click point; "
-                    "next candidate reset around the successful point"
-                )
-            elif kind == "swipe" and not (
-                _contains_point(final_bbox, action.get("start_coordinate", []))
-                and _contains_point(final_bbox, action.get("end_coordinate", []))
-            ):
-                final_bbox = result.bbox
-                review_record["constraint_adjustment"] = (
-                    "Qwen replacement excluded a swipe endpoint; retained rule container"
-                )
-            reviews.append(review_record)
-            if review.decision == "accept":
-                verified = True
-                break
-            if final_bbox == review.bbox and _iou(reviewed_candidate, final_bbox) >= 0.985:
-                review_record["converged_as_verified"] = True
-                verified = True
-                break
-
-        result.bbox = final_bbox
+        review = reviewer.review(
+            image_path=image_path,
+            action=action,
+            action_summary=action_summary,
+            candidate_bbox=result.bbox,
+            image_size=image_size,
+            rule_context={
+                "source": result.source,
+                "confidence": result.confidence,
+                "reason": result.reason,
+                "target": result.target,
+            },
+            round_index=1,
+        )
+        reviews.append(review.to_dict())
+        verified = review.decision == "accept"
+        result.bbox = review.bbox
         result.source = "qwen_verified" if verified else "qwen_replaced_unverified"
-        result.confidence = reviews[-1]["confidence"]
-        result.reason = reviews[-1]["reason"]
+        result.confidence = review.confidence
+        result.reason = review.reason
 
     return ActionBoxResolution(
         result=result,
