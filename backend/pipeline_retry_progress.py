@@ -77,6 +77,12 @@ def _quality_progress(root, records, pipeline, jobs):
 
 
 def progress(root, records, pipeline, step) -> int:
+    if step["id"] == "tree":
+        from .tree_build_jobs import tree_retry_progress
+        return tree_retry_progress(root, _bound_jobs(records, "tree_jobs", pipeline, step))
+    if step["id"] == "cot":
+        from .trajectory_correction.cot_jobs import cot_checkpoint_progress
+        return cot_checkpoint_progress(records, pipeline, _bound_jobs(records, "correction_cot_jobs", pipeline, step))
     if step["id"] == "quality":
         return _quality_progress(root, records, pipeline, _bound_jobs(records, "quality_jobs", pipeline, step))
     if step["id"] == "preprocessing":

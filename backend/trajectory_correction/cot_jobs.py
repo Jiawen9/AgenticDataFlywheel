@@ -125,6 +125,34 @@ def _restored_parts(session, payload, target, cot_key, bbox_key):
     return has_cot, has_box
 
 
+def cot_checkpoint_progress(records, pipeline, jobs):
+    """Count saved results for this Pipeline operation, including writes before a crash."""
+    session_id = pipeline.get("session_id")
+    if not session_id:
+        return 0
+    session = records.get("correction_sessions", session_id) or {}
+    receipts = session.get("cot", {})
+    completed = set()
+    for job in jobs:
+        operation = job.get("operation_id")
+        if (not operation or job.get("session_id") != session_id
+                or job.get("pipeline_id") != pipeline["pipeline_id"]
+                or job.get("batch_id") != pipeline["batch_id"]):
+            continue
+        for target in job.get("targets", []):
+            receipt = receipts.get(str(target["excel_row"])) or {}
+            if (receipt.get("operation_id") != operation or receipt.get("step_key") != target["step_key"]
+                    or receipt.get("source_fingerprint") != target["source_fingerprint"]
+                    or receipt.get("task_fingerprint") != target.get("task_fingerprint")
+                    or receipt.get("action_hash") != _action_hash(target["action"])):
+                continue
+            # Only the worker verifies the actual image before restoring a row.
+            # Counting a committed receipt here does not authorize its reuse.
+            if _restored_parts(session, job, target, receipt.get("input_digest"), None)[0]:
+                completed.add(target["step_key"])
+    return len(completed)
+
+
 class CotJobManager:
     def __init__(self, jobs_dir: Path = CORRECTION_COT_JOBS_DIR, generator_factory: Callable[[], QwenCotGenerator] = QwenCotGenerator, executor: Executor | None = None) -> None:
         self.jobs_dir = jobs_dir
@@ -260,7 +288,7 @@ class CotJobManager:
         keys = self._records.matching_keys("correction_cot_jobs", session_id=session_id)
         return sorted(self._records.get_many("correction_cot_jobs", keys), key=lambda job: job["created_at"], reverse=True)
 
-    def submit(self, session_id: str, group_ids: list[str] | None = None, row_ids: list[int] | None = None, *, generate_bbox: bool = False, force_overwrite: bool = False, expected_revision: int | None = None) -> dict[str, Any]:
+    def submit(self, session_id: str, group_ids: list[str] | None = None, row_ids: list[int] | None = None, *, generate_bbox: bool = False, force_overwrite: bool = False, expected_revision: int | None = None, origin_job_id: str | None = None) -> dict[str, Any]:
         reusable = None
         if not force_overwrite:
             # A final job fingerprint alone cannot detect a changed external
@@ -288,9 +316,10 @@ class CotJobManager:
             from .draft_store import storage_root
             ensure_pipeline_write(session_batch_id(session), storage_root())
             return self._submit(session_id, group_ids, row_ids, reusable=reusable, generate_bbox=generate_bbox,
-                                force_overwrite=force_overwrite, expected_revision=expected_revision)
+                                force_overwrite=force_overwrite, expected_revision=expected_revision,
+                                origin_job_id=origin_job_id)
 
-    def _submit(self, session_id: str, group_ids: list[str] | None = None, row_ids: list[int] | None = None, *, generate_bbox: bool = False, force_overwrite: bool = False, expected_revision: int | None = None, reusable=None) -> dict[str, Any]:
+    def _submit(self, session_id: str, group_ids: list[str] | None = None, row_ids: list[int] | None = None, *, generate_bbox: bool = False, force_overwrite: bool = False, expected_revision: int | None = None, reusable=None, origin_job_id: str | None = None) -> dict[str, Any]:
         _check_revision(load_session(session_id) or {}, expected_revision)
         targets = self._targets(session_id, group_ids, row_ids)
         if generate_bbox and not force_overwrite:
@@ -309,7 +338,20 @@ class CotJobManager:
                              force_overwrite, [_target_identity(t) for t in targets]])
         request_fingerprint = fingerprint({"configuration": configuration_fingerprint, "session_id": session_id, "targets": targets,
             "generate_bbox": generate_bbox, "force_overwrite": force_overwrite})
-        previous = next((j for j in self._session_jobs(session_id) if j.get("resume_scope") == scope), {})
+        matching = [job for job in self._session_jobs(session_id) if job.get("resume_scope") == scope]
+        previous = matching[0] if matching else {}
+        if origin_job_id:
+            origin = next((job for job in matching if job["job_id"] == origin_job_id), None)
+            if (not execution_pipeline_id() or not origin or origin.get("status") not in {"interrupted", "failed"}
+                    or origin["request_fingerprint"] != request_fingerprint):
+                raise ValueError("COT 重试来源、模型配置或已确认的输入不匹配")
+            # An accepted retry may already have finished before the response arrives.
+            child = next((job for job in matching if job.get("origin_job_id") == origin_job_id), None)
+            if child:
+                return child
+            if previous.get("status") in {"queued", "running"}:
+                return previous
+            previous = origin
         if previous.get("status") in {"queued", "running"} and (
                 previous.get("request_fingerprint") == request_fingerprint or generate_bbox):
             return previous
@@ -331,6 +373,7 @@ class CotJobManager:
         publish_stage_snapshot(session, _snapshot(session), "06_correction")
         payload = {
             "job_id": job_id, "resume_scope": scope,
+            **({"origin_job_id": origin_job_id} if origin_job_id else {}),
             "operation_id": previous["operation_id"] if resume else job_id,
             "request_fingerprint": request_fingerprint,
             "configuration_fingerprint": configuration_fingerprint,

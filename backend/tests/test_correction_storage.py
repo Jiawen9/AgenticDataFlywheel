@@ -200,6 +200,57 @@ class CorrectionStorageTests(unittest.TestCase):
             self.assertEqual(calls, [1, 2, 2, 1, 2, 1, 2])
             self.assertEqual(manager.submit(self.sid)["job_id"], last["job_id"])
 
+    def test_pipeline_cot_404_resumes_once_from_committed_receipts(self):
+        from backend.pipeline_access import internal_pipeline
+
+        for row in (2, 3):
+            service.patch_row(self.sid, row, {"actions": '{"action":"answer","text":"ok"}'})
+        image = self.root / "screen.jpg"
+        image.write_bytes(b"original")
+        calls = []
+
+        class ModelRejected(Exception):
+            status_code = 404
+
+        class Generator:
+            model = "fake"
+
+            def generate(self, **args):
+                calls.append(args["step"])
+                if calls == [1, 2]:
+                    raise ModelRejected("model not found")
+                return {"thought": "thought", "summary": "summary"}
+
+        executor = DeferredExecutor()
+        manager = cot_jobs.CotJobManager(self.root / "jobs", generator_factory=Generator, executor=executor)
+        pipeline = {"pipeline_id": "p-cot-resume", "session_id": self.sid, "batch_id": "batch-one"}
+        with (internal_pipeline(pipeline["pipeline_id"]),
+              patch.object(cot_jobs, "_snapshot", return_value=self.snapshot),
+              patch.object(cot_jobs, "session_asset", return_value=image),
+              patch.object(cot_jobs, "_source_for_session", return_value=(self.source, self.root)),
+              patch.object(cot_jobs, "resolve_asset", return_value=image),
+              patch.object(cot_jobs, "publish_cot_snapshot", return_value={})):
+            first_id = manager.submit(self.sid)["job_id"]
+            executor.run()
+            failed = manager.get(first_id)
+            self.assertEqual(failed["failure"]["http_status"], 404)
+            self.assertEqual(cot_jobs.cot_checkpoint_progress(manager._records, pipeline, [failed]), 1)
+            with patch.object(manager, "_configuration_fingerprint", return_value="changed"):
+                with self.assertRaisesRegex(ValueError, "输入不匹配"):
+                    manager.submit(self.sid, origin_job_id=first_id)
+            retry = manager.submit(self.sid, origin_job_id=first_id)
+            self.assertEqual(retry["origin_job_id"], first_id)
+            self.assertEqual(retry["operation_id"], failed["operation_id"])
+            self.assertEqual(manager.submit(self.sid, origin_job_id=first_id)["job_id"], retry["job_id"])
+            self.assertEqual(cot_jobs.cot_checkpoint_progress(manager._records, pipeline, [failed, retry]), 1)
+            executor.run()
+            done = manager.get(retry["job_id"])
+            self.assertEqual(done["status"], "succeeded")
+            self.assertEqual(calls, [1, 2, 2])
+            self.assertEqual(cot_jobs.cot_checkpoint_progress(manager._records, pipeline, [failed, done]), 2)
+            self.assertEqual(manager.submit(self.sid, origin_job_id=first_id)["job_id"], done["job_id"])
+            self.assertEqual(len(manager.list_jobs()), 2)
+
     def test_new_session_reads_json_after_source_changes(self):
         # Use actual snapshot/source functions only in this test.
         self.patches[1].stop()

@@ -33,6 +33,7 @@ ACTIVE_JOBS = {"queued", "starting", "running", "dispatching", "pending"}
 FAILED_JOBS = {"failed", "interrupted", "cancelled", "stale"}
 RETRY_POLICY = {"version": 1, "max_attempts": 3, "delays_seconds": [30, 120]}
 MODEL_STAGE_LIMITS = {"preprocessing": 6, "quality": 6}
+OVERNIGHT_STAGES = frozenset((*MODEL_STAGE_LIMITS, "tree", "cot"))
 OVERNIGHT_RETRIES = 100
 RETRYABLE_STEPS = {"collection", "preprocessing", "tree", "quality", "cot", "publication", "overview"}
 
@@ -365,6 +366,11 @@ class PipelineRuntime:
         return [self.factory.collection_runs._current_paths(job) for job in jobs] if step == "collection" else jobs
 
     def submit(self, step, pipeline, retry=False):
+        retry_origin = {}
+        if retry and step in {"tree", "cot"}:
+            state = next(item for item in pipeline["steps"] if item["id"] == step)
+            if state.get("overnight_retry") and state.get("retry_job_id"):
+                retry_origin["origin_job_id"] = state["retry_job_id"]
         if step == "preprocessing":
             state = next(item for item in pipeline["steps"] if item["id"] == step)
             previous = [state["retry_job_id"]] if state.get("retry_job_id") else state["job_ids"]
@@ -372,7 +378,7 @@ class PipelineRuntime:
                 return self.preprocessing.retry(previous[-1])
             return self.preprocessing.submit(pipeline["batch_id"])
         if step == "tree":
-            return self.tree.submit(pipeline["task_ids"], batch_id=pipeline["batch_id"])
+            return self.tree.submit(pipeline["task_ids"], batch_id=pipeline["batch_id"], **retry_origin)
         if step == "quality":
             quality_step = next(item for item in pipeline["steps"] if item["id"] == "quality")
             previous = quality_step.get("retry_job_id") or next(reversed(quality_step.get("job_ids", [])), None)
@@ -390,7 +396,7 @@ class PipelineRuntime:
                     return None
                 raise
             return self.cot.submit(pipeline["session_id"], group_ids, force_overwrite=False,
-                                   expected_revision=session["storage_revision"])
+                                   expected_revision=session["storage_revision"], **retry_origin)
         raise PipelineError("未知处理阶段")
 
     def selection(self, pipeline):
@@ -655,7 +661,7 @@ class PipelineManager:
                 self._clear_overnight(step)
                 if p.get("retry_policy"):
                     step["retry_info"] = retry_info(p["retry_policy"], step["id"])
-                if step["id"] in MODEL_STAGE_LIMITS and _overnight_enabled():
+                if step["id"] in OVERNIGHT_STAGES and _overnight_enabled():
                     # Keep the bound child until the scheduler has reconciled its exit.
                     self._begin_overnight(p, step)["manual_pending"] = True
                     step["retry_info"]["next_retry_at"] = _retry_at(0)
@@ -813,6 +819,13 @@ class PipelineManager:
         previous = job_ids[-1] if job_ids else None
         if step.get("overnight_retry") or step["id"] in policy.get("stage_max_attempts", {}):
             previous = step.pop("failed_retry_job_id", None) or previous or step.get("retry_job_id")
+        if previous and step.get("overnight_retry") and step["id"] == "tree":
+            child = self.records.get("tree_jobs", previous) or {}
+            # An initial build may have adopted an existing job for part of this batch.
+            # Re-submit our full frozen selection when that job cannot be our origin.
+            requested = child.get("requested_task_ids") or child.get("task_ids")
+            if child.get("pipeline_id") != pipeline["pipeline_id"] or (requested and set(requested) != set(pipeline["task_ids"])):
+                previous = None
         step["retry_job_id"] = previous
         step.setdefault("previous_job_ids", []).extend(job_ids)
         step.update(status="pending", error=None, retry=True, job_ids=[])
@@ -979,7 +992,9 @@ class PipelineManager:
                 if key == "quality" and hasattr(self.runtime, "quality_incomplete_message"):
                     raise PipelineError(self.runtime.quality_incomplete_message(p))
                 raise PipelineError("作业已结束但整批有效结果不完整，不能继续发布")
-        frozen_retry = step.get("overnight_retry") and step.get("retry") and step.get("retry_job_id")
+        # Only these services can launch the child directly from its frozen config.
+        frozen_retry = (key in MODEL_STAGE_LIMITS and step.get("overnight_retry")
+                        and step.get("retry") and step.get("retry_job_id"))
         if not frozen_retry and self.runtime.configurations().get(key) != p["config_fingerprints"].get(key):
             raise PipelineError("处理配置已变化，请结束流程后重新创建")
         if key != "cot" and self.runtime.ready(key, p):
@@ -1190,7 +1205,7 @@ class PipelineManager:
             p["current_step"] = step["id"]
             if p["status"] in {"paused", "failed", "waiting_for_correction"}:
                 return
-            overnight = step["id"] in MODEL_STAGE_LIMITS and _overnight_enabled()
+            overnight = step["id"] in OVERNIGHT_STAGES and _overnight_enabled()
             try:
                 night_due = overnight and p["status"] == "retry_waiting"
                 if night_due:

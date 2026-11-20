@@ -20,6 +20,7 @@ from .trajectory_data import TREE_JOBS_DIR
 from .tree_build_service import build_tree_run, tree_build_config
 from .data_store import RecordStore, ArtifactStore
 from .identifiers import allocate_id
+from .model_stage_checkpoint import ModelStageCheckpoint
 from .file_io import io_path
 from .batch_results import (annotation_task_fingerprints, tree_task_fingerprints,
                             current_tree_payload, assert_task_inputs, StaleTaskInput)
@@ -32,6 +33,17 @@ BuildRunner = Callable[..., tuple[str, dict[str, Any]]]
 
 def _now() -> str:
     return datetime.now(ZoneInfo("Asia/Shanghai")).isoformat()
+
+
+def tree_retry_progress(root: Path, jobs) -> int:
+    """Count distinct committed units added since each task's frozen store was bound."""
+    baselines = {}
+    for job in jobs:
+        for item in (job.get("retry_checkpoint_scopes") or {}).values():
+            scope, initial = item["scope"], item["initial_count"]
+            baselines[scope] = min(initial, baselines.get(scope, initial))
+    return sum(max(0, ModelStageCheckpoint.count_scope(root, "tree", scope) - initial)
+               for scope, initial in baselines.items())
 
 
 class TreeBuildJobManager:
@@ -103,17 +115,34 @@ class TreeBuildJobManager:
                 self._write(payload)
 
     def submit(self, task_ids: list[str], *, batch_id: str | None = None,
-               annotation_version: str | None = None) -> dict[str, Any]:
+               annotation_version: str | None = None, origin_job_id: str | None = None) -> dict[str, Any]:
         if batch_id is not None:
             with active_batch_lock(batch_id, self.data_root), self._lock:
                 from .pipeline_access import ensure_pipeline_write
                 ensure_pipeline_write(batch_id, self.data_root)
                 context = resolve_batch_context(batch_id, annotation_version, self.data_root)
-                return self._submit_batch(task_ids, context)
+                return self._submit_batch(task_ids, context, origin_job_id)
+        if origin_job_id is not None:
+            raise ValueError("续跑建树作业需要原批次编号")
         return self._submit_job(task_ids)
 
-    def _submit_batch(self, task_ids, context):
+    def _submit_batch(self, task_ids, context, origin_job_id=None):
         batch_id = context.batch_id
+        owner = execution_pipeline_id()
+        jobs = self.list_jobs(batch_id)
+        if origin_job_id is not None:
+            origin = self.get(origin_job_id)
+            if (not owner or not origin or origin.get("batch_id") != batch_id
+                    or origin.get("pipeline_id") != owner
+                    or set(origin.get("requested_task_ids") or origin.get("task_ids") or []) != set(task_ids)):
+                raise ValueError("建树续跑作业不属于当前流程或任务范围")
+            for job in jobs:
+                if job.get("origin_job_id") == origin_job_id and job.get("pipeline_id") == owner:
+                    return job  # Includes a child that already failed before submit was acknowledged.
+            if any(job.get("status") in {"queued", "running"} and job.get("pipeline_id") != owner
+                   and set(job.get("task_ids") or []).intersection(task_ids) for job in jobs):
+                raise RuntimeError("同一任务已有其他来源的活动建树作业，等待其结束后再续跑")
+            jobs = [job for job in jobs if job.get("pipeline_id") == owner]
         validate_batch_sources(context, self.data_root)
         available = {row_task_id(row) for rows in context.payload["sheets"].values() for row in rows}
         if not task_ids or any(task_id not in available for task_id in task_ids):
@@ -122,8 +151,19 @@ class TreeBuildJobManager:
         inputs = annotation_task_fingerprints(context.payload)
         fingerprints = tree_task_fingerprints(context.payload, config)
         expected = {task: fingerprints[task] for task in task_ids}
+        retry_fields = {}
+        if origin_job_id is not None:
+            if origin.get("build_config") != config:
+                raise StaleTaskInput("建树模型配置已变化，请重新提交")
+            if origin.get("annotation_version") != context.annotation_version:
+                original = resolve_batch_context(batch_id, origin["annotation_version"], self.data_root)
+                frozen = tree_task_fingerprints(original.payload, config)
+                if any(frozen.get(task) != value for task, value in expected.items()):
+                    raise StaleTaskInput("建树输入已变化，请重新提交")
+            retry_fields = {"origin_job_id": origin_job_id, "retry_checkpoint_scopes": {
+                task: item for task, item in (origin.get("retry_checkpoint_scopes") or {}).items()
+                if task in expected}}
         current = current_tree_payload(batch_id, self.data_root).get("task_fingerprints", {})
-        jobs = self.list_jobs(batch_id)
         for job in jobs:
             if job.get("status") in {"queued", "running"} and all(
                     job.get("task_fingerprints", {}).get(task) == value for task, value in expected.items()):
@@ -140,7 +180,7 @@ class TreeBuildJobManager:
                 for task, value in expected.items())), None)
             if waiting is not None:
                 return waiting
-        extra = {"batch_id": batch_id, "annotation_version": context.annotation_version,
+        extra = {**retry_fields, "batch_id": batch_id, "annotation_version": context.annotation_version,
                  "annotation_ref": context.annotation_ref, "raw_root": str(context.raw_root),
                  "task_fingerprints": {task: expected[task] for task in pending} if pending else expected, "build_config": config,
                  "source_task_fingerprints": {task: inputs[task] for task in pending},
@@ -198,6 +238,19 @@ class TreeBuildJobManager:
             payload["percent"] = min(99, max(0, percent))
             self._write(payload)
 
+    def _register_checkpoint(self, job_id, task_id, checkpoint):
+        # Establish the baseline before the first model call, including for a
+        # pre-upgrade job whose SQLite already contains completed work.
+        with self._lock, job_commit_guard(self.records, "tree_jobs", job_id):
+            job = self.get(job_id)
+            scopes = job.setdefault("retry_checkpoint_scopes", {})
+            existing = scopes.get(task_id)
+            if existing is None:
+                scopes[task_id] = {"scope": checkpoint.path.stem, "initial_count": checkpoint.count()}
+                self._write(job)
+            elif existing["scope"] != checkpoint.path.stem:
+                raise StaleTaskInput("建树续跑的冻结输入已变化，请重新提交")
+
     def _run(self, job_id: str, task_ids: list[str]) -> None:
         try:
             job = self.get(job_id) or {}
@@ -227,6 +280,9 @@ class TreeBuildJobManager:
                     if self.runner is build_tree_run:
                         context_options.update(expected_task_inputs=payload["source_task_fingerprints"],
                                                expected_build_config=payload["build_config"])
+                        if payload.get("pipeline_id"):
+                            context_options["register_checkpoint"] = lambda task, checkpoint: self._register_checkpoint(
+                                job_id, task, checkpoint)
                 if self.runner is build_tree_run:
                     context_options.update(check_stop=check_stop,
                         commit_guard=lambda: job_commit_guard(self.records, "tree_jobs", job_id))

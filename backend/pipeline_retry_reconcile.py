@@ -32,6 +32,11 @@ def reconcile(manager, pipeline, step):
             if stage == "quality" and (not job.get("task_ids")
                     or not set(job["task_ids"]).issubset(pipeline["task_ids"])):
                 continue
+            if stage == "tree" and set(job.get("requested_task_ids") or job.get("task_ids") or ()) != set(pipeline["task_ids"]):
+                continue
+            if stage == "cot" and (job.get("session_id") != pipeline.get("session_id") or
+                    job.get("group_ids") != (pipeline.get("confirmation") or {}).get("group_ids")):
+                continue
         if origin in bound:
             bound.remove(origin)
             if origin not in previous:

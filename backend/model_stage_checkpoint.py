@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from contextlib import closing, contextmanager, nullcontext
 
@@ -22,19 +23,20 @@ class ModelStageCheckpoint:
                                    identity_hash + ".sqlite")
         self.commit_guard = commit_guard or nullcontext
 
+    @staticmethod
     @contextmanager
-    def _read(self):
-        if not io_path(self.path).is_file():
+    def _read(path):
+        if not io_path(path).is_file():
             yield None
             return
-        with closing(sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True)) as db:
+        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
             table = db.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='results'"
             ).fetchone()
             yield db if table else None
 
     def get(self, kind, key):
-        with self._read() as db:
+        with self._read(self.path) as db:
             if db is None:
                 return None
             row = db.execute("SELECT result FROM results WHERE kind=? AND unit=?",
@@ -61,7 +63,19 @@ class ModelStageCheckpoint:
             db.execute("DELETE FROM results WHERE kind=? AND unit=?", (kind, _serialized(key)))
 
     def count(self, kind=None):
-        with self._read() as db:
+        return self._count(self.path, kind)
+
+    @classmethod
+    def count_scope(cls, root, stage, scope):
+        """Count a previously registered result store without re-reading model inputs."""
+        if not re.fullmatch(r"[0-9a-f]{64}", scope):
+            raise ValueError("Invalid model checkpoint scope")
+        path = contained_path(root, "system", "model_stage_checkpoints", stage, scope + ".sqlite")
+        return cls._count(path)
+
+    @classmethod
+    def _count(cls, path, kind=None):
+        with cls._read(path) as db:
             if db is None:
                 return 0
             if kind is None:
