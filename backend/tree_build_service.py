@@ -211,6 +211,7 @@ def build_tree_run(
     expected_build_config: dict[str, Any] | None = None,
     check_stop: Callable[[], None] | None = None,
     commit_guard=nullcontext,
+    register_checkpoint: Callable[[str, ModelStageCheckpoint], None] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     operation_batch = batch_id
     if operation_batch is None and structured_input_exists(xlsx_path):
@@ -331,6 +332,8 @@ def build_tree_run(
                         commit_guard=commit_guard,
                     )
                     checkpoints[task_id] = checkpoint
+                    if register_checkpoint is not None:
+                        register_checkpoint(task_id, checkpoint)
                     classifier.checkpoint = alignment_reviewer.checkpoint = checkpoint
                     restored = checkpoint.get("task_tree", tree_key)
                     if restored is not None:
