@@ -15,7 +15,7 @@ def _finite(value):
     return type(value) in (int, float) and math.isfinite(value)
 
 
-def fuse(evaluation: dict, checklist: dict, *, definition_digest: str | None = None) -> dict:
+def rubric_invalid_reasons(evaluation: dict) -> list[str]:
     reasons = []
     g = evaluation.get("global_score")
     if not _finite(g) or not 1 <= g <= 5:
@@ -27,6 +27,12 @@ def fuse(evaluation: dict, checklist: dict, *, definition_digest: str | None = N
     dimensions = evaluation.get("dimension_global_scores")
     if isinstance(dimensions, dict) and any(not _finite(value) or not 1 <= value <= 5 for value in dimensions.values()):
         reasons.append("rubric_evidence_invalid")
+    return list(dict.fromkeys(reasons))
+
+
+def fuse(evaluation: dict, checklist: dict, *, definition_digest: str | None = None) -> dict:
+    reasons = rubric_invalid_reasons(evaluation)
+    g = evaluation.get("global_score")
     if checklist.get("status") != "complete":
         reasons.append("checklist_incomplete")
         # A failed invocation has no report to validate. Do not turn one known

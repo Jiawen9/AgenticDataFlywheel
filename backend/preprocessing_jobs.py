@@ -135,13 +135,13 @@ class PreprocessingJobManager:
         owner = execution_pipeline_id() or (previous or {}).get("pipeline_id")
         if owner:
             job["pipeline_id"] = owner
-            if previous and previous.get("pipeline_id") == owner:
-                job["annotation_chain_id"] = previous.get("annotation_chain_id") or previous["job_id"]
-            else:
-                job["annotation_chain_id"] = job_id
-            done, total = AnnotationCheckpoint(self.root, job, None).progress()
-            job.update(completed_steps=done, total_steps=total,
-                       percent=min(99, round(100 * done / total)) if total else 0)
+        if previous and previous.get("pipeline_id") == owner:
+            job["annotation_chain_id"] = previous.get("annotation_chain_id") or previous["job_id"]
+        else:
+            job["annotation_chain_id"] = job_id
+        done, total = AnnotationCheckpoint(self.root, job, None).progress()
+        job.update(completed_steps=done, total_steps=total,
+                   percent=min(99, round(100 * done / total)) if total else 0)
         self.records.put("preprocessing_jobs", job_id, job, expected_revision=0)
         diagnostics.record_job_snapshot(job, "preprocessing", self.root)
         try:
@@ -324,13 +324,15 @@ class PreprocessingJobManager:
                                 raise PreprocessingError("排队后模型配置已变化，请重新开始预处理")
                             settings = qwen_settings(api_key=values["YUNAI_API_KEY"], base_url=config["base_url"])
                             reviewer = QwenBoxReviewer(model=config["model"], cache_path=cache_path,
-                                                       client_settings=settings)
+                                                       client_settings=settings, use_response_cache=False)
                             reviewer.client = reviewer.client.with_options(max_retries=0)
                             reviewer.max_output_attempts = 1
                             one_shot_reviewers.append(reviewer)
                             return reviewer
                     checkpoint = (AnnotationCheckpoint(self.root, job, commit_guard)
                                   if job.get("annotation_chain_id") else None)
+                    if restored_steps:
+                        diagnostics.log_event("annotation_checkpoint_reused", restored_steps=restored_steps)
                     try:
                         check_stop()
                         result, counts = self.annotator(json_path, payload, output, snapshot=snapshot,

@@ -96,7 +96,7 @@ class TreeBuildJobManager:
                         "status": "interrupted",
                         "stage": "interrupted",
                         "completed_at": _now(),
-                        "error": "服务重启导致作业中断；可重新提交并复用已有模型缓存。",
+                        "error": "服务重启导致作业中断；可重新提交并继续已保存的处理进度。",
                         "failure": failure_from_payload({"category": "service_restart"}),
                     }
                 )
@@ -191,8 +191,6 @@ class TreeBuildJobManager:
                 summary_total = int(payload.get("total_trajectories") or 0)
                 summarized = int(payload.get("summarized_trajectories") or 0)
                 percent = 80 + round(10 * summarized / summary_total) if summary_total else 80
-            elif payload.get("stage") == "building" and total:
-                percent = 92
             elif payload.get("stage") == "publishing":
                 percent = 97
             else:

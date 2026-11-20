@@ -176,6 +176,7 @@ class CotResponseTests(unittest.TestCase):
         reviewer_class.assert_called_once_with(
             model="bbox-model",
             cache_path=reviewer_class.call_args.kwargs["cache_path"],
+            use_response_cache=False,
         )
 
 if __name__ == "__main__":

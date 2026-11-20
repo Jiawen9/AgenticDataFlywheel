@@ -162,6 +162,44 @@ class CorrectionStorageTests(unittest.TestCase):
         self.assertNotIn("actions", current["row_edits"]["2"])
         self.assertNotIn("2", current["cot"])
 
+    def test_cot_retry_resumes_rows_then_retries_export_only(self):
+        for row in (2, 3):
+            service.patch_row(self.sid, row, {"actions": '{"action":"answer","text":"ok"}'})
+        calls = []
+        image = self.root / "screen.jpg"
+        image.write_bytes(b"original")
+        class Generator:
+            model = "fake"
+            def generate(self, **args):
+                calls.append(args["step"])
+                if calls == [1, 2]:
+                    raise TimeoutError("test timeout")
+                return {"thought": "thought", "summary": "summary"}
+        executor = DeferredExecutor()
+        manager = cot_jobs.CotJobManager(self.root / "jobs", generator_factory=Generator, executor=executor)
+        def submit(force=False):
+            job = manager.submit(self.sid, force_overwrite=force)
+            executor.run()
+            return manager.get(job["job_id"])
+        with (patch.object(cot_jobs, "_snapshot", side_effect=lambda _: deepcopy(self.snapshot)),
+              patch.object(cot_jobs, "session_asset", return_value=image),
+              patch.object(cot_jobs, "_source_for_session", return_value=(self.source, self.root)),
+              patch.object(cot_jobs, "resolve_asset", return_value=image),
+              patch.object(cot_jobs, "publish_cot_snapshot", side_effect=[OSError("disk"), {}, {}, {}])):
+            first = submit(force=True)
+            self.assertEqual(first["completed_steps"], 1)
+            manager = cot_jobs.CotJobManager(self.root / "jobs", generator_factory=Generator, executor=executor)
+            self.assertEqual(submit(force=True)["stage"], "export_failed")
+            self.assertEqual(submit(force=True)["status"], "succeeded")
+            self.assertEqual(calls, [1, 2, 2])
+            self.assertEqual(submit(force=True)["status"], "succeeded")
+            self.assertEqual(calls, [1, 2, 2, 1, 2])
+            image.write_bytes(b"changed")
+            last = submit()
+            self.assertEqual(last["status"], "succeeded")
+            self.assertEqual(calls, [1, 2, 2, 1, 2, 1, 2])
+            self.assertEqual(manager.submit(self.sid)["job_id"], last["job_id"])
+
     def test_new_session_reads_json_after_source_changes(self):
         # Use actual snapshot/source functions only in this test.
         self.patches[1].stop()

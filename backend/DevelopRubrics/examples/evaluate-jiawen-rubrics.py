@@ -40,6 +40,7 @@ from adarubric import (
     TrajectoryStep,
 )
 from adarubric.core.exceptions import EvaluationError
+from adarubric.core.models import StepEvaluation
 from adarubric.evaluator.aggregator import (
     ConfidenceNormalizedAggregator,
     GeometricMeanAggregator,
@@ -64,6 +65,9 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from backend.file_io import io_path
 from backend.quality_execution import execution_write_guard
 from backend.data_store import DATA_ROOT
+from backend.batch_results import digest
+from backend.pipeline_diagnostics import log_event, trace_context
+from backend.quality_fusion import rubric_invalid_reasons
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "examples" / "jiawen_rubric_config.json"
 DEFAULT_REPORT_PATH = DATA_ROOT / "system" / "rubric_outputs" / "evaluations" / "jiawen_gui_eval.md"
 DEFAULT_EVALUATIONS_PATH = (
@@ -755,6 +759,7 @@ async def evaluate_trajectory(
     config: Config,
     temperature: float,
     eval_max_tokens: int,
+    chunk_checkpoint=None,
 ) -> TrajectoryEvaluation:
     include_action = _bool_setting(
         config,
@@ -826,16 +831,51 @@ async def evaluate_trajectory(
     )
 
     step_evaluations = []
+    chunk_keys = []
+    if chunk_checkpoint is not None:
+        scoring_fingerprint = digest({
+            "version": 1,
+            "model": GEN._setting(config, "model", "ADARUBRIC_MODEL", "gpt-4o"),
+            "endpoint": GEN._setting(config, "base_url", "ADARUBRIC_BASE_URL", None),
+            "rubric": rubric.model_dump(mode="json"),
+            "settings": _evaluation_settings(config),
+            "task_instruction": task.instruction,
+            "temperature": temperature,
+            "max_tokens": eval_max_tokens,
+        })
     for chunk_number, chunk in enumerate(chunks, 1):
+        chunk_key = None
+        if chunk_checkpoint is not None:
+            chunk_key = digest({
+                "scoring": scoring_fingerprint,
+                "input": chunk.trajectory.model_dump(mode="json"),
+                "steps": sorted(chunk.core_step_ids),
+            })
+            chunk_keys.append(chunk_key)
+            saved = chunk_checkpoint.get("rubric_chunk", chunk_key)
+            if isinstance(saved, list):
+                try:
+                    restored = [StepEvaluation.model_validate(step) for step in saved]
+                except ValueError:
+                    restored = []
+                if (len(restored) == len(chunk.core_step_ids)
+                        and {step.step_id for step in restored} == chunk.core_step_ids):
+                    step_evaluations.extend(restored)
+                    log_event("quality_chunk_resumed", trajectory_id=trajectory.trajectory_id,
+                              chunk_number=chunk_number, core_step_ids=sorted(chunk.core_step_ids))
+                    continue
+            log_event("quality_chunk_started", trajectory_id=trajectory.trajectory_id,
+                      chunk_number=chunk_number, core_step_ids=sorted(chunk.core_step_ids))
         try:
-            chunk_eval = await pipeline.evaluate(
-                chunk.trajectory,
-                rubric,
-                temperature=temperature,
-                task_instruction=task.instruction,
-                max_tokens=eval_max_tokens,
-                target_step_ids=chunk.core_step_ids,
-            )
+            with trace_context(chunk_number=chunk_number, core_step_ids=sorted(chunk.core_step_ids)):
+                chunk_eval = await pipeline.evaluate(
+                    chunk.trajectory,
+                    rubric,
+                    temperature=temperature,
+                    task_instruction=task.instruction,
+                    max_tokens=eval_max_tokens,
+                    target_step_ids=chunk.core_step_ids,
+                )
         except Exception as exc:
             steps = chunk.trajectory.steps
             core_range = (
@@ -856,18 +896,22 @@ async def evaluate_trajectory(
                 },
             ) from exc
 
-        step_evaluations.extend(
+        evaluated_steps = [
             step_eval
             for step_eval in chunk_eval.step_evaluations
             if step_eval.step_id in chunk.core_step_ids
-        )
+        ]
+        if (chunk_key is not None and len(evaluated_steps) == len(chunk.core_step_ids)
+                and {step.step_id for step in evaluated_steps} == chunk.core_step_ids):
+            chunk_checkpoint.save("rubric_chunk", chunk_key, [step.model_dump(mode="json") for step in evaluated_steps])
+        step_evaluations.extend(evaluated_steps)
 
     step_evaluations.sort(key=lambda step_eval: step_eval.step_id)
     dimension_globals, global_score = _build_aggregator(config).aggregate_steps(
         step_evaluations,
         rubric,
     )
-    return TrajectoryEvaluation(
+    evaluation = TrajectoryEvaluation(
         trajectory_id=trajectory.trajectory_id,
         task_id=trajectory.task_id,
         rubric_used=rubric,
@@ -884,6 +928,13 @@ async def evaluate_trajectory(
             "evaluation_include_action_input": include_action_input,
         },
     )
+    invalid = rubric_invalid_reasons(evaluation.model_dump(mode="json")) if chunk_keys else []
+    if invalid:
+        # Replaying the same evidence can only reproduce this aggregate.
+        for key in chunk_keys:
+            chunk_checkpoint.discard("rubric_chunk", key)
+        log_event("quality_chunk_results_invalid", trajectory_id=trajectory.trajectory_id, reasons=invalid)
+    return evaluation
 
 
 async def evaluate_run_incrementally(
@@ -901,6 +952,7 @@ async def evaluate_run_incrementally(
     config: Config,
     existing_evaluations: dict[EvaluationKey, TrajectoryEvaluation],
     on_trajectory_complete: Callable[[TrajectoryEvaluation], None] | None = None,
+    chunk_checkpoint=None,
 ) -> PipelineResult:
     sem = asyncio.Semaphore(max(1, max_concurrent))
     evaluation_settings = _evaluation_settings(config)
@@ -942,6 +994,7 @@ async def evaluate_run_incrementally(
                     config=config,
                     temperature=temperature,
                     eval_max_tokens=eval_max_tokens,
+                    **({"chunk_checkpoint": chunk_checkpoint} if chunk_checkpoint is not None else {}),
                 )
             return index, evaluation
 
@@ -957,26 +1010,34 @@ async def evaluate_run_incrementally(
         for completed in asyncio.as_completed(tasks):
             index, evaluation = await completed
             ordered_evaluations[index] = evaluation
-            append_evaluation_jsonl(
-                path=evaluations_path,
-                task=task,
-                rubric_path=rubric_path,
-                run_number=run_number,
-                evaluation=evaluation,
-                evaluation_settings=evaluation_settings,
+            invalid = (
+                rubric_invalid_reasons(evaluation.model_dump(mode="json", exclude={"rubric_used", "step_evaluations"}))
+                if chunk_checkpoint is not None else []
             )
-            print(
-                f"Saved JSONL result: task={task.task_id}, "
-                f"run={run_number}, trajectory={evaluation.trajectory_id}, "
-                f"global_score={evaluation.global_score:.3f}"
-            )
-            key = _evaluation_key(
-                task_id=task.task_id,
-                run_number=run_number,
-                trajectory_id=evaluation.trajectory_id,
-                settings_signature=settings_signature,
-            )
-            existing_evaluations[key] = evaluation
+            if invalid:
+                log_event("quality_checkpoint_not_saved", task_id=task.task_id,
+                          trajectory_id=evaluation.trajectory_id, reasons=invalid)
+            else:
+                append_evaluation_jsonl(
+                    path=evaluations_path,
+                    task=task,
+                    rubric_path=rubric_path,
+                    run_number=run_number,
+                    evaluation=evaluation,
+                    evaluation_settings=evaluation_settings,
+                )
+                print(
+                    f"Saved JSONL result: task={task.task_id}, "
+                    f"run={run_number}, trajectory={evaluation.trajectory_id}, "
+                    f"global_score={evaluation.global_score:.3f}"
+                )
+                key = _evaluation_key(
+                    task_id=task.task_id,
+                    run_number=run_number,
+                    trajectory_id=evaluation.trajectory_id,
+                    settings_signature=settings_signature,
+                )
+                existing_evaluations[key] = evaluation
             if on_trajectory_complete is not None:
                 on_trajectory_complete(evaluation)
     except BaseException:

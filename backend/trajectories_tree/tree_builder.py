@@ -824,34 +824,35 @@ def build_tree(
                     statistics.resync_candidate_count += 1
                     skipped = steps[position : position + candidate.skip_count]
                     try:
-                        review = alignment_reviewer.review(
-                            trajectory=trajectory,
-                            skipped_steps=[_step_context(item) for item in skipped],
-                            candidate_image_paths=[
-                                _artifact_path(
-                                    trajectory_root, item.image, require_file=False
-                                )
-                                for item in candidate.confirmation_steps
-                            ],
-                            reference_image_paths=[
-                                _artifact_path(
-                                    trajectory_root,
-                                    node.reference.image,
-                                    require_file=False,
-                                )
-                                for node in candidate.confirmation_nodes
-                                if node.reference is not None
-                            ],
-                            candidate_steps=[
-                                _step_context(item)
-                                for item in candidate.confirmation_steps
-                            ],
-                            reference_steps=[
-                                _step_context(node.reference)
-                                for node in candidate.confirmation_nodes
-                                if node.reference is not None
-                            ],
-                        )
+                        with trace_context(trajectory_id=trajectory, step=step.step_index):
+                            review = alignment_reviewer.review(
+                                trajectory=trajectory,
+                                skipped_steps=[_step_context(item) for item in skipped],
+                                candidate_image_paths=[
+                                    _artifact_path(
+                                        trajectory_root, item.image, require_file=False
+                                    )
+                                    for item in candidate.confirmation_steps
+                                ],
+                                reference_image_paths=[
+                                    _artifact_path(
+                                        trajectory_root,
+                                        node.reference.image,
+                                        require_file=False,
+                                    )
+                                    for node in candidate.confirmation_nodes
+                                    if node.reference is not None
+                                ],
+                                candidate_steps=[
+                                    _step_context(item)
+                                    for item in candidate.confirmation_steps
+                                ],
+                                reference_steps=[
+                                    _step_context(node.reference)
+                                    for node in candidate.confirmation_nodes
+                                    if node.reference is not None
+                                ],
+                            )
                     except Exception as exc:
                         raise RuntimeError(
                             f"截图一致性复核失败: trajectory={trajectory}, "

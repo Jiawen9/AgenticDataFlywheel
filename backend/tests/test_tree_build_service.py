@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import unittest
+from collections import Counter
 from functools import partial
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from openpyxl import Workbook, load_workbook
 from PIL import Image
@@ -49,6 +52,105 @@ class FakeSummarizer:
 
     def summarize_trajectory(self, task, trajectory_id, steps):
         return f"{task}: {trajectory_id} 共 {len(steps)} 步"
+
+
+class TreeCheckpointTests(unittest.TestCase):
+    def test_classification_checkpoint_contains_validated_fields_and_skips_the_model(self):
+        from backend.model_stage_checkpoint import ModelStageCheckpoint
+        from backend.trajectories_tree.intermediate_state_classifier import QwenIntermediateStateClassifier
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = root / "before.jpg"
+            Image.new("RGB", (10, 10), "white").save(image)
+            content = '{"category":"none","reason":"normal","confidence":0.8,"observation":"page"}'
+            create = Mock(return_value=SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))]))
+
+            def classifier():
+                instance = object.__new__(QwenIntermediateStateClassifier)
+                instance.checkpoint = ModelStageCheckpoint(root, "tree", ["test", "task"])
+                instance.model = "fake-model"
+                instance.cache_path = None
+                instance.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+                return instance
+
+            inputs = dict(trajectory="tr1", step_index=1, current_image_path=image, next_image_path=None,
+                          action={"action": "wait"}, summary="", previous_summary="", next_summary="")
+            first = classifier().classify(**inputs)
+            restored = classifier().classify(**inputs)
+            self.assertEqual(first.to_dict(0.8), restored.to_dict(0.8))
+            self.assertEqual(restored.raw_response, "")
+            self.assertEqual(restored.observation, "page")
+            create.assert_called_once()
+
+    def test_summary_failure_retains_completed_task_trees_and_summaries(self):
+        from backend.data_store import ArtifactStore
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rollout, workbook = prepare_source(root)
+            raw = root / "raw"
+            rollout.rename(raw)
+            env_path = root / ".env"
+            env_path.write_text("MODEL_NAME=fake-model\nMODEL_URL=http://127.0.0.1:1/v1\nYUNAI_API_KEY=local-test\n")
+            store = ArtifactStore(root)
+            payload = workbook_payload(workbook)
+            conversion = store.publish("batch", "01_conversion", payload,
+                                       source_refs=[{"kind": "raw_trajectories", "path": str(raw)}])
+            store.publish("batch", "02_annotation", payload, source_refs=[conversion])
+            cache_path = root / "unreadable-old-replies.json"
+            cache_path.write_bytes(b"invalid legacy reply cache")
+            classified, requested = [], []
+            updates = []
+            first_summary_started = threading.Event()
+            second_summary_failed = threading.Event()
+
+            class RecordingClassifier(FakeClassifier):
+                def classify(self, **kwargs):
+                    classified.append(kwargs["trajectory"])
+                    return super().classify(**kwargs)
+
+            class RejectSecondSummary(FakeSummarizer):
+                def summarize_trajectory(self, task, trajectory_id, steps):
+                    requested.append(trajectory_id)
+                    if trajectory_id.startswith("TASK-A"):
+                        first_summary_started.set()
+                        if not second_summary_failed.wait(timeout=5):
+                            raise AssertionError("second summary never ran")
+                    if trajectory_id.startswith("TASK-B") and requested.count(trajectory_id) == 1:
+                        if not first_summary_started.wait(timeout=5):
+                            raise AssertionError("first summary never ran")
+                        second_summary_failed.set()
+                        raise RuntimeError("synthetic model HTTP 404")
+                    return super().summarize_trajectory(task, trajectory_id, steps)
+
+            options = {"batch_id": "batch", "data_root": root, "env_path": env_path,
+                       "progress": updates.append, "classification_cache": cache_path,
+                       "alignment_cache": cache_path}
+            with patch("backend.tree_build_service.configure_reviewer_environment", return_value="fake-model"), \
+                 patch("backend.tree_build_service.QwenIntermediateStateClassifier",
+                       side_effect=RecordingClassifier) as classifier, \
+                 patch("backend.tree_build_service.QwenStateAlignmentReviewer",
+                       side_effect=FakeAlignmentReviewer) as alignment, \
+                 patch("backend.quality_input_builder.QwenSummarizer",
+                       return_value=RejectSecondSummary()) as summarizer:
+                with self.assertRaisesRegex(RuntimeError, "synthetic model HTTP 404"):
+                    build_tree_run(["TASK-A", "TASK-B"], job_id="attempt-one", **options)
+                self.assertIsNone(store.get("batch", "03_observation"))
+                self.assertIsNone(store.get("batch", "04_tree"))
+                updates.clear()
+                build_tree_run(["TASK-A", "TASK-B"], job_id="attempt-two", **options)
+                self.assertEqual([call.args[1] for call in classifier.call_args_list], [None, None])
+                self.assertEqual([call.args[1] for call in alignment.call_args_list], [None, None])
+                self.assertEqual([call.args[3] for call in summarizer.call_args_list], [None, None])
+
+            self.assertEqual(sorted(classified), ["TASK-A-1", "TASK-B-1"])
+            self.assertEqual(Counter(requested), {"TASK-A-1": 1, "TASK-B-1": 2})
+            summary_updates = [change for change in updates if change["stage"] == "summarizing_trajectories"]
+            self.assertEqual(summary_updates[0]["summarized_trajectories"], 1)
+            self.assertIsNotNone(store.get("batch", "03_observation"))
+            self.assertIsNotNone(store.get("batch", "04_tree"))
+            self.assertEqual(cache_path.read_bytes(), b"invalid legacy reply cache")
 
 
 def prepare_source(root: Path) -> tuple[Path, Path]:

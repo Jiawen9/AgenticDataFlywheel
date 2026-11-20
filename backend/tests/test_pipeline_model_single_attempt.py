@@ -121,30 +121,46 @@ class PreprocessingSingleAttemptTests(unittest.TestCase):
 
 class CotRestartRetryEvidenceTests(unittest.TestCase):
     def test_cot_box_reviewer_uses_pipeline_budget_only_when_managed(self):
-        from contextlib import nullcontext
+        from copy import deepcopy
         from types import SimpleNamespace
         from unittest.mock import Mock
-        from backend.trajectory_correction import cot_jobs
+        from backend.tests.test_correction_storage import CorrectionStorageTests, DeferredExecutor
+        from backend.trajectory_correction import cot_jobs, draft_store
 
         for managed in (True, False):
             with self.subTest(managed=managed):
+                fixture = CorrectionStorageTests()
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                draft_store.update_session(fixture.sid, lambda session: session["row_edits"].update(
+                    {"2": {"actions": '{"action":"click","coordinate":[3,4]}'}}))
                 client = Mock()
                 client.with_options.return_value = client
-                reviewer = SimpleNamespace(client=client, max_output_attempts=3)
-                manager = cot_jobs.CotJobManager.__new__(cot_jobs.CotJobManager)
-                manager.get = Mock(return_value={"session_id": "session", "generate_bbox": True,
-                    "configuration_fingerprint": "same", "pipeline_id": "pipeline", "targets": []})
-                manager._progress = Mock()
-                manager._configuration_fingerprint = Mock(return_value="same")
-                manager.generator_factory = Mock(return_value=object())
-                with patch.object(cot_jobs, "load_session", return_value={}), \
-                     patch.object(cot_jobs, "active_session_lock", return_value=nullcontext()), \
-                     patch.object(cot_jobs, "_bbox_reviewer", return_value=reviewer), \
+                reviewer = SimpleNamespace(model="box", client=client, max_output_attempts=3)
+                queue = DeferredExecutor()
+                generator = Mock(model="cot")
+                generator.generate.side_effect = [TimeoutError("test"), {"summary": "done", "thought": "ok"}]
+                def factory():
+                    return generator
+                manager = cot_jobs.CotJobManager(fixture.root / "jobs", generator_factory=factory, executor=queue)
+                image = fixture.root / "input.jpg"
+                image.write_bytes(b"fixture")
+                resolution = SimpleNamespace(result=SimpleNamespace(bbox=(1, 2, 5, 6)))
+                with patch.object(cot_jobs, "_snapshot", side_effect=lambda _: deepcopy(fixture.snapshot)), \
+                     patch.object(cot_jobs, "session_asset", return_value=image), \
+                     patch.object(cot_jobs, "_bbox_reviewer", return_value=reviewer) as create_reviewer, \
+                     patch.object(cot_jobs, "resolve_action_box", return_value=resolution), \
                      patch.object(cot_jobs, "retry_enabled_for_pipeline", return_value=managed), \
                      patch.object(cot_jobs, "publish_cot_snapshot", return_value={}):
-                    manager._run_with_diagnostics("job")
+                    first = manager.submit(fixture.sid, generate_bbox=True, force_overwrite=True)
+                    queue.run()
+                    self.assertEqual(manager.get(first["job_id"])["status"], "failed")
+                    retried = manager.submit(fixture.sid, generate_bbox=True, force_overwrite=True)
+                    queue.run()
+                    self.assertEqual(manager.get(retried["job_id"])["status"], "succeeded")
+                    create_reviewer.assert_called_once()
                 self.assertEqual(reviewer.max_output_attempts, 1 if managed else 3)
-                self.assertEqual(manager._progress.call_args.args[1]["status"], "succeeded")
+                self.assertEqual(client.with_options.call_count, int(managed))
 
     def test_interrupted_cot_job_records_restart_evidence(self):
         import tempfile

@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from backend.file_io import io_path
 from backend.pipeline_retry_errors import ModelOutputError
+from backend.pipeline_diagnostics import log_event
 from backend.trajectories_tree.model_response import response_text
 
 from typing import Any
@@ -88,7 +89,7 @@ def parse_alignment_response(raw: str) -> StateAlignmentResult:
 class QwenStateAlignmentReviewer:
     """Confirm that two post-gap steps match two existing tree states."""
 
-    def __init__(self, model: str, cache_path: Path) -> None:
+    def __init__(self, model: str, cache_path: Path | None) -> None:
         settings = qwen_settings()
         http_client = httpx.Client(
             proxy=settings["proxy"] or None,
@@ -107,8 +108,9 @@ class QwenStateAlignmentReviewer:
         )
         self.model = model
         self.cache_path = cache_path
+        self.checkpoint = None
         self.cache: dict[str, str] = {}
-        if io_path(cache_path).exists():
+        if cache_path is not None and io_path(cache_path).exists():
             payload = json.loads(io_path(cache_path).read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError(f"alignment cache must be a JSON object: {cache_path}")
@@ -155,7 +157,15 @@ class QwenStateAlignmentReviewer:
         cache_key = hashlib.sha256(
             json.dumps(cache_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()
-        cached = cache_key in self.cache
+        checkpoint = getattr(self, "checkpoint", None)
+        if checkpoint is not None:
+            saved = checkpoint.get("alignment", cache_key)
+            if saved is not None:
+                result = parse_alignment_response(json.dumps(saved, ensure_ascii=False))
+                result.raw_response = ""
+                log_event("model_checkpoint_reused", operation="state_alignment_review")
+                return result
+        cached = checkpoint is None and self.cache_path is not None and cache_key in self.cache
         if cached:
             raw = self.cache[cache_key]
             try:
@@ -215,10 +225,16 @@ class QwenStateAlignmentReviewer:
                 **({"response_format": {"type": "json_object"}} if self.model.strip().lower() == "qwen3.8-max" else {}),
             )
             raw = response_text(response)
-            parse_alignment_response(raw)
+        result = parse_alignment_response(raw)
+        if checkpoint is not None:
+            checkpoint.save("alignment", cache_key, {
+                "same_task_state": result.same_task_state,
+                "confidence": result.confidence,
+                "reason": result.reason,
+            })
+            result.raw_response = ""
+        elif not cached and self.cache_path is not None:
             self.cache[cache_key] = raw
             self._save_cache()
-
-        result = parse_alignment_response(raw)
         result.cached = cached
         return result
