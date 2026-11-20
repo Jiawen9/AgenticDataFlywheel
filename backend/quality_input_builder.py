@@ -12,12 +12,13 @@ from typing import Any, Callable
 
 from .DevelopRubrics.trajectory_tools.gui_trajectory_excel import (
     QwenSummarizer, StepRecord, TaskRecord, TrajectoryRecord, write_workbook,
-    SYSTEM_PROMPT, DOMAIN, EXPECTED_TOOLS,
+    SYSTEM_PROMPT, DOMAIN, EXPECTED_TOOLS, TRAJECTORY_SUMMARY_PROMPT_VERSION,
 )
 from .data_store import DATA_ROOT
 from .stage_artifacts import write_sidecar
 from .model_http import model_http_options
-from .pipeline_diagnostics import trace_context
+from .batch_results import digest
+from .pipeline_diagnostics import log_event, trace_context
 from .trajectories_tree import intermediate_state_classifier
 
 FINAL_ANSWER_CACHE = DATA_ROOT / "cache" / "rubric_outputs" / "qwen_tree_final_answers.json"
@@ -38,16 +39,18 @@ def build_quality_workbook(*, grouped: dict[str, list[tuple[str, list[Any]]]], t
                            progress: Callable[[dict[str, Any]], None] | None = None,
                            summarizer: Any | None = None,
                            max_concurrent: int = 1,
-                           check_stop: Callable[[], None] | None = None) -> tuple[int, int, int]:
+                           check_stop: Callable[[], None] | None = None,
+                           checkpoints: dict[str, Any] | None = None) -> tuple[int, int, int]:
     values = _env(env_path) if summarizer is None else {"MODEL_NAME": getattr(summarizer, "model", "test-model")}
     owned = summarizer is None
     if owned:
-        summarizer = QwenSummarizer(values["MODEL_NAME"], values["MODEL_URL"], values["YUNAI_API_KEY"], FINAL_ANSWER_CACHE,
+        summarizer = QwenSummarizer(values["MODEL_NAME"], values["MODEL_URL"], values["YUNAI_API_KEY"],
+                                    None if checkpoints is not None else FINAL_ANSWER_CACHE,
                                     http_options=model_http_options(values))
     try:
         return _build_quality_workbook(grouped=grouped, task_goals=task_goals, trajectory_root=trajectory_root, output=output,
             progress=progress, summarizer=summarizer, max_concurrent=max_concurrent, model=values["MODEL_NAME"],
-            check_stop=check_stop)
+            check_stop=check_stop, checkpoints=checkpoints)
     finally:
         if owned:
             with suppress(Exception):
@@ -58,7 +61,8 @@ def _build_quality_workbook(*, grouped: dict[str, list[tuple[str, list[Any]]]],
                             task_goals: dict[str, str], trajectory_root: Path, output: Path,
                             progress: Callable[[dict[str, Any]], None] | None,
                             summarizer: Any, max_concurrent: int,
-                            model: str, check_stop: Callable[[], None] | None = None) -> tuple[int, int, int]:
+                            model: str, check_stop: Callable[[], None] | None = None,
+                            checkpoints: dict[str, Any] | None = None) -> tuple[int, int, int]:
     if not Path(trajectory_root).is_absolute():
         raise ValueError("质检输入原件根目录必须为明确的绝对路径")
     raw_root = resolve_path(trajectory_root)
@@ -105,19 +109,44 @@ def _build_quality_workbook(*, grouped: dict[str, list[tuple[str, list[Any]]]],
     total = len(prepared)
     final_answers: list[str | None] = [None] * total
 
-    def _summarize(item: tuple[str, str, str, str, list[StepRecord]]) -> str:
+    summary_keys = {}
+    remaining = []
+    for index, (task_id, task_text, trajectory_id, _, records) in enumerate(prepared):
         if check_stop is not None:
             check_stop()
-        task_id, task_text, trajectory_id, _, records = item
+        if checkpoints is not None:
+            key = digest([TRAJECTORY_SUMMARY_PROMPT_VERSION, task_text, trajectory_id,
+                          [(step.step_id, step.action, step.observation) for step in records]])
+            summary_keys[index] = key
+            saved = checkpoints[task_id].get("trajectory_summary", key)
+            if isinstance(saved, str) and saved.strip():
+                final_answers[index] = saved
+                with trace_context(task_id=task_id, trajectory_id=trajectory_id):
+                    log_event("model_checkpoint_reused", operation="trajectory_summary")
+                continue
+        remaining.append(index)
+
+    def _summarize(index: int) -> str:
+        if check_stop is not None:
+            check_stop()
+        task_id, task_text, trajectory_id, _, records = prepared[index]
         with trace_context(task_id=task_id, trajectory_id=trajectory_id,
                            operation="trajectory_summary", concurrency=max(1, int(max_concurrent))):
-            return summarizer.summarize_trajectory(task_text, trajectory_id, records)
+            answer = summarizer.summarize_trajectory(task_text, trajectory_id, records)
+            if checkpoints is not None:
+                if not isinstance(answer, str) or not answer.strip():
+                    raise ValueError(f"模型未返回轨迹摘要：{trajectory_id}")
+                checkpoints[task_id].save("trajectory_summary", summary_keys[index], answer)
+            return answer
 
     worker_count = max(1, int(max_concurrent))
-    completed = 0
+    completed = total - len(remaining)
+    if progress and completed:
+        progress({"stage": "summarizing_trajectories", "summarized_trajectories": completed,
+                  "total_trajectories": total})
     if worker_count == 1:
-        for index, item in enumerate(prepared):
-            final_answers[index] = _summarize(item)
+        for index in remaining:
+            final_answers[index] = _summarize(index)
             completed += 1
             if progress:
                 progress({"stage": "summarizing_trajectories", "summarized_trajectories": completed,
@@ -128,8 +157,8 @@ def _build_quality_workbook(*, grouped: dict[str, list[tuple[str, list[Any]]]],
             thread_name_prefix="tree-summary",
         ) as executor:
             pending = {
-                executor.submit(copy_context().run, _summarize, item): index
-                for index, item in enumerate(prepared)
+                executor.submit(copy_context().run, _summarize, index): index
+                for index in remaining
             }
             for future in as_completed(pending):
                 final_answers[pending[future]] = future.result()

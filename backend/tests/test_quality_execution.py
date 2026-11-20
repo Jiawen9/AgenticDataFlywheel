@@ -21,6 +21,7 @@ from backend.quality_execution import (
     revoke_execution, start_execution, update_process,
     update_job_progress,
 )
+from backend.quality_resume import quality_chunk_checkpoint
 
 
 class QualityExecutionTests(unittest.TestCase):
@@ -41,6 +42,49 @@ class QualityExecutionTests(unittest.TestCase):
 
     def context(self):
         return execution_context(self.root, "job", self.token)
+
+    def test_rubric_chunk_resume_only_requests_unsaved_work(self):
+        E = self.worker.EVAL
+        task = E.TaskDescription(task_id="case", instruction="检查页面")
+        rubric = E.DynamicRubric(task_id=task.task_id, dimensions=[{
+            "name": "完成度", "description": "检查任务最终页面是否符合用户目标",
+            "scoring_criteria": {score: str(score) for score in range(1, 6)},
+        }])
+        trajectory = E.Trajectory(trajectory_id="tr", task_id=task.task_id, steps=[
+            E.TrajectoryStep(step_id=step_id, action="点击", observation="页面") for step_id in (1, 2, 3)
+        ])
+        calls = []
+        failed = True
+
+        async def evaluate(chunk, _rubric, *, target_step_ids, **_):
+            (step_id,) = target_step_ids
+            calls.append(step_id)
+            if step_id == 3 and failed:
+                error = RuntimeError("HTTP 404")
+                raise error
+            return SimpleNamespace(step_evaluations=[E.StepEvaluation(step_id=step_id, dimension_scores=[
+                {"dimension_name": "完成度", "score": 3, "confidence": 1.0},
+            ])])
+
+        def run():
+            checkpoint = quality_chunk_checkpoint(self.root, "batch", task.task_id, "frozen",
+                                                  commit_guard=execution_write_guard)
+            with self.context():
+                return asyncio.run(E.evaluate_trajectory(
+                    pipeline=SimpleNamespace(evaluate=evaluate), task=task, trajectory=trajectory, rubric=rubric,
+                    config={"evaluation_chunk_enabled": True, "evaluation_chunk_threshold": 1},
+                    temperature=0.0, eval_max_tokens=30, chunk_checkpoint=checkpoint,
+                ))
+
+        with self.assertRaisesRegex(E.EvaluationError, "HTTP 404"):
+            run()
+        self.assertEqual(calls, [1, 2, 3])
+        self.assertEqual(quality_chunk_checkpoint(self.root, "batch", task.task_id, "frozen").count("rubric_chunk"), 2)
+        failed = False
+        result = run()
+        self.assertEqual(calls, [1, 2, 3, 3])
+        self.assertEqual([step.step_id for step in result.step_evaluations], [1, 2, 3])
+        self.assertAlmostEqual(result.global_score, 3.0)
 
     def test_active_revoked_and_unconfirmed_processes_block_new_dispatch(self):
         with self.assertRaises(QualityExecutionBlocked):

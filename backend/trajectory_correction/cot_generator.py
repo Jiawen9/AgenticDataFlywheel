@@ -102,7 +102,7 @@ def _image_data_url(path: Path) -> str:
 
 
 class QwenCotGenerator:
-    def __init__(self, *, env_file: Path | None = None, cache_dir: Path = CORRECTION_COT_CACHE_DIR) -> None:
+    def __init__(self, *, env_file: Path | None = None, cache_dir: Path | None = CORRECTION_COT_CACHE_DIR) -> None:
         from openai import OpenAI
 
         values = read_env(env_file)
@@ -131,9 +131,11 @@ class QwenCotGenerator:
 
     @model_operation("cot_generate")
     def generate(self, *, task: str, trajectory_id: str, step: int, history: str, action: dict[str, Any], image: Path, reference_answer: str = "") -> dict[str, str | bool]:
-        key = self._key(task=task, trajectory_id=trajectory_id, step=step, history=history, action=action, reference_answer=reference_answer, image=image, model=self.model, endpoint=getattr(self, "endpoint", ""))
-        path = self.cache_dir / f"{key}.json"
-        if io_path(path).is_file():
+        path = None
+        if self.cache_dir is not None:
+            key = self._key(task=task, trajectory_id=trajectory_id, step=step, history=history, action=action, reference_answer=reference_answer, image=image, model=self.model, endpoint=getattr(self, "endpoint", ""))
+            path = self.cache_dir / f"{key}.json"
+        if path is not None and io_path(path).is_file():
             cached = json.loads(io_path(path).read_text(encoding="utf-8"))
             if isinstance(cached, dict) and cached.get("thought") and cached.get("summary"):
                 return {"thought": str(cached["thought"]), "summary": str(cached["summary"]), "bbox_hash": hashlib.sha256(reference_answer.encode()).hexdigest(), "cached": True}
@@ -157,9 +159,10 @@ class QwenCotGenerator:
         )
         raw = (response.choices[0].message.content or "").strip()
         result = parse_cot_response(raw, action)
-        io_path(self.cache_dir).mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".tmp")
         bbox_hash = hashlib.sha256(reference_answer.encode()).hexdigest()
-        io_path(temporary).write_text(json.dumps({**result, "model": self.model, "content_tag": "thought_summary", "bbox_hash": bbox_hash}, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(io_path(temporary), io_path(path))
+        if path is not None:
+            io_path(path.parent).mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(".tmp")
+            io_path(temporary).write_text(json.dumps({**result, "model": self.model, "content_tag": "thought_summary", "bbox_hash": bbox_hash}, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(io_path(temporary), io_path(path))
         return {**result, "bbox_hash": bbox_hash, "cached": False}

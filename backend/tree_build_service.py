@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import threading
 from contextlib import nullcontext
+from dataclasses import fields
 from datetime import datetime
 from pathlib import Path
 from backend.file_io import io_path, resolve_path
@@ -18,6 +20,8 @@ from .batch_operations import batch_operation
 from .trajectories_preprocessing import configure_reviewer_environment, read_env_file
 from .quality_input_builder import build_quality_workbook
 from .data_store import ArtifactStore
+from .model_stage_checkpoint import ModelStageCheckpoint
+from .pipeline_diagnostics import log_event, trace_context
 from .batch_results import (annotation_task_fingerprints, tree_task_fingerprints, digest,
                             assert_task_inputs, merge_tree_results, current_tree_batch, current_tree_payload, tree_result_hashes)
 from .trajectory_context import resolve_batch_context, row_task_id, validate_batch_sources
@@ -33,10 +37,12 @@ from .trajectory_data import (
     task_id_from_resource,
 )
 from .trajectories_tree.intermediate_state_classifier import (
+    IntermediateStateResult,
     QwenIntermediateStateClassifier,
 )
 from .trajectories_tree import intermediate_state_classifier
-from .trajectories_tree.state_alignment_reviewer import QwenStateAlignmentReviewer
+from .trajectories_tree.state_alignment_reviewer import (PROMPT_VERSION as ALIGNMENT_PROMPT_VERSION,
+                                                          QwenStateAlignmentReviewer)
 from .trajectories_tree.tree_builder import (
     DEFAULT_ALIGNMENT_CACHE,
     DEFAULT_CLASSIFICATION_CACHE,
@@ -86,6 +92,7 @@ class _ProgressClassifier:
         offset: int,
         total_steps: int,
         check_stop: Callable[[], None] | None,
+        restored_steps: int = 0,
     ) -> None:
         self.classifier = classifier
         self.model = classifier.model
@@ -94,29 +101,72 @@ class _ProgressClassifier:
         self.offset = offset
         self.total_steps = total_steps
         self.check_stop = check_stop
-        self.completed = 0
+        self.completed = restored_steps
         self._lock = threading.Lock()
 
     def classify(self, **kwargs: Any):
         if self.check_stop is not None:
             self.check_stop()
         result = self.classifier.classify(**kwargs)
+        if getattr(result, "checkpoint_restored", False):
+            return result
         with self._lock:
             self.completed += 1
-            completed = self.completed
-        self.callback(
-            {
+            self.callback({
                 "stage": "classifying_and_observing",
                 "current_task": self.task_id,
-                "classified_steps": self.offset + completed,
+                "classified_steps": self.offset + self.completed,
                 "total_steps": self.total_steps,
-            }
-        )
+            })
         return result
 
 
 def _task_for_trajectory(steps: list[Any]) -> str:
     return (steps[0].task_id or task_id_from_resource(steps[0].image)) if steps else ""
+
+
+def _task_tree_key(trajectories, trajectory_root, check_stop):
+    paths = set()
+    row_ids = []
+    for trajectory, steps in trajectories:
+        row_ids.append([trajectory, [step.excel_row for step in steps]])
+        for step in steps:
+            image = trajectory_root / step.image
+            paths.add(image)
+            paths.add(image.with_name(re.sub(r"_input(?:_stability)?\.jpg$", "_done.jpg",
+                                             image.name, flags=re.IGNORECASE)))
+        if steps:
+            paths.add((trajectory_root / steps[0].image).with_name("initial_orch.jpg"))
+            paths.add((trajectory_root / steps[0].xml).with_name("initial_orch_ui.xml"))
+    fingerprints = []
+    for path in sorted(paths):
+        if check_stop is not None:
+            check_stop()
+        fingerprints.append([str(path), hashlib.sha256(io_path(path).read_bytes()).hexdigest()
+                             if io_path(path).is_file() else None])
+    # The old tree embeds Excel row numbers. A change to the workbook layout
+    # invalidates this composite output but the per-step decisions remain reusable.
+    return digest(fingerprints), digest(row_ids)
+
+
+def _restore_tree_steps(tree_payload, trajectories):
+    audit = {(row["trajectory"], step["step"], step["excel_row"]): step
+             for row in tree_payload["source_trajectories"] for step in row["steps"]}
+    attributes = {"decision": "tree_decision", "node_id": "tree_node_id", "score": "tree_score"}
+    names = ("observation", "excluded_intermediate_terminate", "classification_candidate",
+             "alignment_review", "counted_in_tree", "decision", "decision_source", "node_id",
+             "score", "skip_count", "confirmation_node_ids", "confirmation_step_indices")
+    for trajectory, steps in trajectories:
+        for step in steps:
+            state = audit[trajectory, step.step_index, step.excel_row]
+            classification = state["classification"]
+            if classification is not None:
+                step.classification = IntermediateStateResult(**{
+                    item.name: classification[item.name] for item in fields(IntermediateStateResult)
+                })
+                step.effective_intermediate = classification["effective_intermediate"]
+            for name in names:
+                setattr(step, attributes.get(name, name), state[name])
 
 
 def _file_fingerprint(path: Path) -> dict[str, Any]:
@@ -255,36 +305,67 @@ def build_tree_run(
                 name="TREE_SUMMARY_MAX_CONCURRENT",
                 default=DEFAULT_TREE_SUMMARY_MAX_CONCURRENT,
             )
-            classifier = QwenIntermediateStateClassifier(model_name, classification_cache)
-            alignment_reviewer = QwenStateAlignmentReviewer(model_name, alignment_cache)
+            checkpoints = {} if context is not None else None
+            classifier = QwenIntermediateStateClassifier(model_name, None if checkpoints is not None else classification_cache)
+            alignment_reviewer = QwenStateAlignmentReviewer(model_name, None if checkpoints is not None else alignment_cache)
             for task_index, task_id in enumerate(task_ids, 1):
                 trajectories = grouped[task_id]
+                item = metadata.get(task_id)
+                task_step_count = sum(
+                    1
+                    for _, steps in trajectories
+                    for position, step in enumerate(steps)
+                    if not (step.action.get("action") == "terminate" and position < len(steps) - 1)
+                )
+                tree_path = temporary_dir / f"{task_id}.json"
+                checkpoint = None
+                restored_steps = 0
+                if checkpoints is not None:
+                    if check_stop is not None:
+                        check_stop()
+                    evidence_fingerprint, tree_key = _task_tree_key(trajectories, trajectory_root, check_stop)
+                    checkpoint = ModelStageCheckpoint(
+                        store_root(runs_dir, data_root), "tree",
+                        [batch_id, task_id, fingerprints[task_id], evidence_fingerprint,
+                         ALIGNMENT_PROMPT_VERSION, item.goal if item else task_id],
+                        commit_guard=commit_guard,
+                    )
+                    checkpoints[task_id] = checkpoint
+                    classifier.checkpoint = alignment_reviewer.checkpoint = checkpoint
+                    restored = checkpoint.get("task_tree", tree_key)
+                    if restored is not None:
+                        _restore_tree_steps(restored["tree"], trajectories)
+                        io_path(tree_path).write_text(json.dumps(restored["tree"], ensure_ascii=False),
+                                                      encoding="utf-8")
+                        task_manifests.append(restored["manifest"])
+                        completed_steps += task_step_count
+                        progress({"stage": "building", "current_task": task_id, "task_index": task_index,
+                                  "total_tasks": len(task_ids), "classified_steps": completed_steps,
+                                  "total_steps": total_steps})
+                        with trace_context(task_id=task_id):
+                            log_event("tree_checkpoint_reused", restored_tree=1, restored_steps=task_step_count)
+                        continue
+                    restored_steps = checkpoint.count("classification")
                 progress(
                     {
-                "stage": "classifying_and_observing",
+                        "stage": "classifying_and_observing",
                         "current_task": task_id,
                         "task_index": task_index,
                         "total_tasks": len(task_ids),
-                        "classified_steps": completed_steps,
+                        "classified_steps": completed_steps + restored_steps,
                         "total_steps": total_steps,
                     }
                 )
                 progress_classifier = _ProgressClassifier(
-                    classifier, progress, task_id, completed_steps, total_steps, check_stop
+                    classifier, progress, task_id, completed_steps, total_steps, check_stop, restored_steps
                 )
                 classify_trajectories(
                     trajectories,
                     progress_classifier,
                     trajectory_root,
                     confidence_threshold,
-                    task=(metadata[task_id].goal if task_id in metadata else task_id),
+                    task=item.goal if item else task_id,
                     max_concurrent=classification_max_concurrent,
-                )
-                task_step_count = sum(
-                    1
-                    for _, steps in trajectories
-                    for position, step in enumerate(steps)
-                    if not (step.action.get("action") == "terminate" and position < len(steps) - 1)
                 )
                 completed_steps += task_step_count
                 for _, steps in trajectories:
@@ -303,15 +384,15 @@ def build_tree_run(
                         "total_steps": total_steps,
                     }
                 )
-                root, decisions, statistics = build_tree(
-                    trajectories,
-                    confidence_threshold=confidence_threshold,
-                    trajectory_root=trajectory_root,
-                    alignment_reviewer=alignment_reviewer,
-                    max_incidental_skip=max_incidental_skip,
-                    check_stop=check_stop,
-                )
-                tree_path = temporary_dir / f"{task_id}.json"
+                with trace_context(task_id=task_id):
+                    root, decisions, statistics = build_tree(
+                        trajectories,
+                        confidence_threshold=confidence_threshold,
+                        trajectory_root=trajectory_root,
+                        alignment_reviewer=alignment_reviewer,
+                        max_incidental_skip=max_incidental_skip,
+                        check_stop=check_stop,
+                    )
                 write_output(
                     root,
                     decisions,
@@ -324,19 +405,19 @@ def build_tree_run(
                     extra_metadata={"task_id": task_id},
                 )
                 tree_payload = json.loads(io_path(tree_path).read_text(encoding="utf-8"))
-                item = metadata.get(task_id)
-                task_manifests.append(
-                    {
-                        "task_id": task_id,
-                        "goal": item.goal if item else task_id,
-                        "tree_file": tree_path.name,
-                        "trajectory_count": tree_payload["trajectory_count"],
-                        "original_step_count": tree_payload["original_step_count"],
-                        "tree_step_count": tree_payload["tree_step_count"],
-                        "ignored_step_count": tree_payload["ignored_incidental_step_count"],
-                        "action_node_count": count_nodes(root) - 1,
-                    }
-                )
+                task_manifest = {
+                    "task_id": task_id,
+                    "goal": item.goal if item else task_id,
+                    "tree_file": tree_path.name,
+                    "trajectory_count": tree_payload["trajectory_count"],
+                    "original_step_count": tree_payload["original_step_count"],
+                    "tree_step_count": tree_payload["tree_step_count"],
+                    "ignored_step_count": tree_payload["ignored_incidental_step_count"],
+                    "action_node_count": count_nodes(root) - 1,
+                }
+                if checkpoint is not None:
+                    checkpoint.save("task_tree", tree_key, {"tree": tree_payload, "manifest": task_manifest})
+                task_manifests.append(task_manifest)
 
             quality_workbook = temporary_dir / "rubric_trajectories.xlsx"
             quality_task_count, quality_trajectory_count, quality_step_count = quality_builder(
@@ -347,7 +428,8 @@ def build_tree_run(
                 env_path=env_path,
                 progress=progress,
                 max_concurrent=summary_max_concurrent,
-                **({"check_stop": check_stop} if quality_builder is build_quality_workbook else {}),
+                **({"check_stop": check_stop, "checkpoints": checkpoints}
+                   if quality_builder is build_quality_workbook else {}),
             )
 
             progress({"stage": "publishing", "classified_steps": total_steps, "total_steps": total_steps})

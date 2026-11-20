@@ -160,7 +160,8 @@ def annotate_input(json_path: Path, payload: dict, output_path: Path, *, snapsho
         if values.get("MODEL_NAME") != config["model"] or values.get("MODEL_URL") != config["base_url"]:
             raise PreprocessingError("排队后模型配置已变化，请重新开始预处理")
         settings = qwen_settings(api_key=values["YUNAI_API_KEY"], base_url=config["base_url"])
-        reviewer = QwenBoxReviewer(model=config["model"], cache_path=cache_path, client_settings=settings)
+        reviewer = QwenBoxReviewer(model=config["model"], cache_path=cache_path, client_settings=settings,
+                                   use_response_cache=False)
     else:
         reviewer = reviewer_factory(config=config, cache_path=cache_path)
     result = copy.deepcopy(payload)

@@ -29,9 +29,11 @@ from backend.data_store import DATA_ROOT, ArtifactStore, RecordStore
 from backend.short_paths import short_cache_directory
 from backend.stage_artifacts import load_quality_objects, quality_tables, write_payload_workbook, write_sidecar
 from backend.batch_results import (current_tree_payload, current_tree_batch, merge_quality_results,
-                                   quality_task_fingerprints, StaleTaskInput)
+                                   digest, quality_task_fingerprints, StaleTaskInput)
 from backend.trajectory_data import resolve_tree_run_dir
 from backend.quality_data import quality_manifest
+from backend.quality_fusion import rubric_invalid_reasons
+from backend.quality_resume import quality_chunk_checkpoint
 from backend.pipeline_retry_errors import failure_from_exception
 from backend.pipeline_job_stop import PipelineJobCancelled, job_commit_guard
 from backend import pipeline_diagnostics as diagnostics
@@ -160,23 +162,39 @@ def _rubric_candidates(task_id: str) -> list[Path]:
     ]
 
 
-def _matching_rubric(task_id: str) -> Path | None:
-    for path in _rubric_candidates(task_id):
+def _rubric_path(task_id: str, directory: Path) -> Path:
+    safe = GEN._safe_filename_part(task_id)
+    return directory / f"jiawen_gui_initial_rubric__{safe}.json"
+
+
+def _matching_rubric(task_id: str, directory: Path | None = None) -> Path | None:
+    for path in [_rubric_path(task_id, directory)] if directory is not None else _rubric_candidates(task_id):
         if not io_path(path).is_file():
             continue
         try:
-            if json.loads(io_path(path).read_text(encoding="utf-8")).get("task_id") == task_id:
+            data = json.loads(io_path(path).read_text(encoding="utf-8"))
+            if directory is not None:
+                EVAL.DynamicRubric.model_validate(data)
+            if data.get("task_id") == task_id:
                 return path
-        except (OSError, ValueError, json.JSONDecodeError):
-            continue
+        except ValueError:
+            diagnostics.log_event("rubric_checkpoint_invalid", task_id=task_id, source_path=str(path))
     return None
 
 
-async def _generate_rubric(task: Any, trajectories: list[Any], config: dict[str, Any], workbook: Path) -> Path:
-    safe = GEN._safe_filename_part(task.task_id)
-    rubric_path = RUBRIC_DIR / f"jiawen_gui_initial_rubric__{safe}.json"
-    evidence_path = RUBRIC_DIR / f"jiawen_gui_initial_rubric__{safe}.evidence.md"
-    raw_path = RUBRIC_DIR / f"jiawen_gui_initial_rubric__{safe}.raw_response.txt"
+def _write_rubric(rubric_path: Path, rubric: Any) -> None:
+    temporary = rubric_path.with_suffix(".json.tmp")
+    with execution_write_guard():
+        io_path(rubric_path.parent).mkdir(parents=True, exist_ok=True)
+        io_path(temporary).write_text(GEN._rubric_text(rubric) + "\n", encoding="utf-8")
+        os.replace(io_path(temporary), io_path(rubric_path))
+
+
+async def _generate_rubric(task: Any, trajectories: list[Any], config: dict[str, Any], workbook: Path,
+                           *, directory: Path | None = None) -> Path:
+    rubric_path = _rubric_path(task.task_id, directory or RUBRIC_DIR)
+    evidence_path = rubric_path.with_suffix(".evidence.md")
+    raw_path = rubric_path.with_suffix(".raw_response.txt")
     task_config = dict(config)
     task_config.update(
         rubric_path=str(rubric_path), evidence_path=str(evidence_path),
@@ -188,11 +206,22 @@ async def _generate_rubric(task: Any, trajectories: list[Any], config: dict[str,
         io_path(evidence_path.parent).mkdir(parents=True, exist_ok=True)
         io_path(evidence_path).write_text(GEN._evidence_from_messages(messages, workbook, task_config, trajectories), encoding="utf-8")
     rubric = await GEN.generate_rubric(task=task, trajectories=trajectories, messages=messages, config=task_config, num_dimensions=dimensions)
-    temporary = rubric_path.with_suffix(".json.tmp")
-    with execution_write_guard():
-        io_path(temporary).write_text(GEN._rubric_text(rubric) + "\n", encoding="utf-8")
-        os.replace(io_path(temporary), io_path(rubric_path))
+    _write_rubric(rubric_path, rubric)
     return rubric_path
+
+
+def _usable_scores(path: Path, task_id: str, signature: str, trajectory_ids: set[str]) -> dict:
+    existing = {}
+    for key, evaluation in EVAL.load_existing_evaluations_jsonl(path).items():
+        if (key[0] != task_id or key[1] != 1 or key[2] not in trajectory_ids or key[3] != signature
+                or evaluation.task_id != task_id or evaluation.rubric_used.task_id != task_id):
+            continue
+        invalid = rubric_invalid_reasons(evaluation.model_dump(mode="json", exclude={"rubric_used", "step_evaluations"}))
+        if invalid:
+            diagnostics.log_event("quality_checkpoint_invalid", task_id=task_id, trajectory_id=key[2], reasons=invalid)
+        else:
+            existing[key] = evaluation
+    return existing
 
 
 def _ensure_workbook(run_id: str, manifest: dict[str, Any], task_ids: list[str]) -> tuple[Path, dict[str, Any], list[Any]]:
@@ -267,6 +296,7 @@ async def _run_frozen(run_id: str, task_ids: list[str], job_id: str,
     config = GEN.load_config(CONFIG_PATH)
     queued = RecordStore(DATA_ROOT).get("quality_jobs", job_id) or {}
     checklist_options = queued.get("checklist_options")
+    rubric_fingerprints = quality_task_fingerprints(current) if current is not None else {}
     input_fingerprints = quality_task_fingerprints(current, checklist_options=checklist_options) if current is not None else {}
     if current is not None and queued.get("task_fingerprints") and any(
             queued["task_fingerprints"].get(task) != input_fingerprints.get(task) for task in task_ids):
@@ -276,6 +306,8 @@ async def _run_frozen(run_id: str, task_ids: list[str], job_id: str,
     checklist_failed = 0
     summaries: list[dict[str, Any]] = []
     task_results: list[dict[str, Any]] = []
+    settings = EVAL._evaluation_settings(config)
+    signature = EVAL._settings_signature(settings)
 
     def report_progress(**changes):
         percent = (5 + round(45 * completed / max(total, 1)) + round(45 * checklist_completed / max(total, 1))
@@ -301,6 +333,18 @@ async def _run_frozen(run_id: str, task_ids: list[str], job_id: str,
         by_id = {item.trajectory_id: item for item in trajectories}
         if terminals != set(by_id):
             raise ValueError(f"tree/workbook trajectory mismatch for {task_id}: tree={sorted(terminals)}, workbook={sorted(by_id)}")
+        rubric_fingerprint = rubric_fingerprints.get(task_id)
+        checkpoint_parent = CHECKPOINT_ROOT / run_id
+        rule_directory = None
+        if rubric_fingerprint:
+            checkpoint_parent = short_cache_directory(DATA_ROOT, run_id, "quality_checkpoint",
+                                                      rubric_fingerprint, checkpoint_parent)
+            rule_directory = short_cache_directory(
+                DATA_ROOT, run_id, "frozen_rubric", digest(["rubric-v1", task_id, rubric_fingerprint]),
+                DATA_ROOT / "system" / "rubric_outputs" / "rubrics" / run_id,
+            )
+        checkpoint = checkpoint_parent / f"{task_id}.jsonl"
+        existing = _usable_scores(checkpoint, task_id, signature, set(by_id))
         serialized = {}
         checklists = {item.trajectory_id: {"status": "pending"} for item in trajectories}
         definition_digest = None
@@ -321,7 +365,7 @@ async def _run_frozen(run_id: str, task_ids: list[str], job_id: str,
         partial_result()
         checklist_task = None
         if checklist_options:
-            from backend.quality_checklist import build_task, evaluate_task, digest
+            from backend.quality_checklist import build_task, evaluate_task
             from backend.quality_fusion import enrich_task
             try:
                 report_progress(stage="checklist_preparing", current_task=task_id)
@@ -335,17 +379,9 @@ async def _run_frozen(run_id: str, task_ids: list[str], job_id: str,
                               "failure": failure_from_exception(exc)} for item in trajectories}
                 # Preserve already paid-for Rubric checkpoints, but do not call
                 # a model for a task whose source cannot currently be evaluated.
-                checkpoint_key = quality_task_fingerprints(current).get(task_id) if current is not None else None
-                checkpoint = (short_cache_directory(DATA_ROOT, run_id, "quality_checkpoint", checkpoint_key,
-                    CHECKPOINT_ROOT / run_id) / f"{task_id}.jsonl" if checkpoint_key else CHECKPOINT_ROOT / run_id / f"{task_id}.jsonl")
-                existing = EVAL.load_existing_evaluations_jsonl(checkpoint)
-                signature = EVAL._settings_signature(EVAL._evaluation_settings(config))
-                for trajectory in trajectories:
-                    key = EVAL._evaluation_key(task_id=task_id, run_number=1,
-                        trajectory_id=trajectory.trajectory_id, settings_signature=signature)
-                    if key in existing:
-                        serialized[trajectory.trajectory_id] = json.loads(existing[key].model_dump_json(exclude={"rubric_used"}))
-                        completed += 1
+                for evaluation in existing.values():
+                    serialized[evaluation.trajectory_id] = json.loads(evaluation.model_dump_json(exclude={"rubric_used"}))
+                    completed += 1
                 task_result = enrich_task(task_result, tree, checklists, [item.trajectory_id for item in trajectories])
                 task_result.update(checklist_options=checklist_options, primary_error=safe_error[:1000], completed_at=_now())
                 checklist_completed += len(trajectories)
@@ -357,24 +393,27 @@ async def _run_frozen(run_id: str, task_ids: list[str], job_id: str,
                     "results_available": bool(serialized)})
                 report_progress(stage="fusing", current_task=task_id, results_available=bool(serialized))
                 continue
-        rubric_path = _matching_rubric(task_id)
+        rubric_path = _matching_rubric(task_id, rule_directory)
+        if rubric_path is None and rule_directory is not None and existing:
+            # The frozen score artifact carries the actual rule used before upgrade.
+            rubric_path = _rubric_path(task_id, rule_directory)
+            _write_rubric(rubric_path, next(iter(existing.values())).rubric_used)
+            diagnostics.log_event("rubric_checkpoint_restored", task_id=task_id, source_path=str(checkpoint))
         if rubric_path is None:
             report_progress(stage="generating_rubric", current_task=task_id, task_index=task_index)
             with diagnostics.trace_context(task_id=task_id, concurrency=1):
-                rubric_path = await _generate_rubric(task, trajectories, config, workbook)
+                rubric_path = await _generate_rubric(task, trajectories, config, workbook, directory=rule_directory)
         else:
             diagnostics.log_event("rubric_reused", task_id=task_id, source_path=str(rubric_path))
         rubric = EVAL._load_rubric(rubric_path, task)
+        existing = {key: evaluation for key, evaluation in existing.items() if evaluation.rubric_used == rubric}
+        chunks = quality_chunk_checkpoint(
+            DATA_ROOT, queued.get("batch_id") or run_id, task_id, input_fingerprints[task_id],
+            commit_guard=execution_write_guard,
+        ) if input_fingerprints.get(task_id) else None
         async with EVAL.evaluation_pipeline(config) as pipeline:
-            checkpoint_key = quality_task_fingerprints(current).get(task_id) if current is not None else None
-            checkpoint = (short_cache_directory(DATA_ROOT, run_id, "quality_checkpoint", checkpoint_key,
-                                               CHECKPOINT_ROOT / run_id) / f"{task_id}.jsonl" if checkpoint_key
-                          else CHECKPOINT_ROOT / run_id / f"{task_id}.jsonl")
             EVAL.initialize_evaluations_jsonl(checkpoint, resume=True)
-            existing = EVAL.load_existing_evaluations_jsonl(checkpoint)
-            settings = EVAL._evaluation_settings(config)
             task_result.update(rubric=json.loads(rubric.model_dump_json()), rubric_path=str(rubric_path), evaluation_settings=settings)
-            signature = EVAL._settings_signature(settings)
             cached_count = 0
             for trajectory in trajectories:
                 key = EVAL._evaluation_key(
@@ -424,6 +463,7 @@ async def _run_frozen(run_id: str, task_ids: list[str], job_id: str,
                     config=config,
                     existing_evaluations=existing,
                     on_trajectory_complete=on_trajectory_complete,
+                    chunk_checkpoint=chunks,
                 )
         evaluations = result.all_evaluations
         serialized = {}

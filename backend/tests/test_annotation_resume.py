@@ -157,26 +157,17 @@ class AnnotationResumeTests(unittest.TestCase):
         self.assertEqual(model.call_count, 1)
         self.assertIn("<bbox>", self.store.read_payload(done["artifacts"][1])["sheets"][SHEET][0]["actions_box"])
 
-    def test_legacy_attempt_replays_cached_rows_once_and_next_retry_uses_checkpoint(self):
+    def test_independent_annotation_retries_only_uncommitted_rows(self):
         self.make_trajectory(4)
-        model = self.use_cached_reviewer()
-        accepted = model.return_value
-        model.side_effect = [accepted, TimeoutError("step 3"), accepted, TimeoutError("step 4"), accepted]
-        # Independent annotation uses the same response cache and writes no row ledger.
-        # Adding the original owner reconstructs the pre-checkpoint managed job record.
-        old = self.finish(self.manager.submit(self.batch))
-        self.assertEqual((old["status"], old["completed_steps"], model.call_count), ("failed", 2, 2))
-        self.manager.records.update("preprocessing_jobs", old["job_id"], lambda job: job.update(pipeline_id=self.owner))
-        restored = self.submit(old["job_id"])
-        self.assertEqual(restored["completed_steps"], 0)
-        failed_again = self.finish(restored)
-        self.assertEqual((failed_again["status"], failed_again["completed_steps"], model.call_count), ("failed", 3, 4))
-        retry = self.submit(failed_again["job_id"])
-        self.assertEqual((retry["completed_steps"], retry["total_steps"]), (3, 4))
-        with patch("backend.trajectories_preprocessing.parse_action_cell", wraps=parse_action_cell) as parse:
-            done = self.finish(retry)
+        self.fail_at = 3
+        first = self.finish(self.manager.submit(self.batch))
+        self.assertEqual((first["status"], first["completed_steps"], self.calls), ("failed", 2, [1, 3]))
+        self.fail_at = None
+        retry = self.manager.retry(first["job_id"])
+        self.assertEqual((retry["completed_steps"], retry["total_steps"]), (2, 4))
+        done = self.finish(retry)
         self.assertEqual(done["status"], "succeeded", done.get("error"))
-        self.assertEqual((model.call_count, parse.call_count), (5, 1))
+        self.assertEqual(self.calls, [1, 3, 3, 4])
 
     def test_termination_while_waiting_for_model_rejects_late_row_and_publication(self):
         self.make_trajectory(4)

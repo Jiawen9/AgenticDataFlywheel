@@ -21,13 +21,15 @@ from zoneinfo import ZoneInfo
 
 from .constants import CORRECTION_BBOX_CACHE_DIR, CORRECTION_COT_JOBS_DIR, PROJECT_ROOT
 from ..data_store import RecordStore, DATA_ROOT, rebase_data_path
+from ..stage_artifacts import fingerprint as file_digest
 from ..identifiers import allocate_id
 from .cot_generator import QwenCotGenerator, read_env, SYSTEM_PROMPT
+from .assets import resolve_asset
 from ..bounding_box.build_annotations import resolve_action_box
 from ..bounding_box.qwen_reviewer import QwenBoxReviewer
 from ..trajectory_data import _format_manual_actions_box
 from .draft_store import load_session, update_session, storage_root, session_batch_id
-from .service import _snapshot, session_asset, publish_stage_snapshot, publish_cot_snapshot, _check_revision, active_session_lock
+from .service import _snapshot, _source_for_session, session_asset, publish_stage_snapshot, publish_cot_snapshot, _check_revision, active_session_lock
 from ..pipeline_job_stop import PipelineJobCancelled, check_job_stop, job_commit_guard
 from .session_state import identified, row_index, fingerprint
 from ..batch_lifecycle import BatchPublishedError, is_batch_active
@@ -59,7 +61,8 @@ def _bbox_reviewer() -> QwenBoxReviewer:
     os.environ["TRAJECTORY_API_KEY"] = values["YUNAI_API_KEY"]
     os.environ["TRAJECTORY_API_BASE_URL"] = values["MODEL_URL"]
     os.environ["TRAJECTORY_MODEL"] = bbox_model
-    return QwenBoxReviewer(model=bbox_model, cache_path=CORRECTION_BBOX_CACHE_DIR / "qwen_review_cache.json")
+    return QwenBoxReviewer(model=bbox_model, cache_path=CORRECTION_BBOX_CACHE_DIR / "qwen_review_cache.json",
+                           use_response_cache=False)
 
 
 def _stable_image(image: Path) -> Path:
@@ -82,6 +85,44 @@ def _xml_text(image: Path, row: dict[str, Any]) -> str:
         return io_path(path).read_text(encoding="utf-8", errors="replace") if io_path(path).is_file() else ""
     except OSError:
         return ""
+
+
+def _target_identity(target):
+    return {key: target.get(key) for key in ("step_key", "source_fingerprint", "task_id",
+        "task_fingerprint", "task", "trajectory_id", "action", "history_hash", "step")}
+
+
+def _checkpoint_inputs(payload, target, image):
+    """Bind a draft receipt to the exact inputs consumed by each model."""
+    base = [1, payload["configuration_fingerprint"], _target_identity(target)]
+    try:
+        image_digest = file_digest(image)
+    except FileNotFoundError:
+        # No proof of the image. Never restore a result without it.
+        return None, None
+    bbox_key = None
+    if payload["generate_bbox"] and target["action"].get("action", "").lower() in {"click", "long_press", "swipe"}:
+        stable = _stable_image(image)
+        stable_digest = image_digest if stable == image else file_digest(stable)
+        bbox_key = fingerprint([base, stable_digest, _xml_text(stable, target), target.get("summary", "")])
+    return fingerprint([base, image_digest]), bbox_key
+
+
+def _restored_parts(session, payload, target, cot_key, bbox_key):
+    row = str(target["excel_row"])
+    edit = session.get("row_edits", {}).get(row, {})
+    receipt = edit.get("bbox_checkpoint") or {}
+    box = target["bbox_hash"]
+    same_op = receipt.get("operation_id") == payload["operation_id"]
+    has_box = bool(bbox_key and same_op and receipt.get("input") == bbox_key
+                   and receipt.get("box") == box and edit.get("bbox_source") == "generated")
+    cot = session.get("cot", {}).get(row) or {}
+    has_cot = bool(cot_key and cot.get("input_digest") == cot_key and cot.get("bbox_hash") == box
+                   and cot.get("content_tag") == "thought_summary"
+                   and all(isinstance(cot.get(key), str) and cot[key].strip() for key in ("thought", "summary"))
+                   and (not payload["force_overwrite"] or cot.get("operation_id") == payload["operation_id"])
+                   and (not bbox_key or has_box))
+    return has_cot, has_box
 
 
 class CotJobManager:
@@ -215,15 +256,41 @@ class CotJobManager:
                 "bbox_model": values.get("MODEL_NAME") if generate_bbox else None})
         return fingerprint({"factory": f"{self.generator_factory.__module__}.{self.generator_factory.__qualname__}"})
 
+    def _session_jobs(self, session_id):
+        keys = self._records.matching_keys("correction_cot_jobs", session_id=session_id)
+        return sorted(self._records.get_many("correction_cot_jobs", keys), key=lambda job: job["created_at"], reverse=True)
+
     def submit(self, session_id: str, group_ids: list[str] | None = None, row_ids: list[int] | None = None, *, generate_bbox: bool = False, force_overwrite: bool = False, expected_revision: int | None = None) -> dict[str, Any]:
+        reusable = None
+        if not force_overwrite:
+            # A final job fingerprint alone cannot detect a changed external
+            # image. Validate its committed inputs outside the batch write lock.
+            old = next((job for job in self._session_jobs(session_id)
+                        if job.get("status") == "succeeded" and job.get("resume_scope")
+                        and job["group_ids"] == (group_ids or []) and job["row_ids"] == (row_ids or [])
+                        and job["generate_bbox"] == generate_bbox and not job["force_overwrite"]), None)
+            if old:
+                with active_session_lock(session_id) as session:
+                    _check_revision(session, expected_revision)
+                    _, asset_root = _source_for_session(session)
+                for target in old["targets"]:
+                    try:
+                        image = resolve_asset(asset_root, target["image"])
+                    except FileNotFoundError:
+                        break
+                    cot_key, bbox_key = _checkpoint_inputs(old, target, image)
+                    if not _restored_parts(session, old, target, cot_key, bbox_key)[0]:
+                        break
+                else:
+                    reusable = (old["job_id"], session.get("storage_revision"))
         with active_session_lock(session_id) as session:
             from ..pipeline_access import ensure_pipeline_write
             from .draft_store import storage_root
             ensure_pipeline_write(session_batch_id(session), storage_root())
-            return self._submit(session_id, group_ids, row_ids, generate_bbox=generate_bbox,
+            return self._submit(session_id, group_ids, row_ids, reusable=reusable, generate_bbox=generate_bbox,
                                 force_overwrite=force_overwrite, expected_revision=expected_revision)
 
-    def _submit(self, session_id: str, group_ids: list[str] | None = None, row_ids: list[int] | None = None, *, generate_bbox: bool = False, force_overwrite: bool = False, expected_revision: int | None = None) -> dict[str, Any]:
+    def _submit(self, session_id: str, group_ids: list[str] | None = None, row_ids: list[int] | None = None, *, generate_bbox: bool = False, force_overwrite: bool = False, expected_revision: int | None = None, reusable=None) -> dict[str, Any]:
         _check_revision(load_session(session_id) or {}, expected_revision)
         targets = self._targets(session_id, group_ids, row_ids)
         if generate_bbox and not force_overwrite:
@@ -236,14 +303,35 @@ class CotJobManager:
                 raise ValueError("批量生成将覆盖人工修改，请确认后重试：" + "、".join(conflicts))
         session = load_session(session_id)
         configuration_fingerprint = self._configuration_fingerprint(generate_bbox)
+        # Generated boxes and cleared draft fields can change a session while a
+        # force operation runs. Keep its identity independent of those writes.
+        scope = fingerprint([session_id, execution_pipeline_id(), configuration_fingerprint, generate_bbox,
+                             force_overwrite, [_target_identity(t) for t in targets]])
         request_fingerprint = fingerprint({"configuration": configuration_fingerprint, "session_id": session_id, "targets": targets,
             "generate_bbox": generate_bbox, "force_overwrite": force_overwrite})
-        for previous in self.list_jobs():
-            if previous.get("request_fingerprint") == request_fingerprint and previous.get("status") in {"queued", "running", "succeeded"}:
-                return previous
+        previous = next((j for j in self._session_jobs(session_id) if j.get("resume_scope") == scope), {})
+        if previous.get("status") in {"queued", "running"} and (
+                previous.get("request_fingerprint") == request_fingerprint or generate_bbox):
+            return previous
+        if (reusable and reusable == (previous.get("job_id"), session.get("storage_revision"))
+                and previous.get("request_fingerprint") == request_fingerprint):
+            return previous
+        resume = previous.get("status") in {"interrupted", "failed"}
+        job_id = allocate_id("j", self.data_root)
+        if resume and force_overwrite:
+            # The original confirmation only authorized clearing the manual
+            # values that existed then, never edits made since the failure.
+            originals = {t["step_key"]: t.get("force_baseline", t["edit_baseline"]) for t in previous["targets"]}
+            resume = all(t["bbox_source"] != "manual" or
+                         t["edit_baseline"].get("actions_box") == originals[t["step_key"]].get("actions_box")
+                         for t in targets)
+            if resume:
+                for target in targets:
+                    target["force_baseline"] = originals[target["step_key"]]
         publish_stage_snapshot(session, _snapshot(session), "06_correction")
         payload = {
-            "job_id": allocate_id("j", self.data_root),
+            "job_id": job_id, "resume_scope": scope,
+            "operation_id": previous["operation_id"] if resume else job_id,
             "request_fingerprint": request_fingerprint,
             "configuration_fingerprint": configuration_fingerprint,
             "session_id": session_id,
@@ -313,26 +401,50 @@ class CotJobManager:
                 pass
             if payload.get("configuration_fingerprint") != self._configuration_fingerprint(bool(payload.get("generate_bbox"))):
                 raise RuntimeError("模型配置已更新，请重新提交 COT 任务")
-            generator = self.generator_factory()
-            reviewer = _bbox_reviewer() if payload.get("generate_bbox") else None
-            if retry_enabled_for_pipeline(payload.get("pipeline_id"), storage_root()):
-                # The durable Pipeline controls the three-request budget.
-                if isinstance(generator, QwenCotGenerator):
-                    generator.client = generator.client.with_options(max_retries=0)
-                if reviewer is not None:
-                    reviewer.client = reviewer.client.with_options(max_retries=0)
-                    reviewer.max_output_attempts = 1
-            completed = int(payload.get("completed_steps") or 0)
-            completed_bbox = int(payload.get("completed_bbox") or 0)
-            completed_cot = int(payload.get("completed_cot") or 0)
+            payload.setdefault("operation_id", job_id)
+            managed = retry_enabled_for_pipeline(payload.get("pipeline_id"), storage_root())
+            pending = []
+            verified = {}
+            completed = completed_bbox = 0
             for target in payload["targets"]:
                 check_stop()
-                with active_session_lock(str(payload["session_id"])):
-                    pass
+                row = str(target["excel_row"])
+                if (session.get("cot", {}).get(row, {}).get("input_digest") or
+                        session.get("row_edits", {}).get(row, {}).get("bbox_checkpoint")):
+                    image = session_asset(session_id, target["image"])
+                    cot_key, bbox_key = _checkpoint_inputs(payload, target, image)
+                    has_cot, has_box = _restored_parts(session, payload, target, cot_key, bbox_key)
+                    if has_cot:
+                        completed += 1
+                        completed_bbox += int(has_box)
+                        verified[target["step_key"]] = (cot_key, target["bbox_hash"])
+                        continue
+                pending.append(target)
+            self._progress(job_id, {"completed_steps": completed, "completed_cot": completed,
+                                    "completed_bbox": completed_bbox,
+                                    "percent": round(completed / len(payload["targets"]) * 100)})
+            if pending:
+                generator = self.generator_factory()
+                if isinstance(generator, QwenCotGenerator):
+                    generator.cache_dir = None
+                    if managed:
+                        generator.client = generator.client.with_options(max_retries=0)
+            for target in pending:
+                check_stop()
+                with active_session_lock(session_id) as current:
+                    self._validate_target(current, target)
                 self._progress(job_id, {"current_task": target["task"], "current_trajectory": target["trajectory_id"], "current_step": target["step"]})
-                image = session_asset(str(payload["session_id"]), str(target["image"]))
+                image = session_asset(session_id, target["image"])
+                cot_key, bbox_key = _checkpoint_inputs(payload, target, image)
+                _, has_box = _restored_parts(current, payload, target, cot_key, bbox_key)
+                completed_bbox += int(has_box)
                 action = dict(target["action"])
-                if reviewer is not None and str(action.get("action", "")).lower() in {"click", "long_press", "swipe"}:
+                if payload.get("generate_bbox") and not has_box and str(action.get("action", "")).lower() in {"click", "long_press", "swipe"}:
+                    if reviewer is None:
+                        reviewer = _bbox_reviewer()
+                        if managed:
+                            reviewer.client = reviewer.client.with_options(max_retries=0)
+                            reviewer.max_output_attempts = 1
                     stable = _stable_image(image)
                     with diagnostics.trace_context(task_id=target.get("task_id"), trajectory_id=target["trajectory_id"],
                                                    step=target["step"], step_key=target.get("step_key")):
@@ -351,7 +463,13 @@ class CotJobManager:
                         baseline = target.get("edit_baseline", {})
                         if edit.get("actions_box") != baseline.get("actions_box"):
                             raise RuntimeError("生成期间标框已被修改，请重新提交")
+                        if ("force_baseline" in target and edit.get("bbox_source") == "manual"
+                                and edit.get("actions_box") != target["force_baseline"].get("actions_box")):
+                            raise RuntimeError("已确认的人工标框发生变化，请重新确认覆盖")
                         edit.update(actions_box=box, bbox_source="generated", bbox_generated_at=_now(), bbox_model=reviewer.model)
+                        if bbox_key:
+                            edit["bbox_checkpoint"] = {"operation_id": payload["operation_id"],
+                                                      "input": bbox_key, "box": _bbox_hash(box)}
                         current.setdefault("cot", {}).pop(str(target["excel_row"]), None)
                     with active_session_lock(session_id), commit_guard():
                         update_session(session_id, save_bbox)
@@ -365,6 +483,8 @@ class CotJobManager:
                 with diagnostics.trace_context(task_id=target.get("task_id"), trajectory_id=target["trajectory_id"],
                                                step=target["step"], step_key=target.get("step_key")):
                     result = generator.generate(task=target["task"], trajectory_id=target["trajectory_id"], step=int(target["step"]), history=target["history"], action=target["action"], image=image, reference_answer=str(target.get("reference_answer") or ""))
+                if (cot_key, bbox_key) != _checkpoint_inputs(payload, target, image):
+                    raise RuntimeError("生成期间图片或标框输入发生变化，请重新提交")
                 def save_cot(current):
                     self._validate_target(current, target)
                     edit = current.setdefault("row_edits", {}).setdefault(str(target["excel_row"]), {})
@@ -372,6 +492,7 @@ class CotJobManager:
                     current.setdefault("cot", {})[str(target["excel_row"])] = {
                         "thought": str(result["thought"]), "summary": str(result["summary"]),
                         "model": generator.model, "content_tag": "thought_summary",
+                        "input_digest": cot_key, "operation_id": payload["operation_id"],
                         "step_key": target.get("step_key"), "source_fingerprint": target.get("source_fingerprint"),
                         "task_fingerprint": target.get("task_fingerprint"),
                         "action_hash": _action_hash(target["action"]), "bbox_hash": _bbox_hash(current_bbox),
@@ -380,16 +501,16 @@ class CotJobManager:
                     # Automated generation fills generated content without
                     # removing handwritten text. Only explicit force-overwrite
                     # may replace the baseline, never a later human edit.
-                    baseline = target.get("edit_baseline", {})
+                    baseline = target.get("force_baseline", target.get("edit_baseline", {}))
                     if payload.get("force_overwrite"):
                         for field in ("summary", "thought"):
                             if field in baseline and edit.get(field) == baseline[field]:
                                 edit.pop(field, None)
                 with active_session_lock(session_id), commit_guard():
                     update_session(session_id, save_cot)
+                verified[target["step_key"]] = (cot_key, target["bbox_hash"])
                 completed += 1
-                completed_cot += 1
-                self._progress(job_id, {"stage": "generating_cot", "completed_steps": completed, "completed_cot": completed_cot, "percent": round(completed / len(payload["targets"]) * 100), "error": None})
+                self._progress(job_id, {"stage": "generating_cot", "completed_steps": completed, "completed_cot": completed, "percent": round(completed / len(payload["targets"]) * 100), "error": None})
         except PipelineJobCancelled:
             self._cancelled(job_id)
             return
@@ -415,8 +536,22 @@ class CotJobManager:
                     reviewer.client.close()
         try:
             check_stop()
-            artifact = (publish_cot_snapshot(session_id, commit_guard=commit_guard) if payload.get("pipeline_id")
-                        else publish_cot_snapshot(session_id))
+            with active_session_lock(session_id) as current:
+                # Recheck the entire selection once before publication, including
+                # skipped rows which had no write transaction during this attempt.
+                targets = self._targets(session_id, payload.get("group_ids"), payload.get("row_ids"))
+                latest = {t["step_key"]: t for t in targets}
+                for original in payload["targets"]:
+                    now = latest.get(original["step_key"])
+                    if now is None or _target_identity(now) != _target_identity(original):
+                        raise RuntimeError("COT 生成后步骤来源或动作发生变化，请重新提交")
+                    result = current.get("cot", {}).get(str(now["excel_row"])) or {}
+                    if ((result.get("input_digest"), now["bbox_hash"]) != verified[original["step_key"]] or
+                            result.get("bbox_hash") != now["bbox_hash"] or not result.get("thought")
+                            or not result.get("summary")):
+                        raise RuntimeError("COT 生成后已保存的步骤发生变化，请重新提交")
+                artifact = (publish_cot_snapshot(session_id, commit_guard=commit_guard) if payload.get("pipeline_id")
+                            else publish_cot_snapshot(session_id))
             self._progress(job_id, {"artifact": artifact})
         except PipelineJobCancelled:
             self._cancelled(job_id)

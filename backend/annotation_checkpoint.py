@@ -16,7 +16,7 @@ class AnnotationCheckpoint:
         chain = job["annotation_chain_id"]
         self.path = contained_path(root, "system", "preprocessing", job["batch_id"], chain, "rows.sqlite")
         self.identity = json.dumps([
-            1, job["batch_id"], job["pipeline_id"], chain, job["fingerprint"], job["input_sha256"],
+            1, job["batch_id"], job.get("pipeline_id"), chain, job["fingerprint"], job["input_sha256"],
         ], ensure_ascii=False)
         self.job_id = job["job_id"]
         self.commit_guard = commit_guard

@@ -229,7 +229,8 @@ def _parse_response(
 
 
 class QwenBoxReviewer:
-    def __init__(self, model: str, cache_path: Path, *, client_settings: dict[str, Any] | None = None) -> None:
+    def __init__(self, model: str, cache_path: Path, *, client_settings: dict[str, Any] | None = None,
+                 use_response_cache: bool = True) -> None:
         settings = client_settings if client_settings is not None else qwen_settings()
         proxy = settings["proxy"] or None
         http_client = httpx.Client(
@@ -248,8 +249,9 @@ class QwenBoxReviewer:
         diagnostics.register_secrets(settings["api_key"])
         self.max_output_attempts = 3
         self.cache_path = cache_path
+        self.use_response_cache = use_response_cache
         self.cache: dict[str, str] = {}
-        if io_path(cache_path).exists():
+        if use_response_cache and io_path(cache_path).exists():
             self.cache = json.loads(io_path(cache_path).read_text(encoding="utf-8"))
 
     def _save_cache(self) -> None:
@@ -483,8 +485,9 @@ class QwenBoxReviewer:
                     error.args = (f"{error}; diagnostic: {diagnostics.sanitize(str(path))}",)
                     raise error
                 continue
-            self.cache[cache_key] = raw
-            self._save_cache()
+            if self.use_response_cache:
+                self.cache[cache_key] = raw
+                self._save_cache()
             if failures:
                 self._write_failures(cache_key, payload, image_path, failures, resolved=True)
             result.cached = False

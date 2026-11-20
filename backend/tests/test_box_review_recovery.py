@@ -38,10 +38,22 @@ class BoxReviewRecoveryTests(unittest.TestCase):
                          action_summary="点击按钮", candidate_bbox=(100, 500, 400, 1000),
                          image_size=(1200, 2664), rule_context={"source": "xml"}, round_index=1)
 
-    def reviewer(self, client):
+    def reviewer(self, client, **options):
         with patch("backend.bounding_box.qwen_reviewer.httpx.Client"), \
              patch("backend.bounding_box.qwen_reviewer.OpenAI", return_value=client):
-            return QwenBoxReviewer("test-model", self.cache, client_settings=self.settings)
+            return QwenBoxReviewer("test-model", self.cache, client_settings=self.settings, **options)
+
+    def test_checkpointed_worker_ignores_legacy_reply_file(self):
+        client = MagicMock()
+        client.chat.completions.create.return_value = reply(GOOD)
+        self.reviewer(client).review(**self.args)
+        old = self.cache.read_bytes()
+        client.chat.completions.create.return_value = reply(ACCEPT)
+        result = self.reviewer(client, use_response_cache=False).review(**self.args)
+        self.assertFalse(result.cached)
+        self.assertEqual(result.decision, "accept")
+        self.assertEqual(client.chat.completions.create.call_count, 2)
+        self.assertEqual(self.cache.read_bytes(), old)
 
     def diagnostic(self):
         paths = list((self.root / "box_failures").glob("*.json"))

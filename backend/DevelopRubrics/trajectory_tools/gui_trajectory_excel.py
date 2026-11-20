@@ -244,14 +244,18 @@ def write_workbook(output: Path, tasks: dict[str, TaskRecord], trajectories: lis
     workbook.save(io_path(output))
 
 
+TRAJECTORY_SUMMARY_PROMPT_VERSION = "trajectory-evidence-v2"
+
+
 class QwenSummarizer:
-    def __init__(self, model: str, base_url: str, api_key: str, cache_path: Path,
+    def __init__(self, model: str, base_url: str, api_key: str, cache_path: Path | None,
                  *, http_options: dict[str, Any] | None = None) -> None:
         from openai import OpenAI
 
         self.model = model
         self.cache_path = cache_path
-        self.cache = json.loads(io_path(cache_path).read_text(encoding="utf-8")) if io_path(cache_path).is_file() else {}
+        self.cache = (json.loads(io_path(cache_path).read_text(encoding="utf-8"))
+                      if cache_path is not None and io_path(cache_path).is_file() else {})
         self._cache_lock = threading.RLock()
         resolved_http_options = http_options if http_options is not None else model_http_options()
         http_client = model_http_client(resolved_http_options)
@@ -299,6 +303,8 @@ class QwenSummarizer:
         text = (response.choices[0].message.content or "").strip()
         if not text:
             raise ValueError("Qwen returned an empty summary")
+        if self.cache_path is None:
+            return text
         with self._cache_lock:
             cached = self.cache.get(key)
             if cached is not None:
@@ -324,7 +330,8 @@ class QwenSummarizer:
     def summarize_trajectory(self, task: str, trajectory_id: str, steps: list[StepRecord]) -> str:
         evidence = [{"step_id": item.step_id, "action": item.action, "observation": item.observation} for item in steps]
         payload = json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))
-        key = "trajectory-evidence-v2:" + hashlib.sha256(f"{self.model}\n{task}\n{trajectory_id}\n{payload}".encode()).hexdigest()
+        key = TRAJECTORY_SUMMARY_PROMPT_VERSION + ":" + hashlib.sha256(
+            f"{self.model}\n{task}\n{trajectory_id}\n{payload}".encode()).hexdigest()
         return self._complete(key, [
             {"role": "system", "content": "根据 Task、逐步 Action 和 Observation，用一段简洁中文总结与任务相关的关键可见状态变化以及最终可见页面。只写可观察事实；不得根据 terminate 声明判断成功、失败、完成或未完成，不评价动作，不规划下一步。描述最终可见状态后立即结束。"},
             {"role": "user", "content": f"任务：{task}\n轨迹证据：{payload}"},

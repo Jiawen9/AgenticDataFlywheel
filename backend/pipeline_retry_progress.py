@@ -4,6 +4,7 @@ from __future__ import annotations
 from .annotation_checkpoint import AnnotationCheckpoint
 from .batch_results import digest
 from .quality_fusion import fuse
+from .quality_resume import quality_chunk_checkpoint
 
 
 def _bound_jobs(records, namespace, pipeline, step):
@@ -19,7 +20,7 @@ def _partials(records, job):
         yield from records.get_many("quality_partial_results", keys[start:start + 8])
 
 
-def _quality_progress(records, pipeline, jobs):
+def _quality_progress(root, records, pipeline, jobs):
     # Keep the small union outside the Pipeline's public record. Re-reading an
     # old checkpoint under a new job ID cannot earn another retry budget.
     namespace = "pipeline_quality_retry_progress"
@@ -30,22 +31,21 @@ def _quality_progress(records, pipeline, jobs):
     tasks = record.setdefault("tasks", {})
     changed = False
     for job in jobs:
+        for task, fingerprint in job.get("task_fingerprints", {}).items():
+            tree = job.get("source_tree_hashes", {}).get(task)
+            if tree and fingerprint and task not in tasks:
+                tasks[task] = {"identity": [tree, fingerprint], "units": {}}
+                changed = True
         for partial in _partials(records, job):
             task = partial.get("task_id")
             fingerprint = job.get("task_fingerprints", {}).get(task)
             tree = job.get("source_tree_hashes", {}).get(task)
-            if not tree or not fingerprint:
-                continue
-            identity = [tree, fingerprint]
             saved = tasks.get(task)
-            if saved and saved["identity"] != identity:
+            if not saved or saved["identity"] != [tree, fingerprint]:
                 continue
             if (partial.get("input_fingerprint") != fingerprint or partial.get("source_tree_hash") != tree
                     or partial.get("batch_id") != pipeline["batch_id"] or partial.get("job_id") != job["job_id"]):
                 continue
-            if saved is None:
-                saved = tasks[task] = {"identity": identity, "units": {}}
-                changed = True
             result = partial["result"]
             definition = result.get("checklist_definition_digest")
             for trajectory, evaluation in result.get("evaluations", {}).items():
@@ -70,12 +70,15 @@ def _quality_progress(records, pipeline, jobs):
         # The caller serializes a pipeline's transitions. CAS also protects
         # against accidentally overwriting a newer observation.
         records.put(namespace, key, record, expected_revision=record.get("storage_revision", 0))
-    return sum(mask.bit_count() for task in tasks.values() for mask in task["units"].values())
+    finished = sum(mask.bit_count() for task in tasks.values() for mask in task["units"].values())
+    chunks = sum(quality_chunk_checkpoint(root, pipeline["batch_id"], task, state["identity"][1])
+                 .count("rubric_chunk") for task, state in tasks.items())
+    return finished + chunks
 
 
 def progress(root, records, pipeline, step) -> int:
     if step["id"] == "quality":
-        return _quality_progress(records, pipeline, _bound_jobs(records, "quality_jobs", pipeline, step))
+        return _quality_progress(root, records, pipeline, _bound_jobs(records, "quality_jobs", pipeline, step))
     if step["id"] == "preprocessing":
         jobs = _bound_jobs(records, "preprocessing_jobs", pipeline, step)
         # New retry job IDs refer to the same durable row store. The store

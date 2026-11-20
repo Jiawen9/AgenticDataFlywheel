@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from backend.file_io import io_path
 from backend.pipeline_retry_errors import ModelOutputError
+from backend.pipeline_diagnostics import log_event
 from backend.trajectories_tree.model_response import response_text
 
 from typing import Any
@@ -144,14 +145,16 @@ def _image_data_url(path: Path) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
 
 class QwenIntermediateStateClassifier:
-    def __init__(self, model: str, cache_path: Path) -> None:
+    def __init__(self, model: str, cache_path: Path | None) -> None:
         settings = qwen_settings()
         http_client = httpx.Client(proxy=settings["proxy"] or None, verify=settings["verify"], timeout=settings["timeout"], trust_env=settings["trust_env"])
         instrument_http_client(http_client, api_key=settings["api_key"], settings={
             "proxy": settings["proxy"], "trust_env": settings["trust_env"], "sdk_retries": 0})
         self.client = OpenAI(api_key=settings["api_key"], base_url=settings["base_url"], timeout=settings["timeout"], max_retries=0, http_client=http_client)
         self.model, self.cache_path = model, cache_path
-        self.cache: dict[str, Any] = json.loads(io_path(cache_path).read_text(encoding="utf-8")) if io_path(cache_path).exists() else {}
+        self.checkpoint = None
+        self.cache: dict[str, Any] = (json.loads(io_path(cache_path).read_text(encoding="utf-8"))
+                                      if cache_path is not None and io_path(cache_path).exists() else {})
         if not isinstance(self.cache, dict):
             raise ValueError(f"classification cache must be a JSON object: {cache_path}")
         self._cache_lock = threading.RLock()
@@ -226,14 +229,27 @@ class QwenIntermediateStateClassifier:
                   "next_summary": next_summary}
         combined = {**common, "task": task, "after_image_digest": _image_digest(after)}
         cache_key = self._key({"version": PROMPT_VERSION, **combined})
-        current = self._cached_result(cache_key, PROMPT_VERSION)
-        if current is not None:
-            return current
-
-        legacy_key = self._key({"version": LEGACY_PROMPT_VERSION, **common})
-        previous_key = self._key({"version": PREVIOUS_PROMPT_VERSION, **combined})
-        legacy_result = self._cached_result(legacy_key, LEGACY_PROMPT_VERSION)
-        result = self._cached_result(previous_key, PREVIOUS_PROMPT_VERSION)
+        checkpoint = getattr(self, "checkpoint", None)
+        legacy_result = result = None
+        if checkpoint is not None:
+            saved = checkpoint.get("classification", cache_key)
+            if saved is not None:
+                result = parse_classification_response(json.dumps(saved, ensure_ascii=False),
+                                                       require_observation=True)
+                result.raw_response = ""
+                result.checkpoint_restored = True
+                result.classification_source = {"version": PROMPT_VERSION, "checkpoint_key": cache_key}
+                result.observation_source = dict(result.classification_source)
+                log_event("model_checkpoint_reused", operation="intermediate_classify")
+                return result
+        elif self.cache_path is not None:
+            current = self._cached_result(cache_key, PROMPT_VERSION)
+            if current is not None:
+                return current
+            legacy_key = self._key({"version": LEGACY_PROMPT_VERSION, **common})
+            previous_key = self._key({"version": PREVIOUS_PROMPT_VERSION, **combined})
+            legacy_result = self._cached_result(legacy_key, LEGACY_PROMPT_VERSION)
+            result = self._cached_result(previous_key, PREVIOUS_PROMPT_VERSION)
         if result is not None:
             result.classification_source = {"version": PREVIOUS_PROMPT_VERSION, "cache_key": previous_key}
             result.observation_source = dict(result.classification_source)
@@ -286,6 +302,14 @@ Observation action：{json.dumps(observation_action, ensure_ascii=False)}
             result = parse_classification_response(raw, require_observation=True)
             result.classification_source = {"version": PROMPT_VERSION, "cache_key": cache_key}
             result.observation_source = dict(result.classification_source)
+        if checkpoint is not None:
+            checkpoint.save("classification", cache_key, _normalized_result(result))
+            result.raw_response = ""
+            result.classification_source = {"version": PROMPT_VERSION, "checkpoint_key": cache_key}
+            result.observation_source = dict(result.classification_source)
+            return result
+        if self.cache_path is None:
+            return result
         if legacy_result:
             result.classification_changed = (result.is_intermediate, result.category, result.confidence) != (legacy_result.is_intermediate, legacy_result.category, legacy_result.confidence)
             result.is_intermediate, result.category, result.confidence, result.reason = legacy_result.is_intermediate, legacy_result.category, legacy_result.confidence, legacy_result.reason
